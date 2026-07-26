@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -672,6 +673,47 @@ func TestRestart_PersistsGenerationBeforePollStateReload(t *testing.T) {
 	}
 	if reloaded[0].tmuxSession != freshWrapper || !reloaded[0].lastCodexProbeAt.IsZero() {
 		t.Fatal("pre-restart tmux/backoff cache crossed the durable generation boundary")
+	}
+}
+
+func TestRestart_PersistenceFailureReportsCompletedRestart(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	const profile = "_test_transition_restart_partial_success"
+	_, storage := bootstrapDaemonProfile(t, profile)
+
+	title := uniqueShellTestTitle("RestartPartialSuccess")
+	inst := NewInstance(title, t.TempDir())
+	inst.GroupPath = DefaultGroupPath
+	if err := inst.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { cleanupShellSessions(title) })
+	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+		t.Fatalf("save started instance: %v", err)
+	}
+	loaded, _, err := storage.LoadWithGroups()
+	if err != nil || len(loaded) != 1 {
+		t.Fatalf("load started instance: count=%d err=%v", len(loaded), err)
+	}
+	beforeRestart := loaded[0].LastStartedAt
+	statedb.SetGlobal(nil)
+	if err := storage.Close(); err != nil {
+		t.Fatalf("close owning DB: %v", err)
+	}
+
+	err = loaded[0].Restart()
+	if err == nil {
+		t.Fatal("closed owning DB unexpectedly reported durable restart success")
+	}
+	var completed interface{ RestartCompleted() bool }
+	if !errors.As(err, &completed) || !completed.RestartCompleted() {
+		t.Fatalf("completed pane restart returned an ordinary retryable error: %T %v", err, err)
+	}
+	if !loaded[0].LastStartedAt.After(beforeRestart) {
+		t.Fatal("partial-success restart did not advance its in-memory generation")
+	}
+	if loaded[0].tmuxSession == nil || !loaded[0].tmuxSession.Exists() {
+		t.Fatal("persistence failure hid that the replacement tmux runtime is live")
 	}
 }
 

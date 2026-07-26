@@ -10,6 +10,12 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
+type completedRestartTestError struct{ err error }
+
+func (e completedRestartTestError) Error() string          { return e.err.Error() }
+func (e completedRestartTestError) Unwrap() error          { return e.err }
+func (e completedRestartTestError) RestartCompleted() bool { return true }
+
 func TestRestartWithArchiveTransitionActiveSession(t *testing.T) {
 	inst := &session.Instance{ID: "active"}
 	persisted := false
@@ -78,6 +84,29 @@ func TestRestartWithArchiveTransitionRestoresArchiveOnFailure(t *testing.T) {
 	}
 	if len(persisted) != 2 || !persisted[0].IsZero() || !persisted[1].Equal(archivedAt) {
 		t.Fatalf("persisted timestamps = %v, want [zero, %v]", persisted, archivedAt)
+	}
+}
+
+func TestRestartWithArchiveTransitionKeepsUnarchivedAfterCompletedRestart(t *testing.T) {
+	archivedAt := time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC)
+	inst := &session.Instance{ID: "archived-partial", ArchivedAt: archivedAt}
+	var persisted []time.Time
+	persistErr := errors.New("runtime generation database unavailable")
+
+	unarchived, err := restartWithArchiveTransition(inst, func(current *session.Instance) error {
+		persisted = append(persisted, current.ArchivedAt)
+		return nil
+	}, func() error {
+		return completedRestartTestError{err: persistErr}
+	})
+	if !errors.Is(err, persistErr) {
+		t.Fatalf("error = %v, want partial-success cause %v", err, persistErr)
+	}
+	if !unarchived || inst.IsArchived() {
+		t.Fatalf("completed restart was destructively rolled back: unarchived=%v archivedAt=%v", unarchived, inst.ArchivedAt)
+	}
+	if len(persisted) != 1 || !persisted[0].IsZero() {
+		t.Fatalf("completed restart persisted an archive rollback: %v", persisted)
 	}
 }
 
