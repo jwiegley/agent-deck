@@ -2353,7 +2353,9 @@ func (i *Instance) detectCodexSessionAsync() {
 
 		sessionID, _ := i.queryCodexSessionFromProcessFiles()
 		if sessionID == "" {
-			sessionID = i.queryCodexSession(i.collectOtherCodexSessionIDs(), true)
+			if exclusions, fresh := i.collectOtherCodexSessionIDs(); fresh {
+				sessionID = i.queryCodexSession(exclusions, true)
+			}
 		}
 		if sessionID != "" {
 			i.CodexSessionID = sessionID
@@ -2672,6 +2674,7 @@ type codexOwnershipSnapshotData struct {
 	sourceKey string
 	idsByTmux map[string]string
 	ownedIDs  map[string]int
+	complete  bool
 }
 
 const codexOwnershipRefreshTimeout = 750 * time.Millisecond
@@ -2696,6 +2699,7 @@ func refreshCodexOwnershipSnapshot(sourceKey string, stale *codexOwnershipSnapsh
 	defer cancel()
 
 	idsByTmux, err := tmux.ListAgentDeckCodexSessionIDs(ctx)
+	complete := err == nil
 	if err != nil {
 		idsByTmux = map[string]string{}
 		if stale != nil {
@@ -2711,6 +2715,7 @@ func refreshCodexOwnershipSnapshot(sourceKey string, stale *codexOwnershipSnapsh
 		sourceKey: sourceKey,
 		idsByTmux: idsByTmux,
 		ownedIDs:  ownedIDs,
+		complete:  complete,
 	}
 }
 
@@ -2732,11 +2737,11 @@ func launchCodexOwnershipRefresh(sourceKey string, stale *codexOwnershipSnapshot
 	}()
 }
 
-// collectOtherCodexSessionIDs returns a read-only view of the shared ownership
-// snapshot. The CAS winner launches a bounded batch refresh asynchronously;
-// every caller, including that winner, immediately uses the previous (or empty)
-// snapshot. Published maps are immutable after the atomic store.
-func (i *Instance) collectOtherCodexSessionIDs() codexSessionExclusions {
+// collectOtherCodexSessionIDs returns a read-only view plus whether it is a
+// complete, fresh snapshot for the current tmux source. The CAS winner launches
+// a bounded batch refresh asynchronously; every caller immediately returns.
+// Callers MUST NOT use exclusions for binding unless fresh is true.
+func (i *Instance) collectOtherCodexSessionIDs() (exclusions codexSessionExclusions, fresh bool) {
 	myTmuxName := ""
 	if i.tmuxSession != nil {
 		myTmuxName = i.tmuxSession.Name
@@ -2744,30 +2749,38 @@ func (i *Instance) collectOtherCodexSessionIDs() codexSessionExclusions {
 
 	sourceKey := os.Getenv("PATH") + "\x00" + tmux.DefaultSocketName()
 	snapshot := codexOwnershipSnapshot.Load()
-	if snapshot != nil && snapshot.sourceKey == sourceKey &&
+	if snapshot != nil && snapshot.sourceKey == sourceKey && snapshot.complete &&
 		time.Since(snapshot.loadedAt) < codexBootstrapScanInterval {
-		return codexOwnershipExclusions(snapshot, myTmuxName)
+		return codexOwnershipExclusions(snapshot, myTmuxName), true
 	}
 
 	stale := snapshot
 	if stale != nil && stale.sourceKey != sourceKey {
 		stale = nil
 	}
-	if codexOwnershipRefresh.CompareAndSwap(false, true) {
+	shouldRefresh := stale == nil || time.Since(stale.loadedAt) >= codexBootstrapScanInterval
+	if shouldRefresh && codexOwnershipRefresh.CompareAndSwap(false, true) {
 		launchCodexOwnershipRefresh(sourceKey, stale)
 	}
-	return codexOwnershipExclusions(stale, myTmuxName)
+	return codexOwnershipExclusions(stale, myTmuxName), false
+}
+
+func codexSessionScanInterval(allowUnscoped bool) time.Duration {
+	if allowUnscoped {
+		return codexBootstrapScanInterval
+	}
+	return codexRotationScanInterval
+}
+
+func (i *Instance) codexSessionScanDue(allowUnscoped bool) bool {
+	return i.lastCodexScanAt.IsZero() ||
+		time.Since(i.lastCodexScanAt) >= codexSessionScanInterval(allowUnscoped)
 }
 
 // shouldScanCodexSession returns whether we should run an expensive filesystem
 // scan for Codex session rotation right now.
 func (i *Instance) shouldScanCodexSession(allowUnscoped bool) bool {
-	interval := codexRotationScanInterval
-	if allowUnscoped {
-		interval = codexBootstrapScanInterval
-	}
-
-	if !i.lastCodexScanAt.IsZero() && time.Since(i.lastCodexScanAt) < interval {
+	if !i.codexSessionScanDue(allowUnscoped) {
 		return false
 	}
 
@@ -3158,7 +3171,7 @@ func (i *Instance) updateCodexSession(excludeIDs map[string]bool, forceProbe boo
 
 	// Only allow unscoped fallback when we don't have a known session ID yet.
 	allowUnscoped := envSessionID == "" && i.CodexSessionID == "" && i.CodexStartedAt > 0
-	if !i.shouldScanCodexSession(allowUnscoped) {
+	if !i.codexSessionScanDue(allowUnscoped) {
 		return missingProbeDep
 	}
 
@@ -3167,8 +3180,13 @@ func (i *Instance) updateCodexSession(excludeIDs map[string]bool, forceProbe boo
 	// and the fallback cooldown says a scan will actually run.
 	exclusions := codexSessionExclusions{explicit: excludeIDs}
 	if excludeIDs == nil {
-		exclusions = i.collectOtherCodexSessionIDs()
+		var fresh bool
+		exclusions, fresh = i.collectOtherCodexSessionIDs()
+		if !fresh {
+			return missingProbeDep
+		}
 	}
+	i.lastCodexScanAt = time.Now()
 
 	if sessionID := i.queryCodexSession(exclusions, allowUnscoped); sessionID != "" {
 		// queryCodexSession already filters subagent rollouts out of candidacy

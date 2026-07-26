@@ -3430,7 +3430,7 @@ func TestInstance_UpdateCodexSession_ScanCooldown(t *testing.T) {
 		t.Fatalf("set file1 mtime: %v", err)
 	}
 
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(map[string]bool{})
 	if inst.CodexSessionID != sessionID1 {
 		t.Fatalf("first scan picked %q, want %q", inst.CodexSessionID, sessionID1)
 	}
@@ -3442,7 +3442,7 @@ func TestInstance_UpdateCodexSession_ScanCooldown(t *testing.T) {
 	}
 
 	// Immediate follow-up should skip expensive scan and keep existing ID.
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(map[string]bool{})
 	if inst.CodexSessionID != sessionID1 {
 		t.Fatalf("cooldown should keep %q, got %q", sessionID1, inst.CodexSessionID)
 	}
@@ -3451,7 +3451,7 @@ func TestInstance_UpdateCodexSession_ScanCooldown(t *testing.T) {
 	// disk-scan rebinding. Rotation is handled by hook payloads or live process
 	// file probes, not by periodically walking all old Codex transcripts.
 	inst.lastCodexScanAt = time.Now().Add(-codexRotationScanInterval - time.Second)
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(map[string]bool{})
 	if inst.CodexSessionID != sessionID1 {
 		t.Fatalf("post-cooldown known ID should keep %q, got %q", sessionID1, inst.CodexSessionID)
 	}
@@ -3460,7 +3460,7 @@ func TestInstance_UpdateCodexSession_ScanCooldown(t *testing.T) {
 	// the newest matching session.
 	inst.CodexSessionID = ""
 	inst.lastCodexScanAt = time.Now().Add(-codexRotationScanInterval - time.Second)
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(map[string]bool{})
 	if inst.CodexSessionID != sessionID2 {
 		t.Fatalf("bootstrap scan picked %q, want %q", inst.CodexSessionID, sessionID2)
 	}
@@ -3520,7 +3520,7 @@ func TestInstance_CodexSessionExclusion_SameProjectPath(t *testing.T) {
 
 	// Instance 1 picks up sessionB (most recent) with no exclusions.
 	inst1 := NewInstanceWithTool("codex-excl-1", projectPath, "codex")
-	inst1.UpdateCodexSession(nil)
+	inst1.UpdateCodexSession(map[string]bool{})
 	if inst1.CodexSessionID != sessionB {
 		t.Fatalf("inst1 picked %q, want %q", inst1.CodexSessionID, sessionB)
 	}

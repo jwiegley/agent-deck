@@ -295,7 +295,7 @@ func TestUpdateCodexSession_DiskScan_PrefersUserOverSubagent(t *testing.T) {
 	seedCodexRolloutCwd(t, codexHome, userSID, "user", inst.ProjectPath)
 	seedCodexRolloutCwd(t, codexHome, subSID, "subagent", inst.ProjectPath)
 
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(map[string]bool{})
 
 	if inst.CodexSessionID == subSID {
 		t.Fatalf("disk scan adopted the subagent thread %q — codex refuses user "+
@@ -315,7 +315,7 @@ func TestUpdateCodexSession_DiskScan_RejectsLoneSubagent(t *testing.T) {
 	subSID := uniqueSID(t)
 	seedCodexRolloutCwd(t, codexHome, subSID, "subagent", inst.ProjectPath)
 
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(map[string]bool{})
 
 	if inst.CodexSessionID != "" {
 		t.Fatalf("disk scan must leave the session unbound when only a subagent "+

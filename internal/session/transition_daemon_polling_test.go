@@ -206,7 +206,7 @@ esac
 	originalProbe := updateInstanceStatus.Load().(statusProbeFunc)
 	var completed atomic.Int32
 	updateInstanceStatus.Store(statusProbeFunc(func(inst *Instance) error {
-		_ = inst.collectOtherCodexSessionIDs()
+		_, _ = inst.collectOtherCodexSessionIDs()
 		completed.Add(1)
 		return nil
 	}))
