@@ -2428,11 +2428,32 @@ func runWithTimeout(timeout time.Duration, op func()) bool {
 // while still preventing indefinite hangs.
 const codexWalkDirTimeout = 5 * time.Second
 
+// codexSessionExclusions is a read-only view used by the fallback disk walk.
+// Explicit caller maps preserve the public UpdateCodexSession contract. Shared
+// ownership snapshots carry owner counts so the current tmux session's ID can
+// be allowed without accidentally allowing a duplicate owned by a sibling.
+type codexSessionExclusions struct {
+	explicit map[string]bool
+	ownedIDs map[string]int
+	ownID    string
+}
+
+func (e codexSessionExclusions) contains(id string) bool {
+	if e.explicit != nil {
+		return e.explicit[id]
+	}
+	owners := e.ownedIDs[id]
+	if id == e.ownID && owners == 1 {
+		return false
+	}
+	return owners > 0
+}
+
 // queryCodexSession scans Codex sessions and returns the best candidate.
 // Selection strategy:
 //  1. Prefer sessions whose JSONL metadata matches this instance's project path.
 //  2. Optionally allow unscoped fallback (no cwd metadata) for initial bootstrap.
-func (i *Instance) queryCodexSession(excludeIDs map[string]bool, allowUnscoped bool) string {
+func (i *Instance) queryCodexSession(exclusions codexSessionExclusions, allowUnscoped bool) string {
 	sessionsDir := filepath.Join(i.getCodexHomeDir(), "sessions")
 	if _, err := os.Stat(sessionsDir); os.IsNotExist(err) {
 		return ""
@@ -2462,7 +2483,7 @@ func (i *Instance) queryCodexSession(excludeIDs map[string]bool, allowUnscoped b
 			if sessionID == "" {
 				return nil
 			}
-			if excludeIDs != nil && excludeIDs[sessionID] {
+			if exclusions.contains(sessionID) {
 				return nil
 			}
 
@@ -2625,53 +2646,82 @@ func decodeJSONStringField(raw map[string]json.RawMessage, key string) string {
 	return strings.TrimSpace(s)
 }
 
-// collectOtherCodexSessionIDs enumerates other managed tmux sessions and returns
-// the CODEX_SESSION_ID values they currently own.
-//
-// Bootstrap scans for several unknown Codex instances commonly become due in
-// the same status pass. Cache the fleet snapshot for that bootstrap interval so
-// the first caller pays O(S) tmux reads and the remaining callers only filter
-// the in-process snapshot instead of multiplying the work by instance count.
-var codexOwnershipSnapshot = struct {
-	sync.Mutex
+type codexOwnershipSnapshotData struct {
 	loadedAt  time.Time
 	sourceKey string
 	idsByTmux map[string]string
-}{}
+	ownedIDs  map[string]int
+}
 
-func (i *Instance) collectOtherCodexSessionIDs() map[string]bool {
+const codexOwnershipRefreshTimeout = 750 * time.Millisecond
+
+var (
+	codexOwnershipSnapshot atomic.Pointer[codexOwnershipSnapshotData]
+	codexOwnershipRefresh  atomic.Bool
+)
+
+func codexOwnershipExclusions(snapshot *codexOwnershipSnapshotData, myTmuxName string) codexSessionExclusions {
+	if snapshot == nil {
+		return codexSessionExclusions{}
+	}
+	return codexSessionExclusions{
+		ownedIDs: snapshot.ownedIDs,
+		ownID:    snapshot.idsByTmux[myTmuxName],
+	}
+}
+
+func refreshCodexOwnershipSnapshot(sourceKey string, stale *codexOwnershipSnapshotData) *codexOwnershipSnapshotData {
+	ctx, cancel := context.WithTimeout(context.Background(), codexOwnershipRefreshTimeout)
+	defer cancel()
+
+	idsByTmux, err := tmux.ListAgentDeckCodexSessionIDs(ctx)
+	if err != nil {
+		idsByTmux = map[string]string{}
+		if stale != nil {
+			idsByTmux = stale.idsByTmux
+		}
+	}
+	ownedIDs := make(map[string]int, len(idsByTmux))
+	for _, id := range idsByTmux {
+		ownedIDs[id]++
+	}
+	return &codexOwnershipSnapshotData{
+		loadedAt:  time.Now(),
+		sourceKey: sourceKey,
+		idsByTmux: idsByTmux,
+		ownedIDs:  ownedIDs,
+	}
+}
+
+// collectOtherCodexSessionIDs returns a read-only view of the shared ownership
+// snapshot. One caller refreshes it with a bounded batch query; concurrent
+// callers never wait behind that subprocess and use the previous (or empty)
+// snapshot. Published maps are immutable after the atomic store.
+func (i *Instance) collectOtherCodexSessionIDs() codexSessionExclusions {
 	myTmuxName := ""
 	if i.tmuxSession != nil {
 		myTmuxName = i.tmuxSession.Name
 	}
 
-	codexOwnershipSnapshot.Lock()
-	defer codexOwnershipSnapshot.Unlock()
 	sourceKey := os.Getenv("PATH") + "\x00" + tmux.DefaultSocketName()
-	if codexOwnershipSnapshot.sourceKey != sourceKey ||
-		codexOwnershipSnapshot.loadedAt.IsZero() ||
-		time.Since(codexOwnershipSnapshot.loadedAt) >= codexBootstrapScanInterval {
-		idsByTmux := make(map[string]string)
-		if tmuxSessions, err := tmux.ListAgentDeckSessions(); err == nil {
-			for _, sessName := range tmuxSessions {
-				other := &tmux.Session{Name: sessName}
-				if id, err := other.GetEnvironment("CODEX_SESSION_ID"); err == nil && id != "" {
-					idsByTmux[sessName] = id
-				}
-			}
-		}
-		codexOwnershipSnapshot.loadedAt = time.Now()
-		codexOwnershipSnapshot.sourceKey = sourceKey
-		codexOwnershipSnapshot.idsByTmux = idsByTmux
+	snapshot := codexOwnershipSnapshot.Load()
+	if snapshot != nil && snapshot.sourceKey == sourceKey &&
+		time.Since(snapshot.loadedAt) < codexBootstrapScanInterval {
+		return codexOwnershipExclusions(snapshot, myTmuxName)
 	}
 
-	exclude := make(map[string]bool, len(codexOwnershipSnapshot.idsByTmux))
-	for sessName, id := range codexOwnershipSnapshot.idsByTmux {
-		if sessName != myTmuxName {
-			exclude[id] = true
-		}
+	stale := snapshot
+	if stale != nil && stale.sourceKey != sourceKey {
+		stale = nil
 	}
-	return exclude
+	if !codexOwnershipRefresh.CompareAndSwap(false, true) {
+		return codexOwnershipExclusions(stale, myTmuxName)
+	}
+	defer codexOwnershipRefresh.Store(false)
+
+	refreshed := refreshCodexOwnershipSnapshot(sourceKey, stale)
+	codexOwnershipSnapshot.Store(refreshed)
+	return codexOwnershipExclusions(refreshed, myTmuxName)
 }
 
 // shouldScanCodexSession returns whether we should run an expensive filesystem
@@ -3080,11 +3130,12 @@ func (i *Instance) updateCodexSession(excludeIDs map[string]bool, forceProbe boo
 	// Ownership exclusions are only relevant to the historical disk fallback.
 	// Defer their fleet-wide tmux snapshot until the live-process probe failed
 	// and the fallback cooldown says a scan will actually run.
+	exclusions := codexSessionExclusions{explicit: excludeIDs}
 	if excludeIDs == nil {
-		excludeIDs = i.collectOtherCodexSessionIDs()
+		exclusions = i.collectOtherCodexSessionIDs()
 	}
 
-	if sessionID := i.queryCodexSession(excludeIDs, allowUnscoped); sessionID != "" {
+	if sessionID := i.queryCodexSession(exclusions, allowUnscoped); sessionID != "" {
 		// queryCodexSession already filters subagent rollouts out of candidacy
 		// (incident 2026-07-15), so sessionID here is always a user thread.
 		changed := sessionID != i.CodexSessionID

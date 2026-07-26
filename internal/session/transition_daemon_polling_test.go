@@ -233,6 +233,16 @@ esac
 	if elapsed >= 500*time.Millisecond {
 		t.Fatalf("daemon poll waited too long behind blocked ownership refresh: %s", elapsed)
 	}
+	deadline := time.Now().Add(2 * time.Second)
+	for codexOwnershipRefresh.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if codexOwnershipRefresh.Load() {
+		t.Fatal("bounded Codex ownership refresh did not terminate")
+	}
+	// Keep this package-global cache from coupling later PATH-isolated tests to
+	// the blocking fixture above.
+	codexOwnershipSnapshot.Store(nil)
 }
 
 func TestSyncOnce_WarmsTmuxCachesOnceAcrossProfiles(t *testing.T) {
@@ -737,9 +747,7 @@ func TestUpdateStatus_UnknownCodexFastPollSubprocessBudget(t *testing.T) {
 printf '%s\n' "$*" >> "$TMUX_TEST_LOG"
 case " $* " in
   *" has-session "*) exit 0 ;;
-	*" list-sessions "*) printf '%s\n' 'agentdeck_unknown_codex_budget' 'agentdeck_unknown_codex_budget_two' 'agentdeck_other_codex_a' 'agentdeck_other_codex_b' ;;
-  *" show-environment -t agentdeck_other_codex_a "*) printf '%s\n' 'CODEX_SESSION_ID=11111111-1111-1111-1111-111111111111' ;;
-  *" show-environment -t agentdeck_other_codex_b "*) printf '%s\n' 'CODEX_SESSION_ID=22222222-2222-2222-2222-222222222222' ;;
+  *" list-sessions "*) printf '%s\t%s\n' 'agentdeck_other_codex_a' '11111111-1111-1111-1111-111111111111' 'agentdeck_other_codex_b' '22222222-2222-2222-2222-222222222222' ;;
   *" list-panes "*) printf '%s\n' '999999' ;;
   *) exit 1 ;;
 esac
@@ -814,7 +822,7 @@ esac
 			otherEnvReads++
 		}
 	}
-	if ownershipSnapshots != 1 || otherEnvReads != 2 {
+	if ownershipSnapshots != 1 || otherEnvReads != 0 {
 		t.Fatalf("same-pass Codex fallbacks must share one ownership snapshot; snapshots=%d other-env reads=%d calls=%q",
 			ownershipSnapshots, otherEnvReads, strings.TrimSpace(string(data)))
 	}

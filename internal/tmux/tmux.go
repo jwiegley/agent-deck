@@ -5352,6 +5352,38 @@ func ListAgentDeckSessions() ([]string, error) {
 	return sessions, nil
 }
 
+// ListAgentDeckCodexSessionIDs returns one ownership snapshot using a single
+// tmux subprocess. CODEX_SESSION_ID is a session-environment format variable,
+// so list-sessions can batch it with the session name instead of spawning
+// show-environment once per session. The caller owns the deadline.
+func ListAgentDeckCodexSessionIDs(ctx context.Context) (map[string]string, error) {
+	cmd := tmuxExecContext(ctx, DefaultSocketName(), "list-sessions", "-F", "#{session_name}\t#{CODEX_SESSION_ID}")
+	cmd.WaitDelay = 100 * time.Millisecond
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		lower := strings.ToLower(string(output))
+		if strings.Contains(lower, "no server running") || strings.Contains(lower, "no sessions") {
+			return map[string]string{}, nil
+		}
+		return nil, fmt.Errorf("failed to list Codex session ownership: %w", err)
+	}
+
+	idsByTmux := make(map[string]string)
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		name, id, ok := strings.Cut(line, "\t")
+		name = strings.TrimSpace(name)
+		id = strings.TrimSpace(id)
+		if !ok || !strings.HasPrefix(name, SessionPrefix) || id == "" {
+			continue
+		}
+		idsByTmux[name] = id
+	}
+	return idsByTmux, nil
+}
+
 // SetStatusLeft sets the left side of tmux status bar for a session.
 // Used by NotificationManager to display waiting session notifications.
 func SetStatusLeft(sessionName, text string) error {
