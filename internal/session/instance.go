@@ -6621,6 +6621,11 @@ func (i *Instance) restart(env map[string]string) (err error) {
 	defer func() {
 		if err == nil {
 			i.markStarted()
+			if db := statedb.GetGlobal(); db != nil {
+				if persistErr := db.WriteLastStartedAt(i.ID, i.LastStartedAt); persistErr != nil {
+					err = fmt.Errorf("restart succeeded but runtime generation persistence failed: %w", persistErr)
+				}
+			}
 		}
 	}()
 

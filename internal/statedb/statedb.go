@@ -1442,6 +1442,26 @@ func (s *StateDB) WriteGeminiSessionBinding(id, sessionID string, detectedAt tim
 	})
 }
 
+// WriteLastStartedAt persists the runtime generation stamped by a successful
+// Restart without rewriting the rest of the instance row. Direct restart
+// callers (web/TUI mutators) do not necessarily run SaveInstances afterward;
+// keeping this targeted prevents the transition daemon from reloading the old
+// generation and reattaching pre-restart tmux/status/backoff caches.
+func (s *StateDB) WriteLastStartedAt(id string, startedAt time.Time) error {
+	value := startedAt.UTC().Format(time.RFC3339Nano)
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances
+			   SET tool_data = json_set(
+			         COALESCE(tool_data, '{}'),
+			         '$.last_started_at', ?)
+			 WHERE id = ?`,
+			value, id,
+		)
+		return err
+	})
+}
+
 // ReadAllStatuses returns status + acknowledged flag for every instance.
 func (s *StateDB) ReadAllStatuses() (map[string]StatusRow, error) {
 	rows, err := s.db.Query("SELECT id, status, tool, acknowledged FROM instances")
