@@ -928,6 +928,7 @@ func TestUpdateStatus_DefersDiskFallbackUntilOwnershipSnapshotFresh(t *testing.T
 case " $* " in
   *" has-session "*) exit 0 ;;
   *" list-sessions "*) sleep 0.2; printf '%s\t%s\n' 'agentdeck_other_ownership_freshness' '33333333-3333-4333-8333-333333333333' ;;
+  *" show-environment -g CODEX_SESSION_ID "*) printf '%s\n' 'unknown variable: CODEX_SESSION_ID' >&2; exit 1 ;;
   *) exit 1 ;;
 esac
 `
@@ -1005,6 +1006,7 @@ printf '%s\n' "$*" >> "$TMUX_TEST_LOG"
 case " $* " in
   *" has-session "*) exit 0 ;;
   *" list-sessions "*) printf '%s\t%s\n' 'agentdeck_other_codex_a' '11111111-1111-1111-1111-111111111111' 'agentdeck_other_codex_b' '22222222-2222-2222-2222-222222222222' ;;
+  *" show-environment -g CODEX_SESSION_ID "*) printf '%s\n' 'unknown variable: CODEX_SESSION_ID' >&2; exit 1 ;;
   *" list-panes "*) printf '%s\n' '999999' ;;
   *) exit 1 ;;
 esac
