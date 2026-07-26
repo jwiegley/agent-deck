@@ -783,6 +783,85 @@ esac
 	}
 }
 
+func TestUpdateStatus_FirstCodexOwnershipRefreshIsNonblocking(t *testing.T) {
+	refreshDeadline := time.Now().Add(2 * time.Second)
+	for codexOwnershipRefresh.Load() && time.Now().Before(refreshDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if codexOwnershipRefresh.Load() {
+		t.Fatal("prior Codex ownership refresh did not terminate")
+	}
+	codexOwnershipSnapshot.Store(nil)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("AGENT_DECK_HOME", "")
+	t.Setenv("AGENT_DECK_PROFILE", "")
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	const name = "agentdeck_first_codex_ownership_refresh"
+	projectPath := filepath.Join(home, "first-codex-ownership-refresh")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	inst := &Instance{
+		ID:               "first-codex-ownership-refresh",
+		Title:            "first-codex-ownership-refresh",
+		ProjectPath:      projectPath,
+		GroupPath:        DefaultGroupPath,
+		Command:          "codex",
+		Tool:             "codex",
+		Status:           StatusRunning,
+		CreatedAt:        time.Now().Add(-time.Hour),
+		lastCodexProbeAt: time.Now(),
+		tmuxSession: &tmux.Session{
+			Name:        name,
+			DisplayName: "first-codex-ownership-refresh",
+			WorkDir:     projectPath,
+			Command:     "codex",
+			InstanceID:  "first-codex-ownership-refresh",
+		},
+	}
+	tmux.SeedPaneInfoCacheForTest(t, map[string]tmux.PaneInfo{
+		name: {Title: "⠋ Working", CurrentCommand: "codex"},
+	})
+
+	binDir := t.TempDir()
+	fakeTmux := filepath.Join(binDir, "tmux")
+	script := `#!/bin/sh
+case " $* " in
+  *" has-session "*) exit 0 ;;
+  *" list-sessions "*) sleep 2; exit 0 ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(fakeTmux, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake tmux: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	started := time.Now()
+	if err := inst.UpdateStatus(); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+		t.Fatalf("first ownership refresh blocked UpdateStatus for %s", elapsed)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for codexOwnershipRefresh.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if codexOwnershipRefresh.Load() {
+		t.Fatal("bounded asynchronous ownership refresh leaked or failed to clear its flag")
+	}
+	codexOwnershipSnapshot.Store(nil)
+}
+
 func TestUpdateStatus_UnknownCodexFastPollSubprocessBudget(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
