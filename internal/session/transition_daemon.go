@@ -120,7 +120,11 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 // SyncOnce performs one full monitoring pass and returns the recommended delay
 // until the next pass.
 func (d *TransitionDaemon) SyncOnce(_ context.Context) time.Duration {
-	profiles := profilesForTransitionDaemon()
+	profiles, err := profilesForTransitionDaemon()
+	if err != nil {
+		return notifyPollSlow
+	}
+	d.pruneDeletedProfiles(profiles)
 	if len(profiles) == 0 {
 		return notifyPollSlow
 	}
@@ -323,13 +327,68 @@ func notifierProbeStallLogPath() string {
 	return path
 }
 
-func profilesForTransitionDaemon() []string {
+func profilesForTransitionDaemon() ([]string, error) {
 	profiles, err := ListProfiles()
-	if err != nil || len(profiles) == 0 {
-		return nil
+	if err != nil {
+		return nil, err
 	}
 	sort.Strings(profiles)
-	return profiles
+	return profiles, nil
+}
+
+// pruneDeletedProfiles releases profile resources and process-local poll state
+// only after ListProfiles completed successfully. A transient listing error
+// must not make the daemon forget live profiles; a successful list is the
+// authoritative snapshot and lets deleted profiles be retired immediately.
+func (d *TransitionDaemon) pruneDeletedProfiles(profiles []string) {
+	active := make(map[string]bool, len(profiles))
+	for _, profile := range profiles {
+		active[profile] = true
+	}
+
+	for profile, storage := range d.storages {
+		if active[profile] {
+			continue
+		}
+		if storage != nil {
+			_ = storage.Close()
+		}
+		delete(d.storages, profile)
+	}
+	for profile := range d.lastStatus {
+		if !active[profile] {
+			delete(d.lastStatus, profile)
+		}
+	}
+	for profile := range d.initialized {
+		if !active[profile] {
+			delete(d.initialized, profile)
+		}
+	}
+	for profile := range d.lastDone {
+		if !active[profile] {
+			delete(d.lastDone, profile)
+		}
+	}
+	for profile := range d.lastDoneScan {
+		if !active[profile] {
+			delete(d.lastDoneScan, profile)
+		}
+	}
+	for profile := range d.pollState {
+		if !active[profile] {
+			delete(d.pollState, profile)
+		}
+	}
+	for key := range d.lastProbeStall {
+		profile, _, ok := strings.Cut(key, "|")
+		if ok && !active[profile] {
+			delete(d.lastProbeStall, key)
+		}
+	}
+	if d.selfheal != nil {
+		d.selfheal.pruneProfiles(active)
+	}
 }
 
 func (d *TransitionDaemon) syncProfile(profile string) time.Duration {

@@ -51,6 +51,21 @@ func (r *selfHealRegistry) engineFor(profile string, caps selfheal.Caps) *selfhe
 	return e
 }
 
+func (r *selfHealRegistry) pruneProfiles(active map[string]bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for profile := range r.engines {
+		if !active[profile] {
+			delete(r.engines, profile)
+		}
+	}
+	for profile := range r.sinks {
+		if !active[profile] {
+			delete(r.sinks, profile)
+		}
+	}
+}
+
 // capsFromSettings maps the config dials onto selfheal.Caps, falling back to the
 // trusted defaults for any unset field.
 func capsFromSettings(s SelfHealSettings) selfheal.Caps {
