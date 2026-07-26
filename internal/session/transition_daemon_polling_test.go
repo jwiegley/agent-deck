@@ -186,6 +186,90 @@ func TestSyncOnce_WarmsTmuxCachesOnceAcrossProfiles(t *testing.T) {
 	}
 }
 
+func TestSyncOnce_PrunesDeletedProfileStateAndClosesStorage(t *testing.T) {
+	const (
+		keepProfile    = "_test_transition_profile_keep"
+		deletedProfile = "_test_transition_profile_deleted"
+	)
+	d, keepStorage := bootstrapDaemonProfile(t, keepProfile)
+	deletedStorage, err := NewStorageWithProfile(deletedProfile)
+	if err != nil {
+		t.Fatalf("NewStorageWithProfile(%s): %v", deletedProfile, err)
+	}
+	t.Cleanup(func() { _ = deletedStorage.Close() })
+	d.storages[deletedProfile] = deletedStorage
+
+	d.lastStatus[keepProfile] = map[string]string{"keep": "running"}
+	d.lastStatus[deletedProfile] = map[string]string{"deleted": "waiting"}
+	d.initialized[keepProfile] = true
+	d.initialized[deletedProfile] = true
+	d.lastDone[keepProfile] = map[string]DoneSignal{"keep": {Status: "done"}}
+	d.lastDone[deletedProfile] = map[string]DoneSignal{"deleted": {Status: "done"}}
+	d.lastDoneScan[keepProfile] = map[string]time.Time{"keep": time.Now()}
+	d.lastDoneScan[deletedProfile] = map[string]time.Time{"deleted": time.Now()}
+	d.pollState[keepProfile] = map[string]instancePollingState{"keep": {}}
+	d.pollState[deletedProfile] = map[string]instancePollingState{"deleted": {}}
+	d.lastProbeStall[keepProfile+"|keep|probe_budget"] = time.Now()
+	d.lastProbeStall[deletedProfile+"|deleted|probe_budget"] = time.Now()
+	d.selfheal = newSelfHealRegistry()
+	d.selfheal.engines[keepProfile] = nil
+	d.selfheal.engines[deletedProfile] = nil
+	d.selfheal.sinks[keepProfile] = nil
+	d.selfheal.sinks[deletedProfile] = nil
+
+	deletedDir, err := GetProfileDir(deletedProfile)
+	if err != nil {
+		t.Fatalf("GetProfileDir(%s): %v", deletedProfile, err)
+	}
+	if err := os.RemoveAll(deletedDir); err != nil {
+		t.Fatalf("remove deleted profile fixture: %v", err)
+	}
+
+	d.SyncOnce(context.Background())
+
+	if _, ok := d.storages[deletedProfile]; ok {
+		t.Error("deleted profile storage remained cached")
+	}
+	if _, err := deletedStorage.GetDB().AliveInstanceCount(); err == nil {
+		t.Error("deleted profile storage was pruned without closing its database")
+	}
+	if got := d.storages[keepProfile]; got != keepStorage {
+		t.Fatal("retained profile storage was replaced or pruned")
+	}
+	if _, err := keepStorage.GetDB().AliveInstanceCount(); err != nil {
+		t.Fatalf("retained profile storage was closed: %v", err)
+	}
+
+	for name, present := range map[string]bool{
+		"lastStatus":   d.lastStatus[deletedProfile] != nil,
+		"initialized":  d.initialized[deletedProfile],
+		"lastDone":     d.lastDone[deletedProfile] != nil,
+		"lastDoneScan": d.lastDoneScan[deletedProfile] != nil,
+		"pollState":    d.pollState[deletedProfile] != nil,
+	} {
+		if present {
+			t.Errorf("deleted profile remained in %s", name)
+		}
+	}
+	for key := range d.lastProbeStall {
+		if strings.HasPrefix(key, deletedProfile+"|") {
+			t.Errorf("deleted profile remained in lastProbeStall: %q", key)
+		}
+	}
+	d.selfheal.mu.Lock()
+	_, deletedEngine := d.selfheal.engines[deletedProfile]
+	_, deletedSink := d.selfheal.sinks[deletedProfile]
+	_, keptEngine := d.selfheal.engines[keepProfile]
+	_, keptSink := d.selfheal.sinks[keepProfile]
+	d.selfheal.mu.Unlock()
+	if deletedEngine || deletedSink {
+		t.Error("deleted profile remained in self-heal registry")
+	}
+	if !keptEngine || !keptSink {
+		t.Error("retained profile was pruned from self-heal registry")
+	}
+}
+
 func TestSyncProfile_PreservesHotPollStateAcrossReload(t *testing.T) {
 	const profile = "_test_transition_hot_poll_state"
 	d, storage := bootstrapDaemonProfile(t, profile)
