@@ -333,6 +333,109 @@ esac
 	}
 }
 
+func TestRestorePollingState_InvalidatesRestartAndRebind(t *testing.T) {
+	createdAt := time.Unix(1_700_000_000, 0).UTC()
+	startedAt := createdAt.Add(time.Hour)
+	oldWrapper := &tmux.Session{
+		Name:        "agentdeck_poll_identity",
+		DisplayName: "poll-identity",
+		WorkDir:     "/tmp/poll-identity",
+		Command:     "codex",
+		InstanceID:  "poll-identity",
+	}
+	old := &Instance{
+		ID:             "poll-identity",
+		Title:          "poll-identity",
+		ProjectPath:    "/tmp/poll-identity",
+		Command:        "codex",
+		Tool:           "codex",
+		CreatedAt:      createdAt,
+		LastStartedAt:  startedAt,
+		CodexSessionID: "11111111-1111-1111-1111-111111111111",
+		tmuxSession:    oldWrapper,
+	}
+	seedHotPollState(old, startedAt.Add(time.Minute))
+	state := old.pollingState()
+
+	for _, tc := range []struct {
+		name          string
+		lastStartedAt time.Time
+		sessionID     string
+	}{
+		{
+			name:          "restart generation changed",
+			lastStartedAt: startedAt.Add(time.Minute),
+			sessionID:     old.CodexSessionID,
+		},
+		{
+			name:          "durable binding changed",
+			lastStartedAt: startedAt,
+			sessionID:     "22222222-2222-2222-2222-222222222222",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			freshWrapper := &tmux.Session{
+				Name:        oldWrapper.Name,
+				DisplayName: oldWrapper.DisplayName,
+				WorkDir:     oldWrapper.WorkDir,
+				Command:     oldWrapper.Command,
+				InstanceID:  oldWrapper.InstanceID,
+			}
+			current := &Instance{
+				ID:             old.ID,
+				Title:          old.Title,
+				ProjectPath:    old.ProjectPath,
+				Command:        old.Command,
+				Tool:           old.Tool,
+				CreatedAt:      old.CreatedAt,
+				LastStartedAt:  tc.lastStartedAt,
+				CodexSessionID: tc.sessionID,
+				tmuxSession:    freshWrapper,
+			}
+
+			current.restorePollingState(state)
+
+			if current.tmuxSession != freshWrapper {
+				t.Fatal("stale tmux wrapper crossed a restart/rebind identity boundary")
+			}
+			if !current.lastCodexProbeAt.IsZero() || !current.lastSessionMetaSync.IsZero() || current.tmuxFlipFromRunningPending {
+				t.Fatalf("stale poll backoff crossed a restart/rebind identity boundary: %+v", snapshotHotPollState(current))
+			}
+		})
+	}
+}
+
+func TestStorage_RoundTripsPollingRuntimeGeneration(t *testing.T) {
+	const profile = "_test_transition_runtime_generation"
+	_, storage := bootstrapDaemonProfile(t, profile)
+	startedAt := time.Unix(1_800_000_000, 123_456_789).UTC()
+	inst := &Instance{
+		ID:            "runtime-generation",
+		Title:         "runtime-generation",
+		ProjectPath:   t.TempDir(),
+		GroupPath:     DefaultGroupPath,
+		Command:       "codex",
+		Tool:          "codex",
+		Status:        StatusRunning,
+		CreatedAt:     startedAt.Add(-time.Hour),
+		LastStartedAt: startedAt,
+	}
+	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+		t.Fatalf("save instance: %v", err)
+	}
+
+	loaded, _, err := storage.LoadWithGroups()
+	if err != nil {
+		t.Fatalf("reload instance: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("loaded %d instances, want 1", len(loaded))
+	}
+	if !loaded[0].LastStartedAt.Equal(startedAt) {
+		t.Fatalf("LastStartedAt did not survive storage reload: got %s, want %s", loaded[0].LastStartedAt, startedAt)
+	}
+}
+
 func TestUpdateStatus_KnownCodexSkipsFleetEnumeration(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
