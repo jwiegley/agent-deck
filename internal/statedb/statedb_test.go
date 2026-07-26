@@ -2045,3 +2045,11 @@ func TestTakeMeta(t *testing.T) {
 		t.Fatalf("GetMeta after take = (%q, %v), want (\"\", nil)", got, err)
 	}
 }
+
+func TestWriteLastStartedAtRequiresExistingInstance(t *testing.T) {
+	db := newTestDB(t)
+	err := db.WriteLastStartedAt("missing-instance", time.Now())
+	if err == nil {
+		t.Fatal("WriteLastStartedAt reported success without updating an owning row")
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -646,6 +647,10 @@ func TestRestart_PersistsGenerationBeforePollStateReload(t *testing.T) {
 	beforeRestart := loaded[0].LastStartedAt
 	seedHotPollState(loaded[0], time.Now())
 	staleState := loaded[0].pollingState()
+	// CLI/MCP/plugin handlers can load their profile before main installs the
+	// process-global DB. Restart durability must follow the loaded instance's
+	// owning storage rather than whichever global happens to be installed.
+	statedb.SetGlobal(nil)
 
 	// This is intentionally the direct production contract used by callers such
 	// as WebMutator.RestartSession: no caller-side SaveWithGroups follows it.
