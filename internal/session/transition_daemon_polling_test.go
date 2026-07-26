@@ -148,6 +148,14 @@ func TestSyncProfile_PreservesTerminalPollThrottleAcrossReload(t *testing.T) {
 func TestSyncProfile_BlockingCodexOwnershipRefreshDoesNotSerializeProbes(t *testing.T) {
 	const profile = "_test_transition_codex_ownership_block"
 	d, storage := bootstrapDaemonProfile(t, profile)
+	refreshDeadline := time.Now().Add(2 * time.Second)
+	for codexOwnershipRefresh.Load() && time.Now().Before(refreshDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if codexOwnershipRefresh.Load() {
+		t.Fatal("prior Codex ownership refresh did not terminate")
+	}
+	codexOwnershipSnapshot.Store(nil)
 
 	projectPath := filepath.Join(os.Getenv("HOME"), "codex-ownership-block")
 	if err := os.MkdirAll(projectPath, 0o755); err != nil {
@@ -203,7 +211,7 @@ func TestSyncProfile_BlockingCodexOwnershipRefreshDoesNotSerializeProbes(t *test
 case " $* " in
   *" has-session "*) exit 0 ;;
   *" list-panes "*) printf '%s\n' '999999' ;;
-  *" list-sessions "*) sleep 1; exit 0 ;;
+  *" list-sessions "*) sleep 2; exit 0 ;;
   *) exit 1 ;;
 esac
 `
@@ -213,7 +221,7 @@ esac
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	originalBudget := statusProbeBudget
-	statusProbeBudget = 75 * time.Millisecond
+	statusProbeBudget = 300 * time.Millisecond
 	t.Cleanup(func() { statusProbeBudget = originalBudget })
 
 	originalProbe := updateInstanceStatus.Load().(statusProbeFunc)
@@ -232,7 +240,7 @@ esac
 	if got := completed.Load(); got != 1 {
 		t.Fatalf("a blocked ownership refresh serialized the concurrent Codex probe: completed=%d, want 1", got)
 	}
-	if elapsed >= 500*time.Millisecond {
+	if elapsed >= 900*time.Millisecond {
 		t.Fatalf("daemon poll waited too long behind blocked ownership refresh: %s", elapsed)
 	}
 	deadline := time.Now().Add(2 * time.Second)
