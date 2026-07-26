@@ -472,6 +472,21 @@ type Instance struct {
 	hermesGatewayOK        bool
 }
 
+// terminalPollCheckedAt and restoreTerminalPollCheckedAt let long-lived pollers
+// carry the stopped/error recheck throttle across storage reloads without
+// persisting a runtime-only timestamp in the session database.
+func (i *Instance) terminalPollCheckedAt() time.Time {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.lastErrorCheck
+}
+
+func (i *Instance) restoreTerminalPollCheckedAt(checkedAt time.Time) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.lastErrorCheck = checkedAt
+}
+
 // SandboxConfig holds per-session Docker sandbox settings.
 type SandboxConfig struct {
 	// Enabled indicates the session runs inside a container.

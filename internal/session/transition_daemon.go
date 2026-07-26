@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 const (
@@ -71,17 +73,24 @@ type TransitionDaemon struct {
 	// logs at most once per probeStallLogInterval instead of flooding the log
 	// every few seconds. Accessed only from the single-threaded Run loop.
 	lastProbeStall map[string]time.Time
+
+	// terminalPollState carries Instance's in-process stopped/error throttle
+	// across LoadWithGroups calls. Each load constructs fresh Instance values;
+	// without this bridge lastErrorCheck resets every poll and every terminal
+	// session runs a new tmux existence probe instead of waiting 30 seconds.
+	terminalPollState map[string]map[string]time.Time
 }
 
 func NewTransitionDaemon() *TransitionDaemon {
 	return &TransitionDaemon{
-		notifier:       NewTransitionNotifier(),
-		storages:       map[string]*Storage{},
-		lastStatus:     map[string]map[string]string{},
-		initialized:    map[string]bool{},
-		lastDone:       map[string]map[string]DoneSignal{},
-		lastDoneScan:   map[string]map[string]time.Time{},
-		lastProbeStall: map[string]time.Time{},
+		notifier:          NewTransitionNotifier(),
+		storages:          map[string]*Storage{},
+		lastStatus:        map[string]map[string]string{},
+		initialized:       map[string]bool{},
+		lastDone:          map[string]map[string]DoneSignal{},
+		lastDoneScan:      map[string]map[string]time.Time{},
+		lastProbeStall:    map[string]time.Time{},
+		terminalPollState: map[string]map[string]time.Time{},
 	}
 }
 
@@ -115,6 +124,11 @@ func (d *TransitionDaemon) SyncOnce(_ context.Context) time.Duration {
 	if len(profiles) == 0 {
 		return notifyPollSlow
 	}
+
+	// Match the TUI, web, and CLI status paths: warm each shared tmux cache
+	// once for the whole pass, not once per profile or instance.
+	tmux.RefreshExistingSessions()
+	tmux.RefreshPaneInfoCache()
 
 	nextInterval := notifyPollSlow
 	for _, profile := range profiles {
@@ -328,6 +342,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	if err != nil {
 		return notifyPollSlow
 	}
+	d.restoreTerminalPollState(profile, instances)
 
 	byID := make(map[string]*Instance, len(instances))
 	hookCandidates := make(map[string]hookTransitionCandidate, len(instances))
@@ -411,6 +426,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 				statuses[inst.ID] = previousStatus
 				continue
 			}
+			d.rememberTerminalPollState(profile, inst)
 			status := normalizeStatusString(string(inst.GetStatusThreadSafe()))
 			statuses[inst.ID] = status
 			if db != nil && status != previousStatus {
@@ -468,6 +484,36 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 
 	d.lastStatus[profile] = copyStatusMap(statuses)
 	return choosePollInterval(statuses)
+}
+
+// restoreTerminalPollState hydrates the one volatile polling timestamp that
+// must survive the daemon's per-pass storage reload. Rebuilding the profile map
+// here also drops state for deleted instances.
+func (d *TransitionDaemon) restoreTerminalPollState(profile string, instances []*Instance) {
+	previous := d.terminalPollState[profile]
+	current := make(map[string]time.Time, len(instances))
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		if checkedAt := previous[inst.ID]; !checkedAt.IsZero() {
+			inst.restoreTerminalPollCheckedAt(checkedAt)
+			current[inst.ID] = checkedAt
+		}
+	}
+	if d.terminalPollState == nil {
+		d.terminalPollState = make(map[string]map[string]time.Time)
+	}
+	d.terminalPollState[profile] = current
+}
+
+func (d *TransitionDaemon) rememberTerminalPollState(profile string, inst *Instance) {
+	checkedAt := inst.terminalPollCheckedAt()
+	if checkedAt.IsZero() {
+		delete(d.terminalPollState[profile], inst.ID)
+		return
+	}
+	d.terminalPollState[profile][inst.ID] = checkedAt
 }
 
 // emitDoneSignals turns a worker-printed completion sentinel (persisted into
