@@ -240,9 +240,13 @@ func pluginAttachOrDetach(profile string, args []string, op string) {
 			return
 		}
 		fmt.Println("Restarting session to apply enabledPlugins...")
-		if err := inst.Restart(); err != nil {
-			out.Error(fmt.Sprintf("restart failed: %s", err.Error()), ErrCodeNotFound)
+		restartErr, persistenceWarning := normalizeRestartResult(inst.Restart())
+		if restartErr != nil {
+			out.Error(fmt.Sprintf("restart failed: %s", restartErr.Error()), ErrCodeNotFound)
 			os.Exit(1)
+		}
+		if persistenceWarning != "" {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
 		}
 	}
 }

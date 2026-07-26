@@ -5657,6 +5657,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case sessionRestoredMsg:
+		msg.err, msg.warning = normalizeRestartResult(msg.err, msg.warning)
 		h.reloadMu.Lock()
 		reloading := h.isReloading
 		h.reloadMu.Unlock()
@@ -5738,6 +5739,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case sessionRestartedMsg:
+		msg.err, msg.warning = normalizeRestartResult(msg.err, msg.warning)
 		if msg.err != nil {
 			// Restart failed - clear resuming animation immediately so user can retry.
 			delete(h.resumingSessions, msg.sessionID)
@@ -5776,6 +5778,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case mcpRestartedMsg:
+		if session.IsRestartPartialSuccess(msg.err) {
+			h.setError(fmt.Errorf("%s", msg.err))
+			msg.err = nil
+		}
 		if msg.err != nil {
 			h.setError(fmt.Errorf("failed to restart session for MCP changes: %w", msg.err))
 			return h, nil
@@ -12569,6 +12575,16 @@ type sessionRestartedMsg struct {
 	unarchived bool
 }
 
+func normalizeRestartResult(err error, warning string) (error, string) {
+	if !session.IsRestartPartialSuccess(err) {
+		return err, warning
+	}
+	if warning != "" {
+		warning += "; "
+	}
+	return nil, warning + err.Error()
+}
+
 // mcpRestartedMsg signals that an MCP-triggered restart completed and should auto-attach
 type mcpRestartedMsg struct {
 	session *session.Instance
@@ -12595,6 +12611,9 @@ func restartWithArchiveTransition(
 	}
 
 	if err := restart(); err != nil {
+		if session.IsRestartPartialSuccess(err) {
+			return true, err
+		}
 		inst.ArchivedAt = archivedAt
 		if rollbackErr := persist(inst); rollbackErr != nil {
 			return false, fmt.Errorf("restart failed: %w; restoring archive state failed: %v", err, rollbackErr)

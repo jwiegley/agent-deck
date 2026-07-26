@@ -181,7 +181,12 @@ func (m *WebMutator) RestartSession(id string) error {
 	if inst == nil {
 		return fmt.Errorf("session not found: %s", id)
 	}
-	return inst.Restart()
+	restartErr := inst.Restart()
+	restartErr, warning := normalizeRestartResult(restartErr, "")
+	if warning != "" {
+		uiLog.Warn("web_restart_partial_success", "warning", warning, "instance_id", inst.ID)
+	}
+	return restartErr
 }
 
 // DeleteSession kills a session and removes it from persistent storage.
@@ -328,8 +333,11 @@ func (m *WebMutator) UndoDelete() (string, error) {
 	// tool (e.g. a tool the user has since uninstalled). Bubble the
 	// error up so the handler returns 500; the entry has already been
 	// popped, mirroring the TUI's ctrl+z semantics.
-	if err := entry.instance.Restart(); err != nil {
-		return "", fmt.Errorf("restart session: %w", err)
+	if restartErr := entry.instance.Restart(); restartErr != nil {
+		if !session.IsRestartPartialSuccess(restartErr) {
+			return "", fmt.Errorf("restart session: %w", restartErr)
+		}
+		uiLog.Warn("web_undo_restart_partial_success", "warning", restartErr.Error(), "instance_id", entry.instance.ID)
 	}
 
 	// #1397: hydrate + serialize before reading/persisting the in-memory list so

@@ -723,14 +723,15 @@ func handleSessionRestart(profile string, args []string) {
 	}
 
 	// Restart the session
-	if err := inst.RestartWithEnv(envFlags); err != nil {
-		out.Error(fmt.Sprintf("failed to restart session: %v", err), ErrCodeInvalidOperation)
+	restartErr, persistenceWarning := normalizeRestartResult(inst.RestartWithEnv(envFlags))
+	if restartErr != nil {
+		out.Error(fmt.Sprintf("failed to restart session: %v", restartErr), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 	// Stamp the persisted freshness marker so subsequent watchdog ticks see
 	// this session as "just started" and skip (issue #30).
 	inst.LastStartedAt = time.Now()
-	warning := inst.ConsumeCodexRestartWarning()
+	warning := mergeRestartWarnings(inst.ConsumeCodexRestartWarning(), persistenceWarning)
 	if warning != "" && !*jsonOutput {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
 	}
@@ -785,8 +786,9 @@ func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*s
 			fmt.Printf("Restarting %s...\n", inst.Title)
 		}
 
-		if err := inst.RestartWithEnv(env); err != nil {
-			errMsg := fmt.Sprintf("failed to restart session '%s': %v", inst.Title, err)
+		restartErr, persistenceWarning := normalizeRestartResult(inst.RestartWithEnv(env))
+		if restartErr != nil {
+			errMsg := fmt.Sprintf("failed to restart session '%s': %v", inst.Title, restartErr)
 			if !out.jsonMode {
 				fmt.Fprintf(os.Stderr, "  Error: %s\n", errMsg)
 			}
@@ -798,7 +800,7 @@ func restartAllSessions(out *CLIOutput, storage *session.Storage, instances []*s
 		}
 		inst.LastStartedAt = time.Now()
 
-		warning := inst.ConsumeCodexRestartWarning()
+		warning := mergeRestartWarnings(inst.ConsumeCodexRestartWarning(), persistenceWarning)
 		if warning != "" && !out.jsonMode {
 			fmt.Fprintf(os.Stderr, "  Warning: %s\n", warning)
 		}

@@ -468,13 +468,17 @@ func handleMCPAttach(profile string, args []string) {
 	// Restart if requested
 	restarted := false
 	if *restart && inst.SupportsMCPAgentRestart() {
-		if err := inst.Restart(); err != nil {
+		restartErr, persistenceWarning := normalizeRestartResult(inst.Restart())
+		if restartErr != nil {
 			// Don't fail the whole operation, just warn
 			if !*jsonOutput && !quietMode {
-				fmt.Fprintf(os.Stderr, "Warning: failed to restart session: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Warning: failed to restart session: %v\n", restartErr)
 			}
 		} else {
 			restarted = true
+			if persistenceWarning != "" && !*jsonOutput && !quietMode {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
+			}
 			// Auto-continue: wait for the agent to initialize, then send continue message.
 			time.Sleep(2 * time.Second)
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil && inst.Tool != "cursor" {
@@ -629,13 +633,17 @@ func handleMCPDetach(profile string, args []string) {
 	// Restart if requested
 	restarted := false
 	if *restart && inst.SupportsMCPAgentRestart() {
-		if err := inst.Restart(); err != nil {
+		restartErr, persistenceWarning := normalizeRestartResult(inst.Restart())
+		if restartErr != nil {
 			// Don't fail the whole operation, just warn
 			if !*jsonOutput && !quietMode {
-				fmt.Fprintf(os.Stderr, "Warning: failed to restart session: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Warning: failed to restart session: %v\n", restartErr)
 			}
 		} else {
 			restarted = true
+			if persistenceWarning != "" && !*jsonOutput && !quietMode {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
+			}
 			// Auto-continue: wait for the agent to initialize, then send continue message.
 			time.Sleep(2 * time.Second)
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil && inst.Tool != "cursor" {

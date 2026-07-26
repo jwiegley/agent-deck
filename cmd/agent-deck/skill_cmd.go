@@ -21,11 +21,15 @@ func restartProjectSkillsSession(inst *session.Instance, jsonOutput, quietMode b
 	if inst == nil || !session.ShouldRestartProjectSkills(inst.Tool) {
 		return false
 	}
-	if err := inst.Restart(); err != nil {
+	restartErr, persistenceWarning := normalizeRestartResult(inst.Restart())
+	if restartErr != nil {
 		if !jsonOutput && !quietMode {
-			fmt.Fprintf(os.Stderr, "Warning: failed to restart session: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Warning: failed to restart session: %v\n", restartErr)
 		}
 		return false
+	}
+	if persistenceWarning != "" && !jsonOutput && !quietMode {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
 	}
 	if session.IsClaudeCompatible(inst.Tool) {
 		time.Sleep(2 * time.Second)

@@ -149,9 +149,13 @@ func handleSessionMove(profile string, args []string) {
 
 	restarted := false
 	if !*noRestart && inst.Exists() {
-		if err := inst.Restart(); err != nil {
-			out.Error(fmt.Sprintf("session moved, but restart failed: %v", err), ErrCodeInvalidOperation)
+		restartErr, persistenceWarning := normalizeRestartResult(inst.Restart())
+		if restartErr != nil {
+			out.Error(fmt.Sprintf("session moved, but restart failed: %v", restartErr), ErrCodeInvalidOperation)
 			os.Exit(1)
+		}
+		if persistenceWarning != "" && !*quiet {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
 		}
 		if session.IsClaudeCompatible(inst.Tool) && inst.ClaudeSessionID == "" {
 			inst.PostStartSync(3 * time.Second)

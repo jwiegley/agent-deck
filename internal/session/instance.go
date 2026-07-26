@@ -6644,7 +6644,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 			i.markStarted()
 			if db := i.restartPersistenceDB(); db != nil {
 				if persistErr := db.WriteLastStartedAt(i.ID, i.LastStartedAt); persistErr != nil {
-					err = fmt.Errorf("restart succeeded but runtime generation persistence failed: %w", persistErr)
+					err = &RestartPartialSuccessError{InstanceID: i.ID, Err: persistErr}
 				}
 			}
 		}
