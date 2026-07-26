@@ -6563,7 +6563,16 @@ func (i *Instance) RestartWithEnv(env map[string]string) error {
 	return i.restart(env)
 }
 
-func (i *Instance) restart(env map[string]string) error {
+func (i *Instance) restart(env map[string]string) (err error) {
+	// Every successful branch below represents a new pane/runtime generation,
+	// including the spawnedSince fast path where another caller won the restart.
+	// Stamp centrally so respawn-pane and recreate paths cannot drift apart.
+	defer func() {
+		if err == nil {
+			i.markStarted()
+		}
+	}()
+
 	beforeLock := nowFn()
 	release, lockErr := acquireInstanceSpawnLock(i.ID)
 	if lockErr != nil {
