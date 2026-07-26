@@ -2574,29 +2574,50 @@ func decodeJSONStringField(raw map[string]json.RawMessage, key string) string {
 
 // collectOtherCodexSessionIDs enumerates other managed tmux sessions and returns
 // the CODEX_SESSION_ID values they currently own.
+//
+// Bootstrap scans for several unknown Codex instances commonly become due in
+// the same status pass. Cache the fleet snapshot for that bootstrap interval so
+// the first caller pays O(S) tmux reads and the remaining callers only filter
+// the in-process snapshot instead of multiplying the work by instance count.
+var codexOwnershipSnapshot = struct {
+	sync.Mutex
+	loadedAt  time.Time
+	sourceKey string
+	idsByTmux map[string]string
+}{}
+
 func (i *Instance) collectOtherCodexSessionIDs() map[string]bool {
-	exclude := make(map[string]bool)
-
-	tmuxSessions, err := tmux.ListAgentDeckSessions()
-	if err != nil {
-		return exclude
-	}
-
 	myTmuxName := ""
 	if i.tmuxSession != nil {
 		myTmuxName = i.tmuxSession.Name
 	}
 
-	for _, sessName := range tmuxSessions {
-		if sessName == myTmuxName {
-			continue
+	codexOwnershipSnapshot.Lock()
+	defer codexOwnershipSnapshot.Unlock()
+	sourceKey := os.Getenv("PATH") + "\x00" + tmux.DefaultSocketName()
+	if codexOwnershipSnapshot.sourceKey != sourceKey ||
+		codexOwnershipSnapshot.loadedAt.IsZero() ||
+		time.Since(codexOwnershipSnapshot.loadedAt) >= codexBootstrapScanInterval {
+		idsByTmux := make(map[string]string)
+		if tmuxSessions, err := tmux.ListAgentDeckSessions(); err == nil {
+			for _, sessName := range tmuxSessions {
+				other := &tmux.Session{Name: sessName}
+				if id, err := other.GetEnvironment("CODEX_SESSION_ID"); err == nil && id != "" {
+					idsByTmux[sessName] = id
+				}
+			}
 		}
-		other := &tmux.Session{Name: sessName}
-		if id, err := other.GetEnvironment("CODEX_SESSION_ID"); err == nil && id != "" {
+		codexOwnershipSnapshot.loadedAt = time.Now()
+		codexOwnershipSnapshot.sourceKey = sourceKey
+		codexOwnershipSnapshot.idsByTmux = idsByTmux
+	}
+
+	exclude := make(map[string]bool, len(codexOwnershipSnapshot.idsByTmux))
+	for sessName, id := range codexOwnershipSnapshot.idsByTmux {
+		if sessName != myTmuxName {
 			exclude[id] = true
 		}
 	}
-
 	return exclude
 }
 
@@ -3003,13 +3024,11 @@ func (i *Instance) updateCodexSession(excludeIDs map[string]bool, forceProbe boo
 		return missingProbeDep
 	}
 
-	// When we already have a session ID and the process probe didn't find a
-	// running process, add our current ID to the exclude set so the disk scan
-	// won't reassign it to another instance that shares the same project path.
-	// The disk scan should only discover *new* sessions (e.g. after /new rotation),
-	// not re-discover the same ID we already own.
-	if i.CodexSessionID != "" && excludeIDs != nil {
-		excludeIDs[i.CodexSessionID] = true
+	// Ownership exclusions are only relevant to the historical disk fallback.
+	// Defer their fleet-wide tmux snapshot until the live-process probe failed
+	// and the fallback cooldown says a scan will actually run.
+	if excludeIDs == nil {
+		excludeIDs = i.collectOtherCodexSessionIDs()
 	}
 
 	if sessionID := i.queryCodexSession(excludeIDs, allowUnscoped); sessionID != "" {
@@ -4560,15 +4579,7 @@ func (i *Instance) UpdateStatus() error {
 
 			// Update Codex session tracking (non-blocking, best-effort)
 			if IsCodexCompatible(i.Tool) {
-				// Fleet-wide exclusions are needed only for the bootstrap disk
-				// scan. Once this instance has an ID, updateCodexSession returns
-				// before that scan; enumerating every tmux session and reading
-				// each CODEX_SESSION_ID would be pure subprocess churn.
-				var exclude map[string]bool
-				if i.CodexSessionID == "" {
-					exclude = i.collectOtherCodexSessionIDs()
-				}
-				i.UpdateCodexSession(exclude)
+				i.UpdateCodexSession(nil)
 			}
 
 			// Update OpenCode session tracking (non-blocking, best-effort).
@@ -6723,7 +6734,7 @@ func (i *Instance) restart(env map[string]string) error {
 		i.mu.Lock()
 		i.pendingCodexRestartWarning = ""
 		i.mu.Unlock()
-		if missingDep := i.updateCodexSession(i.collectOtherCodexSessionIDs(), true); missingDep != "" {
+		if missingDep := i.updateCodexSession(nil, true); missingDep != "" {
 			i.mu.Lock()
 			i.pendingCodexRestartWarning = codexProbeMissingWarning(missingDep)
 			i.mu.Unlock()
