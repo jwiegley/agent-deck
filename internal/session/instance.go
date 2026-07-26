@@ -473,9 +473,31 @@ type Instance struct {
 // instancePollingState is process-local status machinery that must survive a
 // long-lived poller's storage reload. It deliberately excludes durable session
 // data: SQLite remains authoritative for that on every pass.
+type instancePollingIdentity struct {
+	tool          string
+	createdAt     time.Time
+	lastStartedAt time.Time
+
+	claudeSessionID   string
+	geminiSessionID   string
+	openCodeSessionID string
+	codexSessionID    string
+	copilotSessionID  string
+}
+
+func (identity instancePollingIdentity) equal(other instancePollingIdentity) bool {
+	return identity.tool == other.tool &&
+		identity.createdAt.Equal(other.createdAt) &&
+		identity.lastStartedAt.Equal(other.lastStartedAt) &&
+		identity.claudeSessionID == other.claudeSessionID &&
+		identity.geminiSessionID == other.geminiSessionID &&
+		identity.openCodeSessionID == other.openCodeSessionID &&
+		identity.codexSessionID == other.codexSessionID &&
+		identity.copilotSessionID == other.copilotSessionID
+}
+
 type instancePollingState struct {
-	tool      string
-	createdAt time.Time
+	identity instancePollingIdentity
 
 	tmuxSession *tmux.Session
 
@@ -497,12 +519,34 @@ type instancePollingState struct {
 	hermesGatewayOK        bool
 }
 
+func (i *Instance) pollingIdentity() instancePollingIdentity {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.pollingIdentityLocked()
+}
+
+func (i *Instance) pollingIdentityLocked() instancePollingIdentity {
+	return instancePollingIdentity{
+		tool:              i.Tool,
+		createdAt:         i.CreatedAt,
+		lastStartedAt:     i.LastStartedAt,
+		claudeSessionID:   i.ClaudeSessionID,
+		geminiSessionID:   i.GeminiSessionID,
+		openCodeSessionID: i.OpenCodeSessionID,
+		codexSessionID:    i.CodexSessionID,
+		copilotSessionID:  i.CopilotSessionID,
+	}
+}
+
 func (i *Instance) pollingState() instancePollingState {
+	return i.pollingStateForIdentity(i.pollingIdentity())
+}
+
+func (i *Instance) pollingStateForIdentity(identity instancePollingIdentity) instancePollingState {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return instancePollingState{
-		tool:                       i.Tool,
-		createdAt:                  i.CreatedAt,
+		identity:                   identity,
 		tmuxSession:                i.tmuxSession,
 		lastOpenCodeScanAt:         i.lastOpenCodeScanAt,
 		lastCodexScanAt:            i.lastCodexScanAt,
@@ -521,17 +565,25 @@ func (i *Instance) pollingState() instancePollingState {
 	}
 }
 
-func (i *Instance) restorePollingState(state instancePollingState) {
+func (i *Instance) restorePollingState(state instancePollingState) bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
 	// A replaced row that reuses an ID is a new runtime identity. Let it start
 	// cold rather than inheriting another tool/session's throttle decisions.
-	if state.tool != i.Tool || !state.createdAt.Equal(i.CreatedAt) {
-		return
+	// A restart or durable tool-session rebind is also a new runtime: cached tmux
+	// environment, status trackers, and probe backoffs all describe the old pane.
+	if !state.identity.equal(i.pollingIdentityLocked()) {
+		return false
 	}
 
-	if tmuxRuntimeCompatible(i.tmuxSession, state.tmuxSession) {
+	if (i.tmuxSession == nil) != (state.tmuxSession == nil) {
+		return false
+	}
+	if i.tmuxSession != nil {
+		if !tmuxRuntimeCompatible(i.tmuxSession, state.tmuxSession) {
+			return false
+		}
 		// ReconnectSessionLazy creates a fresh wrapper on every DB load. Reusing
 		// the compatible prior wrapper preserves its env cache, pane cache, and
 		// status tracker, which otherwise restart cold and shell out every poll.
@@ -552,6 +604,7 @@ func (i *Instance) restorePollingState(state instancePollingState) {
 	i.lastSessionMetaSync = state.lastSessionMetaSync
 	i.hermesGatewayCheckedAt = state.hermesGatewayCheckedAt
 	i.hermesGatewayOK = state.hermesGatewayOK
+	return true
 }
 
 func tmuxRuntimeCompatible(current, previous *tmux.Session) bool {

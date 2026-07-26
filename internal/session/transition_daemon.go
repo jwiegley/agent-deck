@@ -342,6 +342,12 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	if err != nil {
 		return notifyPollSlow
 	}
+	identities := make(map[string]instancePollingIdentity, len(instances))
+	for _, inst := range instances {
+		if inst != nil {
+			identities[inst.ID] = inst.pollingIdentity()
+		}
+	}
 	d.restorePollingState(profile, instances)
 
 	byID := make(map[string]*Instance, len(instances))
@@ -426,7 +432,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 				statuses[inst.ID] = previousStatus
 				continue
 			}
-			d.rememberPollingState(profile, inst)
+			d.rememberPollingState(profile, inst, identities[inst.ID])
 			status := normalizeStatusString(string(inst.GetStatusThreadSafe()))
 			statuses[inst.ID] = status
 			if db != nil && status != previousStatus {
@@ -497,8 +503,9 @@ func (d *TransitionDaemon) restorePollingState(profile string, instances []*Inst
 			continue
 		}
 		if state, ok := previous[inst.ID]; ok {
-			inst.restorePollingState(state)
-			current[inst.ID] = state
+			if inst.restorePollingState(state) {
+				current[inst.ID] = state
+			}
 		}
 	}
 	if d.pollState == nil {
@@ -507,8 +514,8 @@ func (d *TransitionDaemon) restorePollingState(profile string, instances []*Inst
 	d.pollState[profile] = current
 }
 
-func (d *TransitionDaemon) rememberPollingState(profile string, inst *Instance) {
-	d.pollState[profile][inst.ID] = inst.pollingState()
+func (d *TransitionDaemon) rememberPollingState(profile string, inst *Instance, identity instancePollingIdentity) {
+	d.pollState[profile][inst.ID] = inst.pollingStateForIdentity(identity)
 }
 
 // emitDoneSignals turns a worker-printed completion sentinel (persisted into

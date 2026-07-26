@@ -53,6 +53,7 @@ type InstanceData struct {
 	Tool                string    `json:"tool"`
 	Status              Status    `json:"status"`
 	CreatedAt           time.Time `json:"created_at"`
+	LastStartedAt       time.Time `json:"last_started_at,omitempty"`
 	LastAccessedAt      time.Time `json:"last_accessed_at,omitempty"`
 	ArchivedAt          time.Time `json:"archived_at,omitempty"`
 	TmuxSession         string    `json:"tmux_session"`
@@ -845,6 +846,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// the positional MarshalToolData signature so legacy binaries that don't
 	// know the key preserve it via MergeToolDataExtras.
 	toolData = WriteIdleTimeoutSecsToToolData(toolData, inst.IdleTimeoutSecs)
+	toolData = writeLastStartedAtToToolData(toolData, inst.LastStartedAt)
 
 	return &statedb.InstanceRow{
 		ID:                  inst.ID,
@@ -978,6 +980,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			Tool:                      r.Tool,
 			Status:                    Status(r.Status),
 			CreatedAt:                 r.CreatedAt,
+			LastStartedAt:             readLastStartedAtFromToolData(r.ToolData),
 			LastAccessedAt:            r.LastAccessed,
 			ArchivedAt:                r.ArchivedAt,
 			TmuxSession:               r.TmuxSession,
@@ -1097,6 +1100,7 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			Tool:                      r.Tool,
 			Status:                    Status(r.Status),
 			CreatedAt:                 r.CreatedAt,
+			LastStartedAt:             readLastStartedAtFromToolData(r.ToolData),
 			LastAccessedAt:            r.LastAccessed,
 			ArchivedAt:                r.ArchivedAt,
 			TmuxSession:               r.TmuxSession,
@@ -1352,6 +1356,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			Tool:                      instData.Tool,
 			Status:                    instData.Status,
 			CreatedAt:                 instData.CreatedAt,
+			LastStartedAt:             instData.LastStartedAt,
 			LastAccessedAt:            instData.LastAccessedAt,
 			ArchivedAt:                instData.ArchivedAt,
 			WorktreePath:              instData.WorktreePath,
