@@ -372,7 +372,8 @@ func TestUpdateStatus_KnownCodexSkipsFleetEnumeration(t *testing.T) {
 		},
 	}
 	tmux.SeedPaneInfoCacheForTest(t, map[string]tmux.PaneInfo{
-		name: {Title: "⠋ Working", CurrentCommand: "codex"},
+		name:                                 {Title: "⠋ Working", CurrentCommand: "codex"},
+		"agentdeck_unknown_codex_budget_two": {Title: "⠋ Working", CurrentCommand: "codex"},
 	})
 
 	binDir := t.TempDir()
@@ -408,6 +409,134 @@ esac
 	if listSessions != 0 {
 		t.Fatalf("known Codex status refresh must not enumerate the fleet; list-sessions=%d calls=%q",
 			listSessions, strings.TrimSpace(string(data)))
+	}
+}
+
+func TestUpdateStatus_UnknownCodexFastPollSubprocessBudget(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("AGENT_DECK_HOME", "")
+	t.Setenv("AGENT_DECK_PROFILE", "")
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	const name = "agentdeck_unknown_codex_budget"
+	projectPath := filepath.Join(home, "unknown-codex-budget")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	inst := &Instance{
+		ID:              "unknown-codex-budget",
+		Title:           "unknown-codex-budget",
+		ProjectPath:     projectPath,
+		GroupPath:       DefaultGroupPath,
+		Command:         "codex",
+		Tool:            "codex",
+		Status:          StatusRunning,
+		CreatedAt:       time.Now().Add(-time.Hour),
+		lastCodexScanAt: time.Now(),
+		tmuxSession: &tmux.Session{
+			Name:        name,
+			DisplayName: "unknown-codex-budget",
+			WorkDir:     projectPath,
+			Command:     "codex",
+			InstanceID:  "unknown-codex-budget",
+		},
+	}
+	tmux.SeedPaneInfoCacheForTest(t, map[string]tmux.PaneInfo{
+		name: {Title: "⠋ Working", CurrentCommand: "codex"},
+	})
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "unknown-codex-budget.log")
+	fakeTmux := filepath.Join(binDir, "tmux")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$TMUX_TEST_LOG"
+case " $* " in
+  *" has-session "*) exit 0 ;;
+	*" list-sessions "*) printf '%s\n' 'agentdeck_unknown_codex_budget' 'agentdeck_unknown_codex_budget_two' 'agentdeck_other_codex_a' 'agentdeck_other_codex_b' ;;
+  *" show-environment -t agentdeck_other_codex_a "*) printf '%s\n' 'CODEX_SESSION_ID=11111111-1111-1111-1111-111111111111' ;;
+  *" show-environment -t agentdeck_other_codex_b "*) printf '%s\n' 'CODEX_SESSION_ID=22222222-2222-2222-2222-222222222222' ;;
+  *" list-panes "*) printf '%s\n' '999999' ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(fakeTmux, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake tmux: %v", err)
+	}
+	t.Setenv("TMUX_TEST_LOG", logPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for poll := 0; poll < 2; poll++ {
+		inst.lastSessionMetaSync = time.Time{}
+		if err := inst.UpdateStatus(); err != nil {
+			t.Fatalf("UpdateStatus poll %d: %v", poll+1, err)
+		}
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read fake tmux log: %v", err)
+	}
+	var otherEnvReads int
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.Contains(line, "show-environment -t agentdeck_other_codex_") {
+			otherEnvReads++
+		}
+	}
+	if otherEnvReads != 0 {
+		t.Fatalf("unknown Codex fast polls must defer fleet exclusions until the fallback scan is due; other-env reads=%d calls=%q",
+			otherEnvReads, strings.TrimSpace(string(data)))
+	}
+
+	second := &Instance{
+		ID:          "unknown-codex-budget-two",
+		Title:       "unknown-codex-budget-two",
+		ProjectPath: projectPath,
+		GroupPath:   DefaultGroupPath,
+		Command:     "codex",
+		Tool:        "codex",
+		Status:      StatusRunning,
+		CreatedAt:   time.Now().Add(-time.Hour),
+		tmuxSession: &tmux.Session{
+			Name:        "agentdeck_unknown_codex_budget_two",
+			DisplayName: "unknown-codex-budget-two",
+			WorkDir:     projectPath,
+			Command:     "codex",
+			InstanceID:  "unknown-codex-budget-two",
+		},
+	}
+	inst.lastCodexScanAt = time.Time{}
+	inst.lastCodexProbeAt = time.Now()
+	inst.lastSessionMetaSync = time.Time{}
+	second.lastCodexProbeAt = time.Now()
+	if err := inst.UpdateStatus(); err != nil {
+		t.Fatalf("UpdateStatus first due fallback: %v", err)
+	}
+	if err := second.UpdateStatus(); err != nil {
+		t.Fatalf("UpdateStatus second due fallback: %v", err)
+	}
+
+	data, err = os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read fake tmux log after due fallbacks: %v", err)
+	}
+	var ownershipSnapshots int
+	otherEnvReads = 0
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.Contains(line, "list-sessions") {
+			ownershipSnapshots++
+		}
+		if strings.Contains(line, "show-environment -t agentdeck_other_codex_") {
+			otherEnvReads++
+		}
+	}
+	if ownershipSnapshots != 1 || otherEnvReads != 2 {
+		t.Fatalf("same-pass Codex fallbacks must share one ownership snapshot; snapshots=%d other-env reads=%d calls=%q",
+			ownershipSnapshots, otherEnvReads, strings.TrimSpace(string(data)))
 	}
 }
 
