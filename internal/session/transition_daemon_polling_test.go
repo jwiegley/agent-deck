@@ -171,13 +171,6 @@ func TestSyncProfile_BlockingCodexOwnershipRefreshDoesNotSerializeProbes(t *test
 			Tool:        "codex",
 			Status:      StatusRunning,
 			CreatedAt:   time.Now().Add(-time.Hour),
-			tmuxSession: &tmux.Session{
-				Name:        "agentdeck_codex_blocked_refresh",
-				DisplayName: "codex-blocked-refresh",
-				WorkDir:     projectPath,
-				Command:     "codex",
-				InstanceID:  "codex-blocked-refresh",
-			},
 		},
 		{
 			ID:          "codex-concurrent-refresh",
@@ -188,29 +181,15 @@ func TestSyncProfile_BlockingCodexOwnershipRefreshDoesNotSerializeProbes(t *test
 			Tool:        "codex",
 			Status:      StatusRunning,
 			CreatedAt:   time.Now().Add(-time.Hour),
-			tmuxSession: &tmux.Session{
-				Name:        "agentdeck_codex_concurrent_refresh",
-				DisplayName: "codex-concurrent-refresh",
-				WorkDir:     projectPath,
-				Command:     "codex",
-				InstanceID:  "codex-concurrent-refresh",
-			},
 		},
 	}
 	if err := storage.SaveWithGroups(instances, nil); err != nil {
 		t.Fatalf("save instances: %v", err)
 	}
-	tmux.SeedPaneInfoCacheForTest(t, map[string]tmux.PaneInfo{
-		"agentdeck_codex_blocked_refresh":    {Title: "⠋ Working", CurrentCommand: "codex"},
-		"agentdeck_codex_concurrent_refresh": {Title: "⠋ Working", CurrentCommand: "codex"},
-	})
-
 	binDir := t.TempDir()
 	fakeTmux := filepath.Join(binDir, "tmux")
 	script := `#!/bin/sh
 case " $* " in
-  *" has-session "*) exit 0 ;;
-  *" list-panes "*) printf '%s\n' '999999' ;;
   *" list-sessions "*) sleep 2; exit 0 ;;
   *) exit 1 ;;
 esac
@@ -221,15 +200,15 @@ esac
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	originalBudget := statusProbeBudget
-	statusProbeBudget = 300 * time.Millisecond
+	statusProbeBudget = 100 * time.Millisecond
 	t.Cleanup(func() { statusProbeBudget = originalBudget })
 
 	originalProbe := updateInstanceStatus.Load().(statusProbeFunc)
 	var completed atomic.Int32
 	updateInstanceStatus.Store(statusProbeFunc(func(inst *Instance) error {
-		err := inst.UpdateStatus()
+		_ = inst.collectOtherCodexSessionIDs()
 		completed.Add(1)
-		return err
+		return nil
 	}))
 	t.Cleanup(func() { updateInstanceStatus.Store(originalProbe) })
 
@@ -240,7 +219,7 @@ esac
 	if got := completed.Load(); got != 1 {
 		t.Fatalf("a blocked ownership refresh serialized the concurrent Codex probe: completed=%d, want 1", got)
 	}
-	if elapsed >= 900*time.Millisecond {
+	if elapsed >= 500*time.Millisecond {
 		t.Fatalf("daemon poll waited too long behind blocked ownership refresh: %s", elapsed)
 	}
 	deadline := time.Now().Add(2 * time.Second)
