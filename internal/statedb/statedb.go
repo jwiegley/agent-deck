@@ -1450,7 +1450,7 @@ func (s *StateDB) WriteGeminiSessionBinding(id, sessionID string, detectedAt tim
 func (s *StateDB) WriteLastStartedAt(id string, startedAt time.Time) error {
 	value := startedAt.UTC().Format(time.RFC3339Nano)
 	return withBusyRetry(func() error {
-		_, err := s.db.Exec(
+		result, err := s.db.Exec(
 			`UPDATE instances
 			   SET tool_data = json_set(
 			         COALESCE(tool_data, '{}'),
@@ -1458,7 +1458,17 @@ func (s *StateDB) WriteLastStartedAt(id string, startedAt time.Time) error {
 			 WHERE id = ?`,
 			value, id,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read last_started_at rows affected: %w", err)
+		}
+		if rows != 1 {
+			return fmt.Errorf("persist last_started_at for %s: updated %d rows, want 1", id, rows)
+		}
+		return nil
 	})
 }
 

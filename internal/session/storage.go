@@ -326,6 +326,7 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 	// Convert instances to database rows
 	rows := make([]*statedb.InstanceRow, len(instances))
 	for i, inst := range instances {
+		inst.setOwningDB(s.db)
 		row, err := instanceToRow(inst)
 		if err != nil {
 			return err
@@ -594,6 +595,7 @@ func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *Group
 	if newInstance == nil {
 		return fmt.Errorf("nil instance")
 	}
+	newInstance.setOwningDB(s.db)
 	row, err := instanceToRow(newInstance)
 	if err != nil {
 		return err
@@ -1394,6 +1396,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			AdditionalPaths:           instData.AdditionalPaths,
 			MultiRepoTempDir:          instData.MultiRepoTempDir,
 			tmuxSession:               tmuxSess,
+			owningDB:                  s.db,
 		}
 		// Convert multi-repo worktree data
 		for _, wt := range instData.MultiRepoWorktrees {

@@ -399,6 +399,11 @@ type Instance struct {
 	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
 
 	tmuxSession *tmux.Session // Internal tmux session
+	// owningDB is the profile database that loaded or saved this instance.
+	// Restart durability must not depend on the process-global DB: CLI/MCP/plugin
+	// paths can restart immediately after a profile load, before main installs it.
+	// Guarded by mu after the Instance becomes shared.
+	owningDB *statedb.StateDB
 
 	// Hook-based status detection (set by StatusFileWatcher from Claude Code hooks)
 	hookStatus     string    // running, idle, waiting, dead (empty = no hook data)
@@ -523,6 +528,22 @@ func (i *Instance) pollingIdentity() instancePollingIdentity {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return i.pollingIdentityLocked()
+}
+
+func (i *Instance) setOwningDB(db *statedb.StateDB) {
+	i.mu.Lock()
+	i.owningDB = db
+	i.mu.Unlock()
+}
+
+func (i *Instance) restartPersistenceDB() *statedb.StateDB {
+	i.mu.RLock()
+	db := i.owningDB
+	i.mu.RUnlock()
+	if db != nil {
+		return db
+	}
+	return statedb.GetGlobal()
 }
 
 func (i *Instance) pollingIdentityLocked() instancePollingIdentity {
@@ -6621,7 +6642,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 	defer func() {
 		if err == nil {
 			i.markStarted()
-			if db := statedb.GetGlobal(); db != nil {
+			if db := i.restartPersistenceDB(); db != nil {
 				if persistErr := db.WriteLastStartedAt(i.ID, i.LastStartedAt); persistErr != nil {
 					err = fmt.Errorf("restart succeeded but runtime generation persistence failed: %w", persistErr)
 				}
