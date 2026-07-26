@@ -5957,8 +5957,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		inst := h.instanceByID[msg.instanceID]
 		h.instancesMu.RUnlock()
 		if inst != nil {
-			if err := inst.SetGeminiModel(msg.model); err != nil {
-				h.err = fmt.Errorf("failed to set model: %w", err)
+			restartErr, warning := normalizeRestartResult(inst.SetGeminiModel(msg.model), "")
+			if restartErr != nil {
+				h.err = fmt.Errorf("failed to set model: %w", restartErr)
+				h.errTime = time.Now()
+			} else if warning != "" {
+				h.err = fmt.Errorf("%s", warning)
 				h.errTime = time.Now()
 			}
 			// Force save to persist the model change
