@@ -623,6 +623,53 @@ func TestStorage_RoundTripsPollingRuntimeGeneration(t *testing.T) {
 	}
 }
 
+func TestRestart_PersistsGenerationBeforePollStateReload(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	const profile = "_test_transition_restart_generation_persist"
+	_, storage := bootstrapDaemonProfile(t, profile)
+
+	title := uniqueShellTestTitle("PollGenerationPersist")
+	inst := NewInstance(title, t.TempDir())
+	inst.GroupPath = DefaultGroupPath
+	if err := inst.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { cleanupShellSessions(title) })
+	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+		t.Fatalf("save started instance: %v", err)
+	}
+
+	loaded, _, err := storage.LoadWithGroups()
+	if err != nil || len(loaded) != 1 {
+		t.Fatalf("load started instance: count=%d err=%v", len(loaded), err)
+	}
+	beforeRestart := loaded[0].LastStartedAt
+	seedHotPollState(loaded[0], time.Now())
+	staleState := loaded[0].pollingState()
+
+	// This is intentionally the direct production contract used by callers such
+	// as WebMutator.RestartSession: no caller-side SaveWithGroups follows it.
+	if err := loaded[0].Restart(); err != nil {
+		t.Fatalf("direct Restart: %v", err)
+	}
+
+	reloaded, _, err := storage.LoadWithGroups()
+	if err != nil || len(reloaded) != 1 {
+		t.Fatalf("reload after direct Restart: count=%d err=%v", len(reloaded), err)
+	}
+	if !reloaded[0].LastStartedAt.After(beforeRestart) {
+		t.Fatalf("direct Restart generation was not persisted: before=%s after=%s",
+			beforeRestart, reloaded[0].LastStartedAt)
+	}
+	freshWrapper := reloaded[0].tmuxSession
+	if reloaded[0].restorePollingState(staleState) {
+		t.Fatal("stale pre-restart poll state was restored after storage reload")
+	}
+	if reloaded[0].tmuxSession != freshWrapper || !reloaded[0].lastCodexProbeAt.IsZero() {
+		t.Fatal("pre-restart tmux/backoff cache crossed the durable generation boundary")
+	}
+}
+
 func TestUpdateStatus_KnownCodexSkipsFleetEnumeration(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
