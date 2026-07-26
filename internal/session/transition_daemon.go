@@ -74,23 +74,23 @@ type TransitionDaemon struct {
 	// every few seconds. Accessed only from the single-threaded Run loop.
 	lastProbeStall map[string]time.Time
 
-	// terminalPollState carries Instance's in-process stopped/error throttle
-	// across LoadWithGroups calls. Each load constructs fresh Instance values;
-	// without this bridge lastErrorCheck resets every poll and every terminal
-	// session runs a new tmux existence probe instead of waiting 30 seconds.
-	terminalPollState map[string]map[string]time.Time
+	// pollState carries process-local status caches and throttles across
+	// LoadWithGroups calls. Each load constructs fresh Instance and tmux.Session
+	// values; without this bridge every profile poll starts cold and repeats
+	// tmux, ps, lsof, metadata, and gateway probes.
+	pollState map[string]map[string]instancePollingState
 }
 
 func NewTransitionDaemon() *TransitionDaemon {
 	return &TransitionDaemon{
-		notifier:          NewTransitionNotifier(),
-		storages:          map[string]*Storage{},
-		lastStatus:        map[string]map[string]string{},
-		initialized:       map[string]bool{},
-		lastDone:          map[string]map[string]DoneSignal{},
-		lastDoneScan:      map[string]map[string]time.Time{},
-		lastProbeStall:    map[string]time.Time{},
-		terminalPollState: map[string]map[string]time.Time{},
+		notifier:       NewTransitionNotifier(),
+		storages:       map[string]*Storage{},
+		lastStatus:     map[string]map[string]string{},
+		initialized:    map[string]bool{},
+		lastDone:       map[string]map[string]DoneSignal{},
+		lastDoneScan:   map[string]map[string]time.Time{},
+		lastProbeStall: map[string]time.Time{},
+		pollState:      map[string]map[string]instancePollingState{},
 	}
 }
 
@@ -342,7 +342,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	if err != nil {
 		return notifyPollSlow
 	}
-	d.restoreTerminalPollState(profile, instances)
+	d.restorePollingState(profile, instances)
 
 	byID := make(map[string]*Instance, len(instances))
 	hookCandidates := make(map[string]hookTransitionCandidate, len(instances))
@@ -426,7 +426,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 				statuses[inst.ID] = previousStatus
 				continue
 			}
-			d.rememberTerminalPollState(profile, inst)
+			d.rememberPollingState(profile, inst)
 			status := normalizeStatusString(string(inst.GetStatusThreadSafe()))
 			statuses[inst.ID] = status
 			if db != nil && status != previousStatus {
@@ -486,34 +486,29 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	return choosePollInterval(statuses)
 }
 
-// restoreTerminalPollState hydrates the one volatile polling timestamp that
-// must survive the daemon's per-pass storage reload. Rebuilding the profile map
-// here also drops state for deleted instances.
-func (d *TransitionDaemon) restoreTerminalPollState(profile string, instances []*Instance) {
-	previous := d.terminalPollState[profile]
-	current := make(map[string]time.Time, len(instances))
+// restorePollingState hydrates process-local status machinery after the
+// daemon's per-pass storage reload. Rebuilding the profile map also drops state
+// for deleted instances.
+func (d *TransitionDaemon) restorePollingState(profile string, instances []*Instance) {
+	previous := d.pollState[profile]
+	current := make(map[string]instancePollingState, len(instances))
 	for _, inst := range instances {
 		if inst == nil {
 			continue
 		}
-		if checkedAt := previous[inst.ID]; !checkedAt.IsZero() {
-			inst.restoreTerminalPollCheckedAt(checkedAt)
-			current[inst.ID] = checkedAt
+		if state, ok := previous[inst.ID]; ok {
+			inst.restorePollingState(state)
+			current[inst.ID] = state
 		}
 	}
-	if d.terminalPollState == nil {
-		d.terminalPollState = make(map[string]map[string]time.Time)
+	if d.pollState == nil {
+		d.pollState = make(map[string]map[string]instancePollingState)
 	}
-	d.terminalPollState[profile] = current
+	d.pollState[profile] = current
 }
 
-func (d *TransitionDaemon) rememberTerminalPollState(profile string, inst *Instance) {
-	checkedAt := inst.terminalPollCheckedAt()
-	if checkedAt.IsZero() {
-		delete(d.terminalPollState[profile], inst.ID)
-		return
-	}
-	d.terminalPollState[profile][inst.ID] = checkedAt
+func (d *TransitionDaemon) rememberPollingState(profile string, inst *Instance) {
+	d.pollState[profile][inst.ID] = inst.pollingState()
 }
 
 // emitDoneSignals turns a worker-printed completion sentinel (persisted into

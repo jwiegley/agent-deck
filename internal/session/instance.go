@@ -102,10 +102,7 @@ const (
 	// timestamp on every received line, so 30s of silence means the stream
 	// (and likely the process) is gone — fall back to tmux polling.
 	opencodeSSEFreshnessWindow = 30 * time.Second
-	// codexProbeScanInterval rate-limits process-file probing to avoid
-	// repeated /proc and lsof scans on every status tick.
-	codexProbeScanInterval    = 2 * time.Second
-	codexProbeMissingSentinel = "__AGENT_DECK_MISSING_TOOL__"
+	codexProbeMissingSentinel  = "__AGENT_DECK_MISSING_TOOL__"
 	// codexLsofProbeTimeout hard-caps a single lsof invocation so a slow or
 	// hung child can never stall the shared status pass. lsof is also run with
 	// -n -P (no host/port name resolution) to avoid reverse-DNS PTR lookups on
@@ -427,7 +424,8 @@ type Instance struct {
 
 	// lastErrorCheck tracks when we last confirmed the session doesn't exist
 	// Used to skip expensive Exists() checks for ghost sessions (sessions in JSON but not in tmux)
-	// Not serialized - resets on load, but that's fine since we'll recheck on first poll
+	// Not serialized; long-lived pollers that reload instances must carry it in
+	// process so the recheck interval survives the reload.
 	lastErrorCheck time.Time
 
 	// Tiered polling: skip expensive checks for idle sessions with no activity
@@ -472,19 +470,105 @@ type Instance struct {
 	hermesGatewayOK        bool
 }
 
-// terminalPollCheckedAt and restoreTerminalPollCheckedAt let long-lived pollers
-// carry the stopped/error recheck throttle across storage reloads without
-// persisting a runtime-only timestamp in the session database.
-func (i *Instance) terminalPollCheckedAt() time.Time {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	return i.lastErrorCheck
+// instancePollingState is process-local status machinery that must survive a
+// long-lived poller's storage reload. It deliberately excludes durable session
+// data: SQLite remains authoritative for that on every pass.
+type instancePollingState struct {
+	tool      string
+	createdAt time.Time
+
+	tmuxSession *tmux.Session
+
+	lastOpenCodeScanAt time.Time
+	lastCodexScanAt    time.Time
+	lastCodexProbeAt   time.Time
+	lastPromptModTime  time.Time
+	lastJSONLSize      int64
+	lastJSONLPath      string
+	cachedPrompt       string
+
+	lastErrorCheck             time.Time
+	lastIdleCheck              time.Time
+	lastKnownActivity          int64
+	tmuxFlipFromRunningPending bool
+	lastSessionMetaSync        time.Time
+
+	hermesGatewayCheckedAt time.Time
+	hermesGatewayOK        bool
 }
 
-func (i *Instance) restoreTerminalPollCheckedAt(checkedAt time.Time) {
+func (i *Instance) pollingState() instancePollingState {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return instancePollingState{
+		tool:                       i.Tool,
+		createdAt:                  i.CreatedAt,
+		tmuxSession:                i.tmuxSession,
+		lastOpenCodeScanAt:         i.lastOpenCodeScanAt,
+		lastCodexScanAt:            i.lastCodexScanAt,
+		lastCodexProbeAt:           i.lastCodexProbeAt,
+		lastPromptModTime:          i.lastPromptModTime,
+		lastJSONLSize:              i.lastJSONLSize,
+		lastJSONLPath:              i.lastJSONLPath,
+		cachedPrompt:               i.cachedPrompt,
+		lastErrorCheck:             i.lastErrorCheck,
+		lastIdleCheck:              i.lastIdleCheck,
+		lastKnownActivity:          i.lastKnownActivity,
+		tmuxFlipFromRunningPending: i.tmuxFlipFromRunningPending,
+		lastSessionMetaSync:        i.lastSessionMetaSync,
+		hermesGatewayCheckedAt:     i.hermesGatewayCheckedAt,
+		hermesGatewayOK:            i.hermesGatewayOK,
+	}
+}
+
+func (i *Instance) restorePollingState(state instancePollingState) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	i.lastErrorCheck = checkedAt
+
+	// A replaced row that reuses an ID is a new runtime identity. Let it start
+	// cold rather than inheriting another tool/session's throttle decisions.
+	if state.tool != i.Tool || !state.createdAt.Equal(i.CreatedAt) {
+		return
+	}
+
+	if tmuxRuntimeCompatible(i.tmuxSession, state.tmuxSession) {
+		// ReconnectSessionLazy creates a fresh wrapper on every DB load. Reusing
+		// the compatible prior wrapper preserves its env cache, pane cache, and
+		// status tracker, which otherwise restart cold and shell out every poll.
+		i.tmuxSession = state.tmuxSession
+	}
+
+	i.lastOpenCodeScanAt = state.lastOpenCodeScanAt
+	i.lastCodexScanAt = state.lastCodexScanAt
+	i.lastCodexProbeAt = state.lastCodexProbeAt
+	i.lastPromptModTime = state.lastPromptModTime
+	i.lastJSONLSize = state.lastJSONLSize
+	i.lastJSONLPath = state.lastJSONLPath
+	i.cachedPrompt = state.cachedPrompt
+	i.lastErrorCheck = state.lastErrorCheck
+	i.lastIdleCheck = state.lastIdleCheck
+	i.lastKnownActivity = state.lastKnownActivity
+	i.tmuxFlipFromRunningPending = state.tmuxFlipFromRunningPending
+	i.lastSessionMetaSync = state.lastSessionMetaSync
+	i.hermesGatewayCheckedAt = state.hermesGatewayCheckedAt
+	i.hermesGatewayOK = state.hermesGatewayOK
+}
+
+func tmuxRuntimeCompatible(current, previous *tmux.Session) bool {
+	if current == nil || previous == nil {
+		return false
+	}
+	return current.Name == previous.Name &&
+		current.DisplayName == previous.DisplayName &&
+		current.WorkDir == previous.WorkDir &&
+		current.Command == previous.Command &&
+		current.InstanceID == previous.InstanceID &&
+		current.SocketName == previous.SocketName &&
+		maps.Equal(current.OptionOverrides, previous.OptionOverrides) &&
+		current.RunCommandAsInitialProcess == previous.RunCommandAsInitialProcess &&
+		current.VimMode == previous.VimMode &&
+		current.LaunchInUserScope == previous.LaunchInUserScope &&
+		current.LaunchAs == previous.LaunchAs
 }
 
 // SandboxConfig holds per-session Docker sandbox settings.
@@ -2540,7 +2624,14 @@ func (i *Instance) shouldRunCodexProcessProbe(force bool) bool {
 		return true
 	}
 
-	if !i.lastCodexProbeAt.IsZero() && time.Since(i.lastCodexProbeAt) < codexProbeScanInterval {
+	// Keep the fast cadence only while bootstrapping an unknown ID. Once an ID
+	// is known, hooks and the tmux environment are the primary rotation signals;
+	// the process-file probe (ps+lsof on macOS) is a 30-second safety net.
+	interval := codexBootstrapScanInterval
+	if i.CodexSessionID != "" {
+		interval = codexRotationScanInterval
+	}
+	if !i.lastCodexProbeAt.IsZero() && time.Since(i.lastCodexProbeAt) < interval {
 		return false
 	}
 
@@ -4469,11 +4560,14 @@ func (i *Instance) UpdateStatus() error {
 
 			// Update Codex session tracking (non-blocking, best-effort)
 			if IsCodexCompatible(i.Tool) {
-				// Always collect other instances' session IDs to prevent the
-				// disk scan from assigning a session that belongs to another
-				// instance. Without this, instances that share the same
-				// project_path can all claim the same Codex session file.
-				exclude := i.collectOtherCodexSessionIDs()
+				// Fleet-wide exclusions are needed only for the bootstrap disk
+				// scan. Once this instance has an ID, updateCodexSession returns
+				// before that scan; enumerating every tmux session and reading
+				// each CODEX_SESSION_ID would be pure subprocess churn.
+				var exclude map[string]bool
+				if i.CodexSessionID == "" {
+					exclude = i.collectOtherCodexSessionIDs()
+				}
 				i.UpdateCodexSession(exclude)
 			}
 
