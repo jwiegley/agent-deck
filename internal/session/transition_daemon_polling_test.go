@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -139,6 +140,98 @@ func TestSyncProfile_PreservesTerminalPollThrottleAcrossReload(t *testing.T) {
 		if !got[1].Equal(want) {
 			t.Fatalf("%s: terminal poll state did not survive reload: want %s, got %s", id, want, got[1])
 		}
+	}
+}
+
+func TestSyncProfile_BlockingCodexOwnershipRefreshDoesNotSerializeProbes(t *testing.T) {
+	const profile = "_test_transition_codex_ownership_block"
+	d, storage := bootstrapDaemonProfile(t, profile)
+
+	projectPath := filepath.Join(os.Getenv("HOME"), "codex-ownership-block")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	instances := []*Instance{
+		{
+			ID:          "codex-blocked-refresh",
+			Title:       "codex-blocked-refresh",
+			ProjectPath: projectPath,
+			GroupPath:   DefaultGroupPath,
+			Command:     "codex",
+			Tool:        "codex",
+			Status:      StatusRunning,
+			CreatedAt:   time.Now().Add(-time.Hour),
+			tmuxSession: &tmux.Session{
+				Name:        "agentdeck_codex_blocked_refresh",
+				DisplayName: "codex-blocked-refresh",
+				WorkDir:     projectPath,
+				Command:     "codex",
+				InstanceID:  "codex-blocked-refresh",
+			},
+		},
+		{
+			ID:          "codex-concurrent-refresh",
+			Title:       "codex-concurrent-refresh",
+			ProjectPath: projectPath,
+			GroupPath:   DefaultGroupPath,
+			Command:     "codex",
+			Tool:        "codex",
+			Status:      StatusRunning,
+			CreatedAt:   time.Now().Add(-time.Hour),
+			tmuxSession: &tmux.Session{
+				Name:        "agentdeck_codex_concurrent_refresh",
+				DisplayName: "codex-concurrent-refresh",
+				WorkDir:     projectPath,
+				Command:     "codex",
+				InstanceID:  "codex-concurrent-refresh",
+			},
+		},
+	}
+	if err := storage.SaveWithGroups(instances, nil); err != nil {
+		t.Fatalf("save instances: %v", err)
+	}
+	tmux.SeedPaneInfoCacheForTest(t, map[string]tmux.PaneInfo{
+		"agentdeck_codex_blocked_refresh":    {Title: "⠋ Working", CurrentCommand: "codex"},
+		"agentdeck_codex_concurrent_refresh": {Title: "⠋ Working", CurrentCommand: "codex"},
+	})
+
+	binDir := t.TempDir()
+	fakeTmux := filepath.Join(binDir, "tmux")
+	script := `#!/bin/sh
+case " $* " in
+  *" has-session "*) exit 0 ;;
+  *" list-panes "*) printf '%s\n' '999999' ;;
+  *" list-sessions "*) sleep 1; exit 0 ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(fakeTmux, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake tmux: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	originalBudget := statusProbeBudget
+	statusProbeBudget = 75 * time.Millisecond
+	t.Cleanup(func() { statusProbeBudget = originalBudget })
+
+	originalProbe := updateInstanceStatus.Load().(statusProbeFunc)
+	var completed atomic.Int32
+	updateInstanceStatus.Store(statusProbeFunc(func(inst *Instance) error {
+		err := inst.UpdateStatus()
+		completed.Add(1)
+		return err
+	}))
+	t.Cleanup(func() { updateInstanceStatus.Store(originalProbe) })
+
+	started := time.Now()
+	d.syncProfile(profile)
+	elapsed := time.Since(started)
+
+	if got := completed.Load(); got != 1 {
+		t.Fatalf("a blocked ownership refresh serialized the concurrent Codex probe: completed=%d, want 1", got)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("daemon poll waited too long behind blocked ownership refresh: %s", elapsed)
 	}
 }
 
