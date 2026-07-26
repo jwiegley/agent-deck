@@ -44,8 +44,14 @@ func TestRestart_ShellSession_PostRestartIsHealthy(t *testing.T) {
 		t.Fatalf("tmux session %q never appeared after Start", inst.tmuxSession.Name)
 	}
 
+	previousGeneration := inst.LastStartedAt
+	restartBegan := time.Now()
 	if err := inst.Restart(); err != nil {
 		t.Fatalf("Restart returned error: %v", err)
+	}
+	if !inst.LastStartedAt.After(previousGeneration) || inst.LastStartedAt.Before(restartBegan) {
+		t.Fatalf("successful Restart did not advance runtime generation: before=%s after=%s restart began=%s",
+			previousGeneration, inst.LastStartedAt, restartBegan)
 	}
 
 	// Settle: respawn-pane / new-session is async on some platforms.
