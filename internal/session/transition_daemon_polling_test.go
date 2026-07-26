@@ -216,8 +216,8 @@ esac
 	d.syncProfile(profile)
 	elapsed := time.Since(started)
 
-	if got := completed.Load(); got != 1 {
-		t.Fatalf("a blocked ownership refresh serialized the concurrent Codex probe: completed=%d, want 1", got)
+	if got := completed.Load(); got != 2 {
+		t.Fatalf("a blocked ownership refresh stalled a daemon Codex probe: completed=%d, want 2", got)
 	}
 	if elapsed >= 500*time.Millisecond {
 		t.Fatalf("daemon poll waited too long behind blocked ownership refresh: %s", elapsed)

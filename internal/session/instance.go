@@ -2714,9 +2714,27 @@ func refreshCodexOwnershipSnapshot(sourceKey string, stale *codexOwnershipSnapsh
 	}
 }
 
+func launchCodexOwnershipRefresh(sourceKey string, stale *codexOwnershipSnapshotData) {
+	go func() {
+		// The context-bounded subprocess below must never strand the refresh gate.
+		// Recover as a final containment boundary: a future parser/runtime panic
+		// should preserve the prior immutable snapshot and allow the next poll to
+		// retry rather than permanently disabling refreshes.
+		defer codexOwnershipRefresh.Store(false)
+		defer func() {
+			if recover() != nil {
+				sessionLog.Warn("codex_ownership_refresh_panicked")
+			}
+		}()
+
+		refreshed := refreshCodexOwnershipSnapshot(sourceKey, stale)
+		codexOwnershipSnapshot.Store(refreshed)
+	}()
+}
+
 // collectOtherCodexSessionIDs returns a read-only view of the shared ownership
-// snapshot. One caller refreshes it with a bounded batch query; concurrent
-// callers never wait behind that subprocess and use the previous (or empty)
+// snapshot. The CAS winner launches a bounded batch refresh asynchronously;
+// every caller, including that winner, immediately uses the previous (or empty)
 // snapshot. Published maps are immutable after the atomic store.
 func (i *Instance) collectOtherCodexSessionIDs() codexSessionExclusions {
 	myTmuxName := ""
@@ -2735,14 +2753,10 @@ func (i *Instance) collectOtherCodexSessionIDs() codexSessionExclusions {
 	if stale != nil && stale.sourceKey != sourceKey {
 		stale = nil
 	}
-	if !codexOwnershipRefresh.CompareAndSwap(false, true) {
-		return codexOwnershipExclusions(stale, myTmuxName)
+	if codexOwnershipRefresh.CompareAndSwap(false, true) {
+		launchCodexOwnershipRefresh(sourceKey, stale)
 	}
-	defer codexOwnershipRefresh.Store(false)
-
-	refreshed := refreshCodexOwnershipSnapshot(sourceKey, stale)
-	codexOwnershipSnapshot.Store(refreshed)
-	return codexOwnershipExclusions(refreshed, myTmuxName)
+	return codexOwnershipExclusions(stale, myTmuxName)
 }
 
 // shouldScanCodexSession returns whether we should run an expensive filesystem
