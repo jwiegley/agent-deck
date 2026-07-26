@@ -862,6 +862,103 @@ esac
 	codexOwnershipSnapshot.Store(nil)
 }
 
+func TestUpdateStatus_DefersDiskFallbackUntilOwnershipSnapshotFresh(t *testing.T) {
+	refreshDeadline := time.Now().Add(2 * time.Second)
+	for codexOwnershipRefresh.Load() && time.Now().Before(refreshDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if codexOwnershipRefresh.Load() {
+		t.Fatal("prior Codex ownership refresh did not terminate")
+	}
+	codexOwnershipSnapshot.Store(nil)
+	t.Cleanup(func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for codexOwnershipRefresh.Load() && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		codexOwnershipSnapshot.Store(nil)
+	})
+
+	home := t.TempDir()
+	codexHome := filepath.Join(home, ".codex")
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", codexHome)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("AGENT_DECK_HOME", "")
+	t.Setenv("AGENT_DECK_PROFILE", "")
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	const (
+		name    = "agentdeck_ownership_freshness"
+		ownedID = "33333333-3333-4333-8333-333333333333"
+	)
+	projectPath := filepath.Join(home, "ownership-freshness")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	writeCodexSessionFile(t, codexHome, ownedID, projectPath)
+	inst := &Instance{
+		ID:               "ownership-freshness",
+		Title:            "ownership-freshness",
+		ProjectPath:      projectPath,
+		GroupPath:        DefaultGroupPath,
+		Command:          "codex",
+		Tool:             "codex",
+		Status:           StatusRunning,
+		CreatedAt:        time.Now().Add(-time.Hour),
+		lastCodexProbeAt: time.Now(),
+		tmuxSession: &tmux.Session{
+			Name:        name,
+			DisplayName: "ownership-freshness",
+			WorkDir:     projectPath,
+			Command:     "codex",
+			InstanceID:  "ownership-freshness",
+		},
+	}
+	tmux.SeedPaneInfoCacheForTest(t, map[string]tmux.PaneInfo{
+		name: {Title: "⠋ Working", CurrentCommand: "codex"},
+	})
+
+	binDir := t.TempDir()
+	fakeTmux := filepath.Join(binDir, "tmux")
+	script := `#!/bin/sh
+case " $* " in
+  *" has-session "*) exit 0 ;;
+  *" list-sessions "*) sleep 0.2; printf '%s\t%s\n' 'agentdeck_other_ownership_freshness' '33333333-3333-4333-8333-333333333333' ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(fakeTmux, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake tmux: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := inst.UpdateStatus(); err != nil {
+		t.Fatalf("first UpdateStatus: %v", err)
+	}
+	if inst.CodexSessionID != "" {
+		t.Fatalf("cold ownership snapshot bound rollout %q before ownership was known", inst.CodexSessionID)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for codexOwnershipRefresh.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if codexOwnershipRefresh.Load() {
+		t.Fatal("ownership snapshot did not publish")
+	}
+	inst.lastSessionMetaSync = time.Time{}
+	if err := inst.UpdateStatus(); err != nil {
+		t.Fatalf("second UpdateStatus: %v", err)
+	}
+	if inst.CodexSessionID != "" {
+		t.Fatalf("fresh ownership snapshot failed to exclude sibling-owned rollout %q", inst.CodexSessionID)
+	}
+}
+
 func TestUpdateStatus_UnknownCodexFastPollSubprocessBudget(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
