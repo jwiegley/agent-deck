@@ -52,8 +52,10 @@ func newWakeNudgeFixture(t *testing.T) (*TransitionNotifier, string, TransitionN
 		Status:      StatusIdle,
 		CreatedAt:   now,
 	}
-	if err := storage.SaveWithGroups([]*Instance{child, parent}, nil); err != nil {
-		t.Fatalf("save: %v", err)
+	for _, inst := range []*Instance{parent, child} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert %s: %v", inst.ID, err)
+		}
 	}
 
 	event := TransitionNotificationEvent{

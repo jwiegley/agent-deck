@@ -140,7 +140,7 @@ func TestFormatFleetRecover_DistinguishesEveryOutcome(t *testing.T) {
 		Halted:     true,
 		HaltReason: "3 consecutive restarts failed",
 		Results: []fleet.Result{
-			{Title: "ok-one", Outcome: fleet.OutcomeRecovered,
+			{Title: "ok-one", Outcome: fleet.OutcomeRecovered, Warning: "runtime durability reconciliation incomplete",
 				Report: fleet.VerifyReport{PaneAlive: true, ToolStarted: true, Status: "running", Elapsed: 4 * time.Second}},
 			{Title: "half-one", Outcome: fleet.OutcomeUnverified,
 				Report: fleet.VerifyReport{PaneAlive: true, Status: "starting", Substate: "auth-401"}},
@@ -152,7 +152,7 @@ func TestFormatFleetRecover_DistinguishesEveryOutcome(t *testing.T) {
 	got := formatFleetRecover(sum, false)
 
 	for _, want := range []string{
-		"ok         ok-one", "unverified half-one", "auth-401",
+		"ok         ok-one", "warning: runtime durability reconciliation incomplete", "unverified half-one", "auth-401",
 		"FAILED     broken-one", "tmux exploded",
 		"skipped    untried-one",
 		"halted=true", "HALTED: 3 consecutive restarts failed",
@@ -180,6 +180,7 @@ func TestFleetRecoverJSON_ShapeIsMachineCheckable(t *testing.T) {
 		HaltReason: "auth circuit open",
 		Results: []fleet.Result{
 			{ID: "id-a", Title: "a", Status: "error", Outcome: fleet.OutcomeRecovered,
+				Warning:      "runtime durability reconciliation incomplete",
 				WaitedBefore: 5 * time.Second,
 				Report:       fleet.VerifyReport{PaneAlive: true, ToolStarted: true, Status: "running", Elapsed: 2 * time.Second}},
 			{ID: "id-b", Title: "b", Status: "error", Outcome: fleet.OutcomeSkipped, Reason: "halted"},
@@ -204,6 +205,9 @@ func TestFleetRecoverJSON_ShapeIsMachineCheckable(t *testing.T) {
 	first := sessions[0]
 	if first["outcome"] != string(fleet.OutcomeRecovered) {
 		t.Errorf("outcome = %v", first["outcome"])
+	}
+	if first["warning"] != "runtime durability reconciliation incomplete" {
+		t.Errorf("warning = %v", first["warning"])
 	}
 	if first["waited_ms"] != int64(5000) || first["verify_ms"] != int64(2000) {
 		t.Errorf("timings = %v / %v", first["waited_ms"], first["verify_ms"])

@@ -96,8 +96,12 @@ type IdleTimeoutWatcherConfig struct {
 	// Defaults to instance.tmuxSession.CapturePane().
 	Capture func(*Instance) (string, error)
 	// Stop is invoked once when an instance has been idle for >= its
-	// IdleTimeoutSecs. Defaults to inst.Kill().
+	// IdleTimeoutSecs. Retained for compatibility with existing callers; new
+	// code should use StopCaptured so the selected runtime identity is explicit.
 	Stop func(*Instance) error
+	// StopCaptured receives the identity observed with the pane content.
+	// Defaults to inst.KillCaptured(selection).
+	StopCaptured func(*Instance, RuntimeSelection) error
 	// LogEvent persists a "session lifecycle" row. Defaults to
 	// WriteSessionLifecycleEvent.
 	LogEvent func(SessionLifecycleEvent) error
@@ -120,6 +124,7 @@ type IdleTimeoutWatcher struct {
 type idleSeenEntry struct {
 	hash       uint64
 	lastChange time.Time
+	runtime    RuntimeSelection
 }
 
 // NewIdleTimeoutWatcher constructs a watcher with production defaults filled
@@ -131,8 +136,14 @@ func NewIdleTimeoutWatcher(cfg IdleTimeoutWatcherConfig) *IdleTimeoutWatcher {
 	if cfg.Capture == nil {
 		cfg.Capture = defaultCapture
 	}
-	if cfg.Stop == nil {
-		cfg.Stop = defaultStop
+	if cfg.StopCaptured == nil {
+		if cfg.Stop != nil {
+			cfg.StopCaptured = func(inst *Instance, _ RuntimeSelection) error {
+				return cfg.Stop(inst)
+			}
+		} else {
+			cfg.StopCaptured = defaultStopCaptured
+		}
 	}
 	if cfg.LogEvent == nil {
 		cfg.LogEvent = WriteSessionLifecycleEvent
@@ -187,16 +198,24 @@ func (w *IdleTimeoutWatcher) Tick(instances []*Instance) {
 			continue
 		}
 
+		beforeCapture := inst.CaptureRuntimeSelection()
 		content, err := w.cfg.Capture(inst)
 		if err != nil {
 			// transient capture failure (tmux race, snapshot truncate) —
 			// don't reset state, just try again next tick.
 			continue
 		}
+		afterCapture := inst.CaptureRuntimeSelection()
+		if !samePhysicalRuntime(beforeCapture.State, afterCapture.State) {
+			// Capture crossed a restart boundary. The content cannot be assigned
+			// safely to either generation, so re-arm on the next tick.
+			delete(w.lastSeen, inst.ID)
+			continue
+		}
 		h := hashPaneContent(content)
 		prev, ok := w.lastSeen[inst.ID]
-		if !ok || prev.hash != h {
-			w.lastSeen[inst.ID] = idleSeenEntry{hash: h, lastChange: now}
+		if !ok || prev.hash != h || !samePhysicalRuntime(prev.runtime.State, afterCapture.State) {
+			w.lastSeen[inst.ID] = idleSeenEntry{hash: h, lastChange: now, runtime: afterCapture}
 			continue
 		}
 		elapsed := now.Sub(prev.lastChange)
@@ -205,7 +224,7 @@ func (w *IdleTimeoutWatcher) Tick(instances []*Instance) {
 			continue
 		}
 		// idle threshold exceeded — trigger stop.
-		if stopErr := w.cfg.Stop(inst); stopErr != nil {
+		if stopErr := w.cfg.StopCaptured(inst, afterCapture); stopErr != nil {
 			idleLog.Warn("idle_timeout_stop_failed",
 				slog.String("instance_id", inst.ID),
 				slog.String("error", stopErr.Error()),
@@ -277,11 +296,11 @@ func defaultCapture(inst *Instance) (string, error) {
 	return tm.CapturePane()
 }
 
-func defaultStop(inst *Instance) error {
+func defaultStopCaptured(inst *Instance, selection RuntimeSelection) error {
 	if inst == nil {
 		return errors.New("nil instance")
 	}
-	return inst.Kill()
+	return inst.KillCaptured(selection)
 }
 
 // ParseIdleTimeoutFlag parses a --idle-timeout flag value: a Go-style

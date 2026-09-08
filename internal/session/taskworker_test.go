@@ -46,15 +46,15 @@ func seedChildOnly(t *testing.T, profile, parentID string) (childID string) {
 		Status:          StatusWaiting,
 		CreatedAt:       time.Now(),
 	}
-	if err := storage.SaveWithGroups([]*Instance{child}, nil); err != nil {
-		t.Fatalf("save: %v", err)
+	if err := storage.InsertSessionAndVerify(child, nil); err != nil {
+		t.Fatalf("insert child: %v", err)
 	}
 	return child.ID
 }
 
 // addParentRow saves the parent conductor alongside the existing child so the
 // next delivery attempt resolves a live parent (the conductor "came back up").
-func addParentRow(t *testing.T, profile, parentID, childID string) {
+func addParentRow(t *testing.T, profile, parentID, _ string) {
 	t.Helper()
 	storage, err := NewStorageWithProfile(profile)
 	if err != nil {
@@ -70,13 +70,8 @@ func addParentRow(t *testing.T, profile, parentID, childID string) {
 		Status:      StatusIdle,
 		CreatedAt:   time.Now(),
 	}
-	children, err := storage.Load()
-	if err != nil || len(children) != 1 || children[0].ID != childID {
-		t.Fatalf("load existing child: instances=%v err=%v", children, err)
-	}
-	child := children[0]
-	if err := storage.SaveWithGroups([]*Instance{parent, child}, nil); err != nil {
-		t.Fatalf("save: %v", err)
+	if err := storage.InsertSessionAndVerify(parent, nil); err != nil {
+		t.Fatalf("insert parent: %v", err)
 	}
 }
 

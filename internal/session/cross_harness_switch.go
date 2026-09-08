@@ -146,7 +146,7 @@ func (s StorageCrossHarnessTargetStore) SaveTarget(target *Instance) error {
 	if s.Storage == nil {
 		return fmt.Errorf("cross-harness storage is unavailable")
 	}
-	return s.Storage.InsertSessionAndVerify(target, nil)
+	return s.Storage.Save([]*Instance{target})
 }
 
 func (s StorageCrossHarnessTargetStore) FinalizeTargetHandoff(source, target *Instance) error {
@@ -416,6 +416,7 @@ func ExecuteCrossHarnessSwitch(ctx context.Context, cfg *UserConfig, source *Ins
 	if restorer, ok := deps.Observer.(CrossHarnessTargetObservationJournaler); ok && !journal.Observation.StartedAt.IsZero() {
 		restorer.RestoreTargetObservation(target, journal.Observation)
 	}
+	bindingObservation := target.CaptureRuntimeBindingObservation("codex")
 	evidence, observeErr := deps.Observer.ObserveTarget(ctx, target, plan.Target)
 	if observeErr != nil {
 		contract := missingTargetContract(plan.Target.Tool) + ": " + observeErr.Error()
@@ -443,7 +444,9 @@ func ExecuteCrossHarnessSwitch(ctx context.Context, cfg *UserConfig, source *Ins
 		// The observed rollout ID, not a launch field, is the fresh Codex
 		// identity. Persist it before replacement so recovery cannot mistake a
 		// ready target for an unbound fresh shell.
-		target.CodexSessionID = evidence.SessionID
+		if err := target.PublishRuntimeBindingObservation(bindingObservation, evidence.SessionID, time.Now()); err != nil {
+			return pendingCrossHarness(journalPath, journal, result, "publish observed Codex native identity: "+err.Error())
+		}
 		if err := deps.Store.SaveTarget(target); err != nil {
 			return pendingCrossHarness(journalPath, journal, result, "persist observed Codex native identity: "+err.Error())
 		}
@@ -826,5 +829,13 @@ func (InstanceCrossHarnessLifecycle) StartTarget(ctx context.Context, target *In
 	defer func() { target.crossHarnessLaunch = nil }()
 	// crossHarnessPlanCommand reads the already staged payload at exec time;
 	// passing it here would recreate the oversized tmux command failure.
-	return target.StartWithMessage("")
+	runtime, err := target.StartWithMessageRuntime("")
+	_, failure, warning := ConsumePhysicalRuntimeResult(target, runtime, err, nil)
+	if failure != nil {
+		return failure
+	}
+	if warning != "" {
+		return fmt.Errorf("target started with runtime durability warning: %s", warning)
+	}
+	return nil
 }

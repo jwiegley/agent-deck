@@ -109,6 +109,31 @@ func SwitchAccount(cfg *UserConfig, inst *Instance, account string, opts Account
 	}, err
 }
 
+func commitSwitchAccount(inst *Instance, account string, persist func() error) (string, error) {
+	oldAccount, postCommit, err := SetField(inst, FieldAccount, account, nil)
+	if err != nil {
+		return oldAccount, err
+	}
+	if postCommit != nil {
+		postCommit()
+	}
+	if persist == nil {
+		return oldAccount, nil
+	}
+	if err := persist(); err == nil {
+		return oldAccount, nil
+	} else {
+		_, rollbackPostCommit, rollbackErr := SetField(inst, FieldAccount, oldAccount, nil)
+		if rollbackPostCommit != nil {
+			rollbackPostCommit()
+		}
+		if rollbackErr != nil {
+			return oldAccount, fmt.Errorf("failed to save session state: %v; failed to restore account: %w", err, rollbackErr)
+		}
+		return oldAccount, fmt.Errorf("failed to save session state: %w", err)
+	}
+}
+
 // CommitAccountSwitch persists a successful compatibility account switch with
 // the same scoped native-result CAS used by the unified CLI and TUI. It must
 // replace any legacy full-registry SaveWithGroups call: lifecycle monitoring

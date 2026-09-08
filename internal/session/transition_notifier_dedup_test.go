@@ -232,8 +232,8 @@ func TestSelfSuppress_TopLevelConductorWithEmptyParent(t *testing.T) {
 		Status:          StatusWaiting,
 		CreatedAt:       now,
 	}
-	if err := storage.SaveWithGroups([]*Instance{conductor}, nil); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(conductor, nil); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	n := NewTransitionNotifier()
@@ -299,8 +299,8 @@ func TestSelfSuppress_TopLevelConductorWithParentMatchingSelf(t *testing.T) {
 		Status:          StatusWaiting,
 		CreatedAt:       now,
 	}
-	if err := storage.SaveWithGroups([]*Instance{conductor}, nil); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(conductor, nil); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	n := NewTransitionNotifier()

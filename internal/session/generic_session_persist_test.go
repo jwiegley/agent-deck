@@ -75,9 +75,7 @@ func TestGenericSessionID_SQLiteRoundTrip(t *testing.T) {
 	inst.GenericDetectedAt = detected
 
 	groupTree := NewGroupTreeWithGroups([]*Instance{inst}, nil)
-	if err := storage.SaveWithGroups([]*Instance{inst}, groupTree); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, groupTree)
 
 	loaded, _, err := storage.LoadWithGroups()
 	if err != nil {
@@ -295,9 +293,7 @@ func TestWriteGenericSessionBinding_Clear(t *testing.T) {
 	inst.Tool = "shell"
 	inst.GenericSessionID = "sid-to-clear"
 	inst.GenericDetectedAt = time.Now()
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 	if err := storage.db.WriteGenericSessionBinding(inst.ID, "", inst.Tool, inst.Command, LocationOf(inst).String(), time.Time{}); err != nil {
 		t.Fatal(err)
 	}
@@ -324,9 +320,7 @@ func TestRebootResume_Simulated(t *testing.T) {
 	inst.Command = "fake-tool"
 	inst.GenericSessionID = "conversation-after-reboot"
 	inst.GenericDetectedAt = time.Now()
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	loaded, _, err := storage.LoadWithGroups()
 	if err != nil {

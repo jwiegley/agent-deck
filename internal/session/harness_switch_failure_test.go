@@ -131,6 +131,12 @@ func TestHarnessSwitchFailure_DivergedOrNewerDestinationIsPreserved(t *testing.T
 // a source stop. It deliberately uses no tmux: the restart seam records the
 // identity it would restart and returns a rollback error for reporting.
 func TestHarnessSwitchFailure_CommittedJournalFailureRestoresRunningNativeSource(t *testing.T) {
+	withTempAgentDeckHome(t, `
+	[profiles.personal.codex]
+	config_dir = "~/.codex-personal"
+	[profiles.work.codex]
+	config_dir = "~/.codex-work"
+	`)
 	originalStart, originalWrite := nativeSwitchStart, harnessSwitchJournalWrite
 	t.Cleanup(func() {
 		nativeSwitchStart, harnessSwitchJournalWrite = originalStart, originalWrite
@@ -139,7 +145,7 @@ func TestHarnessSwitchFailure_CommittedJournalFailureRestoresRunningNativeSource
 	inst := &Instance{ID: "native-source", Tool: "codex", Account: "personal", Command: "codex", ProjectPath: "/project", Title: "source"}
 	journal := &switchJournal{Version: 1, OperationID: "op", Source: identityForInstance(inst)}
 	var restartCalls int
-	nativeSwitchStart = func(got *Instance) error {
+	nativeSwitchStart = func(got *Instance, _ *runtimeTransitionAuthority) error {
 		restartCalls++
 		if got.Tool != "codex" || got.Account != "personal" || got.Command != "codex" {
 			t.Fatalf("restart identity = %#v, want original Codex source", got)
@@ -168,6 +174,12 @@ func TestHarnessSwitchFailure_CommittedJournalFailureRestoresRunningNativeSource
 // A stopped or --no-start source has no lifecycle to restart, but it still
 // must be restored before the failed operation is returned to the caller.
 func TestHarnessSwitchFailure_CommittedJournalFailureRestoresStoppedNativeSource(t *testing.T) {
+	withTempAgentDeckHome(t, `
+	[profiles.personal.codex]
+	config_dir = "~/.codex-personal"
+	[profiles.work.codex]
+	config_dir = "~/.codex-work"
+	`)
 	originalStart, originalWrite := nativeSwitchStart, harnessSwitchJournalWrite
 	t.Cleanup(func() {
 		nativeSwitchStart, harnessSwitchJournalWrite = originalStart, originalWrite
@@ -176,7 +188,7 @@ func TestHarnessSwitchFailure_CommittedJournalFailureRestoresStoppedNativeSource
 	inst := &Instance{ID: "native-source", Tool: "codex", Account: "personal", Command: "codex", ProjectPath: "/project", Title: "source"}
 	journal := &switchJournal{Version: 1, OperationID: "op", Source: identityForInstance(inst)}
 	var restartCalls int
-	nativeSwitchStart = func(*Instance) error {
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error {
 		restartCalls++
 		return nil
 	}

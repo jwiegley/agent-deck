@@ -92,7 +92,7 @@ func perfRows(n int) []*InstanceRow {
 			Tool:        "claude",
 			Status:      "idle",
 			CreatedAt:   now,
-			ToolData:    json.RawMessage(`{"claude_session_id":"sess-abcdef"}`),
+			ToolData:    json.RawMessage(fmt.Sprintf(`{"claude_session_id":"sess-%04d"}`, i)),
 		}
 	}
 	return rows
@@ -102,6 +102,12 @@ func perfRows(n int) []*InstanceRow {
 // the timed window).
 func clearInstances(t *testing.T, db *StateDB) {
 	t.Helper()
+	if _, err := db.DB().Exec("DELETE FROM instance_runtime_binding"); err != nil {
+		t.Fatalf("clear runtime bindings: %v", err)
+	}
+	if _, err := db.DB().Exec("DELETE FROM instance_runtime_state"); err != nil {
+		t.Fatalf("clear runtime state: %v", err)
+	}
 	if _, err := db.DB().Exec("DELETE FROM instances"); err != nil {
 		t.Fatalf("clear instances: %v", err)
 	}

@@ -31,9 +31,7 @@ func newScopedGenericInstance(t *testing.T, id string) (*Storage, *Instance) {
 	inst.GenericSessionCommand = scope.Command
 	inst.GenericSessionLocation = scope.Location
 
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 	return storage, inst
 }
 

@@ -54,8 +54,8 @@ func TestReviveDoesNotClobberConcurrentlyAddedSession(t *testing.T) {
 		Status:      StatusError, // errored -> revive flips to running
 		CreatedAt:   time.Now().Add(-2 * time.Minute),
 	}
-	require.NoError(t, reviveStorage.SaveWithGroups(
-		[]*Instance{existing}, NewGroupTree([]*Instance{existing})))
+	require.NoError(t, reviveStorage.InsertSessionAndVerify(
+		existing, NewGroupTree([]*Instance{existing})))
 
 	// Step 1: revive loads the snapshot (only knows about sess-existing).
 	snapshot, groups, err := reviveStorage.LoadWithGroups()
@@ -132,8 +132,8 @@ func TestPersistRevivedInstances_IsSweepFree(t *testing.T) {
 		GroupPath: "test", Command: "claude", Tool: "claude",
 		Status: StatusError, CreatedAt: time.Now().Add(-2 * time.Minute),
 	}
-	require.NoError(t, reviveStorage.SaveWithGroups(
-		[]*Instance{existing}, NewGroupTree([]*Instance{existing})))
+	require.NoError(t, reviveStorage.InsertSessionAndVerify(
+		existing, NewGroupTree([]*Instance{existing})))
 
 	// revive loads its snapshot (only sess-existing).
 	snapshot, _, err := reviveStorage.LoadWithGroups()
