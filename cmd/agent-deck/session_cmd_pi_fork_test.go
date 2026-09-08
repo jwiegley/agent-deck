@@ -32,8 +32,8 @@ func TestSessionFork_PiUsesNativeForkBeforeStart(t *testing.T) {
 		t.Fatalf("NewStorageWithProfile: %v", err)
 	}
 	t.Cleanup(func() { _ = storage.Close() })
-	if err := storage.SaveWithGroups([]*session.Instance{parent}, session.NewGroupTreeWithGroups([]*session.Instance{parent}, nil)); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(parent, session.NewGroupTreeWithGroups([]*session.Instance{parent}, nil)); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	var capturedParent *session.Instance

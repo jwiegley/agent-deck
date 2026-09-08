@@ -16,8 +16,8 @@ import (
 )
 
 // These are independently executed production CLI binaries, not two handles or
-// test-helper processes. Only tmux is substituted: its ordinary set-environment call
-// pauses a session-ID edit after loading and before saving, without a production test hook.
+// test-helper processes. Only tmux is substituted: its set-environment call
+// pauses after the binding CAS and before the final metadata save.
 func TestStorageTwoCLIProcesses(t *testing.T) {
 	for _, scenario := range []string{"disjoint account", "same session id", "deleted row", "new addition", "group metadata"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -96,7 +96,7 @@ exit 0
 			require.NoError(t, b.Wait(), "second CLI: %s", bOut)
 			require.NoError(t, os.WriteFile(aBarrier+".release", nil, 0600))
 			err = a.Wait()
-			if scenario == "same session id" || scenario == "deleted row" {
+			if scenario == "deleted row" {
 				require.Error(t, err, "stale first CLI must fail: %s", aOut)
 				require.Contains(t, aOut.String(), "conflict")
 			} else {

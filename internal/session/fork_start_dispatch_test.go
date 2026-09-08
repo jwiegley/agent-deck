@@ -15,7 +15,7 @@ import (
 // @petitcl reported that sessions forked via f/F in the TUI come up empty
 // — the new session has none of the conversation history from the parent.
 //
-// Root cause: Instance.Start()'s claude-compatible dispatch
+// Root cause: Instance.start()'s claude-compatible dispatch
 // (instance.go:2173-2183) rebuilds the command unconditionally:
 //
 //	if i.ClaudeSessionID != "" {
@@ -76,13 +76,13 @@ func TestRegression745_ForkTargetCarriesAwaitingStartSentinel(t *testing.T) {
 	require.Equal(t, "-", tag,
 		"Instance.IsForkAwaitingStart MUST be tagged json:\"-\" — transient only")
 
-	// Contract 4: Start()'s claude-compatible dispatch MUST consult
+	// Contract 4: start()'s claude-compatible dispatch MUST consult
 	// IsForkAwaitingStart BEFORE calling buildClaudeResumeCommand. Without
 	// this early return, the sentinel is inert and the #745 symptom
 	// survives. Structural grep asserted against instance.go so this
 	// cannot regress silently in a future refactor.
 	require.True(t, startDispatchHonorsForkSentinel(),
-		"Instance.Start() MUST consult IsForkAwaitingStart before invoking buildClaudeResumeCommand / buildClaudeCommand (#745)")
+		"Instance.start() MUST consult IsForkAwaitingStart before invoking buildClaudeResumeCommand / buildClaudeCommand (#745)")
 }
 
 // forkAwaitingStartValue returns (value, true) when the Instance struct
@@ -108,14 +108,14 @@ func forkAwaitingStartTag(i *Instance) (string, bool) {
 }
 
 // startDispatchHonorsForkSentinel structurally asserts that
-// Instance.Start() checks IsForkAwaitingStart before invoking the
+// Instance.start() checks IsForkAwaitingStart before invoking the
 // claude-compatible resume/fresh dispatch. Pattern required:
 //
 //	if i.IsForkAwaitingStart { ... command = i.Command ... }
 //
-// ... appearing BEFORE buildClaudeResumeCommand(i) inside Start().
+// ... appearing BEFORE buildClaudeResumeCommand(i) inside start().
 func startDispatchHonorsForkSentinel() bool {
-	body := extractFuncBodyInstance("Start")
+	body := extractFuncBodyInstance("start")
 	if body == "" {
 		return false
 	}
@@ -175,8 +175,8 @@ func TestRegression_ForkSecondStartDoesNotReuseForkCommandAsCustomCommand(t *tes
 }
 
 func TestCodexForkStartDispatchConsumesAwaitingStart(t *testing.T) {
-	requireCodexForkStartGuard(t, "Start")
-	requireCodexForkStartGuard(t, "StartWithMessage")
+	requireCodexForkStartGuard(t, "start")
+	requireCodexForkStartGuard(t, "startWithMessage")
 }
 
 // TestOpenCodeForkStartDispatchConsumesAwaitingStart guards the OpenCode arm of
@@ -184,8 +184,8 @@ func TestCodexForkStartDispatchConsumesAwaitingStart(t *testing.T) {
 // one-shot ForkStartCommand on first start rather than re-running i.Command,
 // whose script self-deletes (so a restart would reference a missing file).
 func TestOpenCodeForkStartDispatchConsumesAwaitingStart(t *testing.T) {
-	requireOpenCodeForkStartGuard(t, "Start")
-	requireOpenCodeForkStartGuard(t, "StartWithMessage")
+	requireOpenCodeForkStartGuard(t, "start")
+	requireOpenCodeForkStartGuard(t, "startWithMessage")
 }
 
 func requireOpenCodeForkStartGuard(t *testing.T, funcName string) {
@@ -250,8 +250,8 @@ func requireCodexForkStartGuard(t *testing.T, funcName string) {
 // branch must therefore stamp CodexStartedAt itself, in both Start() and
 // StartWithMessage().
 func TestCodexForkStartStampsStartedAt(t *testing.T) {
-	requireCodexForkAwaitingStartStampsStartedAt(t, "Start")
-	requireCodexForkAwaitingStartStampsStartedAt(t, "StartWithMessage")
+	requireCodexForkAwaitingStartStampsStartedAt(t, "start")
+	requireCodexForkAwaitingStartStampsStartedAt(t, "startWithMessage")
 }
 
 func requireCodexForkAwaitingStartStampsStartedAt(t *testing.T, funcName string) {

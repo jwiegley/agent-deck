@@ -1349,15 +1349,16 @@ func TestUpdateClaudeSessionsWithDedup_DoesNotReorderInput(t *testing.T) {
 
 	UpdateClaudeSessionsWithDedup(input)
 
-	// Dedup should clear the newer duplicate but preserve caller order.
+	// CreatedAt order is not durable ownership evidence. Preserve both local
+	// claims and let the runtime-binding owner lease govern cleanup.
 	if input[0].ID != "newer" || input[1].ID != "older" {
 		t.Fatalf("input order was mutated: got [%s, %s]", input[0].ID, input[1].ID)
 	}
 	if older.ClaudeSessionID != "shared-id" {
 		t.Fatalf("older should keep shared ID, got %q", older.ClaudeSessionID)
 	}
-	if newer.ClaudeSessionID != "" {
-		t.Fatalf("newer duplicate should be cleared, got %q", newer.ClaudeSessionID)
+	if newer.ClaudeSessionID != "shared-id" {
+		t.Fatalf("newer unproven claim should be preserved, got %q", newer.ClaudeSessionID)
 	}
 }
 
@@ -3490,6 +3491,11 @@ func TestInstance_UpdateCodexSession_ScanCooldown(t *testing.T) {
 
 	inst := NewInstanceWithTool("codex-cooldown", projectPath, "codex")
 	inst.lastCodexProbeAt = time.Now().Add(time.Hour) // This test isolates disk-scan cooldown.
+	storage := runtimeBindingTestStorage(t)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatal(err)
+	}
+	noExclusions := map[string]bool{}
 
 	sessionID1 := "11111111-1111-4111-8111-111111111111"
 	sessionID2 := "22222222-2222-4222-8222-222222222222"
@@ -3500,7 +3506,7 @@ func TestInstance_UpdateCodexSession_ScanCooldown(t *testing.T) {
 		t.Fatalf("set file1 mtime: %v", err)
 	}
 
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(noExclusions)
 	if inst.CodexSessionID != sessionID1 {
 		t.Fatalf("first scan picked %q, want %q", inst.CodexSessionID, sessionID1)
 	}
@@ -3512,7 +3518,7 @@ func TestInstance_UpdateCodexSession_ScanCooldown(t *testing.T) {
 	}
 
 	// Immediate follow-up should skip expensive scan and keep existing ID.
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(noExclusions)
 	if inst.CodexSessionID != sessionID1 {
 		t.Fatalf("cooldown should keep %q, got %q", sessionID1, inst.CodexSessionID)
 	}
@@ -3521,16 +3527,18 @@ func TestInstance_UpdateCodexSession_ScanCooldown(t *testing.T) {
 	// disk-scan rebinding. Rotation is handled by hook payloads or live process
 	// file probes, not by periodically walking all old Codex transcripts.
 	inst.lastCodexScanAt = time.Now().Add(-codexRotationScanInterval - time.Second)
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(noExclusions)
 	if inst.CodexSessionID != sessionID1 {
 		t.Fatalf("post-cooldown known ID should keep %q, got %q", sessionID1, inst.CodexSessionID)
 	}
 
 	// If the binding is genuinely missing, bootstrap scan still works and picks
 	// the newest matching session.
-	inst.CodexSessionID = ""
+	if err := inst.publishRuntimeBinding("codex", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	inst.lastCodexScanAt = time.Now().Add(-codexRotationScanInterval - time.Second)
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(noExclusions)
 	if inst.CodexSessionID != sessionID2 {
 		t.Fatalf("bootstrap scan picked %q, want %q", inst.CodexSessionID, sessionID2)
 	}
@@ -3591,7 +3599,7 @@ func TestInstance_CodexSessionExclusion_SameProjectPath(t *testing.T) {
 	// Instance 1 picks up sessionB (most recent) with no exclusions.
 	inst1 := NewInstanceWithTool("codex-excl-1", projectPath, "codex")
 	inst1.lastCodexProbeAt = time.Now().Add(time.Hour) // This test isolates disk exclusion.
-	inst1.UpdateCodexSession(nil)
+	inst1.UpdateCodexSession(map[string]bool{})
 	if inst1.CodexSessionID != sessionB {
 		t.Fatalf("inst1 picked %q, want %q", inst1.CodexSessionID, sessionB)
 	}

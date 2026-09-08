@@ -62,9 +62,7 @@ func TestGenericSessionPersistError_NilWhenDurable(t *testing.T) {
 
 	inst := NewInstance("persist-ok", "/tmp/proj")
 	inst.Tool = "mytool"
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatalf("seed save: %v", err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	if _, _, err := SetField(inst, FieldToolSessionID, "sid-durable", nil); err != nil {
 		t.Fatalf("SetField: %v", err)

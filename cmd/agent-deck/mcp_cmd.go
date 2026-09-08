@@ -471,14 +471,20 @@ func handleMCPAttach(profile string, args []string) {
 
 	// Restart if requested
 	restarted := false
+	persistenceWarning := ""
 	if *restart && inst.SupportsMCPAgentRestart() {
-		if err := inst.Restart(); err != nil {
+		runtime, restartErr := inst.RestartRuntime()
+		restartErr, persistenceWarning = consumeRuntimeResult(inst, runtime, restartErr)
+		if restartErr != nil {
 			// Don't fail the whole operation, just warn
 			if !*jsonOutput && !quietMode {
-				fmt.Fprintf(os.Stderr, "Warning: failed to restart session: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Warning: failed to restart session: %v\n", restartErr)
 			}
 		} else {
 			restarted = true
+			if persistenceWarning != "" && !*jsonOutput && !quietMode {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
+			}
 			// Auto-continue: wait for the agent to initialize, then send continue message.
 			time.Sleep(2 * time.Second)
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil && inst.Tool != "cursor" {
@@ -507,6 +513,9 @@ func handleMCPAttach(profile string, args []string) {
 			"scope":   scope,
 		}
 		outcome.addTo(payload)
+		if persistenceWarning != "" {
+			payload["warning"] = persistenceWarning
+		}
 		out.Print("", payload)
 	} else {
 		message := fmt.Sprintf("Attached %s to %s (%s)", mcpName, inst.Title, scope)
@@ -644,14 +653,20 @@ func handleMCPDetach(profile string, args []string) {
 
 	// Restart if requested
 	restarted := false
+	persistenceWarning := ""
 	if *restart && inst.SupportsMCPAgentRestart() {
-		if err := inst.Restart(); err != nil {
+		runtime, restartErr := inst.RestartRuntime()
+		restartErr, persistenceWarning = consumeRuntimeResult(inst, runtime, restartErr)
+		if restartErr != nil {
 			// Don't fail the whole operation, just warn
 			if !*jsonOutput && !quietMode {
-				fmt.Fprintf(os.Stderr, "Warning: failed to restart session: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Warning: failed to restart session: %v\n", restartErr)
 			}
 		} else {
 			restarted = true
+			if persistenceWarning != "" && !*jsonOutput && !quietMode {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
+			}
 			// Auto-continue: wait for the agent to initialize, then send continue message.
 			time.Sleep(2 * time.Second)
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil && inst.Tool != "cursor" {
@@ -677,6 +692,9 @@ func handleMCPDetach(profile string, args []string) {
 			"scope":   scope,
 		}
 		outcome.addTo(payload)
+		if persistenceWarning != "" {
+			payload["warning"] = persistenceWarning
+		}
 		out.Print("", payload)
 	} else {
 		message := fmt.Sprintf("Detached %s from %s (%s)", mcpName, inst.Title, scope)

@@ -94,7 +94,11 @@ func handleSessionRemove(profile string, args []string) {
 	//
 	// KillAndWait runs the SIGTERM→SIGKILL escalation synchronously so
 	// the kill completes before this short-lived CLI exits.
-	_ = inst.KillAndWait()
+	selection := inst.CaptureRuntimeSelection()
+	if err := inst.DeleteAndWaitCaptured(selection); err != nil {
+		out.Error(fmt.Sprintf("failed to remove session: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
 
 	if *pruneWorktree {
 		pruneSessionWorktree(inst)
@@ -107,8 +111,12 @@ func handleSessionRemove(profile string, args []string) {
 	// reports success but row stays" failure noted in the bug report.
 	instances = dropInstance(instances, inst.ID)
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
-	if err := storage.RemoveSessionAndVerify(inst.ID, instances, groupTree); err != nil {
+	if err := storage.SaveGroupsOnly(groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to remove session: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if exists, err := storage.InstanceExists(inst.ID); err != nil || exists {
+		out.Error(fmt.Sprintf("failed to verify conditional removal: exists=%v err=%v", exists, err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
@@ -207,14 +215,17 @@ func bulkRemoveSessions(
 
 	removed := make([]removedSessionRow, 0, len(doomed))
 	removedIDs := make([]string, 0, len(doomed))
+	selections := make(map[string]session.RuntimeSelection, len(doomed))
 	for _, inst := range doomed {
-		_ = inst.KillAndWait()
-		if pruneWorktree {
-			pruneSessionWorktree(inst)
-		}
-		if err := storage.DeleteInstance(inst.ID); err != nil {
+		selections[inst.ID] = inst.CaptureRuntimeSelection()
+	}
+	for _, inst := range doomed {
+		if err := inst.DeleteAndWaitCaptured(selections[inst.ID]); err != nil {
 			out.Error(fmt.Sprintf("failed to remove session %s: %v", inst.ID, err), ErrCodeInvalidOperation)
 			os.Exit(1)
+		}
+		if pruneWorktree {
+			pruneSessionWorktree(inst)
 		}
 		removedIDs = append(removedIDs, inst.ID)
 		removed = append(removed, map[string]interface{}{"id": inst.ID, "title": inst.Title})
@@ -233,8 +244,9 @@ func bulkRemoveSessions(
 	}
 
 	for _, id := range removedIDs {
-		if exists, _ := storage.InstanceExists(id); exists {
-			_ = storage.DeleteInstance(id)
+		if exists, err := storage.InstanceExists(id); err != nil || exists {
+			out.Error(fmt.Sprintf("failed to verify conditional removal %s: exists=%v err=%v", id, exists, err), ErrCodeInvalidOperation)
+			os.Exit(1)
 		}
 		// Best-effort transition-notifier cleanup (issue #910).
 		_, _ = session.SweepInboxesForChildSession(id)
@@ -243,13 +255,10 @@ func bulkRemoveSessions(
 	return removed
 }
 
-// pruneSessionWorktree kills the session and removes its git worktree (if any).
+// pruneSessionWorktree removes the git worktree after the runtime-aware delete
+// has succeeded.
 // Errors are logged to stderr but never block the remove.
-//
-// Uses KillAndWait so the SIGTERM→SIGKILL escalation completes before
-// this short-lived CLI exits (issue #59, v1.7.68).
 func pruneSessionWorktree(inst *session.Instance) {
-	_ = inst.KillAndWait()
 	if inst.IsWorktree() {
 		if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
 			if err := backend.RemoveWorktree(inst.WorktreePath, true); err != nil {

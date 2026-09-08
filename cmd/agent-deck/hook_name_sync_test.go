@@ -130,8 +130,8 @@ func TestApplyClaudeTitleSync_UpdatesInstance(t *testing.T) {
 		ProjectPath: projectDir,
 		Command:     "claude",
 	}
-	if err := storage.Save([]*session.Instance{inst}); err != nil {
-		t.Fatalf("seed save: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("seed insert: %v", err)
 	}
 
 	applyClaudeTitleSync("inst-A", sid)
@@ -181,8 +181,8 @@ func TestApplyClaudeTitleSync_NoopWhenNameMissing(t *testing.T) {
 		ProjectPath: projectDir,
 		Command:     "claude",
 	}
-	if err := storage.Save([]*session.Instance{inst}); err != nil {
-		t.Fatalf("seed save: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("seed insert: %v", err)
 	}
 
 	applyClaudeTitleSync("inst-B", "no-such-sid")
@@ -231,8 +231,8 @@ func TestApplyClaudeTitleSync_NoopWhenNameEqualsTitle(t *testing.T) {
 		ProjectPath: projectDir,
 		Command:     "claude",
 	}
-	if err := storage.Save([]*session.Instance{inst}); err != nil {
-		t.Fatalf("seed save: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("seed insert: %v", err)
 	}
 	beforeTS, err := storage.GetUpdatedAt()
 	if err != nil {
@@ -286,8 +286,8 @@ func TestApplyClaudeTitleSync_NoopWhenTitleLocked(t *testing.T) {
 		ProjectPath: projectDir,
 		Command:     "claude",
 	}
-	if err := storage.Save([]*session.Instance{inst}); err != nil {
-		t.Fatalf("seed save: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("seed insert: %v", err)
 	}
 
 	applyClaudeTitleSync("inst-697", sid)
@@ -354,8 +354,8 @@ func titleAfterSync(t *testing.T, home, profile, sid, claudeName, startTitle str
 		ProjectPath: projectDir,
 		Command:     "claude",
 	}
-	if err := storage.Save([]*session.Instance{inst}); err != nil {
-		t.Fatalf("seed save: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("seed insert: %v", err)
 	}
 
 	applyClaudeTitleSync("inst-sync", sid)

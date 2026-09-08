@@ -48,8 +48,10 @@ func TestPersistence_Account_RoundTrip(t *testing.T) {
 		},
 	}
 
-	if err := s.SaveWithGroups(instances, nil); err != nil {
-		t.Fatalf("SaveWithGroups failed: %v", err)
+	for _, inst := range instances {
+		if err := s.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("InsertSessionAndVerify failed: %v", err)
+		}
 	}
 
 	loaded, _, err := s.LoadWithGroups()

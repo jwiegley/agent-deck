@@ -1,8 +1,19 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
+
+func TestRuntimeLifecycle_LaunchPersistenceUsesOneCreationBoundary(t *testing.T) {
+	body := sourceFunctionBody(t, "launch_cmd.go", "handleLaunch")
+	if got := strings.Count(body, "InsertSessionAndVerify("); got != 1 {
+		t.Fatalf("handleLaunch has %d insert-capable writes, want exactly the initial creation", got)
+	}
+	requireCallOrder(t, body, "newInstance.Status = session.StatusQueued", "InsertSessionAndVerify(")
+	requireCallOrder(t, body, "InsertSessionAndVerify(", "newInstance.PostStartSync(")
+	requireCallOrder(t, body, "newInstance.PostStartSync(", "storage.SaveWithGroups([]*session.Instance{newInstance}, nil)")
+}
 
 // TestLaunch_ToolWithFlags_FoldsExtrasIntoWrapper pins the CLI parse boundary
 // of the issue-#601 data flow. The reporter's repro:

@@ -35,12 +35,15 @@ type spyCall struct {
 // a cleanup func.
 func withSpyKiller(t *testing.T) (*[]spyCall, func()) {
 	t.Helper()
-	prev := killDuplicateSessionsFn
+	prev, prevLegacy := killDuplicateSessionsFn, legacyDuplicateSweepForTests
 	var calls []spyCall
+	legacyDuplicateSweepForTests = true
 	killDuplicateSessionsFn = func(envKey, envValue, excludeName string) {
 		calls = append(calls, spyCall{envKey, envValue, excludeName})
 	}
-	return &calls, func() { killDuplicateSessionsFn = prev }
+	return &calls, func() {
+		killDuplicateSessionsFn, legacyDuplicateSweepForTests = prev, prevLegacy
+	}
 }
 
 // findSweepCall returns the first spyCall with the given envKey, or nil.

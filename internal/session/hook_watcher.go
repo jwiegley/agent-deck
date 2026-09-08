@@ -29,6 +29,19 @@ const (
 	codexConsumeLockDelay    = 5 * time.Millisecond
 )
 
+// HookStatusFingerprint identifies the exact hook file contents that produced
+// a status observation. Hook timestamps have whole-second granularity, so they
+// cannot safely distinguish two different events written during one second.
+type HookStatusFingerprint [sha256.Size]byte
+
+func hookStatusSourceFingerprint(data []byte) HookStatusFingerprint {
+	return sha256.Sum256(data)
+}
+
+func (f HookStatusFingerprint) valid() bool {
+	return f != HookStatusFingerprint{}
+}
+
 // readStatusFileNoFollow reads a hook status file without following a
 // final-component symlink (O_NOFOLLOW) and bounded in size, so a compromised
 // sandbox cannot symlink <id>.json at a sibling/host/device file to exfiltrate
@@ -145,6 +158,7 @@ type HookStatus struct {
 	HookGeneration           string
 	Sequence                 uint64
 	codexCompletionConsumed  bool
+	Fingerprint              HookStatusFingerprint // Exact source-file identity
 	// DoneStatus/DoneSummary carry a worker-printed completion sentinel
 	// detected on the Stop edge (issue #1186). Empty for ordinary turns.
 	DoneStatus  string // "ok" or "fail" when a completion sentinel was seen
@@ -521,6 +535,7 @@ func (w *StatusFileWatcher) scanDirEntriesInto(out map[string]*HookStatus, dir s
 			CodexCompletedSessionID:  raw.CodexCompletedSessionID,
 			HookGeneration:           raw.HookGeneration,
 			Sequence:                 raw.Sequence,
+			Fingerprint:              hookStatusSourceFingerprint(data),
 		}
 		maskConsumedCodexCompletion(instanceID, hookStatus)
 		out[instanceID] = hookStatus
@@ -697,6 +712,7 @@ func (w *StatusFileWatcher) processFile(filePath string) {
 		CodexCompletedSessionID:  status.CodexCompletedSessionID,
 		HookGeneration:           status.HookGeneration,
 		Sequence:                 status.Sequence,
+		Fingerprint:              hookStatusSourceFingerprint(data),
 	}
 	maskConsumedCodexCompletion(instanceID, hookStatus)
 

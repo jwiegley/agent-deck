@@ -22,6 +22,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 func TestShiftReorder_PersistsDuringReload_Issue1582(t *testing.T) {
@@ -42,7 +43,9 @@ func TestShiftReorder_PersistsDuringReload_Issue1582(t *testing.T) {
 	second := session.NewInstanceWithGroup("second", "/tmp/proj-b", "test")
 	second.Order = 1
 
+	previousGlobal := statedb.GetGlobal()
 	home := NewHome()
+	t.Cleanup(func() { statedb.SetGlobal(previousGlobal) })
 	home.width, home.height = 100, 30
 	home.storage = storage
 	home.profile = "_i1582manual"
@@ -55,7 +58,17 @@ func TestShiftReorder_PersistsDuringReload_Issue1582(t *testing.T) {
 	home.instancesMu.Unlock()
 	home.groupTree = session.NewGroupTree(home.instances)
 
-	// Seed disk with the initial order via a normal (non-reload) save.
+	// Fresh sessions must cross the insert-only creation boundary before the
+	// ordinary save path can update their order without resurrecting deleted
+	// rows. The production create flow does this before publishing the session.
+	if err := storage.InsertSessionAndVerify(first, nil); err != nil {
+		t.Fatalf("insert first session: %v", err)
+	}
+	if err := storage.InsertSessionAndVerify(second, nil); err != nil {
+		t.Fatalf("insert second session: %v", err)
+	}
+
+	// Seed disk with the initial group and order via a normal non-reload save.
 	home.forceSaveInstances()
 
 	// Sanity: disk order is first, second.

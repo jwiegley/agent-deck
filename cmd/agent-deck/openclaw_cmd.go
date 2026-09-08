@@ -121,6 +121,10 @@ func handleOpenClawSync(profile string, args []string) {
 			}
 			wrapperJSON, _ := json.Marshal(wrapper)
 			inst.ToolOptionsJSON = wrapperJSON
+			if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to insert OpenClaw session: %v\n", err)
+				os.Exit(1)
+			}
 
 			instances = append(instances, inst)
 			created++

@@ -38,6 +38,7 @@ type StorageData struct {
 // InstanceData represents the serializable session data
 type InstanceData struct {
 	ID                 string `json:"id"`
+	Incarnation        string `json:"-"`
 	Title              string `json:"title"`
 	ProjectPath        string `json:"project_path"`
 	GroupPath          string `json:"group_path"`
@@ -75,9 +76,12 @@ type InstanceData struct {
 	// hook-evidenced activity, persisted via the tool_data extras zone (see
 	// last_activity_persist.go). Zero means unknown (old record or never
 	// active).
-	LastActivityAt time.Time `json:"last_activity_at,omitempty"`
-	ArchivedAt     time.Time `json:"archived_at,omitempty"`
-	TmuxSession    string    `json:"tmux_session"`
+	LastActivityAt    time.Time                         `json:"last_activity_at,omitempty"`
+	RuntimeGeneration uint64                            `json:"runtime_generation,omitempty"`
+	StatusRevision    uint64                            `json:"status_revision,omitempty"`
+	RuntimeBindings   map[string]statedb.RuntimeBinding `json:"-"`
+	ArchivedAt        time.Time                         `json:"archived_at,omitempty"`
+	TmuxSession       string                            `json:"tmux_session"`
 	// TmuxSocketName is the tmux -L selector captured at Instance creation
 	// (issue #687, v1.7.50). Empty for pre-v1.7.50 rows — those keep hitting
 	// the default server after upgrade.
@@ -104,6 +108,10 @@ type InstanceData struct {
 	// process restart and the id can never launder itself into a resumable
 	// one just by being written and read back.
 	ClaudeSessionIDUnverified bool `json:"claude_session_id_unverified,omitempty"`
+
+	// GitHub Copilot session (persisted for resume after app restart)
+	CopilotSessionID  string    `json:"copilot_session_id,omitempty"`
+	CopilotDetectedAt time.Time `json:"copilot_detected_at,omitempty"`
 
 	// Gemini session (persisted for resume after app restart)
 	GeminiSessionID  string    `json:"gemini_session_id,omitempty"`
@@ -198,10 +206,11 @@ type GroupData struct {
 // Thread-safe with mutex protection for concurrent access within a single process.
 // Multiple processes share data via SQLite WAL mode.
 type Storage struct {
-	db      *statedb.StateDB
-	dbPath  string     // Path to state.db (for change detection)
-	profile string     // The profile this storage is for
-	mu      sync.Mutex // Protects operations during transition
+	db                           *statedb.StateDB
+	dbPath                       string     // Path to state.db (for change detection)
+	profile                      string     // The profile this storage is for
+	mu                           sync.Mutex // Protects operations during transition
+	testAfterSyncInstanceCwdLoad func()     // deterministic delete-race barrier; nil in production
 }
 
 // NewStorageWithProfile creates a storage instance for a specific profile.
@@ -358,15 +367,8 @@ func (s *Storage) Save(instances []*Instance) error {
 }
 
 // SaveWithGroups persists instances and groups to SQLite.
-// Converts Instance objects to database rows, then batch-upserts in a transaction.
-//
-// UPSERT-ONLY (#1550): this path never deletes rows. It used to route through
-// statedb.SaveInstances, whose `DELETE FROM instances WHERE id NOT IN (...)`
-// sweep let any process holding a stale snapshot silently delete sessions a
-// concurrent process created after that snapshot was loaded (the TUI-side twin
-// of #909/#1031). Deletions must be explicit and targeted instead:
-// DeleteInstance / RemoveSessionAndVerify at the moment the user deletes a
-// session, or statedb.ClearAllInstances for an intentional full wipe.
+// Metadata and group edits merge atomically; runtime identity remains owned by
+// instance_runtime_state and instance_runtime_binding.
 func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) error {
 	rows, err := s.saveWithGroups(instances, groupTree)
 	if err == nil {
@@ -378,9 +380,11 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([]*statedb.InstanceRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if s.db == nil {
 		return nil, fmt.Errorf("storage database not initialized")
 	}
+
 	UpdateClaudeSessionsWithDedup(instances)
 	updates := make([]statedb.InstanceSnapshot, len(instances))
 	clearIntents := make([]bool, len(instances))
@@ -388,6 +392,7 @@ func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([
 		if inst == nil {
 			return nil, fmt.Errorf("nil instance")
 		}
+		inst.setOwningDB(s.db)
 		row, err := instanceToRow(inst)
 		if err != nil {
 			return nil, err
@@ -399,6 +404,7 @@ func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([
 			updates[i].Stored = snapshot.stored
 		}
 	}
+
 	groupBatch, err := s.prepareGroupSave(groupTree)
 	if err != nil {
 		return nil, err
@@ -408,15 +414,27 @@ func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([
 		return nil, fmt.Errorf("failed to save instances: %w", err)
 	}
 	for i, inst := range instances {
-		// Only the submitted representation was saved. Reading the live model
-		// again here could acknowledge edits made while this save was in flight.
+		committed := result.Instances[i]
+		if updates[i].Stored == nil {
+			inst.adoptPersistenceIncarnation(committed.Incarnation)
+		}
+		// Only submitted metadata becomes this writer's next baseline. Runtime
+		// fields in committed remain authoritative and are never metadata intent.
 		original := statedb.CloneInstanceRow(updates[i].Desired)
+		original.Incarnation = committed.Incarnation
+		original.Status = committed.Status
+		original.TmuxSession = committed.TmuxSession
+		original.TmuxSocketName = committed.TmuxSocketName
+		original.RuntimeGeneration = committed.RuntimeGeneration
+		original.StatusRevision = committed.StatusRevision
+		original.LastStartedAt = committed.LastStartedAt
+		original.RuntimeBindings = committed.RuntimeBindings
 		if clearIntents[i] {
 			inst.genericSessionIDCleared = false
 			original.ToolData = WriteGenericSessionIDToToolData(original.ToolData, "", time.Time{}, false)
 			original.ToolData = WriteGenericSessionScopeToToolData(original.ToolData, "", "", "", false)
 		}
-		s.rememberInstanceSnapshot(inst, original, result.Instances[i])
+		s.rememberInstanceSnapshot(inst, original, committed)
 	}
 	s.finishGroupSave(groupBatch, result.Groups)
 	_ = s.db.Touch()
@@ -465,6 +483,12 @@ func (s *Storage) UpdateTitleIfUnlocked(id, title string) (applied bool, err err
 // DeleteInstance removes a single instance from the database by ID.
 // This ensures the row is immediately removed, preventing resurrection on reload.
 func (s *Storage) DeleteInstance(id string) error {
+	release, err := acquireInstanceSpawnLock(id)
+	if err != nil {
+		return fmt.Errorf("lock instance %s for deletion: %w", id, err)
+	}
+	defer release()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -615,27 +639,108 @@ func (s *Storage) RemoveSessionAndVerify(id string, remainingInstances []*Instan
 	return nil
 }
 
-// ErrInsertNotPersistent reports that a successfully inserted row was removed
-// before verification. Do not retry the insertion over a deliberate deletion.
-var ErrInsertNotPersistent = errors.New("insert not persistent: row dropped by concurrent writer")
+// ErrSessionAlreadyExists means an insert-only restore lost to another writer
+// that already owns the same logical instance ID.
+var ErrSessionAlreadyExists = errors.New("session already exists")
 
-// InsertSessionAndVerify inserts one new snapshot and verifies its presence.
-// The insert and optional groups commit together. Missing rows are reported to
-// the caller; retrying an UPSERT here would undo another writer's deletion.
-func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *GroupTree) error {
-	if newInstance == nil {
-		return fmt.Errorf("nil instance")
+// InsertSessionIfAbsent restores one session and its initial runtime without
+// updating an existing same-ID row. The returned token can safely roll back
+// only this exact seed.
+func (s *Storage) InsertSessionIfAbsent(inst *Instance) (statedb.InstanceSeedToken, error) {
+	if inst == nil {
+		return statedb.InstanceSeedToken{}, fmt.Errorf("nil instance")
 	}
-	if err := s.SaveWithGroups([]*Instance{newInstance}, groupTree); err != nil {
+	if inst.PersistenceIncarnation() == "" {
+		inst.adoptPersistenceIncarnation(newPersistenceIncarnation())
+	}
+	row, err := instanceToRow(inst)
+	if err != nil {
+		return statedb.InstanceSeedToken{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return statedb.InstanceSeedToken{}, fmt.Errorf("storage database not initialized")
+	}
+	// Attach the profile database before the write attempt. A losing restore is
+	// still a persisted/reloaded instance and must never use the premetadata
+	// new-instance runtime initializer in the interval around this insert.
+	inst.setOwningDB(s.db)
+	seed, inserted, err := s.db.InsertInstanceIfAbsent(row)
+	if err != nil {
+		return statedb.InstanceSeedToken{}, fmt.Errorf("restore instance %s: %w", inst.ID, err)
+	}
+	if !inserted {
+		return statedb.InstanceSeedToken{}, fmt.Errorf("%w: %s", ErrSessionAlreadyExists, inst.ID)
+	}
+	inst.adoptRuntimeState(seed.Runtime)
+	inst.adoptRuntimeBindings(seed.Bindings)
+	inst.adoptPersistenceIncarnation(seed.Incarnation)
+	committed := statedb.CloneInstanceRow(row)
+	committed.Incarnation = seed.Incarnation
+	committed.RuntimeGeneration = seed.Runtime.Generation
+	committed.StatusRevision = seed.Runtime.StatusRevision
+	committed.Status = seed.Runtime.Status
+	committed.TmuxSession = seed.Runtime.TmuxSession
+	committed.TmuxSocketName = seed.Runtime.TmuxSocketName
+	committed.LastStartedAt = seed.Runtime.LastStartedAt
+	committed.RuntimeBindings = seed.Bindings
+	s.rememberInstanceSnapshot(inst, committed, committed)
+	return seed, nil
+}
+
+// ReinsertDeletedSession creates a new logical insertion for a session object
+// retained across delete/undo. The deleted object's old incarnation must never
+// authorize the replacement, while ordinary new and pre-parent insertion paths
+// must retain the token they minted before publishing a runtime.
+func (s *Storage) ReinsertDeletedSession(inst *Instance) (statedb.InstanceSeedToken, error) {
+	if inst == nil {
+		return statedb.InstanceSeedToken{}, fmt.Errorf("nil instance")
+	}
+	previous := inst.PersistenceIncarnation()
+	if previous == "" {
+		return statedb.InstanceSeedToken{}, fmt.Errorf("reinsert deleted instance %s: missing prior incarnation", inst.ID)
+	}
+	next := newPersistenceIncarnation()
+	for next == previous {
+		next = newPersistenceIncarnation()
+	}
+	inst.adoptPersistenceIncarnation(next)
+	return s.InsertSessionIfAbsent(inst)
+}
+
+// RollbackSessionSeed removes only the unchanged parent/runtime pair returned
+// by InsertSessionIfAbsent. A concurrent winner is preserved and reported as a
+// conflict.
+func (s *Storage) RollbackSessionSeed(seed statedb.InstanceSeedToken) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return fmt.Errorf("storage database not initialized")
+	}
+	if err := s.db.DeleteInstanceSeedIfUnchanged(seed); err != nil {
+		return fmt.Errorf("rollback instance %s: %w", seed.Runtime.InstanceID, err)
+	}
+	return nil
+}
+
+// InsertSessionAndVerify creates one parent/runtime seed through the same
+// atomic insert-only boundary used by restores. A same-ID winner is never
+// updated, and a delete that linearizes after this insert is never retried or
+// resurrected. Group persistence remains a separate metadata operation.
+func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *GroupTree) error {
+	if _, err := s.InsertSessionIfAbsent(newInstance); err != nil {
 		return err
 	}
-	exists, err := s.InstanceExists(newInstance.ID)
-	if err != nil {
-		return fmt.Errorf("verify insert of %s: %w", newInstance.ID, err)
+	consumeGenericSessionIDCleared(newInstance)
+
+	if groupTree != nil {
+		if err := s.SaveGroupsOnly(groupTree); err != nil {
+			return fmt.Errorf("failed to save groups during insert: %w", err)
+		}
 	}
-	if !exists {
-		return fmt.Errorf("%w: concurrent deletion conflict for instance %s", ErrInsertNotPersistent, newInstance.ID)
-	}
+
 	return nil
 }
 
@@ -666,6 +771,9 @@ func (s *Storage) SyncInstanceCwd(id, newCwd string) (bool, error) {
 	if row == nil {
 		return false, nil
 	}
+	if s.testAfterSyncInstanceCwdLoad != nil {
+		s.testAfterSyncInstanceCwdLoad()
+	}
 	if row.ProjectPath == newCwd {
 		return true, nil
 	}
@@ -678,7 +786,6 @@ func (s *Storage) SyncInstanceCwd(id, newCwd string) (bool, error) {
 		)
 		return true, nil
 	}
-	original := statedb.CloneInstanceRow(row)
 	newToolData, err := swapAdditionalPath(row.ToolData, row.ProjectPath, newCwd)
 	if err != nil {
 		return true, err
@@ -686,7 +793,9 @@ func (s *Storage) SyncInstanceCwd(id, newCwd string) (bool, error) {
 	row.ToolData = newToolData
 	row.ProjectPath = newCwd
 	row.LastAccessed = time.Now()
-	if _, err := s.db.MergeInstanceSnapshots([]statedb.InstanceSnapshot{{Original: original, Stored: original, Desired: row}}, nil); err != nil {
+	// Another process may delete the row after LoadInstanceByID. CWD sync is
+	// update-only so that stale observation cannot recreate the session.
+	if err := s.db.UpdateInstances([]*statedb.InstanceRow{row}); err != nil {
 		return true, fmt.Errorf("failed to persist cwd for %s: %w", id, err)
 	}
 	_ = s.db.Touch()
@@ -773,7 +882,7 @@ func swapAdditionalPath(toolData json.RawMessage, oldCwd, newCwd string) (json.R
 //     touched.
 //
 //  2. Clobber vs. concurrent edit of a row being revived. A full-row write
-//     (INSERT OR REPLACE) would push EVERY column from
+//     (an unrestricted metadata upsert) would push EVERY column from
 //     revive's stale in-memory snapshot, overwriting any field (title, group,
 //     tool_data, last_accessed, claude_session_id, …) a concurrent process
 //     edited between revive's load and its save. Revive owns exactly ONE field:
@@ -785,41 +894,174 @@ func swapAdditionalPath(toolData json.RawMessage, oldCwd, newCwd string) (json.R
 // Callers should pass only the instances they actually revived; rows whose id
 // is absent are simply not in the batch and stay untouched.
 func (s *Storage) PersistRevivedInstances(instances []*Instance) error {
-	updates := make([]statedb.InstanceStatusUpdate, 0, len(instances))
-	for _, inst := range instances {
-		if inst == nil {
-			continue
-		}
-		updates = append(updates, statedb.InstanceStatusUpdate{
-			ID:     inst.ID,
-			Status: string(inst.Status),
-		})
-	}
-	if len(updates) == 0 {
-		return nil
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.db == nil {
 		return fmt.Errorf("storage database not initialized")
 	}
-	return s.db.PersistInstanceStatusesTx(updates)
+
+	updates := make([]statedb.InstanceStatusUpdate, 0, len(instances))
+	updated := make([]*Instance, 0, len(instances))
+	incarnations := make(map[*Instance]string, len(instances))
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		inst.mu.RLock()
+		local := inst.runtimeStateSnapshotLocked()
+		incarnation := inst.persistenceIncarnation
+		inst.mu.RUnlock()
+		if err := s.db.ValidateInstanceIncarnation(inst.ID, incarnation); err != nil {
+			return fmt.Errorf("persist revived %s: %w", inst.ID, err)
+		}
+		durable, found, err := s.db.ReadRuntimeState(inst.ID)
+		if err != nil {
+			return err
+		}
+		if !found || !sameReviverRuntime(local, durable) {
+			if found {
+				inst.adoptRuntimeState(durable)
+			}
+			return fmt.Errorf("persist revived %s: %w", inst.ID, statedb.ErrRuntimeGenerationConflict)
+		}
+		if local.StatusRevision != durable.StatusRevision {
+			inst.adoptRuntimeState(durable)
+			return fmt.Errorf("persist revived %s: %w", inst.ID, statedb.ErrStatusRevisionConflict)
+		}
+		// The generation-aware production action already publishes its heal.
+		// Keep this CLI compatibility path idempotent instead of incrementing
+		// the same status revision a second time.
+		if durable.Status == local.Status {
+			continue
+		}
+		updates = append(updates, statedb.InstanceStatusUpdate{
+			ID:             inst.ID,
+			Incarnation:    incarnation,
+			Status:         local.Status,
+			Generation:     local.Generation,
+			StatusRevision: local.StatusRevision,
+			Versioned:      true,
+		})
+		updated = append(updated, inst)
+		incarnations[inst] = incarnation
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	if err := s.db.PersistInstanceStatusesTx(updates); err != nil {
+		if errors.Is(err, statedb.ErrRuntimeGenerationConflict) || errors.Is(err, statedb.ErrStatusRevisionConflict) ||
+			errors.Is(err, statedb.ErrInstanceParentConflict) {
+			return errors.Join(err, s.reloadRevivedRuntimeWinners(updated, incarnations))
+		}
+		return err
+	}
+	for index, inst := range updated {
+		u := updates[index]
+		if err := s.db.ValidateInstanceIncarnation(u.ID, u.Incarnation); err != nil {
+			return errors.Join(err, s.reloadRevivedRuntimeWinners(updated, incarnations))
+		}
+		durable, found, err := s.db.ReadRuntimeState(u.ID)
+		if err != nil {
+			return err
+		}
+		if !found || durable.Generation != u.Generation {
+			return errors.Join(
+				fmt.Errorf("persist revived %s: %w", u.ID, statedb.ErrRuntimeGenerationConflict),
+				s.reloadRevivedRuntimeWinners(updated, incarnations),
+			)
+		}
+		if durable.StatusRevision != u.StatusRevision+1 || durable.Status != u.Status {
+			return errors.Join(
+				fmt.Errorf("persist revived %s: %w", u.ID, statedb.ErrStatusRevisionConflict),
+				s.reloadRevivedRuntimeWinners(updated, incarnations),
+			)
+		}
+		if !inst.AcceptStatusRevision(u.Generation, u.StatusRevision) {
+			return errors.Join(statedb.ErrStatusRevisionConflict, s.reloadRevivedRuntimeWinners(updated, incarnations))
+		}
+	}
+	return nil
 }
 
-// PersistRecoveredInstances saves only the recovered sessions, using their
-// loaded snapshots to preserve concurrent edits and reject conflicting changes.
-// Failures are per-row and joined so one bad session does not hide the rest.
+func (s *Storage) reloadRevivedRuntimeWinners(instances []*Instance, incarnations map[*Instance]string) error {
+	var reloadErr error
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		if err := s.db.ValidateInstanceIncarnation(inst.ID, incarnations[inst]); err != nil {
+			reloadErr = errors.Join(reloadErr, err)
+			continue
+		}
+		state, found, err := s.db.ReadRuntimeState(inst.ID)
+		if err != nil {
+			reloadErr = errors.Join(reloadErr, err)
+			continue
+		}
+		if found {
+			inst.adoptRuntimeState(state)
+		}
+	}
+	return reloadErr
+}
+
+// PersistRecoveredInstances validates the rows a fleet-recovery sweep restarted,
+// and ONLY those rows.
+//
+// RestartRuntime already commits the complete authoritative runtime tuple and
+// binding plan, including the legacy instances projection, before it returns.
+// Writing the fleet's minutes-old Instance snapshot afterward is therefore not
+// persistence: it is a stale full-row metadata rewrite that can undo a
+// concurrent rename, move, account switch, or archive of the same logical row.
+//
+// This compatibility hook now performs only an incarnation + exact-runtime
+// validation. It issues no INSERT, UPDATE, DELETE, or Touch: concurrent adds
+// remain untouched, concurrent deletes are reported instead of resurrected,
+// and metadata edits on a recovered row remain owned by their actual writer.
+//
+// Errors are per-row and returned joined, so one bad row does not hide the rest.
 func (s *Storage) PersistRecoveredInstances(instances []*Instance) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return fmt.Errorf("storage database not initialized")
+	}
+
 	var errs []error
 	for _, inst := range instances {
 		if inst == nil {
 			continue
 		}
-		if err := s.Save([]*Instance{inst}); err != nil {
-			errs = append(errs, err)
+		inst.setOwningDB(s.db)
+		incarnation := inst.PersistenceIncarnation()
+		if err := s.db.ValidateInstanceIncarnation(inst.ID, incarnation); err != nil {
+			errs = append(errs, fmt.Errorf("validate recovered %s: %w", inst.ID, err))
+			continue
 		}
+		durable, found, err := s.db.ReadRuntimeState(inst.ID)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read recovered %s: %w", inst.ID, err))
+			continue
+		}
+		local := inst.RuntimeState()
+		if !found {
+			errs = append(errs, fmt.Errorf("validate recovered %s: %w", inst.ID, statedb.ErrRuntimeGenerationConflict))
+			continue
+		}
+		if !sameStatusRuntime(local, durable) {
+			errs = append(errs, fmt.Errorf("validate recovered %s: %w", inst.ID, statusRuntimeConflict(local, durable)))
+		}
+		consumeGenericSessionIDCleared(inst)
 	}
 	return errors.Join(errs...)
+}
+
+func consumeGenericSessionIDCleared(instances ...*Instance) {
+	for _, inst := range instances {
+		if inst != nil {
+			inst.genericSessionIDCleared = false
+		}
+	}
 }
 
 // instanceToRow converts a session.Instance into the statedb row shape.
@@ -935,6 +1177,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 
 	return &statedb.InstanceRow{
 		ID:                  inst.ID,
+		Incarnation:         inst.persistenceIncarnationSnapshot(),
 		Title:               inst.Title,
 		ProjectPath:         inst.ProjectPath,
 		GroupPath:           inst.GroupPath,
@@ -945,6 +1188,10 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 		Status:              string(inst.Status),
 		TmuxSession:         tmuxName,
 		TmuxSocketName:      inst.TmuxSocketName,
+		RuntimeGeneration:   inst.RuntimeGeneration,
+		StatusRevision:      inst.StatusRevision,
+		RuntimeBindings:     runtimeBindingsForSave(inst),
+		LastStartedAt:       inst.LastStartedAt,
 		CreatedAt:           inst.CreatedAt,
 		LastAccessed:        inst.LastAccessedAt,
 		ParentSessionID:     inst.ParentSessionID,
@@ -961,6 +1208,39 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 		Pin:                 string(inst.Pin),
 		ToolData:            toolData,
 	}, nil
+}
+
+func runtimeBindingsForSave(inst *Instance) map[string]statedb.RuntimeBinding {
+	if inst.RuntimeBindings != nil {
+		return inst.RuntimeBindings
+	}
+	bindings := make(map[string]statedb.RuntimeBinding)
+	add := func(kind, value string, detectedAt time.Time) {
+		if value == "" {
+			return
+		}
+		bindings[kind] = statedb.RuntimeBinding{
+			InstanceID: inst.ID, Kind: kind, Generation: inst.RuntimeGeneration,
+			Value: value, DetectedAt: detectedAt,
+		}
+	}
+	add("claude", inst.ClaudeSessionID, inst.ClaudeDetectedAt)
+	add("copilot", inst.CopilotSessionID, inst.CopilotDetectedAt)
+	add("codex", inst.CodexSessionID, inst.CodexDetectedAt)
+	add("gemini", inst.GeminiSessionID, inst.GeminiDetectedAt)
+	add("opencode", inst.OpenCodeSessionID, inst.OpenCodeDetectedAt)
+	if len(bindings) == 0 {
+		return nil
+	}
+	return bindings
+}
+
+func runtimeBindingValue(bindings map[string]statedb.RuntimeBinding, kind string) (string, time.Time) {
+	binding, ok := bindings[kind]
+	if !ok {
+		return "", time.Time{}
+	}
+	return binding.Value, binding.DetectedAt
 }
 
 // SaveGroupsOnly persists only the groups table to SQLite.
@@ -1019,11 +1299,11 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 	// Convert to InstanceData format (for backward compat with CLI commands)
 	instances := make([]*InstanceData, len(dbRows))
 	for i, r := range dbRows {
-		claudeSID, claudeAt,
-			geminiSID, geminiAt,
+		_, _,
+			_, _,
 			geminiYolo, geminiModel,
-			opencodeSID, opencodeAt,
-			codexSID, codexAt,
+			_, _,
+			_, _,
 			latestPrompt, notes, loadedMCPs,
 			toolOpts,
 			sandboxJSON, sandboxContainer,
@@ -1036,10 +1316,16 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			pluginChannelLinkDisabled2,
 			autoLinkedChannels2,
 			color2 := statedb.UnmarshalToolData(r.ToolData)
+		claudeSID, claudeAt := runtimeBindingValue(r.RuntimeBindings, "claude")
+		copilotSID, copilotAt := runtimeBindingValue(r.RuntimeBindings, "copilot")
+		codexSID, codexAt := runtimeBindingValue(r.RuntimeBindings, "codex")
+		geminiSID, geminiAt := runtimeBindingValue(r.RuntimeBindings, "gemini")
+		opencodeSID, opencodeAt := runtimeBindingValue(r.RuntimeBindings, "opencode")
 		sandboxCfg := decodeSandboxConfig(sandboxJSON)
 
 		instances[i] = &InstanceData{
 			ID:                        r.ID,
+			Incarnation:               r.Incarnation,
 			Title:                     r.Title,
 			ProjectPath:               r.ProjectPath,
 			GroupPath:                 r.GroupPath,
@@ -1066,6 +1352,8 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			Pin:                       PinMode(r.Pin),
 			ClaudeSessionID:           claudeSID,
 			ClaudeDetectedAt:          claudeAt,
+			CopilotSessionID:          copilotSID,
+			CopilotDetectedAt:         copilotAt,
 			GeminiSessionID:           geminiSID,
 			GeminiDetectedAt:          geminiAt,
 			GeminiYoloMode:            geminiYolo,
@@ -1095,7 +1383,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
 			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
-			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
+			LastStartedAt:             r.LastStartedAt,
 			GenericSessionID:          ReadGenericSessionIDFromToolData(r.ToolData),
 			GenericDetectedAt:         ReadGenericDetectedAtFromToolData(r.ToolData),
 			GenericSessionTool:        genericScopeTool(r.ToolData),
@@ -1103,6 +1391,9 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			GenericSessionLocation:    genericScopeLocation(r.ToolData),
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
+			RuntimeGeneration:         r.RuntimeGeneration,
+			StatusRevision:            r.StatusRevision,
+			RuntimeBindings:           r.RuntimeBindings,
 		}
 	}
 
@@ -1150,11 +1441,11 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 		Instances: make([]*InstanceData, len(dbRows)),
 	}
 	for i, r := range dbRows {
-		claudeSID, claudeAt,
-			geminiSID, geminiAt,
+		_, _,
+			_, _,
 			geminiYolo, geminiModel,
-			opencodeSID, opencodeAt,
-			codexSID, codexAt,
+			_, _,
+			_, _,
 			latestPrompt, notes, loadedMCPs,
 			toolOpts,
 			sandboxJSON, sandboxContainer,
@@ -1167,10 +1458,16 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			pluginChannelLinkDisabled,
 			autoLinkedChannels,
 			color := statedb.UnmarshalToolData(r.ToolData)
+		claudeSID, claudeAt := runtimeBindingValue(r.RuntimeBindings, "claude")
+		copilotSID, copilotAt := runtimeBindingValue(r.RuntimeBindings, "copilot")
+		codexSID, codexAt := runtimeBindingValue(r.RuntimeBindings, "codex")
+		geminiSID, geminiAt := runtimeBindingValue(r.RuntimeBindings, "gemini")
+		opencodeSID, opencodeAt := runtimeBindingValue(r.RuntimeBindings, "opencode")
 		sandboxCfg := decodeSandboxConfig(sandboxJSON)
 
 		data.Instances[i] = &InstanceData{
 			ID:                        r.ID,
+			Incarnation:               r.Incarnation,
 			Title:                     r.Title,
 			ProjectPath:               r.ProjectPath,
 			GroupPath:                 r.GroupPath,
@@ -1197,6 +1494,8 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			Pin:                       PinMode(r.Pin),
 			ClaudeSessionID:           claudeSID,
 			ClaudeDetectedAt:          claudeAt,
+			CopilotSessionID:          copilotSID,
+			CopilotDetectedAt:         copilotAt,
 			GeminiSessionID:           geminiSID,
 			GeminiDetectedAt:          geminiAt,
 			GeminiYoloMode:            geminiYolo,
@@ -1226,7 +1525,7 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
 			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
-			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
+			LastStartedAt:             r.LastStartedAt,
 			GenericSessionID:          ReadGenericSessionIDFromToolData(r.ToolData),
 			GenericDetectedAt:         ReadGenericDetectedAtFromToolData(r.ToolData),
 			GenericSessionTool:        genericScopeTool(r.ToolData),
@@ -1234,6 +1533,9 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			GenericSessionLocation:    genericScopeLocation(r.ToolData),
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
+			RuntimeGeneration:         r.RuntimeGeneration,
+			StatusRevision:            r.StatusRevision,
+			RuntimeBindings:           r.RuntimeBindings,
 		}
 	}
 
@@ -1478,6 +1780,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 
 		inst := &Instance{
 			ID:                           instData.ID,
+			persistenceIncarnation:       instData.Incarnation,
 			Title:                        instData.Title,
 			ProjectPath:                  projectPath,
 			GroupPath:                    groupPath,
@@ -1504,6 +1807,8 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			ClaudeSessionID:              instData.ClaudeSessionID,
 			ClaudeDetectedAt:             instData.ClaudeDetectedAt,
 			claudeSessionIDsFromDiskScan: restoreClaudeSessionVerification(instData.ClaudeSessionID, instData.ClaudeSessionIDUnverified),
+			CopilotSessionID:             instData.CopilotSessionID,
+			CopilotDetectedAt:            instData.CopilotDetectedAt,
 			GeminiSessionID:              instData.GeminiSessionID,
 			GeminiDetectedAt:             instData.GeminiDetectedAt,
 			GeminiYoloMode:               instData.GeminiYoloMode,
@@ -1536,6 +1841,9 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			// throttle has an accurate baseline.
 			lastActivityAt:        instData.LastActivityAt,
 			lastActivityPersisted: instData.LastActivityAt,
+			RuntimeGeneration:     instData.RuntimeGeneration,
+			StatusRevision:        instData.StatusRevision,
+			RuntimeBindings:       instData.RuntimeBindings,
 			Sandbox:               instData.Sandbox,
 			SandboxContainer:      instData.SandboxContainer,
 			SSHHost:               instData.SSHHost,
@@ -1544,6 +1852,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			AdditionalPaths:       instData.AdditionalPaths,
 			MultiRepoTempDir:      instData.MultiRepoTempDir,
 			tmuxSession:           tmuxSess,
+			owningDB:              s.db,
 		}
 		// Convert multi-repo worktree data
 		for _, wt := range instData.MultiRepoWorktrees {

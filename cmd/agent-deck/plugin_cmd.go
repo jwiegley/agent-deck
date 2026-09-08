@@ -243,9 +243,14 @@ func pluginAttachOrDetach(profile string, args []string, op string) {
 		// See adoptStateDB: the restart records its new tmux name through the
 		// process-wide StateDB, which a CLI process does not have until now.
 		adoptStateDB(storage)
-		if err := inst.Restart(); err != nil {
-			out.Error(fmt.Sprintf("restart failed: %s", err.Error()), ErrCodeNotFound)
+		runtime, restartErr := inst.RestartRuntime()
+		restartErr, persistenceWarning := consumeRuntimeResult(inst, runtime, restartErr)
+		if restartErr != nil {
+			out.Error(fmt.Sprintf("restart failed: %s", restartErr.Error()), ErrCodeNotFound)
 			os.Exit(1)
+		}
+		if persistenceWarning != "" {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
 		}
 		// The save above ran BEFORE the restart, so it recorded the tmux name
 		// the restart then killed. The replacement name is recorded at the

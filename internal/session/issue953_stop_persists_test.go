@@ -177,7 +177,7 @@ func TestIssue953_KillStatusPersistsAcrossSaveLoad(t *testing.T) {
 		"baseline: Kill must set StatusStopped")
 
 	s := newTestStorage(t)
-	require.NoError(t, s.SaveWithGroups([]*Instance{inst}, nil))
+	require.NoError(t, s.InsertSessionAndVerify(inst, nil))
 
 	loaded, _, err := s.LoadWithGroups()
 	require.NoError(t, err)

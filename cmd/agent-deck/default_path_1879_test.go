@@ -39,8 +39,8 @@ func seedGroupWithSession(t *testing.T, profile, name, groupPath, sessionPath st
 	groupTree := session.NewGroupTreeWithGroups(instances, []*session.GroupData{
 		{Name: name, Path: groupPath, Expanded: true, DefaultPath: ""},
 	})
-	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, groupTree); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 	if err := storage.Close(); err != nil {
 		t.Fatalf("Close storage: %v", err)
@@ -141,8 +141,8 @@ func TestResolveLaunchPathExplicitGroupDefaultStillWins(t *testing.T) {
 	groupTree := session.NewGroupTreeWithGroups(instances, []*session.GroupData{
 		{Name: "MyGroup", Path: "my-group", Expanded: true, DefaultPath: groupDefault},
 	})
-	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, groupTree); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 	if err := storage.Close(); err != nil {
 		t.Fatalf("Close storage: %v", err)

@@ -273,8 +273,8 @@ func TestStatusPersistence_RoundTrip(t *testing.T) {
 		CreatedAt:   time.Now(),
 	}
 
-	err := s.SaveWithGroups([]*Instance{inst}, nil)
-	require.NoError(t, err, "SaveWithGroups should succeed")
+	err := s.InsertSessionAndVerify(inst, nil)
+	require.NoError(t, err, "InsertSessionAndVerify should succeed")
 
 	loaded, _, err := s.LoadWithGroups()
 	require.NoError(t, err, "LoadWithGroups should succeed")
@@ -286,8 +286,8 @@ func TestStatusPersistence_RoundTrip(t *testing.T) {
 		"loaded instance should have the correct ID")
 }
 
-// TestStatusPersistence_UpdatedStatus verifies that saving an instance, changing
-// its status, saving again, and loading reflects the updated status.
+// TestStatusPersistence_UpdatedStatus verifies that the targeted status CAS is
+// authoritative and a later metadata save cannot overwrite it.
 func TestStatusPersistence_UpdatedStatus(t *testing.T) {
 	s := newTestStorage(t)
 
@@ -302,16 +302,20 @@ func TestStatusPersistence_UpdatedStatus(t *testing.T) {
 		CreatedAt:   time.Now(),
 	}
 
-	// Save with initial status
-	err := s.SaveWithGroups([]*Instance{inst}, nil)
-	require.NoError(t, err, "first SaveWithGroups should succeed")
+	// Insert with initial status.
+	err := s.InsertSessionAndVerify(inst, nil)
+	require.NoError(t, err, "InsertSessionAndVerify should succeed")
 
-	// Change status
-	inst.Status = StatusWaiting
+	// Status is runtime-owned and must be published with the generation and
+	// revision observed by the caller.
+	applied, err := s.db.WriteStatusIfVersion(inst.ID, inst.PersistenceIncarnation(), 0, 0, string(StatusWaiting))
+	require.NoError(t, err, "WriteStatusIfVersion should succeed")
+	require.True(t, applied, "status CAS should apply")
 
-	// Save again with updated status
+	// The in-memory row is intentionally stale (running). Saving metadata again
+	// must not clobber the targeted waiting status.
 	err = s.SaveWithGroups([]*Instance{inst}, nil)
-	require.NoError(t, err, "second SaveWithGroups should succeed")
+	require.NoError(t, err, "stale metadata SaveWithGroups should succeed")
 
 	// Load and verify updated status
 	loaded, _, err := s.LoadWithGroups()
@@ -347,7 +351,7 @@ func TestSubcommandPassthroughPersistence_ClearingSurvivesSave(t *testing.T) {
 		SubcommandPassthrough: true,
 	}
 
-	require.NoError(t, s.SaveWithGroups([]*Instance{inst}, nil), "first save should succeed")
+	insertTestInstances(t, s, []*Instance{inst}, nil)
 
 	loaded, _, err := s.LoadWithGroups()
 	require.NoError(t, err)
@@ -406,8 +410,10 @@ func TestStatusPersistence_MultipleInstances(t *testing.T) {
 		},
 	}
 
-	err := s.SaveWithGroups(instances, nil)
-	require.NoError(t, err, "SaveWithGroups should succeed")
+	for _, inst := range instances {
+		err := s.InsertSessionAndVerify(inst, nil)
+		require.NoError(t, err, "InsertSessionAndVerify should succeed")
+	}
 
 	loaded, _, err := s.LoadWithGroups()
 	require.NoError(t, err, "LoadWithGroups should succeed")
@@ -451,10 +457,10 @@ func TestStatusPersistence_EndToEnd(t *testing.T) {
 	liveStatus := inst.Status
 	t.Logf("Live status from tmux: %s", liveStatus)
 
-	// Save to SQLite
+	// Insert into SQLite.
 	s := newTestStorage(t)
-	err = s.SaveWithGroups([]*Instance{inst}, nil)
-	require.NoError(t, err, "SaveWithGroups should succeed")
+	err = s.InsertSessionAndVerify(inst, nil)
+	require.NoError(t, err, "InsertSessionAndVerify should succeed")
 
 	// Load and verify status matches live status
 	loaded, _, err := s.LoadWithGroups()

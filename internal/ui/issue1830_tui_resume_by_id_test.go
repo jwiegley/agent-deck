@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // TestIssue1830_TUICreateResumeByIDVouchesOwnership pins a review finding on
@@ -23,6 +24,17 @@ import (
 // resume chokepoint.
 func TestIssue1830_TUICreateResumeByIDVouchesOwnership(t *testing.T) {
 	const wantID = "a1a1a1a1-2222-4333-8444-555555555555"
+	t.Setenv("HOME", t.TempDir())
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
+	if err := session.SaveUserConfig(&session.UserConfig{
+		Claude: session.ClaudeSettings{Command: "/bin/sh -c 'exec sleep 30' --"},
+	}); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	previousDB := statedb.GetGlobal()
+	statedb.SetGlobal(nil)
+	t.Cleanup(func() { statedb.SetGlobal(previousDB) })
 
 	opts := session.NewClaudeOptions(nil)
 	opts.SessionMode = "resume"

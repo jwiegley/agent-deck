@@ -67,14 +67,15 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 		}
 
 		inst := &Instance{
-			ID:             GenerateID(),
-			Title:          title,
-			ProjectPath:    projectPath,
-			GroupPath:      groupPath,
-			Status:         StatusIdle,
-			Tool:           tool,
-			TmuxSocketName: sess.SocketName, // Inherit from the tmux session we discovered (#687)
-			tmuxSession:    sess,
+			ID:                     GenerateID(),
+			persistenceIncarnation: newPersistenceIncarnation(),
+			Title:                  title,
+			ProjectPath:            projectPath,
+			GroupPath:              groupPath,
+			Status:                 StatusIdle,
+			Tool:                   tool,
+			TmuxSocketName:         sess.SocketName, // Inherit from the tmux session we discovered (#687)
+			tmuxSession:            sess,
 		}
 		_ = inst.UpdateStatus()
 		discovered = append(discovered, inst)

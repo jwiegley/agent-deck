@@ -107,9 +107,10 @@ phase5:
 		"externally killed session should show error")
 }
 
-// TestDedup_ThreeSessions verifies dedup with 3 sessions sharing the same
-// ClaudeSessionID: only the oldest keeps it.
-func TestDedup_ThreeSessions(t *testing.T) {
+// TestDedup_ThreeSessionsPreservesUnprovenClaims verifies that CreatedAt order
+// cannot authorize cross-instance binding cleanup. Durable-owner cleanup is
+// covered by TestRuntimeLifecycle_CrossInstanceBindingSweepRequiresUniqueOwnerLease.
+func TestDedup_ThreeSessionsPreservesUnprovenClaims(t *testing.T) {
 	now := time.Now()
 	oldest := &Instance{
 		ID: "oldest", Tool: "claude",
@@ -127,9 +128,9 @@ func TestDedup_ThreeSessions(t *testing.T) {
 	input := []*Instance{newest, oldest, middle}
 	UpdateClaudeSessionsWithDedup(input)
 
-	assert.Equal(t, "shared-abc", oldest.ClaudeSessionID, "oldest should keep the ID")
-	assert.Empty(t, middle.ClaudeSessionID, "middle duplicate should be cleared")
-	assert.Empty(t, newest.ClaudeSessionID, "newest duplicate should be cleared")
+	assert.Equal(t, "shared-abc", oldest.ClaudeSessionID)
+	assert.Equal(t, "shared-abc", middle.ClaudeSessionID)
+	assert.Equal(t, "shared-abc", newest.ClaudeSessionID)
 
 	// Input order must be preserved
 	assert.Equal(t, "newest", input[0].ID)

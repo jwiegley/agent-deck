@@ -15,11 +15,12 @@
 // new spawn kills its older siblings — the journalctl shape from the bug
 // report (3-5 scopes started within 2-4s, all dead by the next minute).
 //
-// Fix shape: acquire a per-instance file lock at
+// Fix shape: acquire a per-instance advisory lock at
 // ~/.agent-deck/locks/instance-spawn-<safeID>.lock around the spawn step,
 // with an in-lock AlreadyAlive gate so the second waiter exits with nil
-// instead of re-spawning. Mirrors acquirePluginLock (#735, plugin_install.go):
-// O_CREATE|O_EXCL marker + PID + stale-reclaim by `kill -0` or by age TTL.
+// instead of re-spawning. The stable lockfile is never unlinked: flock
+// ownership is released by the OS on close or process exit, so there is no
+// stale marker to reclaim and no compare-then-unlink race.
 //
 // Related-but-not-the-same: #1031 was a *storage-layer* race in
 // SaveInstances' DELETE-NOT-IN sweep during concurrent `launch`. The fix
@@ -31,10 +32,12 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -157,17 +160,31 @@ func instanceSpawnStampPath(instanceID string) (string, error) {
 // stuck plugin install and a stuck restart fail with the same shape on
 // the same wall clock — easier triage.
 const (
-	instanceSpawnLockRetryInterval  = 100 * time.Millisecond
-	instanceSpawnLockBudget         = 30 * time.Second
-	instanceSpawnLockLegacyStaleTTL = 2 * time.Minute
+	instanceSpawnLockRetryInterval = 100 * time.Millisecond
+	instanceSpawnLockBudget        = 30 * time.Second
 )
+
+// flock behavior for separate opens can vary across supported kernels, so the
+// per-path mutex also serializes holders inside this process. The stable file's
+// flock supplies the cross-process half of the same pattern.
+var instanceSpawnLockMu sync.Map // map[string]*sync.Mutex
 
 // Test seam — paralleling pluginLockAcquireFn. Tests substitute this to
 // inject contention behaviors without touching the filesystem.
 var instanceSpawnLockAcquireFn = defaultAcquireInstanceSpawnLock
 
+// The duplicate-binding sweep already holds its source instance lock and its
+// binding lock when it checks a foreign instance. Waiting for that foreign
+// instance's lock would permit two opposite-direction sweeps to deadlock, so
+// this separate primitive makes one fail-closed acquisition attempt.
+var instanceSpawnLockTryAcquireFn = defaultTryAcquireInstanceSpawnLock
+
 func acquireInstanceSpawnLock(instanceID string) (func(), error) {
 	return instanceSpawnLockAcquireFn(instanceID)
+}
+
+func tryAcquireInstanceSpawnLock(instanceID string) (func(), bool, error) {
+	return instanceSpawnLockTryAcquireFn(instanceID)
 }
 
 func defaultAcquireInstanceSpawnLock(instanceID string) (func(), error) {
@@ -176,25 +193,121 @@ func defaultAcquireInstanceSpawnLock(instanceID string) (func(), error) {
 		return nil, err
 	}
 	deadline := time.Now().Add(instanceSpawnLockBudget)
-	for {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			fmt.Fprintf(f, "%d", os.Getpid())
-			_ = f.Close()
-			return func() { _ = os.Remove(path) }, nil
-		}
-
-		if reclaimStaleInstanceSpawnLock(path) {
-			continue
-		}
-
+	inProc := instanceSpawnMutex(path)
+	for !inProc.TryLock() {
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf(
-				"instance spawn lock %q held by live process; gave up after %s",
-				path, instanceSpawnLockBudget,
-			)
+			return nil, instanceSpawnLockTimeout(path)
 		}
 		time.Sleep(instanceSpawnLockRetryInterval)
+	}
+
+	f, err := openInstanceSpawnLock(path)
+	if err != nil {
+		inProc.Unlock()
+		return nil, err
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !instanceSpawnLockWouldBlock(err) {
+			_ = f.Close()
+			inProc.Unlock()
+			return nil, fmt.Errorf("flock instance spawn lock %q: %w", path, err)
+		}
+		if time.Now().After(deadline) {
+			_ = f.Close()
+			inProc.Unlock()
+			return nil, instanceSpawnLockTimeout(path)
+		}
+		time.Sleep(instanceSpawnLockRetryInterval)
+	}
+	if err := writeInstanceSpawnLockMarker(f); err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+		inProc.Unlock()
+		return nil, err
+	}
+	return instanceSpawnLockRelease(f, inProc), nil
+}
+
+func defaultTryAcquireInstanceSpawnLock(instanceID string) (func(), bool, error) {
+	path, err := instanceSpawnLockPath(instanceID)
+	if err != nil {
+		return nil, false, err
+	}
+	inProc := instanceSpawnMutex(path)
+	if !inProc.TryLock() {
+		return nil, false, nil
+	}
+	f, err := openInstanceSpawnLock(path)
+	if err != nil {
+		inProc.Unlock()
+		return nil, false, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		inProc.Unlock()
+		if instanceSpawnLockWouldBlock(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("flock instance spawn lock %q: %w", path, err)
+	}
+	if err := writeInstanceSpawnLockMarker(f); err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+		inProc.Unlock()
+		return nil, false, err
+	}
+	return instanceSpawnLockRelease(f, inProc), true, nil
+}
+
+func instanceSpawnMutex(path string) *sync.Mutex {
+	value, _ := instanceSpawnLockMu.LoadOrStore(path, &sync.Mutex{})
+	return value.(*sync.Mutex)
+}
+
+func openInstanceSpawnLock(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open instance spawn lock %q: %w", path, err)
+	}
+	return f, nil
+}
+
+func instanceSpawnLockWouldBlock(err error) bool {
+	return errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN)
+}
+
+func instanceSpawnLockTimeout(path string) error {
+	return fmt.Errorf(
+		"instance spawn lock %q held; gave up after %s",
+		path, instanceSpawnLockBudget,
+	)
+}
+
+func writeInstanceSpawnLockMarker(f *os.File) error {
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("truncate instance spawn lock marker: %w", err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return fmt.Errorf("seek instance spawn lock marker: %w", err)
+	}
+	if _, err := fmt.Fprintf(f, "%d", os.Getpid()); err != nil {
+		return fmt.Errorf("write instance spawn lock marker: %w", err)
+	}
+	return nil
+}
+
+func instanceSpawnLockRelease(f *os.File, inProc *sync.Mutex) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			inProc.Unlock()
+		})
 	}
 }
 
@@ -242,51 +355,4 @@ func resolveLocksDirForSpawnLock() (string, error) {
 		return filepath.Join(agentDeckDirOverride, "locks"), nil
 	}
 	return dataPath("locks", "locks")
-}
-
-// reclaimStaleInstanceSpawnLock mirrors reclaimStalePluginLock — older
-// than 2m means the holder timed out anyway; PID-not-alive means the
-// holder crashed without unlinking.
-func reclaimStaleInstanceSpawnLock(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	if time.Since(info.ModTime()) > instanceSpawnLockLegacyStaleTTL {
-		_ = os.Remove(path)
-		return true
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	pid, parseErr := parseInstanceSpawnLockPID(string(data))
-	if parseErr != nil {
-		return false
-	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		_ = os.Remove(path)
-		return true
-	}
-	if err := proc.Signal(syscall.Signal(0)); err != nil {
-		_ = os.Remove(path)
-		return true
-	}
-	return false
-}
-
-func parseInstanceSpawnLockPID(content string) (int, error) {
-	trimmed := strings.TrimSpace(content)
-	if trimmed == "" {
-		return 0, fmt.Errorf("empty marker")
-	}
-	var pid int
-	if _, err := fmt.Sscanf(trimmed, "%d", &pid); err != nil {
-		return 0, err
-	}
-	if pid <= 0 {
-		return 0, fmt.Errorf("invalid pid %d", pid)
-	}
-	return pid, nil
 }

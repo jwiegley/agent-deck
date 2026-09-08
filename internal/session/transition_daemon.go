@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/desknotify"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 const (
@@ -115,6 +117,12 @@ type TransitionDaemon struct {
 	// off the poll loop so a wedged notifier binary cannot stall session
 	// monitoring. Only tests wait on it.
 	desktopWG sync.WaitGroup
+
+	// pollState carries process-local status caches and throttles across
+	// LoadWithGroups calls. Each load constructs fresh Instance and tmux.Session
+	// values; without this bridge every profile poll starts cold and repeats
+	// tmux, ps, lsof, metadata, and gateway probes.
+	pollState map[string]map[string]instancePollingState
 }
 
 func NewTransitionDaemon() *TransitionDaemon {
@@ -131,6 +139,7 @@ func NewTransitionDaemon() *TransitionDaemon {
 		lastProbeStall: map[string]time.Time{},
 
 		lastDesktopNotify: map[string]string{},
+		pollState:         map[string]map[string]instancePollingState{},
 	}
 }
 
@@ -160,7 +169,11 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 // SyncOnce performs one full monitoring pass and returns the recommended delay
 // until the next pass.
 func (d *TransitionDaemon) SyncOnce(_ context.Context) time.Duration {
-	profiles := profilesForTransitionDaemon()
+	profiles, err := profilesForTransitionDaemon()
+	if err != nil {
+		return notifyPollSlow
+	}
+	d.pruneDeletedProfiles(profiles)
 	if len(profiles) == 0 {
 		return notifyPollSlow
 	}
@@ -169,6 +182,11 @@ func (d *TransitionDaemon) SyncOnce(_ context.Context) time.Duration {
 	// alive", and a daemon wedged inside a probe should still look alive for one
 	// staleness window rather than flipping to "absent" the moment it stalls.
 	WriteNotifyHeartbeat()
+
+	// Match the TUI, web, and CLI status paths: warm each shared tmux cache
+	// once for the whole pass, not once per profile or instance.
+	tmux.RefreshExistingSessions()
+	tmux.RefreshPaneInfoCache()
 
 	nextInterval := notifyPollSlow
 	for _, profile := range profiles {
@@ -260,6 +278,7 @@ func (d *TransitionDaemon) maybeSweepInboxTTL() {
 // backstop that keeps the daemon alive even if some future call site is added
 // without its own timeout, or several probes pile up at once.
 var statusProbeBudget = 6 * time.Second
+var statusProbeTimeoutFn = time.After
 
 // syncPassBudget bounds the cumulative time one no-live-TUI pass spends probing
 // instance status. Past it the remaining instances keep their last-known status
@@ -272,19 +291,21 @@ var syncPassBudget = 30 * time.Second
 // breadcrumb so a permanently wedged instance doesn't flood the log.
 const probeStallLogInterval = time.Minute
 
-// statusProbeFunc is the signature of the swappable status-probe seam.
-type statusProbeFunc = func(inst *Instance) error
+// statusProbeFunc is the signature of the swappable status-authority seam.
+type statusProbeFunc = func(context.Context, *Instance, statedb.RuntimeState, string) (statedb.RuntimeState, error)
 
 // updateInstanceStatus is the swappable status-probe seam used by the
 // no-live-TUI sync path, held in an atomic.Value so the production read at
 // probe-spawn time stays race-free against tests that swap it (a detached probe
 // goroutine may still be parked when a test restores the seam). Production
-// points it at (*Instance).UpdateStatus, set once in init; tests Store a
+// points it at the generation-fenced status authority, set once in init; tests Store a
 // controllable blocking probe to prove a hung tmux call can't freeze the loop.
 var updateInstanceStatus atomic.Value
 
 func init() {
-	updateInstanceStatus.Store(statusProbeFunc(func(inst *Instance) error { return inst.UpdateStatus() }))
+	updateInstanceStatus.Store(statusProbeFunc(func(ctx context.Context, inst *Instance, observed statedb.RuntimeState, incarnation string) (statedb.RuntimeState, error) {
+		return inst.UpdateStatusObserved(ctx, observed, incarnation)
+	}))
 }
 
 // refreshInstanceStatusBounded runs the status probe for inst under
@@ -302,19 +323,41 @@ func init() {
 // times out again next pass instead of wedging the daemon, and the leak is
 // bounded in practice because the subprocess context timeouts let the detached
 // probe return within a few seconds.
-func (d *TransitionDaemon) refreshInstanceStatusBounded(profile string, inst *Instance) (timedOut bool) {
+func (d *TransitionDaemon) refreshInstanceStatusBounded(profile string, inst *Instance, observed statedb.RuntimeState, incarnation string) (statedb.RuntimeState, bool) {
 	probe := updateInstanceStatus.Load().(statusProbeFunc)
-	done := make(chan struct{})
+	fence := &statusCommitFence{}
+	base := context.WithValue(context.Background(), statusCommitFenceKey{}, fence)
+	ctx, cancel := context.WithCancel(base)
+	type result struct {
+		state statedb.RuntimeState
+		err   error
+	}
+	done := make(chan result, 1)
 	go func() {
-		defer close(done)
-		_ = probe(inst)
+		state, err := probe(ctx, inst, observed, incarnation)
+		done <- result{state: state, err: err}
 	}()
 	select {
-	case <-done:
-		return false
-	case <-time.After(statusProbeBudget):
+	case result := <-done:
+		cancel()
+		if result.state.InstanceID == "" {
+			result.state = observed
+		}
+		return result.state, false
+	case <-statusProbeTimeoutFn(statusProbeBudget):
 		d.logProbeStall(profile, inst.ID, "probe_budget")
-		return true
+		if fence.cancel() {
+			cancel()
+			return observed, true
+		}
+		// Publication already began. Wait for that bounded DB/memory critical
+		// section so this function never reports timeout before a late publish.
+		cancel()
+		result := <-done
+		if result.state.InstanceID == "" {
+			result.state = observed
+		}
+		return result.state, false
 	}
 }
 
@@ -370,13 +413,68 @@ func notifierProbeStallLogPath() string {
 	return path
 }
 
-func profilesForTransitionDaemon() []string {
+func profilesForTransitionDaemon() ([]string, error) {
 	profiles, err := ListProfiles()
-	if err != nil || len(profiles) == 0 {
-		return nil
+	if err != nil {
+		return nil, err
 	}
 	sort.Strings(profiles)
-	return profiles
+	return profiles, nil
+}
+
+// pruneDeletedProfiles releases profile resources and process-local poll state
+// only after ListProfiles completed successfully. A transient listing error
+// must not make the daemon forget live profiles; a successful list is the
+// authoritative snapshot and lets deleted profiles be retired immediately.
+func (d *TransitionDaemon) pruneDeletedProfiles(profiles []string) {
+	active := make(map[string]bool, len(profiles))
+	for _, profile := range profiles {
+		active[profile] = true
+	}
+
+	for profile, storage := range d.storages {
+		if active[profile] {
+			continue
+		}
+		if storage != nil {
+			_ = storage.Close()
+		}
+		delete(d.storages, profile)
+	}
+	for profile := range d.lastStatus {
+		if !active[profile] {
+			delete(d.lastStatus, profile)
+		}
+	}
+	for profile := range d.initialized {
+		if !active[profile] {
+			delete(d.initialized, profile)
+		}
+	}
+	for profile := range d.lastDone {
+		if !active[profile] {
+			delete(d.lastDone, profile)
+		}
+	}
+	for profile := range d.lastDoneScan {
+		if !active[profile] {
+			delete(d.lastDoneScan, profile)
+		}
+	}
+	for profile := range d.pollState {
+		if !active[profile] {
+			delete(d.pollState, profile)
+		}
+	}
+	for key := range d.lastProbeStall {
+		profile, _, ok := strings.Cut(key, "|")
+		if ok && !active[profile] {
+			delete(d.lastProbeStall, key)
+		}
+	}
+	if d.selfheal != nil {
+		d.selfheal.pruneProfiles(active)
+	}
 }
 
 func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
@@ -389,6 +487,13 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	if err != nil {
 		return notifyPollSlow
 	}
+	identities := make(map[string]instancePollingIdentity, len(instances))
+	for _, inst := range instances {
+		if inst != nil {
+			identities[inst.ID] = inst.pollingIdentity()
+		}
+	}
+	d.restorePollingState(profile, instances)
 
 	byID := make(map[string]*Instance, len(instances))
 	hookCandidates := make(map[string]hookTransitionCandidate, len(instances))
@@ -438,6 +543,10 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 			if _, ok := statuses[inst.ID]; !ok {
 				statuses[inst.ID] = normalizeStatusString(string(inst.Status))
 			}
+			// Hook processing above can publish a new binding and its validated
+			// hook cache. Preserve both under the post-hook identity so the next
+			// storage reload can restore the cache instead of revalidating it.
+			d.rememberPollingState(profile, inst, inst.pollingIdentity())
 		}
 	} else {
 		// No live TUI: the daemon is the only thing refreshing status, so it
@@ -452,7 +561,9 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 		passStart := time.Now()
 		passBudgetSpent := false
 		for _, inst := range instances {
-			previousStatus := normalizeStatusString(string(inst.Status))
+			selection := inst.CaptureRuntimeSelection()
+			observed := selection.State
+			previousStatus := normalizeStatusString(observed.Status)
 			if passBudgetSpent || time.Since(passStart) > syncPassBudget {
 				if !passBudgetSpent {
 					passBudgetSpent = true
@@ -464,7 +575,8 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 				statuses[inst.ID] = previousStatus
 				continue
 			}
-			if d.refreshInstanceStatusBounded(profile, inst) {
+			committed, timedOut := d.refreshInstanceStatusBounded(profile, inst, observed, selection.Incarnation)
+			if timedOut {
 				// Probe exceeded its per-instance budget. A detached goroutine is
 				// still inside UpdateStatus and may hold inst.mu, so reading
 				// GetStatusThreadSafe would block on that same lock — fall back to
@@ -472,11 +584,8 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 				statuses[inst.ID] = previousStatus
 				continue
 			}
-			status := normalizeStatusString(string(inst.GetStatusThreadSafe()))
-			statuses[inst.ID] = status
-			if db != nil && status != previousStatus {
-				_ = db.WriteStatus(inst.ID, status, inst.Tool)
-			}
+			statuses[inst.ID] = normalizeStatusString(committed.Status)
+			d.rememberPollingState(profile, inst, identities[inst.ID])
 		}
 	}
 
@@ -543,6 +652,32 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 
 	d.lastStatus[profile] = copyStatusMap(statuses)
 	return choosePollInterval(statuses)
+}
+
+// restorePollingState hydrates process-local status machinery after the
+// daemon's per-pass storage reload. Rebuilding the profile map also drops state
+// for deleted instances.
+func (d *TransitionDaemon) restorePollingState(profile string, instances []*Instance) {
+	previous := d.pollState[profile]
+	current := make(map[string]instancePollingState, len(instances))
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		if state, ok := previous[inst.ID]; ok {
+			if inst.restorePollingState(state) {
+				current[inst.ID] = state
+			}
+		}
+	}
+	if d.pollState == nil {
+		d.pollState = make(map[string]map[string]instancePollingState)
+	}
+	d.pollState[profile] = current
+}
+
+func (d *TransitionDaemon) rememberPollingState(profile string, inst *Instance, identity instancePollingIdentity) {
+	d.pollState[profile][inst.ID] = inst.pollingStateForIdentity(identity)
 }
 
 // recordTerminalTurns records EVERY completed turn into the drainable ledgers,
@@ -916,7 +1051,8 @@ func (d *TransitionDaemon) hookStatusForInstance(instanceID string) *HookStatus 
 		}
 	}
 	if hs := readHookStatusFile(instanceID); hs != nil {
-		if best == nil || hs.UpdatedAt.After(best.UpdatedAt) {
+		if best == nil || hs.UpdatedAt.After(best.UpdatedAt) ||
+			(hs.UpdatedAt.Equal(best.UpdatedAt) && hs.Fingerprint != best.Fingerprint) {
 			best = hs
 		}
 	}
@@ -1000,6 +1136,7 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		CodexCompletedSessionID:  raw.CodexCompletedSessionID,
 		HookGeneration:           raw.HookGeneration,
 		Sequence:                 raw.Sequence,
+		Fingerprint:              hookStatusSourceFingerprint(data),
 	}
 	maskConsumedCodexCompletion(instanceID, hookStatus)
 	return hookStatus

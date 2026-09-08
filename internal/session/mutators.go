@@ -26,6 +26,7 @@ const (
 	FieldColor             = "color"
 	FieldNotes             = "notes"
 	FieldClaudeSessionID   = "claude-session-id"
+	FieldCopilotSessionID  = "copilot-session-id"
 	FieldGeminiSessionID   = "gemini-session-id"
 	FieldOpenCodeSessionID = "opencode-session-id"
 	FieldCodexSessionID    = "codex-session-id"
@@ -62,6 +63,7 @@ var ValidMutableFields = []string{
 	FieldColor,
 	FieldNotes,
 	FieldClaudeSessionID,
+	FieldCopilotSessionID,
 	FieldGeminiSessionID,
 	FieldOpenCodeSessionID,
 	FieldCodexSessionID,
@@ -142,7 +144,8 @@ func normalizeToolSessionID(field, value string) (string, error) {
 // extraArgsTokens supplies pre-tokenized argv for FieldExtraArgs (CLI path);
 // when nil, FieldExtraArgs falls back to strings.Fields(value) (TUI path).
 //
-// Persistence is the caller's responsibility.
+// Persistence is the caller's responsibility except for runtime binding
+// fields, which publish through their generation/revision CAS before return.
 func SetField(inst *Instance, field, value string, extraArgsTokens []string) (oldValue string, postCommit func(), err error) {
 	switch field {
 	case FieldTitle:
@@ -313,11 +316,12 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 
 	case FieldClaudeSessionID:
 		oldValue = inst.ClaudeSessionID
-		inst.ClaudeSessionID = value
+		if err := inst.publishRuntimeBinding("claude", value, time.Now()); err != nil {
+			return oldValue, nil, err
+		}
 		// #1815: an operator naming the conversation id for this session is
 		// an explicit ownership declaration.
 		inst.markClaudeSessionIDVerified()
-		inst.ClaudeDetectedAt = time.Now()
 		postCommit = makeSessionEnvPostCommit(inst, "CLAUDE_SESSION_ID", value)
 		// Issue #923 (reporter @bautrey): when the user explicitly clears
 		// the session id, the hook .sid sidecar at
@@ -330,10 +334,18 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 			ClearHookSessionAnchor(inst.ID)
 		}
 
+	case FieldCopilotSessionID:
+		oldValue = inst.CopilotSessionID
+		if err := inst.publishRuntimeBinding("copilot", value, time.Now()); err != nil {
+			return oldValue, nil, err
+		}
+		postCommit = makeSessionEnvPostCommit(inst, "COPILOT_SESSION_ID", value)
+
 	case FieldGeminiSessionID:
 		oldValue = inst.GeminiSessionID
-		inst.GeminiSessionID = value
-		inst.GeminiDetectedAt = time.Now()
+		if err := inst.publishRuntimeBinding("gemini", value, time.Now()); err != nil {
+			return oldValue, nil, err
+		}
 		postCommit = makeSessionEnvPostCommit(inst, "GEMINI_SESSION_ID", value)
 
 	case FieldOpenCodeSessionID:
@@ -342,8 +354,9 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 		if err != nil {
 			return oldValue, nil, err
 		}
-		inst.OpenCodeSessionID = normalized
-		inst.OpenCodeDetectedAt = time.Now()
+		if err := inst.publishRuntimeBinding("opencode", normalized, time.Now()); err != nil {
+			return oldValue, nil, err
+		}
 
 	case FieldCodexSessionID:
 		oldValue = inst.CodexSessionID
@@ -351,8 +364,9 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 		if err != nil {
 			return oldValue, nil, err
 		}
-		inst.CodexSessionID = normalized
-		inst.CodexDetectedAt = time.Now()
+		if err := inst.publishRuntimeBinding("codex", normalized, time.Now()); err != nil {
+			return oldValue, nil, err
+		}
 
 	case FieldToolSessionID:
 		// Trim so whitespace-only is a clear; resume argv must not inject bare spaces.

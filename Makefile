@@ -1,4 +1,4 @@
-.PHONY: build run install clean dev release-local test test-perf bench fmt lint ci css tools css-verify test-web test-web-unit test-web-e2e test-web-install
+.PHONY: build run install clean dev release-local test test-perf test-runtime-lifecycle bench fmt lint ci css tools css-verify test-web test-web-unit test-web-e2e test-web-install
 
 BINARY_NAME=agent-deck
 BUILD_DIR=./build
@@ -139,6 +139,89 @@ dev:
 # Run tests (with race detector)
 test:
 	go test -race -v ./...
+
+# Hermetic runtime-state race gate. Keep discovery here so package builds fail
+# when a package silently loses its lifecycle coverage, without duplicating a
+# list of individual test names in downstream packaging.
+test-runtime-lifecycle:
+	@set -eu; \
+	sandbox=$$(mktemp -d); \
+	trap 'chmod -R u+w "$$sandbox" 2>/dev/null || true; rm -rf "$$sandbox"' EXIT INT TERM; \
+	result="$$sandbox/result.json"; \
+	incoming_goproxy=$${GOPROXY:-}; \
+	case " $${GOFLAGS:-} " in \
+		*' -mod=vendor '*) gomodcache="$$sandbox/go-mod"; offline_goproxy=off ;; \
+		*) case "$$incoming_goproxy" in \
+			file://*) gomodcache="$$sandbox/go-mod"; offline_goproxy="$$incoming_goproxy" ;; \
+			*) gomodcache=$$(GOENV=off GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go env GOMODCACHE); offline_goproxy=off ;; \
+		esac ;; \
+	esac; \
+	mkdir -p "$$sandbox/home" "$$sandbox/config" "$$sandbox/data" \
+		"$$sandbox/cache" "$$sandbox/state" "$$sandbox/tmux" \
+		"$$sandbox/go-build" "$$sandbox/bin" "$$sandbox/tmp" "$$gomodcache"; \
+	printf '%s\n' '#!/bin/sh' \
+		'echo "no server running on hermetic runtime-lifecycle socket" >&2' \
+		'exit 1' >"$$sandbox/bin/tmux"; \
+	chmod 755 "$$sandbox/bin/tmux"; \
+	unset TMUX TMUX_PANE; \
+	export HOME="$$sandbox/home" \
+		TMPDIR="$$sandbox/tmp" \
+		XDG_CONFIG_HOME="$$sandbox/config" \
+		XDG_DATA_HOME="$$sandbox/data" \
+		XDG_CACHE_HOME="$$sandbox/cache" \
+		XDG_STATE_HOME="$$sandbox/state" \
+		TMUX_TMPDIR="$$sandbox/tmux" \
+		GOCACHE="$$sandbox/go-build" \
+		GOMODCACHE="$$gomodcache" \
+		GOENV=off \
+		GOPROXY="$$offline_goproxy" \
+		GOSUMDB=off \
+		GOTOOLCHAIN=local \
+		AGENT_DECK_TEST_ISOLATED=1 \
+		PATH="$$sandbox/bin:$$PATH"; \
+	: 'verify offline module-cache contents unless the fixed-output vendor tree is authoritative'; \
+	case " $${GOFLAGS:-} " in \
+		*' -mod=vendor '*) : ;; \
+		*) go mod verify >/dev/null ;; \
+	esac; \
+	packages='./internal/statedb ./internal/session ./internal/tmux ./internal/ui ./internal/fleet ./cmd/agent-deck'; \
+	for pkg in $$packages; do \
+		tests=$$(AGENTDECK_RUNTIME_LIFECYCLE_ONLY=1 go test "$$pkg" -list '^TestRuntimeLifecycle_' | sed -n '/^TestRuntimeLifecycle_/p'); \
+		if [ -z "$$tests" ]; then \
+			echo "ERROR: $$pkg has no TestRuntimeLifecycle_ tests" >&2; \
+			exit 1; \
+		fi; \
+		printf '%s\n' "$$tests"; \
+	done; \
+	session_tests=$$(AGENTDECK_RUNTIME_LIFECYCLE_ONLY=1 go test ./internal/session -list '^TestRuntimeLifecycle_' | sed -n '/^TestRuntimeLifecycle_/p'); \
+	printf '%s\n' "$$session_tests" | grep -qx 'TestRuntimeLifecycle_Multiprocess' || { \
+		echo 'ERROR: session multiprocess lifecycle test is absent' >&2; \
+		exit 1; \
+	}; \
+	printf '%s\n' "$$session_tests" | grep -qx 'TestRuntimeLifecycle_PackagedCrashHelper' || { \
+		echo 'ERROR: session packaged crash-helper lifecycle test is absent' >&2; \
+		exit 1; \
+	}; \
+	statedb_tests=$$(AGENTDECK_RUNTIME_LIFECYCLE_ONLY=1 go test ./internal/statedb -list '^TestRuntimeLifecycle_' | sed -n '/^TestRuntimeLifecycle_/p'); \
+	printf '%s\n' "$$statedb_tests" | grep -qx 'TestRuntimeLifecycle_MultiprocessSQLite' || { \
+		echo 'ERROR: statedb multiprocess lifecycle test is absent' >&2; \
+		exit 1; \
+	}; \
+	printf '%s\n' "$$statedb_tests" | grep -qx 'TestRuntimeLifecycle_PackagedHelper' || { \
+		echo 'ERROR: statedb packaged-helper lifecycle test is absent' >&2; \
+		exit 1; \
+	}; \
+	if ! AGENTDECK_RUNTIME_LIFECYCLE_ONLY=1 go test -race -json -count=1 -run '^TestRuntimeLifecycle_' \
+		$$packages >"$$result"; then \
+		cat "$$result"; \
+		exit 1; \
+	fi; \
+	if grep '"Action":"skip"' "$$result" | grep -q '"Test":"TestRuntimeLifecycle_'; then \
+		cat "$$result"; \
+		echo 'ERROR: a runtime lifecycle test was skipped' >&2; \
+		exit 1; \
+	fi; \
+	echo 'runtime lifecycle tests passed'
 
 # Run hard-gated walltime regression tests (Track B). Honors PERF_BUDGET_MULTIPLIER
 # (default 1.0 locally; CI sets 2.0). See docs/perf-budget-suite.md.

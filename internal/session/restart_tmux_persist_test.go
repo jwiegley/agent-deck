@@ -35,8 +35,8 @@ func restartPersistFixture(t *testing.T, profile, oldName string) (*Storage, *In
 	inst.tmuxSession = tmux.ReconnectSessionLazy(oldName, inst.ID, inst.ProjectPath, "shell", "running")
 
 	instances := []*Instance{inst}
-	if err := storage.SaveWithGroups(instances, NewGroupTree(instances)); err != nil {
-		t.Fatalf("seed save: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, NewGroupTree(instances)); err != nil {
+		t.Fatalf("seed insert: %v", err)
 	}
 	if got := storedTmuxName(t, storage, inst.ID); got != oldName {
 		t.Fatalf("fixture: stored tmux name = %q, want %q", got, oldName)
@@ -139,6 +139,51 @@ func TestRestartRecordsWhatItProduced(t *testing.T) {
 	}
 }
 
+// TestRestartOutcomeUsesOwningProfile prevents process-global profile state
+// from redirecting the post-commit acknowledgement. The authoritative runtime
+// transition already uses the database that loaded the instance; its companion
+// stamp must use that same database even when a different profile is global.
+func TestRestartOutcomeUsesOwningProfile(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+
+	const oldName = "agentdeck_restartprofile_deadbeef"
+	storage, inst := restartPersistFixture(t, "_test_restart_tmux_profile", oldName)
+
+	other, err := NewStorageWithProfile("_test_restart_tmux_wrong_global")
+	if err != nil {
+		t.Fatalf("NewStorageWithProfile(other): %v", err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+	previous := statedb.GetGlobal()
+	statedb.SetGlobal(other.GetDB())
+	t.Cleanup(func() { statedb.SetGlobal(previous) })
+
+	if err := inst.Restart(); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	t.Cleanup(func() {
+		if sess := inst.GetTmuxSession(); sess != nil {
+			_ = sess.Kill()
+		}
+	})
+
+	recorded, recordErr := inst.RestartTmuxNameRecorded()
+	if !recorded || recordErr != nil {
+		t.Fatalf("RestartTmuxNameRecorded() = (%v, %v), want owning-profile success", recorded, recordErr)
+	}
+	live := inst.GetTmuxSession()
+	if live == nil || storedTmuxName(t, storage, inst.ID) != live.Name {
+		t.Fatalf("owning profile did not retain the restarted runtime: live=%v", live)
+	}
+	rows, err := other.GetDB().LoadInstances()
+	if err != nil {
+		t.Fatalf("LoadInstances(other): %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("global non-owning profile gained %d rows", len(rows))
+	}
+}
+
 // TestRestartReportsAnUnrecordedTmuxName pins the honesty half. If the write
 // cannot land -- here because the row was deleted while the restart ran -- the
 // restart still succeeded and the process is live, so Restart must not fail.
@@ -150,14 +195,26 @@ func TestRestartReportsAnUnrecordedTmuxName(t *testing.T) {
 	const oldName = "agentdeck_restartunrecorded_deadbeef"
 	storage, inst := restartPersistFixture(t, "_test_restart_tmux_unrecorded", oldName)
 
-	// Another process removes the session while this one is restarting it.
-	if err := storage.GetDB().DeleteInstance(inst.ID); err != nil {
-		t.Fatalf("DeleteInstance: %v", err)
+	// Another process removes the parent after the physical runtime and its
+	// authoritative generation committed, but before the restart can emit its
+	// acknowledgement stamp. Deleting before Restart would merely prove the
+	// lifecycle precondition rejects a missing parent without spawning.
+	deleted := false
+	previous := restartOutcomeBeforeWriteFn
+	restartOutcomeBeforeWriteFn = func() {
+		deleted = true
+		if err := storage.GetDB().DeleteInstance(inst.ID); err != nil {
+			t.Fatalf("DeleteInstance in restart outcome window: %v", err)
+		}
 	}
+	t.Cleanup(func() { restartOutcomeBeforeWriteFn = previous })
 
 	if err := inst.Restart(); err != nil {
 		t.Fatalf("Restart returned %v; a restart whose bookkeeping failed still started the "+
 			"process, and reporting it as failed invites a retry that leaks another tmux session", err)
+	}
+	if !deleted {
+		t.Fatal("restart never crossed the post-commit acknowledgement window")
 	}
 	t.Cleanup(func() {
 		if sess := inst.GetTmuxSession(); sess != nil {

@@ -1,6 +1,7 @@
 package statedb
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -32,6 +33,10 @@ import (
 // empty sweep turns silent data loss into a loud, recoverable error. Callers
 // that genuinely intend to empty the table must use ClearAllInstances.
 var ErrRefusingEmptySweep = errors.New("statedb: refusing to wipe populated instances table with an empty SaveInstances payload (use ClearAllInstances to intentionally clear)")
+
+// ErrFutureSchema refuses to let an older binary mutate a database created by
+// a newer schema version.
+var ErrFutureSchema = errors.New("statedb: database schema is newer than this binary")
 
 // backupDBFile copies the live SQLite database file to "<path>.bak" so a
 // destructive sweep is recoverable (S2 data-loss safeguard, 2026-06-04
@@ -74,7 +79,10 @@ func (s *StateDB) backupDBFile() error {
 // op MUST be idempotent or otherwise safe to retry (e.g. idempotent UPDATEs,
 // INSERT OR IGNORE/REPLACE, DELETE).
 func withBusyRetry(op func() error) error {
-	const attempts = 5
+	return withBusyRetryAttempts(op, 5)
+}
+
+func withBusyRetryAttempts(op func() error, attempts int) error {
 	var err error
 	for attempt := 0; attempt < attempts; attempt++ {
 		err = op()
@@ -97,7 +105,7 @@ func withBusyRetry(op func() error) error {
 
 // SchemaVersion tracks the current database schema version.
 // Bump this when adding migrations.
-const SchemaVersion = 13
+const SchemaVersion = 18
 
 // StateDB wraps a SQLite database for session/group persistence.
 // Thread-safe for concurrent use from multiple goroutines within one process.
@@ -119,6 +127,18 @@ type StateDB struct {
 	// large DELETE+re-insert sweep (S2 data-loss safeguard, 2026-06-04
 	// incident). Empty for in-memory databases (no file to back up).
 	path string
+	// testBeforeInstanceWriteTransaction is a deterministic barrier for mixed-
+	// writer regression tests. Production StateDB values leave it nil.
+	testBeforeInstanceWriteTransaction func()
+	// testBeforeMigrationBegin is a deterministic barrier for migration race
+	// regression tests. Production StateDB values leave it nil.
+	testBeforeMigrationBegin func()
+	// testBeforeMigrationDDL records entry into the migration body for current-
+	// schema fast-path tests. Production StateDB values leave it nil.
+	testBeforeMigrationDDL func()
+	// testAfterImmediateBegin is a deterministic barrier for lifecycle writer
+	// contention tests. Production StateDB values leave it nil.
+	testAfterImmediateBegin func()
 }
 
 // newOwnerToken builds a claim-ownership token unique to this process
@@ -140,16 +160,28 @@ const backupRowDropThreshold = 3
 
 // InstanceRow represents a session row in the database.
 type InstanceRow struct {
-	ID                 string
-	Title              string
-	ProjectPath        string
-	GroupPath          string
-	Order              int
-	Command            string
-	Wrapper            string
-	Tool               string
-	Status             string
-	TmuxSession        string
+	ID string
+	// Incarnation is the durable identity of this particular insertion of ID.
+	// It changes whenever a missing parent is inserted again, so update-only
+	// writers cannot mistake a byte-identical delete/recreate cycle for the row
+	// they originally loaded.
+	Incarnation string
+	Title       string
+	ProjectPath string
+	GroupPath   string
+	Order       int
+	Command     string
+	Wrapper     string
+	Tool        string
+	Status      string
+	TmuxSession string
+	// RuntimeGeneration and StatusRevision come from the authoritative
+	// instance_runtime_state row. The legacy runtime-looking columns above are
+	// compatibility projections only.
+	RuntimeGeneration  uint64
+	StatusRevision     uint64
+	LastStartedAt      time.Time
+	RuntimeBindings    map[string]RuntimeBinding
 	CreatedAt          time.Time
 	LastAccessed       time.Time
 	ParentSessionID    string
@@ -202,13 +234,11 @@ func mergeAutoNameFields(inst *InstanceRow, existing existingAutoNameFields) (bo
 		autoName = false
 	}
 
-	description := inst.AutoNameDescription
-	if description == "" && existing.description != "" {
-		// The capture path writes non-empty descriptions with a targeted UPDATE.
-		// Keep that fresher value when a stale snapshot still has the old empty
-		// column value.
-		description = existing.description
-	}
+	// AutoNameDescription is owned by the targeted capture writer. Once a row
+	// exists, a full-row snapshot has no freshness token with which to prove it
+	// is newer, so the transaction-read value always wins (including clears).
+	// New rows still take the incoming value through the !existing.found path.
+	description := existing.description
 	return autoName, description
 }
 
@@ -282,9 +312,11 @@ type GroupRow struct {
 
 // StatusRow holds status + acknowledgment for a session.
 type StatusRow struct {
-	Status       string
-	Tool         string
-	Acknowledged bool
+	Status         string
+	Tool           string
+	Acknowledged   bool
+	Generation     uint64
+	StatusRevision uint64
 }
 
 // RecentSessionRow captures the config of a deleted session for quick re-creation.
@@ -343,8 +375,13 @@ func Open(dbPath string) (*StateDB, error) {
 		return nil, fmt.Errorf("statedb: open: %w", err)
 	}
 
-	// WAL mode: persistent on the file, not per-connection.
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+	// WAL mode is persistent on the file, but simultaneous first-open callers
+	// can still contend while reading or establishing it. Treat that pragma as
+	// the same short idempotent writer operation as the migrations it precedes.
+	if err := withBusyRetry(func() error {
+		_, execErr := db.Exec("PRAGMA journal_mode=WAL")
+		return execErr
+	}); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("statedb: wal mode: %w", err)
 	}
@@ -392,11 +429,61 @@ func (s *StateDB) DB() *sql.DB {
 
 // Migrate creates tables if they don't exist and runs any pending migrations.
 func (s *StateDB) Migrate() error {
-	tx, err := s.db.Begin()
+	// Migrations are longer than ordinary targeted writes and many short-lived
+	// CLI processes may race here at startup. Retry the complete idempotent
+	// transaction long enough for those writers to serialize.
+	return withBusyRetryAttempts(s.migrateOnce, 20)
+}
+
+func (s *StateDB) migrateOnce() error {
+	// Use an immediate transaction so the future-schema guard and every DDL
+	// statement share one writer reservation. A deferred transaction would let
+	// a newer migrator commit after this process inspected metadata but before
+	// its first write, allowing this older binary to mutate and downgrade the
+	// newer schema.
+	migrationDB, err := sql.Open("sqlite", s.path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)&_txlock=immediate")
 	if err != nil {
-		return fmt.Errorf("statedb: begin migrate: %w", err)
+		return fmt.Errorf("statedb: open migration connection: %w", err)
+	}
+	defer migrationDB.Close()
+	if s.testBeforeMigrationBegin != nil {
+		s.testBeforeMigrationBegin()
+	}
+	tx, err := migrationDB.Begin()
+	if err != nil {
+		return fmt.Errorf("statedb: begin immediate migrate: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// This guard must run after BEGIN IMMEDIATE but before even an idempotent
+	// CREATE/ALTER. An older binary cannot know which invariants a future schema
+	// requires.
+	var metadataExists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata'`).Scan(&metadataExists); err != nil {
+		return fmt.Errorf("statedb: inspect schema metadata: %w", err)
+	}
+	if metadataExists != 0 {
+		var versionText string
+		err := tx.QueryRow(`SELECT value FROM metadata WHERE key = 'schema_version'`).Scan(&versionText)
+		if err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("statedb: inspect schema version: %w", err)
+		}
+		if err == nil {
+			version, parseErr := strconv.Atoi(versionText)
+			if parseErr != nil {
+				return fmt.Errorf("statedb: invalid schema version %q: %w", versionText, parseErr)
+			}
+			if version > SchemaVersion {
+				return fmt.Errorf("%w: database=%d binary=%d", ErrFutureSchema, version, SchemaVersion)
+			}
+			if version == SchemaVersion {
+				return nil
+			}
+		}
+	}
+	if s.testBeforeMigrationDDL != nil {
+		s.testBeforeMigrationDDL()
+	}
 
 	// metadata table
 	if _, err := tx.Exec(`
@@ -444,6 +531,47 @@ func (s *StateDB) Migrate() error {
 		return fmt.Errorf("statedb: create instances: %w", err)
 	}
 
+	// v16: insertion identity lives outside instances so legacy whole-row
+	// writers cannot accidentally copy or replace it. A fresh nonce is created
+	// only when a parent is genuinely absent.
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS instance_incarnation (
+			instance_id TEXT PRIMARY KEY,
+			incarnation TEXT NOT NULL CHECK (incarnation <> ''),
+			origin_incarnation TEXT NOT NULL DEFAULT ''
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create instance incarnation: %w", err)
+	}
+	// Keep insertion identity correct even for legacy writers that use
+	// INSERT OR REPLACE and know nothing about the side table. UPDATE and
+	// ON CONFLICT DO UPDATE do not fire this trigger; every actual INSERT does.
+	// Controlled new-parent writers restore their pre-minted token after this
+	// fallback fires, while unknown legacy INSERT OR REPLACE writers still
+	// rotate authority.
+	if _, err := tx.Exec(`
+		CREATE TRIGGER IF NOT EXISTS instances_assign_incarnation
+		AFTER INSERT ON instances
+		BEGIN
+			INSERT OR REPLACE INTO instance_incarnation (instance_id, incarnation)
+			VALUES (NEW.id, lower(hex(randomblob(16))));
+		END
+	`); err != nil {
+		return fmt.Errorf("statedb: create instance incarnation trigger: %w", err)
+	}
+	// Legacy DELETE statements do not know about the side table. Remove their
+	// token automatically so an update-only writer cannot use an orphan token
+	// to reinsert the deleted parent.
+	if _, err := tx.Exec(`
+		CREATE TRIGGER IF NOT EXISTS instances_remove_incarnation
+		AFTER DELETE ON instances
+		BEGIN
+			DELETE FROM instance_incarnation WHERE instance_id = OLD.id;
+		END
+	`); err != nil {
+		return fmt.Errorf("statedb: create instance incarnation cleanup trigger: %w", err)
+	}
+
 	// groups table.
 	// max_concurrent (v1.9.1): caps simultaneous running sessions in the
 	// group. DEFAULT 0 preserves backward compat (legacy unlimited) for any
@@ -472,10 +600,12 @@ func (s *StateDB) Migrate() error {
 	// instance heartbeats
 	if _, err := tx.Exec(`
 		CREATE TABLE IF NOT EXISTS instance_heartbeats (
-			pid        INTEGER PRIMARY KEY,
-			started    INTEGER NOT NULL,
-			heartbeat  INTEGER NOT NULL,
-			is_primary INTEGER NOT NULL DEFAULT 0
+			pid                        INTEGER PRIMARY KEY,
+			started                    INTEGER NOT NULL,
+			heartbeat                  INTEGER NOT NULL,
+			is_primary                 INTEGER NOT NULL DEFAULT 0,
+			writer_schema_version      INTEGER NOT NULL DEFAULT 0,
+			writer_process_start_token TEXT NOT NULL DEFAULT ''
 		)
 	`); err != nil {
 		return fmt.Errorf("statedb: create heartbeats: %w", err)
@@ -629,6 +759,14 @@ func (s *StateDB) Migrate() error {
 		// deliberate-idle (never a self-heal candidate). Additive + targeted-write
 		// only (WriteLastSentAt); never part of a whole-row REPLACE/SaveInstances.
 		"ALTER TABLE instances ADD COLUMN last_sent_at INTEGER NOT NULL DEFAULT 0",
+		// v15: old writers omit this column and therefore register as epoch 0.
+		"ALTER TABLE instance_heartbeats ADD COLUMN writer_schema_version INTEGER NOT NULL DEFAULT 0",
+		// v16: an idempotent profile transfer gets a fresh destination identity
+		// while retaining the source identity only as lineage, never as authority.
+		"ALTER TABLE instance_incarnation ADD COLUMN origin_incarnation TEXT NOT NULL DEFAULT ''",
+		// v17: distinguish a live legacy writer from an unrelated process that
+		// reused its numeric PID. Old writers omit the token and remain fail-closed.
+		"ALTER TABLE instance_heartbeats ADD COLUMN writer_process_start_token TEXT NOT NULL DEFAULT ''",
 	}
 	for _, stmt := range alterMigrations {
 		if _, err := tx.Exec(stmt); err != nil {
@@ -637,6 +775,31 @@ func (s *StateDB) Migrate() error {
 				return fmt.Errorf("statedb: alter migration: %w", err)
 			}
 		}
+	}
+
+	// Refuse the v14 runtime migration while any fresh, live writer from a
+	// different schema epoch is registered. The v15 heartbeat column is added
+	// first so pre-v15 rows remain visible as epoch 0 rather than disappearing.
+	if err := s.requireRuntimeWriterCompatibility(tx, time.Now()); err != nil {
+		return err
+	}
+
+	// v14: isolate physical-runtime identity and tool bindings from the
+	// legacy instances row so a stale INSERT/REPLACE writer cannot own them.
+	// The helper is additive and idempotent; running it on every migration also
+	// repairs a database whose previous process stopped after table creation.
+	if err := migrateRuntimeState(tx); err != nil {
+		return err
+	}
+
+	// Give every legacy parent one durable insertion identity. randomblob is
+	// evaluated once per selected row and INSERT OR IGNORE preserves any nonce
+	// already assigned by a prior, partially completed migration.
+	if _, err := tx.Exec(`
+		INSERT OR IGNORE INTO instance_incarnation (instance_id, incarnation)
+		SELECT id, lower(hex(randomblob(16))) FROM instances
+	`); err != nil {
+		return fmt.Errorf("statedb: backfill instance incarnations: %w", err)
 	}
 
 	// Set schema version only when missing or changed.
@@ -654,7 +817,13 @@ func (s *StateDB) Migrate() error {
 	case err != nil:
 		return fmt.Errorf("statedb: read schema version: %w", err)
 	case existingVersion != schemaVersion:
-		oldVer, _ := strconv.Atoi(existingVersion)
+		oldVer, parseErr := strconv.Atoi(existingVersion)
+		if parseErr != nil {
+			return fmt.Errorf("statedb: invalid schema version %q: %w", existingVersion, parseErr)
+		}
+		if oldVer > SchemaVersion {
+			return fmt.Errorf("%w: database=%d binary=%d", ErrFutureSchema, oldVer, SchemaVersion)
+		}
 		if oldVer < 4 {
 			if _, err := tx.Exec(`ALTER TABLE instances ADD COLUMN is_conductor INTEGER NOT NULL DEFAULT 0`); err != nil {
 				if !strings.Contains(err.Error(), "duplicate column") {
@@ -725,6 +894,7 @@ func (s *StateDB) Migrate() error {
 				}
 			}
 		}
+		// v14 uses new tables, created and backfilled above. No ALTER is needed.
 		if _, err := tx.Exec(`
 			UPDATE metadata SET value = ? WHERE key = 'schema_version'
 		`, schemaVersion); err != nil {
@@ -754,62 +924,12 @@ func archivedAtUnix(t time.Time) int64 {
 	return t.UTC().Unix()
 }
 
-// SaveInstance inserts or replaces a single instance.
+// SaveInstance inserts one instance or updates only metadata on an existing
+// instance. Runtime identity is owned by instance_runtime_state.
 func (s *StateDB) SaveInstance(inst *InstanceRow) error {
-	toolData := inst.ToolData
-	if len(toolData) == 0 {
-		toolData = json.RawMessage("{}")
-	}
-
-	// Preserve any tool_data keys not modeled by the typed schema (e.g.,
-	// manually-set clear_on_compact). Without this merge, every
-	// INSERT OR REPLACE silently drops user-managed extras.
-	var existingToolData []byte
-	existingAutoName := existingAutoNameFields{}
-	if err := s.db.QueryRow("SELECT tool_data FROM instances WHERE id = ?", inst.ID).Scan(&existingToolData); err == nil {
-		toolData = MergeToolDataExtras(json.RawMessage(existingToolData), toolData)
-	}
-	var existingAutoNameInt int
-	if err := s.db.QueryRow("SELECT auto_name, auto_name_description FROM instances WHERE id = ?", inst.ID).Scan(&existingAutoNameInt, &existingAutoName.description); err == nil {
-		existingAutoName.found = true
-		existingAutoName.autoName = existingAutoNameInt != 0
-	}
-
-	isConductorInt := 0
-	if inst.IsConductor {
-		isConductorInt = 1
-	}
-	noTransitionNotifyInt := 0
-	if inst.NoTransitionNotify {
-		noTransitionNotifyInt = 1
-	}
-	titleLockedInt := 0
-	if inst.TitleLocked {
-		titleLockedInt = 1
-	}
-	autoName, autoNameDescription := mergeAutoNameFields(inst, existingAutoName)
-	autoNameInt := 0
-	if autoName {
-		autoNameInt = 1
-	}
-	_, err := s.db.Exec(`
-		INSERT OR REPLACE INTO instances (
-			id, title, project_path, group_path, sort_order,
-			command, wrapper, tool, status, tmux_session, tmux_socket_name,
-			created_at, last_accessed,
-			parent_session_id, is_conductor, no_transition_notify,
-			worktree_path, worktree_repo, worktree_branch, account,
-			archived_at, tool_data, title_locked, auto_name, auto_name_description, pin
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
-		inst.ID, inst.Title, inst.ProjectPath, inst.GroupPath, inst.Order,
-		inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
-		inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
-		inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
-		inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch, inst.Account,
-		archivedAtUnix(inst.ArchivedAt), string(toolData), titleLockedInt, autoNameInt, autoNameDescription, inst.Pin,
-	)
-	return err
+	return withBusyRetry(func() error {
+		return s.saveInstancesOnce([]*InstanceRow{inst}, false, true)
+	})
 }
 
 // SaveInstances inserts or replaces multiple instances in a single transaction.
@@ -826,7 +946,7 @@ func (s *StateDB) SaveInstance(inst *InstanceRow) error {
 // outer transaction on SQLITE_BUSY is safe. Part of the v1.9.1 #909 fix.
 func (s *StateDB) SaveInstances(insts []*InstanceRow) error {
 	return withBusyRetry(func() error {
-		return s.saveInstancesOnce(insts, true)
+		return s.saveInstancesOnce(insts, true, true)
 	})
 }
 
@@ -838,63 +958,30 @@ func (s *StateDB) SaveInstances(insts []*InstanceRow) error {
 // ClearAllInstances for an intentional full wipe. An empty payload is a no-op.
 func (s *StateDB) UpsertInstances(insts []*InstanceRow) error {
 	return withBusyRetry(func() error {
-		return s.saveInstancesOnce(insts, false)
+		return s.saveInstancesOnce(insts, false, true)
+	})
+}
+
+// UpdateInstances updates metadata for parents that still exist. It never
+// inserts a missing parent, runtime, or binding, so a stale routine-save
+// snapshot cannot resurrect a concurrently deleted session.
+func (s *StateDB) UpdateInstances(insts []*InstanceRow) error {
+	return withBusyRetry(func() error {
+		return s.saveInstancesOnce(insts, false, false)
 	})
 }
 
 // saveInstancesOnce persists insts. When sweep is true, rows present in the
 // database but absent from insts are deleted (see SaveInstances); when false,
-// they are left untouched (see UpsertInstances).
-func (s *StateDB) saveInstancesOnce(insts []*InstanceRow, sweep bool) error {
-	// Upsert path with nothing to upsert: no-op without taking the write lock.
+// they are left untouched (see UpsertInstances and UpdateInstances).
+func (s *StateDB) saveInstancesOnce(insts []*InstanceRow, sweep, insertMissing bool) error {
+	// Non-sweeping path with nothing to persist: no-op without a write lock.
 	if !sweep && len(insts) == 0 {
 		return nil
 	}
 
-	// Pre-fetch existing mutable columns per instance ID so we can preserve state
-	// written by targeted UPDATE paths. Without this merge, every INSERT OR
-	// REPLACE can silently drop fresher data from another process.
-	//
-	// IMPORTANT: this read runs OUTSIDE the write transaction below.
-	// In SQLite WAL mode, beginning a transaction with a read and then
-	// trying to upgrade to a write fails with SQLITE_BUSY (rather than
-	// waiting on busy_timeout) when another connection is currently
-	// writing. Pre-reading on the raw DB handle avoids the upgrade path.
-	// There is a tiny race window where a concurrent writer could modify
-	// extras between this read and our commit; we accept it because
-	// extras keys are rarely-mutated user-managed flags and the worst-case
-	// outcome is one stale-overlay save, recoverable on next save.
 	existingToolData := make(map[string]json.RawMessage, len(insts))
 	existingAutoNames := make(map[string]existingAutoNameFields, len(insts))
-	if len(insts) > 0 {
-		placeholders := make([]string, len(insts))
-		args := make([]any, len(insts))
-		for i, inst := range insts {
-			placeholders[i] = "?"
-			args[i] = inst.ID
-		}
-		// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
-		// from len(insts); all values flow through args[], never the SQL string.
-		query := "SELECT id, tool_data, auto_name, auto_name_description FROM instances WHERE id IN (" + strings.Join(placeholders, ",") + ")"
-		rows, queryErr := s.db.Query(query, args...)
-		if queryErr == nil {
-			for rows.Next() {
-				var id string
-				var td []byte
-				var autoNameInt int
-				var autoNameDescription string
-				if scanErr := rows.Scan(&id, &td, &autoNameInt, &autoNameDescription); scanErr == nil {
-					existingToolData[id] = json.RawMessage(td)
-					existingAutoNames[id] = existingAutoNameFields{
-						found:       true,
-						autoName:    autoNameInt != 0,
-						description: autoNameDescription,
-					}
-				}
-			}
-			_ = rows.Close()
-		}
-	}
 
 	// S2 data-loss safeguard (2026-06-04 incident): for a NON-empty payload,
 	// the sweep below DELETEs every on-disk row whose id is absent from the new
@@ -925,12 +1012,93 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow, sweep bool) error {
 			}
 		}
 	}
+	if s.testBeforeInstanceWriteTransaction != nil {
+		s.testBeforeInstanceWriteTransaction()
+	}
 
-	tx, err := s.db.Begin()
+	ctx, cancel := context.WithTimeout(context.Background(), immediateTransactionTimeout)
+	defer cancel()
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	tx := &immediateTransaction{ctx: ctx, conn: conn}
+	defer tx.rollback()
+
+	// Preserve columns owned by targeted writers from the same snapshot as the
+	// metadata update. BEGIN IMMEDIATE reserves SQLite's writer slot first, so a
+	// targeted write either commits before this read and is merged, or waits and
+	// wins after this transaction commits.
+	if len(insts) > 0 {
+		placeholders := make([]string, len(insts))
+		args := make([]any, len(insts))
+		for i, inst := range insts {
+			placeholders[i] = "?"
+			args[i] = inst.ID
+		}
+		// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
+		// from len(insts); all values flow through args[], never the SQL string.
+		query := "SELECT id, tool_data, auto_name, auto_name_description FROM instances WHERE id IN (" + strings.Join(placeholders, ",") + ")"
+		rows, err := tx.Query(query, args...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var id string
+			var td []byte
+			var autoNameInt int
+			var autoNameDescription string
+			if err := rows.Scan(&id, &td, &autoNameInt, &autoNameDescription); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			existingToolData[id] = json.RawMessage(td)
+			existingAutoNames[id] = existingAutoNameFields{
+				found:       true,
+				autoName:    autoNameInt != 0,
+				description: autoNameDescription,
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+	}
+
+	missingAtBegin := make(map[string]bool, len(insts))
+	if insertMissing {
+		for _, inst := range insts {
+			var exists int
+			if err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM instances WHERE id = ?)`, inst.ID).Scan(&exists); err != nil {
+				return err
+			}
+			missingAtBegin[inst.ID] = exists == 0
+			if exists != 0 {
+				continue
+			}
+
+			// A pre-parent runtime reserves this logical ID by persisting its
+			// pre-minted incarnation first. Generic save paths may create the
+			// parent only when they carry that exact token; accepting a blank or
+			// different token would let an unrelated creator adopt the runtime.
+			var reservedIncarnation string
+			err := tx.QueryRow(`SELECT incarnation FROM instance_incarnation WHERE instance_id = ?`, inst.ID).
+				Scan(&reservedIncarnation)
+			switch {
+			case err == nil && (inst.Incarnation == "" || inst.Incarnation != reservedIncarnation):
+				return ErrInstanceParentConflict
+			case err != nil && !errors.Is(err, sql.ErrNoRows):
+				return err
+			}
+		}
+	}
 
 	// Delete rows not in the new list (sweep callers only, see SaveInstances).
 	// The upsert path (#1550) never deletes: rows it doesn't know about are
@@ -961,34 +1129,77 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow, sweep bool) error {
 		}
 		// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
 		// from len(insts); all values flow through args[], never the SQL string.
+		suffix := " WHERE instance_id NOT IN (" + strings.Join(placeholders, ",") + ")"
+		if _, err := tx.Exec("DELETE FROM instance_runtime_binding"+suffix, args...); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM instance_runtime_state"+suffix, args...); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM instance_incarnation"+suffix, args...); err != nil {
+			return err
+		}
 		query := "DELETE FROM instances WHERE id NOT IN (" + strings.Join(placeholders, ",") + ")"
 		if _, err := tx.Exec(query, args...); err != nil {
 			return err
 		}
 	}
 
+	valueClause := `VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	if !insertMissing {
+		valueClause = `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			WHERE EXISTS (
+				SELECT 1 FROM instances current
+				JOIN instance_incarnation token ON token.instance_id = current.id
+				WHERE current.id = ? AND token.incarnation = ?
+			)`
+	}
 	stmt, err := tx.Prepare(`
-		INSERT OR REPLACE INTO instances (
+		INSERT INTO instances (
 			id, title, project_path, group_path, sort_order,
 			command, wrapper, tool, status, tmux_session, tmux_socket_name,
 			created_at, last_accessed,
 			parent_session_id, is_conductor, no_transition_notify,
 			worktree_path, worktree_repo, worktree_branch, account,
 			archived_at, tool_data, title_locked, auto_name, auto_name_description, pin
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) ` + valueClause + `
+		ON CONFLICT(id) DO UPDATE SET
+			title = excluded.title,
+			project_path = excluded.project_path,
+			group_path = excluded.group_path,
+			sort_order = excluded.sort_order,
+			command = excluded.command,
+			wrapper = excluded.wrapper,
+			tool = excluded.tool,
+			created_at = excluded.created_at,
+			last_accessed = excluded.last_accessed,
+			parent_session_id = excluded.parent_session_id,
+			is_conductor = excluded.is_conductor,
+			no_transition_notify = excluded.no_transition_notify,
+			worktree_path = excluded.worktree_path,
+			worktree_repo = excluded.worktree_repo,
+			worktree_branch = excluded.worktree_branch,
+			account = excluded.account,
+			archived_at = excluded.archived_at,
+			tool_data = excluded.tool_data,
+			title_locked = excluded.title_locked,
+			auto_name = excluded.auto_name,
+			auto_name_description = excluded.auto_name_description,
+			pin = excluded.pin
 	`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
+	updatedIDs := make([]string, 0, len(insts))
 	for _, inst := range insts {
 		toolData := inst.ToolData
 		if len(toolData) == 0 {
 			toolData = json.RawMessage("{}")
 		}
 		if existing, ok := existingToolData[inst.ID]; ok {
-			toolData = MergeToolDataExtras(existing, toolData)
+			toolData = mergeMetadataToolData(existing, toolData)
 		}
 		isConductorInt := 0
 		if inst.IsConductor {
@@ -1007,19 +1218,147 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow, sweep bool) error {
 		if autoName {
 			autoNameInt = 1
 		}
-		if _, err := stmt.Exec(
+		args := []any{
 			inst.ID, inst.Title, inst.ProjectPath, inst.GroupPath, inst.Order,
 			inst.Command, inst.Wrapper, inst.Tool, inst.Status, inst.TmuxSession, inst.TmuxSocketName,
 			inst.CreatedAt.Unix(), inst.LastAccessed.Unix(),
 			inst.ParentSessionID, isConductorInt, noTransitionNotifyInt,
 			inst.WorktreePath, inst.WorktreeRepo, inst.WorktreeBranch, inst.Account,
 			archivedAtUnix(inst.ArchivedAt), string(toolData), titleLockedInt, autoNameInt, autoNameDescription, inst.Pin,
-		); err != nil {
+		}
+		if !insertMissing {
+			args = append(args, inst.ID, inst.Incarnation)
+		}
+		result, err := stmt.Exec(args...)
+		if err != nil {
 			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			continue
+		}
+		if insertMissing {
+			if missingAtBegin[inst.ID] && inst.Incarnation != "" {
+				if _, err := tx.Exec(`UPDATE instance_incarnation SET incarnation = ? WHERE instance_id = ?`,
+					inst.Incarnation, inst.ID); err != nil {
+					return fmt.Errorf("preserve instance incarnation for %s: %w", inst.ID, err)
+				}
+			}
+			if _, err := tx.Exec(`
+				INSERT OR IGNORE INTO instance_incarnation (instance_id, incarnation)
+				SELECT id, lower(hex(randomblob(16))) FROM instances WHERE id = ?
+			`, inst.ID); err != nil {
+				return fmt.Errorf("initialize instance incarnation for %s: %w", inst.ID, err)
+			}
+			if err := tx.QueryRow(`SELECT incarnation FROM instance_incarnation WHERE instance_id = ?`, inst.ID).Scan(&inst.Incarnation); err != nil {
+				return fmt.Errorf("load instance incarnation for %s: %w", inst.ID, err)
+			}
+			if _, err := insertInitialRuntimeTx(tx, inst); err != nil {
+				return fmt.Errorf("initialize runtime state for %s: %w", inst.ID, err)
+			}
+		} else {
+			updatedIDs = append(updatedIDs, inst.ID)
+			continue
+		}
+		if err := projectRuntimeToolDataTx(tx, inst.ID); err != nil {
+			return fmt.Errorf("project runtime tool data for %s: %w", inst.ID, err)
+		}
+	}
+	if !insertMissing {
+		if err := projectRuntimeToolDataBatchTx(tx, updatedIDs); err != nil {
+			return fmt.Errorf("project runtime tool data batch: %w", err)
 		}
 	}
 
 	return tx.Commit()
+}
+
+// projectRuntimeToolDataBatchTx restores the legacy instances projection for
+// a routine metadata batch from the authoritative runtime tables. The caller
+// supplies only IDs whose incarnation-guarded metadata UPDATE took effect, so
+// a stale delete/reinsert snapshot cannot write even compatibility fields on
+// the replacement parent.
+//
+// The former routine path queried runtime existence and rebuilt the projection
+// separately for every row. This set-based UPDATE projects the whole guarded
+// batch directly from the current runtime and binding tables.
+func projectRuntimeToolDataBatchTx(tx runtimeQueryExecutor, instanceIDs []string) error {
+	if len(instanceIDs) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, len(instanceIDs))
+	args := make([]any, 0, len(instanceIDs)+1)
+	args = append(args, runtimeDestructionStatus)
+	for i, id := range instanceIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	// #nosec G202 -- placeholders is a fixed sequence of "?" tokens generated
+	// from len(instanceIDs); all IDs flow through args, never the SQL string.
+	_, err := tx.Exec(`
+		UPDATE instances AS i
+		SET status = CASE WHEN r.status = ? THEN (
+		      SELECT reservation.prior_status
+		      FROM instance_runtime_destruction reservation
+		      JOIN instance_incarnation token
+		        ON token.instance_id = reservation.instance_id
+		       AND token.incarnation = reservation.incarnation
+		      WHERE reservation.instance_id = r.instance_id
+		        AND reservation.runtime_generation = r.runtime_generation
+		        AND reservation.claimed_status_revision = r.status_revision
+		    ) ELSE r.status END,
+		    tmux_session = r.tmux_session,
+		    tmux_socket_name = r.tmux_socket_name,
+		    tool_data = json_patch(
+		      json_remove(
+		        CASE WHEN json_valid(i.tool_data) THEN i.tool_data ELSE '{}' END,
+		        '$.last_started_at',
+		        '$.claude_session_id', '$.claude_detected_at',
+		        '$.copilot_session_id', '$.copilot_detected_at',
+		        '$.codex_session_id', '$.codex_detected_at',
+		        '$.gemini_session_id', '$.gemini_detected_at',
+		        '$.opencode_session_id', '$.opencode_detected_at'
+		      ),
+		      COALESCE((
+		        SELECT json_group_object(entry.key, json(entry.value))
+		        FROM (
+		          SELECT 'last_started_at' AS key,
+		                 CAST(r.last_started_at / 1000000000 AS TEXT) AS value
+		          WHERE r.last_started_at > 0
+		          UNION ALL
+		          SELECT CASE b.binding_kind
+		                   WHEN 'claude' THEN 'claude_session_id'
+		                   WHEN 'copilot' THEN 'copilot_session_id'
+		                   WHEN 'codex' THEN 'codex_session_id'
+		                   WHEN 'gemini' THEN 'gemini_session_id'
+		                   WHEN 'opencode' THEN 'opencode_session_id'
+		                 END,
+		                 json_quote(b.binding_value)
+		          FROM instance_runtime_binding b
+		          WHERE b.instance_id = r.instance_id
+		            AND b.runtime_generation = r.runtime_generation
+		            AND b.binding_value <> ''
+		            AND b.binding_kind IN ('claude', 'copilot', 'codex', 'gemini', 'opencode')
+		          UNION ALL
+		          SELECT b.binding_kind || '_detected_at',
+		                 CAST(b.binding_detected_at / 1000000000 AS TEXT)
+		          FROM instance_runtime_binding b
+		          WHERE b.instance_id = r.instance_id
+		            AND b.runtime_generation = r.runtime_generation
+		            AND b.binding_value <> ''
+		            AND b.binding_detected_at > 0
+		            AND b.binding_kind IN ('claude', 'copilot', 'codex', 'gemini', 'opencode')
+		        ) AS entry
+		      ), '{}')
+		    )
+		FROM instance_runtime_state r
+		WHERE r.instance_id = i.id
+		  AND i.id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	return err
 }
 
 // ClearAllInstances is the explicit escape hatch for intentionally emptying the
@@ -1029,8 +1368,27 @@ func (s *StateDB) saveInstancesOnce(insts []*InstanceRow, sweep bool) error {
 // greppable. It is a no-op on an already-empty table.
 func (s *StateDB) ClearAllInstances() error {
 	return withBusyRetry(func() error {
-		_, err := s.db.Exec("DELETE FROM instances")
-		return err
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := s.requireRuntimeWriterCompatibility(tx, time.Now()); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM instance_runtime_binding"); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM instance_runtime_state"); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM instance_incarnation"); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM instances"); err != nil {
+			return err
+		}
+		return tx.Commit()
 	})
 }
 
@@ -1041,14 +1399,31 @@ func (s *StateDB) LoadInstances() ([]*InstanceRow, error) {
 
 func loadInstances(query func(string, ...any) (*sql.Rows, error)) ([]*InstanceRow, error) {
 	rows, err := query(`
-		SELECT id, title, project_path, group_path, sort_order,
-			command, wrapper, tool, status, tmux_session, tmux_socket_name,
-			created_at, last_accessed,
-			parent_session_id, is_conductor, no_transition_notify,
-			worktree_path, worktree_repo, worktree_branch, account,
-			archived_at, tool_data, title_locked, auto_name, auto_name_description, pin
-		FROM instances ORDER BY sort_order
-	`)
+		SELECT i.id, i.title, i.project_path, i.group_path, i.sort_order,
+			i.command, i.wrapper, i.tool,
+			CASE WHEN r.status = ? THEN (
+			  SELECT reservation.prior_status
+			  FROM instance_runtime_destruction reservation
+			  JOIN instance_incarnation token
+			    ON token.instance_id = reservation.instance_id
+			   AND token.incarnation = reservation.incarnation
+			  WHERE reservation.instance_id = r.instance_id
+			    AND reservation.runtime_generation = r.runtime_generation
+			    AND reservation.claimed_status_revision = r.status_revision
+			) ELSE COALESCE(r.status, i.status) END,
+			COALESCE(r.tmux_session, i.tmux_session),
+			COALESCE(r.tmux_socket_name, i.tmux_socket_name),
+			i.created_at, i.last_accessed,
+			i.parent_session_id, i.is_conductor, i.no_transition_notify,
+			i.worktree_path, i.worktree_repo, i.worktree_branch, i.account,
+			i.archived_at, i.tool_data, i.title_locked, i.auto_name, i.auto_name_description, i.pin,
+			COALESCE(r.runtime_generation, 0), COALESCE(r.status_revision, 0),
+			COALESCE(r.last_started_at, 0), COALESCE(c.incarnation, '')
+		FROM instances i
+		LEFT JOIN instance_runtime_state r ON r.instance_id = i.id
+		LEFT JOIN instance_incarnation c ON c.instance_id = i.id
+		ORDER BY i.sort_order
+	`, runtimeDestructionStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -1057,7 +1432,8 @@ func loadInstances(query func(string, ...any) (*sql.Rows, error)) ([]*InstanceRo
 	var result []*InstanceRow
 	for rows.Next() {
 		r := &InstanceRow{}
-		var createdUnix, accessedUnix, archivedUnix int64
+		var createdUnix, accessedUnix, archivedUnix, lastStartedUnix int64
+		var generation, statusRevision uint64
 		var toolDataStr string
 		var isConductorInt, noTransitionNotifyInt, titleLockedInt, autoNameInt int
 		if err := rows.Scan(
@@ -1067,8 +1443,14 @@ func loadInstances(query func(string, ...any) (*sql.Rows, error)) ([]*InstanceRo
 			&r.ParentSessionID, &isConductorInt, &noTransitionNotifyInt,
 			&r.WorktreePath, &r.WorktreeRepo, &r.WorktreeBranch, &r.Account,
 			&archivedUnix, &toolDataStr, &titleLockedInt, &autoNameInt, &r.AutoNameDescription, &r.Pin,
+			&generation, &statusRevision, &lastStartedUnix, &r.Incarnation,
 		); err != nil {
 			return nil, err
+		}
+		r.RuntimeGeneration = generation
+		r.StatusRevision = statusRevision
+		if lastStartedUnix > 0 {
+			r.LastStartedAt = runtimeTime(lastStartedUnix)
 		}
 		r.CreatedAt = time.Unix(createdUnix, 0)
 		if accessedUnix > 0 {
@@ -1084,7 +1466,56 @@ func loadInstances(query func(string, ...any) (*sql.Rows, error)) ([]*InstanceRo
 		r.ToolData = json.RawMessage(toolDataStr)
 		result = append(result, r)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	bindingsByInstance := make(map[string]map[string]RuntimeBinding)
+	bindingRows, err := query(`
+		SELECT instance_id, binding_kind, runtime_generation, binding_revision, binding_value, binding_detected_at
+		FROM instance_runtime_binding`)
+	if err != nil {
+		return nil, err
+	}
+	defer bindingRows.Close()
+	for bindingRows.Next() {
+		var binding RuntimeBinding
+		var generation, revision uint64
+		var detectedAt int64
+		if err := bindingRows.Scan(&binding.InstanceID, &binding.Kind, &generation, &revision, &binding.Value, &detectedAt); err != nil {
+			return nil, err
+		}
+		binding.Generation = generation
+		binding.Revision = revision
+		if detectedAt > 0 {
+			binding.DetectedAt = runtimeTime(detectedAt)
+		}
+		if bindingsByInstance[binding.InstanceID] == nil {
+			bindingsByInstance[binding.InstanceID] = make(map[string]RuntimeBinding)
+		}
+		bindingsByInstance[binding.InstanceID][binding.Kind] = binding
+	}
+	if err := bindingRows.Err(); err != nil {
+		return nil, err
+	}
+	if err := bindingRows.Close(); err != nil {
+		return nil, err
+	}
+	for _, row := range result {
+		current := make(map[string]RuntimeBinding)
+		for kind, binding := range bindingsByInstance[row.ID] {
+			if binding.Generation != row.RuntimeGeneration {
+				continue
+			}
+			current[kind] = binding
+		}
+		row.RuntimeBindings = current
+		row.ToolData = overlayBindings(row.ToolData, current)
+	}
+	return result, nil
 }
 
 // DeleteInstance removes an instance by ID.
@@ -1095,8 +1526,24 @@ func loadInstances(query func(string, ...any) (*sql.Rows, error)) ([]*InstanceRo
 // still reports success — the silent-loss half of issue #909.
 func (s *StateDB) DeleteInstance(id string) error {
 	return withBusyRetry(func() error {
-		_, err := s.db.Exec("DELETE FROM instances WHERE id = ?", id)
-		return err
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.Exec("DELETE FROM instance_runtime_binding WHERE instance_id = ?", id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM instance_runtime_state WHERE instance_id = ?", id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM instance_incarnation WHERE instance_id = ?", id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("DELETE FROM instances WHERE id = ?", id); err != nil {
+			return err
+		}
+		return tx.Commit()
 	})
 }
 
@@ -1254,22 +1701,67 @@ func (s *StateDB) DeleteGroupSubtree(path string) error {
 
 // --- Status + Acknowledgment ---
 
-// WriteStatus updates the status and tool for an instance.
+// WriteStatus is the compatibility/command path for updating an instance's
+// status and tool when there is no prior observation to version. Production
+// observation writers use WriteStatusIfVersion with the generation and status
+// revision they observed.
 //
-// Wrapped in withBusyRetry: the transition daemon (#755 family) calls this
-// under contention with other writers (heartbeat, status poller, hook
-// handler). Without retry, transient SQLITE_BUSY drops the user-visible
-// status update and the TUI shows stale state.
+// The authoritative runtime status, its revision, and the legacy projection
+// commit in one writer-fenced transaction. A destruction sentinel is never
+// overwritten by this unversioned compatibility path.
 func (s *StateDB) WriteStatus(id, status, tool string) error {
+	if err := rejectRuntimeDestructionStatus(status); err != nil {
+		return err
+	}
 	return withBusyRetry(func() error {
-		_, err := s.db.Exec(
+		ctx := context.Background()
+		conn, err := s.db.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		// Take the writer reservation before reading the epoch registry. A
+		// deferred transaction can otherwise lose its read snapshot while a
+		// concurrent writer commits and fail its write upgrade with BUSY_SNAPSHOT.
+		if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+			return err
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_, _ = conn.ExecContext(ctx, "ROLLBACK")
+			}
+		}()
+		if err := s.requireRuntimeWriterCompatibility(conn, time.Now()); err != nil {
+			return err
+		}
+		result, err := conn.ExecContext(ctx, `
+			UPDATE instance_runtime_state
+			SET status = ?, status_revision = status_revision + 1
+			WHERE instance_id = ? AND status <> ?`,
+			status, id, runtimeDestructionStatus)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return ErrStatusRevisionConflict
+		}
+		if _, err := conn.ExecContext(ctx,
 			`UPDATE instances
 			 SET status = ?, tool = ?,
 			     acknowledged = CASE WHEN ? = 'running' THEN 0 ELSE acknowledged END
-			 WHERE id = ?`,
-			status, tool, status, id,
-		)
-		return err
+			 WHERE id = ?`, status, tool, status, id); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return err
+		}
+		committed = true
+		return nil
 	})
 }
 
@@ -1328,8 +1820,12 @@ func (s *StateDB) ReadLastSentAt(id string) (int64, error) {
 // No other column is touched, so a concurrent writer's edits to any other
 // field of the same row are preserved.
 type InstanceStatusUpdate struct {
-	ID     string
-	Status string
+	ID             string
+	Incarnation    string
+	Status         string
+	Generation     uint64
+	StatusRevision uint64
+	Versioned      bool
 }
 
 // PersistInstanceStatusesTx applies a batch of targeted status updates inside a
@@ -1356,8 +1852,9 @@ type InstanceStatusUpdate struct {
 // There is NO DELETE sweep here — a row absent from `updates` is left entirely
 // untouched, so revive can never drop a session a concurrent `add` inserted
 // after revive loaded its snapshot (the lost-update race this fixes). Rows
-// whose id no longer exists (removed concurrently) simply match zero rows; the
-// UPDATE is a benign no-op, never a resurrection.
+// Every row also carries the persisted insertion incarnation. A missing parent
+// or same-ID replacement rejects the whole batch before any status mutation,
+// so a delayed revive cannot update a byte-identical logical successor.
 //
 // The acknowledged-reset mirrors WriteStatus: flipping a row to "running"
 // clears its acknowledged flag so the TUI re-surfaces the freshly-revived
@@ -1367,34 +1864,62 @@ func (s *StateDB) PersistInstanceStatusesTx(updates []InstanceStatusUpdate) erro
 	if len(updates) == 0 {
 		return nil
 	}
+	for _, update := range updates {
+		if err := rejectRuntimeDestructionStatus(update.Status); err != nil {
+			return err
+		}
+	}
 	return withBusyRetry(func() error {
-		tx, err := s.db.Begin()
-		if err != nil {
-			return err
-		}
-		defer func() { _ = tx.Rollback() }()
-
-		stmt, err := tx.Prepare(
-			`UPDATE instances
-			   SET status = ?,
-			       acknowledged = CASE WHEN ? = 'running' THEN 0 ELSE acknowledged END
-			 WHERE id = ?`,
-		)
-		if err != nil {
-			return err
-		}
-		defer stmt.Close()
-
-		for _, u := range updates {
-			if _, err := stmt.Exec(u.Status, u.Status, u.ID); err != nil {
+		return s.withImmediateTransaction(func(tx *immediateTransaction) error {
+			if err := s.requireRuntimeWriterCompatibility(tx, time.Now()); err != nil {
 				return err
 			}
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-		_ = s.Touch()
-		return nil
+			for _, u := range updates {
+				if err := requireInstanceIncarnation(tx, u.ID, u.Incarnation); err != nil {
+					return err
+				}
+			}
+
+			for _, u := range updates {
+				generation, revision := u.Generation, u.StatusRevision
+				if !u.Versioned {
+					var generationInt, revisionInt uint64
+					if err := tx.QueryRow(`SELECT runtime_generation, status_revision FROM instance_runtime_state WHERE instance_id = ?`, u.ID).
+						Scan(&generationInt, &revisionInt); err != nil {
+						if err == sql.ErrNoRows {
+							continue
+						}
+						return err
+					}
+					generation, revision = generationInt, revisionInt
+				}
+				result, err := tx.Exec(`UPDATE instance_runtime_state
+				SET status = ?, status_revision = status_revision + 1
+				WHERE instance_id = ? AND runtime_generation = ? AND status_revision = ?
+				  AND status <> ?`,
+					u.Status, u.ID, generation, revision, runtimeDestructionStatus)
+				if err != nil {
+					return err
+				}
+				rows, err := result.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if rows == 0 {
+					return ErrStatusRevisionConflict
+				}
+				if _, err := tx.Exec(`UPDATE instances
+				SET status = ?, acknowledged = CASE WHEN ? = 'running' THEN 0 ELSE acknowledged END
+				WHERE id = ?`, u.Status, u.Status, u.ID); err != nil {
+					return err
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			_ = s.Touch()
+			return nil
+		})
 	})
 }
 
@@ -1560,9 +2085,53 @@ func (s *StateDB) WriteLastAccessed(id string, at time.Time) error {
 	})
 }
 
+// WriteLastStartedAt persists the runtime generation stamped by a successful
+// Restart without rewriting the rest of the instance row. Direct restart
+// callers (web/TUI mutators) do not necessarily run SaveInstances afterward;
+// keeping this targeted prevents the transition daemon from reloading the old
+// generation and reattaching pre-restart tmux/status/backoff caches.
+func (s *StateDB) WriteLastStartedAt(id string, startedAt time.Time) error {
+	value := startedAt.Unix()
+	return withBusyRetry(func() error {
+		result, err := s.db.Exec(
+			`UPDATE instances
+			   SET tool_data = json_set(
+			         COALESCE(tool_data, '{}'),
+			         '$.last_started_at', ?)
+			 WHERE id = ?`,
+			value, id,
+		)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read last_started_at rows affected: %w", err)
+		}
+		if rows != 1 {
+			return fmt.Errorf("persist last_started_at for %s: updated %d rows, want 1", id, rows)
+		}
+		return nil
+	})
+}
+
 // ReadAllStatuses returns status + acknowledged flag for every instance.
 func (s *StateDB) ReadAllStatuses() (map[string]StatusRow, error) {
-	rows, err := s.db.Query("SELECT id, status, tool, acknowledged FROM instances")
+	rows, err := s.db.Query(`
+		SELECT i.id, CASE WHEN r.status = ? THEN (
+		         SELECT reservation.prior_status
+		         FROM instance_runtime_destruction reservation
+		         JOIN instance_incarnation token
+		           ON token.instance_id = reservation.instance_id
+		          AND token.incarnation = reservation.incarnation
+		         WHERE reservation.instance_id = r.instance_id
+		           AND reservation.runtime_generation = r.runtime_generation
+		           AND reservation.claimed_status_revision = r.status_revision
+		       ) ELSE COALESCE(r.status, i.status) END,
+		       i.tool, i.acknowledged,
+		       COALESCE(r.runtime_generation, 0), COALESCE(r.status_revision, 0)
+		FROM instances i
+		LEFT JOIN instance_runtime_state r ON r.instance_id = i.id`, runtimeDestructionStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -1573,10 +2142,13 @@ func (s *StateDB) ReadAllStatuses() (map[string]StatusRow, error) {
 		var id string
 		var sr StatusRow
 		var ack int
-		if err := rows.Scan(&id, &sr.Status, &sr.Tool, &ack); err != nil {
+		var generation, revision uint64
+		if err := rows.Scan(&id, &sr.Status, &sr.Tool, &ack, &generation, &revision); err != nil {
 			return nil, err
 		}
 		sr.Acknowledged = ack != 0
+		sr.Generation = generation
+		sr.StatusRevision = revision
 		result[id] = sr
 	}
 	return result, rows.Err()
@@ -1629,29 +2201,88 @@ func (s *StateDB) SetArchived(id string, at time.Time) error {
 	return s.touchWithRetry()
 }
 
+// SetArchivedIfIncarnation sets or clears the archive timestamp only while id
+// still names the exact logical parent selected by the caller. Unlike
+// SetArchivedIfRuntime, this guard intentionally ignores runtime generation:
+// unarchive is a metadata-only operation and must survive an unrelated status
+// observation while still rejecting a delete/reinsert ABA replacement.
+func (s *StateDB) SetArchivedIfIncarnation(id, expectedIncarnation string, at time.Time) error {
+	return withBusyRetry(func() error {
+		return s.withImmediateTransaction(func(tx *immediateTransaction) error {
+			if err := s.requireRuntimeWriterCompatibility(tx, time.Now()); err != nil {
+				return err
+			}
+			if err := requireInstanceIncarnation(tx, id, expectedIncarnation); err != nil {
+				return err
+			}
+			result, err := tx.Exec(`UPDATE instances SET archived_at = ? WHERE id = ?`, archivedAtUnix(at), id)
+			if err != nil {
+				return err
+			}
+			rows, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if rows != 1 {
+				return ErrInstanceParentConflict
+			}
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_modified', ?)`,
+				fmt.Sprintf("%d", time.Now().UnixNano())); err != nil {
+				return err
+			}
+			return tx.Commit()
+		})
+	})
+}
+
 // --- Heartbeat ---
 
 // RegisterInstance records this process as an active TUI instance.
 func (s *StateDB) RegisterInstance(isPrimary bool) error {
 	now := time.Now().Unix()
+	startToken, err := s.currentWriterProcessStartToken()
+	if err != nil {
+		return err
+	}
 	primary := 0
 	if isPrimary {
 		primary = 1
 	}
-	_, err := s.db.Exec(`
-		INSERT OR REPLACE INTO instance_heartbeats (pid, started, heartbeat, is_primary)
-		VALUES (?, ?, ?, ?)
-	`, s.pid, now, now, primary)
-	return err
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(`
+			INSERT INTO instance_heartbeats
+				(pid, started, heartbeat, is_primary, writer_schema_version, writer_process_start_token)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(pid) DO UPDATE SET
+				started = excluded.started,
+				heartbeat = excluded.heartbeat,
+				is_primary = excluded.is_primary,
+				writer_schema_version = excluded.writer_schema_version,
+				writer_process_start_token = excluded.writer_process_start_token
+		`, s.pid, now, now, primary, SchemaVersion, startToken)
+		return err
+	})
 }
 
 // Heartbeat updates the heartbeat timestamp for this process.
 func (s *StateDB) Heartbeat() error {
-	_, err := s.db.Exec(
-		"UPDATE instance_heartbeats SET heartbeat = ? WHERE pid = ?",
-		time.Now().Unix(), s.pid,
-	)
-	return err
+	startToken, err := s.currentWriterProcessStartToken()
+	if err != nil {
+		return err
+	}
+	return withBusyRetry(func() error {
+		now := time.Now().Unix()
+		_, err := s.db.Exec(`
+			INSERT INTO instance_heartbeats
+				(pid, started, heartbeat, is_primary, writer_schema_version, writer_process_start_token)
+			VALUES (?, ?, ?, 0, ?, ?)
+			ON CONFLICT(pid) DO UPDATE SET
+				heartbeat = excluded.heartbeat,
+				writer_schema_version = excluded.writer_schema_version,
+				writer_process_start_token = excluded.writer_process_start_token
+		`, s.pid, now, now, SchemaVersion, startToken)
+		return err
+	})
 }
 
 // UnregisterInstance removes this process from the heartbeat table.
@@ -1663,8 +2294,41 @@ func (s *StateDB) UnregisterInstance() error {
 // CleanDeadInstances removes heartbeat entries that haven't been updated within timeout.
 func (s *StateDB) CleanDeadInstances(timeout time.Duration) error {
 	cutoff := time.Now().Add(-timeout).Unix()
-	_, err := s.db.Exec("DELETE FROM instance_heartbeats WHERE heartbeat < ?", cutoff)
-	return err
+	return withBusyRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		rows, err := tx.Query("SELECT pid FROM instance_heartbeats WHERE heartbeat < ? ORDER BY pid", cutoff)
+		if err != nil {
+			return err
+		}
+		var dead []int
+		for rows.Next() {
+			var pid int
+			if err := rows.Scan(&pid); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if !pidAlive(pid) {
+				dead = append(dead, pid)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, pid := range dead {
+			if _, err := tx.Exec("DELETE FROM instance_heartbeats WHERE pid = ? AND heartbeat < ?", pid, cutoff); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	})
 }
 
 // AliveInstanceCount returns how many TUI instances have fresh heartbeats.

@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/fleet"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -43,19 +45,17 @@ func fleetPersistInstance(id, title string, st session.Status) *session.Instance
 // Persist is storage.PersistRecoveredInstances) and asserts a session added
 // mid-sweep survives.
 //
-// A regression that swaps the persist back to saveSessionData / SaveWithGroups /
-// SaveInstances is caught here, not only in a storage unit test.
-func TestFleetRecoverCLI_PersistDoesNotClobberConcurrentAdd(t *testing.T) {
-	// Own profile: saves are upsert-only, so rows written by other tests in the
-	// shared _test profile would otherwise leak into this snapshot.
+// A regression that swaps the persist back to the sweeping SaveInstances path
+// is caught here, not only in a storage unit test.
+func TestRuntimeLifecycle_FleetRecoverCLIPersistDoesNotClobberConcurrentAdd(t *testing.T) {
+	// Own profile: routine saves are update-only, so rows written by other tests
+	// in the shared _test profile would otherwise leak into this snapshot.
 	t.Setenv("AGENTDECK_PROFILE", "_test_fleet_recover_persist")
 	sweepStorage := newFleetCLIStorage(t)
 
 	down := fleetPersistInstance("fleet-down", "down", session.StatusError)
-	require.NoError(t, sweepStorage.SaveWithGroups(
-		[]*session.Instance{down},
-		session.NewGroupTree([]*session.Instance{down}),
-	))
+	require.NoError(t, sweepStorage.InsertSessionAndVerify(
+		down, session.NewGroupTree([]*session.Instance{down})))
 
 	// Step 1: the sweep loads its snapshot (one down session).
 	snapshot, _, err := sweepStorage.LoadWithGroups()
@@ -77,10 +77,26 @@ func TestFleetRecoverCLI_PersistDoesNotClobberConcurrentAdd(t *testing.T) {
 		Status:   string(session.StatusError),
 	}}}
 	rec := &fleet.Recoverer{
-		Restart: func(inst *session.Instance) error {
-			// Mirror what a real restart mutates: the session comes back running.
-			inst.Status = session.StatusRunning
-			return nil
+		RestartRuntime: func(inst *session.Instance) (statedb.RuntimeState, error) {
+			// Mirror the result-aware production restart seam: publish and return
+			// one exact next-generation runtime tuple.
+			current, found, readErr := sweepStorage.GetDB().ReadRuntimeState(inst.ID)
+			if readErr != nil {
+				return statedb.RuntimeState{}, readErr
+			}
+			if !found {
+				return statedb.RuntimeState{}, errors.New("runtime state not found")
+			}
+			next := current
+			next.Generation++
+			next.StatusRevision = 0
+			next.Status = string(session.StatusRunning)
+			next.LastStartedAt = time.Now().UTC()
+			if commitErr := sweepStorage.GetDB().CommitRuntimeTransition(
+				current.Generation, inst.PersistenceIncarnation(), next); commitErr != nil {
+				return statedb.RuntimeState{}, commitErr
+			}
+			return next, nil
 		},
 		Verify: func(*session.Instance) fleet.VerifyReport {
 			return fleet.VerifyReport{PaneAlive: true, ToolStarted: true, Status: string(session.StatusRunning)}
@@ -115,13 +131,15 @@ func TestFleetRecoverCLI_PersistDoesNotClobberConcurrentAdd(t *testing.T) {
 	require.Equal(t, session.StatusRunning, byID["fleet-added-concurrently"].Status)
 }
 
-// PersistRecoveredInstances must ignore nils and report per-row failures without
-// dropping the rows it can write.
+// PersistRecoveredInstances must ignore nils and validate the non-nil rows
+// without replaying their stale metadata.
 func TestPersistRecoveredInstances_ToleratesNilEntries(t *testing.T) {
 	t.Setenv("AGENTDECK_PROFILE", "_test_fleet_persist_nil")
 	storage := newFleetCLIStorage(t)
 
 	inst := fleetPersistInstance("fleet-nil-tolerant", "nil-tolerant", session.StatusRunning)
+	require.NoError(t, storage.InsertSessionAndVerify(inst, nil))
+	inst.Title = "stale-recovery-title"
 	require.NoError(t, storage.PersistRecoveredInstances([]*session.Instance{nil, inst, nil}))
 
 	after, _, err := newFleetCLIStorage(t).LoadWithGroups()
@@ -130,7 +148,83 @@ func TestPersistRecoveredInstances_ToleratesNilEntries(t *testing.T) {
 	for _, got := range after {
 		if got.ID == inst.ID {
 			found = true
+			require.Equal(t, "nil-tolerant", got.Title,
+				"runtime validation must not persist stale recovery metadata")
 		}
 	}
-	require.True(t, found, "the non-nil instance was not persisted")
+	require.True(t, found, "the existing non-nil instance was not updated")
+}
+
+func TestRuntimeLifecycle_PersistRecoveredInstancesDoesNotResurrectConcurrentDelete(t *testing.T) {
+	t.Setenv("AGENTDECK_PROFILE", "_test_fleet_persist_delete")
+	recoveryStorage := newFleetCLIStorage(t)
+	deleteStorage := newFleetCLIStorage(t)
+
+	inst := fleetPersistInstance("fleet-deleted-during-recovery", "before", session.StatusError)
+	require.NoError(t, recoveryStorage.InsertSessionAndVerify(inst, nil))
+	snapshot, _, err := recoveryStorage.LoadWithGroups()
+	require.NoError(t, err)
+	require.Len(t, snapshot, 1)
+
+	require.NoError(t, deleteStorage.DeleteInstance(inst.ID))
+	snapshot[0].Title = "stale recovery snapshot"
+	err = recoveryStorage.PersistRecoveredInstances(snapshot)
+	require.ErrorIs(t, err, statedb.ErrInstanceParentConflict)
+
+	row, err := recoveryStorage.GetDB().LoadInstanceByID(inst.ID)
+	require.NoError(t, err)
+	require.Nil(t, row, "fleet recovery resurrected a concurrently deleted parent")
+	_, found, err := recoveryStorage.GetDB().ReadRuntimeState(inst.ID)
+	require.NoError(t, err)
+	require.False(t, found, "fleet recovery recreated deleted runtime state")
+}
+
+func TestRuntimeLifecycle_PersistRecoveredInstancesPreservesConcurrentMetadataEdits(t *testing.T) {
+	t.Setenv("AGENTDECK_PROFILE", "_test_fleet_persist_same_row_metadata")
+	recoveryStorage := newFleetCLIStorage(t)
+	editorStorage := newFleetCLIStorage(t)
+
+	inst := fleetPersistInstance("fleet-edited-during-recovery", "before", session.StatusError)
+	inst.Account = "old-account"
+	require.NoError(t, recoveryStorage.InsertSessionAndVerify(inst, nil))
+	snapshot, _, err := recoveryStorage.LoadWithGroups()
+	require.NoError(t, err)
+	require.Len(t, snapshot, 1)
+
+	edited, groups, err := editorStorage.LoadWithGroups()
+	require.NoError(t, err)
+	require.Len(t, edited, 1)
+	archivedAt := time.Unix(1_900_000_000, 0).UTC()
+	edited[0].Title = "renamed concurrently"
+	edited[0].GroupPath = "moved/concurrently"
+	edited[0].Account = "new-account"
+	edited[0].ArchivedAt = archivedAt
+	require.NoError(t, editorStorage.SaveWithGroups(edited, session.NewGroupTreeWithGroups(edited, groups)))
+
+	current, found, err := recoveryStorage.GetDB().ReadRuntimeState(inst.ID)
+	require.NoError(t, err)
+	require.True(t, found)
+	next := current
+	next.Generation++
+	next.StatusRevision = 0
+	next.Status = string(session.StatusRunning)
+	next.TmuxSession = "fleet-recovered-g1"
+	next.LastStartedAt = time.Unix(1_900_000_001, 0).UTC()
+	require.NoError(t, recoveryStorage.GetDB().CommitRuntimeTransition(
+		current.Generation, snapshot[0].PersistenceIncarnation(), next,
+	))
+	snapshot[0].ApplyRuntimeState(next)
+	require.NoError(t, recoveryStorage.PersistRecoveredInstances(snapshot))
+
+	row, err := recoveryStorage.GetDB().LoadInstanceByID(inst.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.Equal(t, "renamed concurrently", row.Title)
+	require.Equal(t, "moved/concurrently", row.GroupPath)
+	require.Equal(t, "new-account", row.Account)
+	require.True(t, row.ArchivedAt.Equal(archivedAt), "archived_at = %v", row.ArchivedAt)
+	durable, found, err := recoveryStorage.GetDB().ReadRuntimeState(inst.ID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, next, durable)
 }

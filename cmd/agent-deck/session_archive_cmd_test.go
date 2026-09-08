@@ -2,8 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // archivedFlag parses `list --json` and returns the archived flag for the
@@ -149,5 +154,101 @@ func TestSessionUnarchive_MissingArg_Exit1(t *testing.T) {
 	_, _, code := runAgentDeck(t, home, "session", "unarchive", "--json")
 	if code != 1 {
 		t.Fatalf("expected exit 1 for unarchive with no id, got %d", code)
+	}
+}
+
+func TestRuntimeLifecycle_PersistArchivedCLIRejectsReplacementRuntime(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
+
+	storage, err := session.NewStorageWithProfile("_test_archive_runtime_fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	inst := session.NewInstanceWithGroupAndTool("archive", filepath.Join(home, "project"), "work", "pi")
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatal(err)
+	}
+	killed := statedb.RuntimeState{
+		InstanceID: inst.ID, Generation: 1, StatusRevision: 2,
+		TmuxSession: "runtime-g1", TmuxSocketName: "isolated", Status: "stopped",
+		LastStartedAt: time.Unix(2, 0).UTC(),
+	}
+	db := storage.GetDB()
+	if err := db.CommitRuntimeTransition(0, inst.PersistenceIncarnation(), killed); err != nil {
+		t.Fatal(err)
+	}
+	replacement := killed
+	replacement.Generation++
+	replacement.StatusRevision = 0
+	replacement.TmuxSession = "runtime-g2"
+	replacement.Status = "running"
+	replacement.LastStartedAt = time.Unix(3, 0).UTC()
+	if err := db.CommitRuntimeTransition(
+		killed.Generation, inst.PersistenceIncarnation(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	inst.ArchivedAt = time.Unix(4, 0).UTC()
+	if err := persistArchivedCLI(
+		storage, inst, killed, inst.PersistenceIncarnation()); !errors.Is(err, statedb.ErrRuntimeGenerationConflict) {
+		t.Fatalf("stale CLI archive error = %v, want generation conflict", err)
+	}
+	row, err := db.LoadInstanceByID(inst.ID)
+	if err != nil || row == nil || !row.ArchivedAt.IsZero() {
+		t.Fatalf("replacement archive row=%#v err=%v", row, err)
+	}
+}
+
+func TestRuntimeLifecycle_PersistUnarchiveCLIRejectsReplacementIncarnation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
+
+	storage, err := session.NewStorageWithProfile("_test_unarchive_incarnation_fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	inst := session.NewInstanceWithGroupAndTool("unarchive", filepath.Join(home, "project"), "work", "pi")
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatal(err)
+	}
+	db := storage.GetDB()
+	archivedAt := time.Unix(4, 0).UTC()
+	if err := db.SetArchivedIfIncarnation(inst.ID, inst.PersistenceIncarnation(), archivedAt); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := db.LoadInstanceByID(inst.ID)
+	if err != nil || replacement == nil {
+		t.Fatalf("load A: row=%#v err=%v", replacement, err)
+	}
+	if err := db.DeleteInstance(inst.ID); err != nil {
+		t.Fatal(err)
+	}
+	replacement.Incarnation = "cli-unarchive-replacement"
+	replacement.ArchivedAt = archivedAt
+	if _, inserted, err := db.InsertInstanceIfAbsent(replacement); err != nil || !inserted {
+		t.Fatalf("insert B: inserted=%v err=%v", inserted, err)
+	}
+
+	inst.ArchivedAt = time.Time{}
+	if err := persistArchivedCLI(
+		storage, inst, statedb.RuntimeState{}, inst.PersistenceIncarnation(),
+	); !errors.Is(err, statedb.ErrInstanceParentConflict) {
+		t.Fatalf("stale CLI unarchive error = %v, want parent conflict", err)
+	}
+	row, err := db.LoadInstanceByID(inst.ID)
+	if err != nil || row == nil || !row.ArchivedAt.Equal(archivedAt) || row.Incarnation != replacement.Incarnation {
+		t.Fatalf("replacement unarchive row=%#v err=%v", row, err)
 	}
 }

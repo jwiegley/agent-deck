@@ -50,9 +50,10 @@ func TestUpdateOpenCodeSession_DoesNotHoldLockAcrossSubprocess(t *testing.T) {
 		close(done)
 	}()
 
-	// Wait up to 2s for the stub to actually enter. File signal is more
-	// reliable than a time.Sleep for this handshake.
-	waitDeadline := time.Now().Add(2 * time.Second)
+	// Wait up to 10s for the stub to actually enter. Race instrumentation on
+	// this large package can delay initial goroutine/process scheduling by a
+	// few seconds; the file remains the deterministic handshake.
+	waitDeadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(waitDeadline) {
 		if _, err := os.Stat(startedFile); err == nil {
 			break
@@ -81,10 +82,9 @@ func TestUpdateOpenCodeSession_DoesNotHoldLockAcrossSubprocess(t *testing.T) {
 }
 
 // TestUpdateStatus_DropsLockAroundOpencode is the other half of the regression
-// guard: it parses the UpdateStatus source and asserts that the
-// `if i.Tool == "opencode"` branch releases and reacquires i.mu around the
-// UpdateOpenCodeSession() call. Without this, even a correct callee can be
-// starved by a caller that holds the lock.
+// guard: it parses the post-authority metadata source and asserts that status
+// refresh releases i.mu before delegating to UpdateOpenCodeSession. The
+// callee's subprocess lock boundary is tested above.
 //
 // This is a source-level test because standing up a realistic tmux session
 // that reaches the metadata-sync block at UpdateStatus:~2950 requires
@@ -102,36 +102,35 @@ func TestUpdateStatus_DropsLockAroundOpencode(t *testing.T) {
 		t.Fatalf("parse instance.go: %v", err)
 	}
 
-	var updateStatus *ast.FuncDecl
+	var metadataRefresh *ast.FuncDecl
 	for _, decl := range f.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "UpdateStatus" {
+		if !ok || fn.Name.Name != "refreshStatusMetadataIfCurrent" {
 			continue
 		}
 		if fn.Recv == nil || len(fn.Recv.List) == 0 {
 			continue
 		}
-		updateStatus = fn
+		metadataRefresh = fn
 		break
 	}
-	if updateStatus == nil {
-		t.Fatal("UpdateStatus function not declared in instance.go")
+	if metadataRefresh == nil {
+		t.Fatal("refreshStatusMetadataIfCurrent function not declared in instance.go")
 	}
 
 	// Serialize the function body and scan for the required pattern.
 	// Extract the raw source range of the function body.
-	start := fset.Position(updateStatus.Body.Pos()).Offset
-	end := fset.Position(updateStatus.Body.End()).Offset
+	start := fset.Position(metadataRefresh.Body.Pos()).Offset
+	end := fset.Position(metadataRefresh.Body.End()).Offset
 	body := string(src[start:end])
 
-	// Anchor the search on the UpdateOpenCodeSession call and look for
-	// i.mu.Unlock() immediately before it and i.mu.Lock() immediately
-	// after it, within a small window. Substring-based so it is robust
-	// to whitespace or comment changes.
-	const window = 120 // chars
+	// Anchor the search on the lock-managing public refresh call. Publication
+	// and the subprocess both happen after refreshStatusMetadataIfCurrent has
+	// left its instance critical section.
+	const window = 400 // chars
 	callIdx := strings.Index(body, "i.UpdateOpenCodeSession()")
 	if callIdx == -1 {
-		t.Fatal("UpdateStatus does not call i.UpdateOpenCodeSession() at all")
+		t.Fatal("metadata refresh does not refresh OpenCode at all")
 	}
 
 	beforeStart := callIdx - window
@@ -140,18 +139,7 @@ func TestUpdateStatus_DropsLockAroundOpencode(t *testing.T) {
 	}
 	before := body[beforeStart:callIdx]
 	if !strings.Contains(before, "i.mu.Unlock()") {
-		t.Fatalf("UpdateStatus does not call i.mu.Unlock() within %d chars before i.UpdateOpenCodeSession() — "+
+		t.Fatalf("metadata refresh does not call i.mu.Unlock() within %d chars before the OpenCode refresh — "+
 			"freeze regression: i.mu is held across the opencode subprocess.\nContext:\n%s", window, before)
-	}
-
-	afterStart := callIdx + len("i.UpdateOpenCodeSession()")
-	afterEnd := afterStart + window
-	if afterEnd > len(body) {
-		afterEnd = len(body)
-	}
-	after := body[afterStart:afterEnd]
-	if !strings.Contains(after, "i.mu.Lock()") {
-		t.Fatalf("UpdateStatus does not reacquire i.mu.Lock() within %d chars after i.UpdateOpenCodeSession() — "+
-			"freeze regression.\nContext:\n%s", window, after)
 	}
 }

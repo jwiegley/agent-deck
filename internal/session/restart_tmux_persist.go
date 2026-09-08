@@ -12,9 +12,26 @@ import (
 // restart's new tmux session name could not be recorded anywhere.
 var errNoStateDB = errors.New("no state database open in this process")
 
-// recordRestartOutcome durably records what the restart just produced — the
-// tmux session name it minted and the status it ended in — at the one place
-// that produces them.
+// restartOutcomeBeforeWriteFn is a test seam for the only meaningful failure
+// window: the runtime commit succeeded, then its logical parent disappeared
+// before the acknowledgement write. Production leaves it as a no-op.
+var restartOutcomeBeforeWriteFn = func() {}
+
+// SetRestartOutcomeBeforeWriteForTest installs a hook at the post-commit,
+// pre-acknowledgement boundary and returns a restore function. It lets command
+// package tests exercise a peer deleting the logical parent in that exact
+// window rather than deleting it before the lifecycle precondition runs.
+func SetRestartOutcomeBeforeWriteForTest(fn func()) func() {
+	previous := restartOutcomeBeforeWriteFn
+	if fn == nil {
+		fn = func() {}
+	}
+	restartOutcomeBeforeWriteFn = fn
+	return func() { restartOutcomeBeforeWriteFn = previous }
+}
+
+// recordRestartOutcome acknowledges the exact runtime generation a restart
+// just committed and emits the change-detection stamp used by other processes.
 //
 // restart()'s fallback-recreate path calls recreateTmuxSession, whose
 // tmux.NewSession appends a fresh short id unconditionally, so the name that
@@ -31,7 +48,7 @@ var errNoStateDB = errors.New("no state database open in this process")
 // the fleet recovery sweep and the web mutator all reach the same mint through
 // Instance.Restart, and every one of them would need its own save otherwise.
 //
-// The write is a targeted single-column UPDATE, not a snapshot save. A CLI
+// The write is a targeted compare-and-update, not a snapshot save. A CLI
 // command loads its rows, restarts (seconds, sometimes more), and would then
 // push that stale snapshot back over everything another process changed in the
 // meantime — a far larger blast radius than the one column the restart
@@ -43,8 +60,9 @@ var errNoStateDB = errors.New("no state database open in this process")
 // and leak another tmux session, which is the original bug's own failure mode.
 // It is recorded instead, and RestartTmuxNameRecorded lets callers with no
 // other save on their path say plainly that the outcome is unknown.
-func (i *Instance) recordRestartOutcome() {
-	stamps, err := i.writeRestartOutcome()
+func (i *Instance) recordRestartOutcome(runtime statedb.RuntimeState, incarnation string) {
+	restartOutcomeBeforeWriteFn()
+	stamps, err := i.writeRestartOutcome(runtime, incarnation)
 
 	i.restartTmuxRecordMu.Lock()
 	i.restartTmuxRecordErr = err
@@ -59,22 +77,21 @@ func (i *Instance) recordRestartOutcome() {
 }
 
 // writeRestartOutcome performs the targeted write and reports what stopped it.
-func (i *Instance) writeRestartOutcome() (statedb.WriteStamps, error) {
-	name := ""
-	if i.tmuxSession != nil {
-		name = i.tmuxSession.Name
-	}
-	if name == "" {
+func (i *Instance) writeRestartOutcome(runtime statedb.RuntimeState, incarnation string) (statedb.WriteStamps, error) {
+	if runtime.TmuxSession == "" {
 		return statedb.WriteStamps{}, errors.New("restart left no tmux session name to record")
 	}
 
-	db := statedb.GetGlobal()
+	// The instance's profile database is authoritative. The process-wide
+	// fallback exists for unsaved/legacy callers, but must not redirect a
+	// loaded instance when another profile happens to be globally active.
+	db := i.restartPersistenceDB()
 	if db == nil {
 		return statedb.WriteStamps{}, errNoStateDB
 	}
-	stamps, err := db.WriteRestartOutcome(i.ID, name, string(i.Status), i.Tool)
+	stamps, err := db.WriteRestartOutcome(runtime, incarnation)
 	if err != nil {
-		return statedb.WriteStamps{}, fmt.Errorf("record restart outcome for tmux session %q: %w", name, err)
+		return statedb.WriteStamps{}, fmt.Errorf("record restart outcome for tmux session %q: %w", runtime.TmuxSession, err)
 	}
 	return stamps, nil
 }

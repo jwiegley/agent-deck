@@ -579,6 +579,10 @@ func handleConductorSetup(profile string, args []string) {
 		newInst := session.NewInstanceWithGroupAndTool(sessionTitle, dir, "conductor", spec.Agent)
 		newInst.Command = spec.DefaultCommand
 		newInst.IsConductor = true
+		if err := storage.InsertSessionAndVerify(newInst, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "Error inserting session for %s: %v\n", resolvedProfile, err)
+			os.Exit(1)
+		}
 		instances = append(instances, newInst)
 
 		sessionID = newInst.ID
@@ -732,6 +736,19 @@ func handleConductorSetup(profile string, args []string) {
 	}
 }
 
+type conductorRuntimeTarget interface {
+	CaptureRuntimeSelection() session.RuntimeSelection
+	KillAndWaitCaptured(session.RuntimeSelection) error
+	DeleteAndWaitCaptured(session.RuntimeSelection) error
+}
+
+func applyConductorRuntimeAction(target conductorRuntimeTarget, selection session.RuntimeSelection, remove bool) error {
+	if remove {
+		return target.DeleteAndWaitCaptured(selection)
+	}
+	return target.KillAndWaitCaptured(selection)
+}
+
 // handleConductorTeardown stops conductors and optionally removes directories
 func handleConductorTeardown(_ string, args []string) {
 	fs := flag.NewFlagSet("conductor teardown", flag.ExitOnError)
@@ -828,75 +845,101 @@ func handleConductorTeardown(_ string, args []string) {
 
 	// Step 2: Stop and optionally remove each conductor
 	var removed []string
+conductorLoop:
 	for _, meta := range targets {
 		sessionTitle := session.ConductorSessionTitle(meta.Name)
 		if !*jsonOutput {
 			fmt.Printf("Stopping conductor: %s (profile: %s)\n", meta.Name, meta.Profile)
 		}
 
-		// Stop the session
+		// Resolve and mutate every matching runtime before touching its heartbeat
+		// or directory. Each action captures and revalidates its physical identity.
 		storage, err := session.NewStorageWithProfile(meta.Profile)
-		if err == nil {
-			instances, _, err := storage.LoadWithGroups()
-			if err == nil {
-				for _, inst := range instances {
-					if inst.Title == sessionTitle {
-						if inst.Exists() {
-							_ = inst.Kill()
-						}
-						if !*jsonOutput {
-							fmt.Printf("  [ok] %s stopped\n", sessionTitle)
-						}
-						break
-					}
-				}
+		if err != nil {
+			if !*jsonOutput {
+				fmt.Fprintf(os.Stderr, "  Warning: failed to open profile %s: %v\n", meta.Profile, err)
 			}
+			continue
+		}
+		instances, groups, loadErr := storage.LoadWithGroups()
+		if loadErr != nil {
+			_ = storage.Close()
+			if !*jsonOutput {
+				fmt.Fprintf(os.Stderr, "  Warning: failed to load profile %s: %v\n", meta.Profile, loadErr)
+			}
+			continue
 		}
 
-		// Remove heartbeat timer
-		_ = session.UninstallHeartbeatDaemon(meta.Name)
+		var matching []*session.Instance
+		for _, inst := range instances {
+			if inst.Title == sessionTitle {
+				matching = append(matching, inst)
+			}
+		}
+		selections := make([]session.RuntimeSelection, len(matching))
+		for idx, inst := range matching {
+			selections[idx] = inst.CaptureRuntimeSelection()
+		}
+		for idx, inst := range matching {
+			if actionErr := applyConductorRuntimeAction(inst, selections[idx], *removeAll); actionErr != nil {
+				_ = storage.Close()
+				if !*jsonOutput {
+					fmt.Fprintf(os.Stderr, "  Warning: runtime action aborted for %s: %v\n", sessionTitle, actionErr)
+				}
+				continue conductorLoop
+			}
+		}
+		if len(matching) > 0 && !*jsonOutput {
+			fmt.Printf("  [ok] %s stopped\n", sessionTitle)
+		}
 
-		// Optionally remove directory and session
+		if *removeAll && len(matching) > 0 {
+			removedIDs := make(map[string]bool, len(matching))
+			for _, inst := range matching {
+				removedIDs[inst.ID] = true
+			}
+			filtered := make([]*session.Instance, 0, len(instances)-len(matching))
+			for _, inst := range instances {
+				if !removedIDs[inst.ID] {
+					filtered = append(filtered, inst)
+				}
+			}
+			groupTree := session.NewGroupTreeWithGroups(filtered, groups)
+			if saveErr := storage.SaveGroupsOnly(groupTree); saveErr != nil {
+				_ = storage.Close()
+				if !*jsonOutput {
+					fmt.Fprintf(os.Stderr, "  Warning: failed to save groups in %s: %v\n", meta.Profile, saveErr)
+				}
+				continue
+			}
+			for id := range removedIDs {
+				exists, existsErr := storage.InstanceExists(id)
+				if existsErr != nil || exists {
+					_ = storage.Close()
+					if !*jsonOutput {
+						fmt.Fprintf(os.Stderr, "  Warning: failed to verify conditional removal %s: exists=%v err=%v\n", id, exists, existsErr)
+					}
+					continue conductorLoop
+				}
+			}
+			if !*jsonOutput {
+				fmt.Printf("  [ok] Removed session '%s' from %s\n", sessionTitle, meta.Profile)
+			}
+		}
+		_ = storage.Close()
+
+		// Heartbeat and directory teardown are downstream of the conditional
+		// runtime action, so a stale generation cannot remove either one.
+		_ = session.UninstallHeartbeatDaemon(meta.Name)
 		if *removeAll {
 			if err := session.TeardownConductor(meta.Name); err != nil {
 				if !*jsonOutput {
 					fmt.Fprintf(os.Stderr, "  Warning: failed to remove dir for %s: %v\n", meta.Name, err)
 				}
-			} else if !*jsonOutput {
-				fmt.Printf("  [ok] Removed directory for %s\n", meta.Name)
+				continue
 			}
-
-			// Remove session from storage. #1550: SaveWithGroups is upsert-only
-			// (saving a filtered list no longer drops the missing rows), so
-			// removal goes through the targeted verify path (#909).
-			if storage != nil {
-				instances, groups, err := storage.LoadWithGroups()
-				if err == nil {
-					var filtered []*session.Instance
-					var removedIDs []string
-					for _, inst := range instances {
-						if inst.Title == sessionTitle {
-							removedIDs = append(removedIDs, inst.ID)
-							continue
-						}
-						filtered = append(filtered, inst)
-					}
-					if len(removedIDs) > 0 {
-						groupTree := session.NewGroupTreeWithGroups(filtered, groups)
-						removeFailed := false
-						for _, id := range removedIDs {
-							if rmErr := storage.RemoveSessionAndVerify(id, filtered, groupTree); rmErr != nil {
-								removeFailed = true
-								if !*jsonOutput {
-									fmt.Fprintf(os.Stderr, "  Warning: failed to remove session '%s' (%s) from %s: %v\n", sessionTitle, id, meta.Profile, rmErr)
-								}
-							}
-						}
-						if !removeFailed && !*jsonOutput {
-							fmt.Printf("  [ok] Removed session '%s' from %s\n", sessionTitle, meta.Profile)
-						}
-					}
-				}
+			if !*jsonOutput {
+				fmt.Printf("  [ok] Removed directory for %s\n", meta.Name)
 			}
 		}
 
@@ -904,7 +947,7 @@ func handleConductorTeardown(_ string, args []string) {
 	}
 
 	// Clean up shared files if removing all
-	if *allConductors && *removeAll {
+	if *allConductors && *removeAll && len(removed) == len(targets) {
 		condDir, _ := session.ConductorDir()
 		if condDir != "" {
 			_ = os.Remove(filepath.Join(condDir, "bridge.py"))

@@ -27,6 +27,12 @@ func CloneInstanceRow(row *InstanceRow) *InstanceRow {
 	}
 	copy := *row
 	copy.ToolData = append(json.RawMessage(nil), row.ToolData...)
+	if row.RuntimeBindings != nil {
+		copy.RuntimeBindings = make(map[string]RuntimeBinding, len(row.RuntimeBindings))
+		for kind, binding := range row.RuntimeBindings {
+			copy.RuntimeBindings[kind] = binding
+		}
+	}
 	return &copy
 }
 
@@ -86,7 +92,8 @@ func (s *StateDB) MergeRegistrySnapshots(updates []InstanceSnapshot, groups []Gr
 }
 
 func (s *StateDB) mergeRegistrySnapshotsOnce(updates []InstanceSnapshot, groups []GroupSnapshot) (*RegistrySnapshotResult, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), immediateTransactionTimeout)
+	defer cancel()
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return nil, err
@@ -95,10 +102,10 @@ func (s *StateDB) mergeRegistrySnapshotsOnce(updates []InstanceSnapshot, groups 
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return nil, err
 	}
-	defer func() { _, _ = conn.ExecContext(ctx, "ROLLBACK") }()
-	current, err := loadInstances(func(query string, args ...any) (*sql.Rows, error) {
-		return conn.QueryContext(ctx, query, args...)
-	})
+	tx := &immediateTransaction{ctx: ctx, conn: conn}
+	defer tx.rollback()
+
+	current, err := loadInstances(tx.Query)
 	if err != nil {
 		return nil, fmt.Errorf("read current instances: %w", err)
 	}
@@ -122,9 +129,7 @@ func (s *StateDB) mergeRegistrySnapshotsOnce(updates []InstanceSnapshot, groups 
 			return nil, err
 		}
 	}
-	currentGroups, err := loadGroups(func(query string, args ...any) (*sql.Rows, error) {
-		return conn.QueryContext(ctx, query, args...)
-	})
+	currentGroups, err := loadGroups(tx.Query)
 	if err != nil {
 		return nil, fmt.Errorf("read current groups: %w", err)
 	}
@@ -133,12 +138,12 @@ func (s *StateDB) mergeRegistrySnapshotsOnce(updates []InstanceSnapshot, groups 
 		return nil, err
 	}
 	for _, path := range removedGroups {
-		if _, err := conn.ExecContext(ctx, "DELETE FROM groups WHERE path = ?", path); err != nil {
+		if _, err := tx.Exec("DELETE FROM groups WHERE path = ?", path); err != nil {
 			return nil, err
 		}
 	}
 	for _, row := range merged {
-		if err := writeSnapshotRow(ctx, conn, row, byID[row.ID] != nil); err != nil {
+		if err := writeSnapshotRow(tx, row, byID[row.ID] != nil); err != nil {
 			return nil, err
 		}
 	}
@@ -146,11 +151,23 @@ func (s *StateDB) mergeRegistrySnapshotsOnce(updates []InstanceSnapshot, groups 
 		if group == nil {
 			continue
 		}
-		if _, err := conn.ExecContext(ctx, upsertGroupSQL, group.Path, group.Name, group.Expanded, group.Order, group.DefaultPath, group.MaxConcurrent); err != nil {
+		if _, err := tx.Exec(upsertGroupSQL, group.Path, group.Name, group.Expanded, group.Order, group.DefaultPath, group.MaxConcurrent); err != nil {
 			return nil, fmt.Errorf("save group: %w", err)
 		}
 	}
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+
+	committedRows, err := loadInstances(tx.Query)
+	if err != nil {
+		return nil, fmt.Errorf("read committed instances: %w", err)
+	}
+	committedByID := make(map[string]*InstanceRow, len(committedRows))
+	for _, row := range committedRows {
+		committedByID[row.ID] = row
+	}
+	for i, row := range merged {
+		merged[i] = committedByID[row.ID]
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return &RegistrySnapshotResult{Instances: merged, Groups: mergedGroups}, nil
@@ -171,18 +188,16 @@ func mergeInstanceSnapshot(update InstanceSnapshot, current *InstanceRow) (*Inst
 	if update.Original == nil || update.Stored.ID != id || update.Original.ID != id {
 		return nil, fmt.Errorf("invalid snapshot identity for instance %s", id)
 	}
-	if current == nil {
+	if current == nil || update.Stored.Incarnation == "" || current.Incarnation != update.Stored.Incarnation {
 		return nil, fmt.Errorf("stale concurrent deletion conflict for instance %s", id)
 	}
 	merged := CloneInstanceRow(current)
-	// InstanceRow consists of scalar persisted columns plus ToolData. Iterating
-	// the row type keeps newly added columns in the same conflict contract.
 	want, original := reflect.ValueOf(update.Desired).Elem(), reflect.ValueOf(update.Original).Elem()
 	stored, actual := reflect.ValueOf(update.Stored).Elem(), reflect.ValueOf(current).Elem()
 	out := reflect.ValueOf(merged).Elem()
 	for i := 0; i < want.NumField(); i++ {
 		name := want.Type().Field(i).Name
-		if name == "ToolData" {
+		if name == "ToolData" || runtimeOwnedInstanceField(name) {
 			continue
 		}
 		if snapshotValueEqual(want.Field(i).Interface(), original.Field(i).Interface()) {
@@ -196,6 +211,15 @@ func mergeInstanceSnapshot(update InstanceSnapshot, current *InstanceRow) (*Inst
 	var err error
 	merged.ToolData, err = mergeSnapshotToolData(update, current)
 	return merged, err
+}
+
+func runtimeOwnedInstanceField(name string) bool {
+	switch name {
+	case "Incarnation", "Status", "TmuxSession", "TmuxSocketName", "RuntimeGeneration", "StatusRevision", "LastStartedAt", "RuntimeBindings":
+		return true
+	default:
+		return false
+	}
 }
 
 func snapshotValueEqual(a, b any) bool {
@@ -274,6 +298,9 @@ func mergeSnapshotToolData(update InstanceSnapshot, current *InstanceRow) (json.
 		keys[key] = true
 	}
 	for key := range keys {
+		if runtimeToolDataKeys[key] {
+			continue
+		}
 		if sameJSON(original[key], desired[key]) {
 			continue
 		}
@@ -289,31 +316,52 @@ func mergeSnapshotToolData(update InstanceSnapshot, current *InstanceRow) (json.
 	return json.Marshal(actual)
 }
 
-func writeSnapshotRow(ctx context.Context, conn *sql.Conn, row *InstanceRow, exists bool) error {
+func writeSnapshotRow(tx *immediateTransaction, row *InstanceRow, exists bool) error {
 	data := row.ToolData
 	if len(data) == 0 {
 		data = json.RawMessage("{}")
 	}
-	args := []any{row.Title, row.ProjectPath, row.GroupPath, row.Order,
-		row.Command, row.Wrapper, row.Tool, row.Status, row.TmuxSession, row.TmuxSocketName,
-		row.CreatedAt.Unix(), row.LastAccessed.Unix(), row.ParentSessionID, row.IsConductor, row.NoTransitionNotify,
-		row.WorktreePath, row.WorktreeRepo, row.WorktreeBranch, row.Account, archivedAtUnix(row.ArchivedAt),
-		string(data), row.TitleLocked, row.AutoName, row.AutoNameDescription, row.Pin, row.ID}
-	// UPDATE preserves columns not represented by InstanceRow, such as the
-	// notification acknowledgement. REPLACE would reset their defaults.
-	query := `UPDATE instances SET title=?, project_path=?, group_path=?, sort_order=?,
-		command=?, wrapper=?, tool=?, status=?, tmux_session=?, tmux_socket_name=?,
-		created_at=?, last_accessed=?, parent_session_id=?, is_conductor=?, no_transition_notify=?,
-		worktree_path=?, worktree_repo=?, worktree_branch=?, account=?, archived_at=?,
-		tool_data=?, title_locked=?, auto_name=?, auto_name_description=?, pin=? WHERE id=?`
-	if !exists {
-		query = `INSERT INTO instances (title, project_path, group_path, sort_order,
-			command, wrapper, tool, status, tmux_session, tmux_socket_name,
-			created_at, last_accessed, parent_session_id, is_conductor, no_transition_notify,
-			worktree_path, worktree_repo, worktree_branch, account, archived_at,
-			tool_data, title_locked, auto_name, auto_name_description, pin, id)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	if exists {
+		_, err := tx.Exec(`UPDATE instances SET title=?, project_path=?, group_path=?, sort_order=?,
+			command=?, wrapper=?, tool=?, created_at=?, last_accessed=?, parent_session_id=?,
+			is_conductor=?, no_transition_notify=?, worktree_path=?, worktree_repo=?, worktree_branch=?,
+			account=?, archived_at=?, tool_data=?, title_locked=?, auto_name=?, auto_name_description=?, pin=?
+			WHERE id=?`,
+			row.Title, row.ProjectPath, row.GroupPath, row.Order, row.Command, row.Wrapper, row.Tool,
+			row.CreatedAt.Unix(), row.LastAccessed.Unix(), row.ParentSessionID, row.IsConductor, row.NoTransitionNotify,
+			row.WorktreePath, row.WorktreeRepo, row.WorktreeBranch, row.Account, archivedAtUnix(row.ArchivedAt),
+			string(data), row.TitleLocked, row.AutoName, row.AutoNameDescription, row.Pin, row.ID)
+		return err
 	}
-	_, err := conn.ExecContext(ctx, query, args...)
-	return err
+
+	var reservedIncarnation string
+	err := tx.QueryRow(`SELECT incarnation FROM instance_incarnation WHERE instance_id = ?`, row.ID).Scan(&reservedIncarnation)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if err == nil && (row.Incarnation == "" || row.Incarnation != reservedIncarnation) {
+		return ErrInstanceParentConflict
+	}
+	if _, err := tx.Exec(`INSERT INTO instances (title, project_path, group_path, sort_order,
+		command, wrapper, tool, status, tmux_session, tmux_socket_name, created_at, last_accessed,
+		parent_session_id, is_conductor, no_transition_notify, worktree_path, worktree_repo, worktree_branch,
+		account, archived_at, tool_data, title_locked, auto_name, auto_name_description, pin, id)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		row.Title, row.ProjectPath, row.GroupPath, row.Order, row.Command, row.Wrapper, row.Tool,
+		row.Status, row.TmuxSession, row.TmuxSocketName, row.CreatedAt.Unix(), row.LastAccessed.Unix(),
+		row.ParentSessionID, row.IsConductor, row.NoTransitionNotify, row.WorktreePath, row.WorktreeRepo, row.WorktreeBranch,
+		row.Account, archivedAtUnix(row.ArchivedAt), string(data), row.TitleLocked, row.AutoName, row.AutoNameDescription, row.Pin, row.ID); err != nil {
+		return err
+	}
+	if row.Incarnation == "" {
+		if err := tx.QueryRow(`SELECT incarnation FROM instance_incarnation WHERE instance_id = ?`, row.ID).Scan(&row.Incarnation); err != nil {
+			return err
+		}
+	} else if _, err := tx.Exec(`UPDATE instance_incarnation SET incarnation = ? WHERE instance_id = ?`, row.Incarnation, row.ID); err != nil {
+		return err
+	}
+	if _, err := insertInitialRuntimeTx(tx, row); err != nil {
+		return err
+	}
+	return projectRuntimeToolDataTx(tx, row.ID)
 }

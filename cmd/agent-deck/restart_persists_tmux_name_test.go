@@ -81,11 +81,16 @@ func TestSkillRestartCommandPath_ReportsUnrecordedRestart(t *testing.T) {
 	skipIfNoTmuxBinaryCLI(t)
 
 	storage, inst := newCLIRestartFixture(t, "_test_cli_restart_unrecorded")
-	if err := storage.GetDB().DeleteInstance(inst.ID); err != nil {
-		t.Fatalf("DeleteInstance: %v", err)
-	}
 
 	adoptStateDB(storage)
+	deleted := false
+	restore := session.SetRestartOutcomeBeforeWriteForTest(func() {
+		deleted = true
+		if err := storage.GetDB().DeleteInstance(inst.ID); err != nil {
+			t.Fatalf("DeleteInstance in restart outcome window: %v", err)
+		}
+	})
+	t.Cleanup(restore)
 	outcome := restartProjectSkillsSession(inst, false, true)
 	t.Cleanup(func() {
 		if sess := inst.GetTmuxSession(); sess != nil {
@@ -95,6 +100,9 @@ func TestSkillRestartCommandPath_ReportsUnrecordedRestart(t *testing.T) {
 
 	if !outcome.Restarted {
 		t.Fatal("command path reported no restart; the process did start")
+	}
+	if !deleted {
+		t.Fatal("command path never crossed the post-commit acknowledgement window")
 	}
 	if outcome.Recorded {
 		t.Fatal("outcome.Recorded = true after the row vanished: the command would report a " +
@@ -175,8 +183,8 @@ func newCLIRestartFixture(t *testing.T, profile string) (*session.Storage, *sess
 	))
 
 	instances := []*session.Instance{inst}
-	if err := saveSessionData(storage, instances, nil); err != nil {
-		t.Fatalf("seed save: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, session.NewGroupTree(instances)); err != nil {
+		t.Fatalf("seed insert: %v", err)
 	}
 	if got := storedTmuxNameCLI(t, storage, inst.ID); got != cliRestartOldTmuxName {
 		t.Fatalf("fixture: stored tmux name = %q, want %q", got, cliRestartOldTmuxName)

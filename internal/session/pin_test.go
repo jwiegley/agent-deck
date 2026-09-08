@@ -105,7 +105,7 @@ func TestValidMutableFields_IncludesPin(t *testing.T) {
 }
 
 // TestPin_SurvivesSaveLoad confirms the pin column round-trips through
-// SaveWithGroups/LoadWithGroups, and that an unpinned session defaults to
+// explicit insert/LoadWithGroups, and that an unpinned session defaults to
 // PinNone after reload (the empty-string column default).
 func TestPin_SurvivesSaveLoad(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -124,8 +124,14 @@ func TestPin_SurvivesSaveLoad(t *testing.T) {
 
 	insts := []*Instance{pinned, plain}
 	tree := NewGroupTree(insts)
-	if err := storage.SaveWithGroups(insts, tree); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	for index, inst := range insts {
+		var groups *GroupTree
+		if index == len(insts)-1 {
+			groups = tree
+		}
+		if err := storage.InsertSessionAndVerify(inst, groups); err != nil {
+			t.Fatalf("InsertSessionAndVerify: %v", err)
+		}
 	}
 
 	loaded, _, err := storage.LoadWithGroups()

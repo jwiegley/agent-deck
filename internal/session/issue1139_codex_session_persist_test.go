@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -90,9 +91,7 @@ func TestRebindPersistsCodexSessionIDToDB(t *testing.T) {
 		CreatedAt:   now,
 		ToolData:    json.RawMessage(`{"codex_session_id":"` + oldID + `"}`),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	inst.CodexSessionID = oldID
 	if got := readCodexSessionIDFromDB(t, db, inst.ID); got != oldID {
@@ -119,6 +118,62 @@ func TestRebindPersistsCodexSessionIDToDB(t *testing.T) {
 			"bindCodexSessionFromHook mutated in-memory state but did not "+
 			"persist to tool_data — DB-direct consumers will see the stale UUID "+
 			"until something else triggers a save.", got, newID)
+	}
+}
+
+func TestRuntimeLifecycle_HookRebindRejectsStaleIncarnationAndAcceptsHydratedParent(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	db := withTempGlobalStateDB(t)
+	projectPath := filepath.Join(tmpHome, "project")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inst := NewInstanceWithTool("hook-incarnation-fence", projectPath, "codex")
+	// This test exercises only durable binding authority. A constructor-owned
+	// lazy tmux handle would make the successful branch probe the default
+	// socket, which the hermetic lifecycle gate deliberately never starts.
+	inst.tmuxSession = nil
+	inst.adoptPersistenceIncarnation("stale-hook-incarnation-a")
+	const (
+		oldID = "5ea244ce-0000-0000-0000-000000000c01"
+		newID = "2266314c-0000-0000-0000-000000000c02"
+	)
+	seedRow := &statedb.InstanceRow{
+		ID: inst.ID, Incarnation: "durable-hook-incarnation-b",
+		Title: inst.Title, ProjectPath: inst.ProjectPath, GroupPath: inst.GroupPath,
+		Command: inst.Command, Tool: "codex", Status: "idle", CreatedAt: time.Unix(100, 0).UTC(),
+		ToolData: json.RawMessage(`{"codex_session_id":"` + oldID + `"}`),
+	}
+	if err := db.SaveInstance(seedRow); err != nil {
+		t.Fatal(err)
+	}
+	inst.CodexSessionID = oldID
+
+	status := &HookStatus{
+		Status: "running", SessionID: newID, Event: "UserPromptSubmit",
+		UpdatedAt: time.Unix(200, 0).UTC(),
+	}
+	inst.UpdateHookStatus(status)
+	if inst.CodexSessionID != oldID || readCodexSessionIDFromDB(t, db, inst.ID) != oldID {
+		t.Fatalf("stale incarnation rebound memory=%q durable=%q, want %q",
+			inst.CodexSessionID, readCodexSessionIDFromDB(t, db, inst.ID), oldID)
+	}
+	if err := db.ValidateRuntimeIncarnation(inst.ID, "stale-hook-incarnation-a"); !errors.Is(err, statedb.ErrInstanceParentConflict) {
+		t.Fatalf("stale incarnation validation error = %v, want parent conflict", err)
+	}
+
+	// Hydration adopts the persisted parent's token. The same otherwise-valid
+	// observation must then pass through the durable binding CAS.
+	inst.adoptPersistenceIncarnation(seedRow.Incarnation)
+	status.UpdatedAt = time.Unix(201, 0).UTC()
+	inst.UpdateHookStatus(status)
+	if inst.CodexSessionID != newID || readCodexSessionIDFromDB(t, db, inst.ID) != newID {
+		t.Fatalf("hydrated incarnation rebound memory=%q durable=%q, want %q",
+			inst.CodexSessionID, readCodexSessionIDFromDB(t, db, inst.ID), newID)
 	}
 }
 
@@ -152,9 +207,7 @@ func TestBindPersistsCodexSessionIDToDB(t *testing.T) {
 		CreatedAt:   time.Now(),
 		ToolData:    json.RawMessage(`{}`),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	inst.UpdateHookStatus(&HookStatus{
 		Status:    "running",
@@ -250,9 +303,7 @@ func TestCodexRebindPreservesUnrelatedToolDataKeys(t *testing.T) {
 		CreatedAt:   time.Now(),
 		ToolData:    json.RawMessage(seedJSON),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	inst.CodexSessionID = oldID
 	inst.UpdateHookStatus(&HookStatus{

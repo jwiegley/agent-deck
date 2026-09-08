@@ -13,7 +13,7 @@ import (
 
 // TestConcurrentStorageWrites verifies that two Storage instances backed by
 // the same SQLite file can write concurrently without data loss or errors,
-// and that dedup semantics are preserved after both writes complete (DEDUP-03).
+// and that distinct binding owners survive after both writes complete.
 func TestConcurrentStorageWrites(t *testing.T) {
 	// 1. Create a temp dir with a single shared state.db path.
 	tmpDir := t.TempDir()
@@ -31,10 +31,11 @@ func TestConcurrentStorageWrites(t *testing.T) {
 	s1 := openStorage()
 	s2 := openStorage()
 
-	sharedClaudeID := "claude-session-shared-123"
+	claudeID1 := "claude-session-s1-123"
+	claudeID2 := "claude-session-s2-123"
 
-	// 2. Build instances with the same ClaudeSessionID but different creation times.
-	//    The older session (s1) should retain the ID after dedup.
+	// 2. Build instances with distinct binding IDs. Durable ownership rejects
+	//    duplicate values; concurrency here is about preserving both rows.
 	instances1 := []*Instance{{
 		ID:              "sess-from-s1",
 		Title:           "S1 Session",
@@ -43,8 +44,8 @@ func TestConcurrentStorageWrites(t *testing.T) {
 		Command:         "claude",
 		Tool:            "claude",
 		Status:          StatusRunning,
-		ClaudeSessionID: sharedClaudeID,
-		CreatedAt:       time.Now().Add(-1 * time.Minute), // older — keeps ID after dedup
+		ClaudeSessionID: claudeID1,
+		CreatedAt:       time.Now().Add(-1 * time.Minute),
 	}}
 
 	instances2 := []*Instance{{
@@ -55,11 +56,13 @@ func TestConcurrentStorageWrites(t *testing.T) {
 		Command:         "claude",
 		Tool:            "claude",
 		Status:          StatusRunning,
-		ClaudeSessionID: sharedClaudeID,
-		CreatedAt:       time.Now(), // newer — loses ID after dedup
+		ClaudeSessionID: claudeID2,
+		CreatedAt:       time.Now(),
 	}}
+	require.NoError(t, s1.InsertSessionAndVerify(instances1[0], nil))
+	require.NoError(t, s2.InsertSessionAndVerify(instances2[0], nil))
 
-	// 3. Write both storages concurrently (exercising SQLite WAL concurrent access).
+	// 3. Update both storages concurrently (exercising SQLite WAL concurrent access).
 	var wg sync.WaitGroup
 	var err1, err2 error
 
@@ -80,27 +83,23 @@ func TestConcurrentStorageWrites(t *testing.T) {
 	require.NoError(t, err1, "s1 SaveWithGroups should succeed")
 	require.NoError(t, err2, "s2 SaveWithGroups should succeed")
 
-	// 4. Load from a third independent storage. Both rows must survive: #1550
-	//    made SaveWithGroups upsert-only, so neither concurrent writer can
-	//    sweep the other's row. (Before that fix this test observed only one
-	//    surviving row — the "dedup" was really the destructive DELETE-NOT-IN.)
+	// 4. Load from a third independent storage. Both explicitly created rows
+	//    must survive: routine SaveWithGroups updates existing rows only and
+	//    cannot sweep the other writer's row.
 	s3 := openStorage()
 	loaded, err := s3.Load()
 	require.NoError(t, err)
-	require.Len(t, loaded, 2, "both concurrently-written sessions must survive (#1550)")
+	require.Len(t, loaded, 2, "both concurrently-updated sessions must survive (#1550)")
 
-	// 5. Dedup is a read-side invariant: each writer only dedups its own slice,
-	//    so cross-process duplicates are resolved when a full set is loaded
-	//    (the TUI runs UpdateClaudeSessionsWithDedup after every reload).
+	// 5. The compatibility helper is not an ownership oracle and must not
+	//    mutate either instance after reload.
 	UpdateClaudeSessionsWithDedup(loaded)
-	holdersCount := 0
+	bindings := make(map[string]string, len(loaded))
 	for _, inst := range loaded {
-		if inst.ClaudeSessionID == sharedClaudeID {
-			holdersCount++
-		}
+		bindings[inst.ID] = inst.ClaudeSessionID
 	}
-	assert.LessOrEqual(t, holdersCount, 1,
-		"at most one session should retain the shared ClaudeSessionID after load-time dedup")
+	assert.Equal(t, claudeID1, bindings["sess-from-s1"])
+	assert.Equal(t, claudeID2, bindings["sess-from-s2"])
 }
 
 // A stale TUI snapshot changing the title must not erase a concurrent CLI
@@ -122,8 +121,9 @@ func TestStaleSnapshotPreservesDisjointFieldUpdate(t *testing.T) {
 	require.NoError(t, err)
 	cliRows, _, err := cli.LoadWithGroups()
 	require.NoError(t, err)
-	cliRows[0].Status = StatusRunning
-	require.NoError(t, cli.SaveWithGroups(cliRows, nil))
+	applied, err := cli.db.WriteStatusIfVersion(cliRows[0].ID, cliRows[0].PersistenceIncarnation(), cliRows[0].RuntimeGeneration, cliRows[0].StatusRevision, string(StatusRunning))
+	require.NoError(t, err)
+	require.True(t, applied)
 	tuiRows[0].Title = "renamed"
 	require.NoError(t, tui.SaveWithGroups(tuiRows, nil))
 	check := open()

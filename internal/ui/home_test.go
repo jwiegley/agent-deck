@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/update"
 )
 
@@ -707,6 +708,57 @@ func TestHomeRenamePendingChangesSurviveReload(t *testing.T) {
 	// Pending changes should be cleared after re-application
 	if len(h.pendingTitleChanges) != 0 {
 		t.Errorf("pendingTitleChanges should be empty after re-application, got %d", len(h.pendingTitleChanges))
+	}
+}
+
+func TestLoadSessionsKeepsCanonicalPointerAcrossRuntimeGenerations(t *testing.T) {
+	home := NewHome()
+	canonical := session.NewInstance("canonical", "/tmp/project")
+	storage, err := session.NewStorageWithProfile("_test_load_canonical_pointer")
+	if err != nil {
+		t.Fatalf("NewStorageWithProfile: %v", err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	if err := storage.InsertSessionAndVerify(canonical, nil); err != nil {
+		t.Fatalf("insert canonical session: %v", err)
+	}
+	canonical.ApplyRuntimeState(statedb.RuntimeState{
+		InstanceID: canonical.ID, Generation: 2, TmuxSession: "tmux-g2", Status: "running",
+	})
+	home.instances = []*session.Instance{canonical}
+	home.instanceByID[canonical.ID] = canonical
+	home.groupTree = session.NewGroupTree(home.instances)
+
+	loadDetached := func(title string) *session.Instance {
+		t.Helper()
+		instances, _, err := storage.LoadWithGroups()
+		if err != nil || len(instances) != 1 {
+			t.Fatalf("load canonical session: instances=%d err=%v", len(instances), err)
+		}
+		instances[0].Title = title
+		return instances[0]
+	}
+
+	stale := loadDetached("stale")
+	stale.ApplyRuntimeState(statedb.RuntimeState{
+		InstanceID: stale.ID, Generation: 1, TmuxSession: "tmux-g1", Status: "error",
+	})
+	model, _ := home.Update(loadSessionsMsg{instances: []*session.Instance{stale}})
+	home = model.(*Home)
+	if home.instances[0] != canonical || canonical.RuntimeState().Generation != 2 || canonical.Title != "stale" {
+		t.Fatalf("stale reload did not retain canonical runtime while merging metadata: ptr=%p want=%p state=%#v title=%q",
+			home.instances[0], canonical, canonical.RuntimeState(), canonical.Title)
+	}
+
+	newer := loadDetached("new metadata")
+	newer.ApplyRuntimeState(statedb.RuntimeState{
+		InstanceID: newer.ID, Generation: 3, TmuxSession: "tmux-g3", Status: "waiting",
+	})
+	model, _ = home.Update(loadSessionsMsg{instances: []*session.Instance{newer}})
+	home = model.(*Home)
+	if home.instances[0] != canonical || canonical.RuntimeState().Generation != 3 || canonical.Title != "new metadata" {
+		t.Fatalf("new reload did not merge into canonical object: ptr=%p want=%p state=%#v title=%q",
+			home.instances[0], canonical, canonical.RuntimeState(), canonical.Title)
 	}
 }
 
@@ -3860,6 +3912,9 @@ func TestStatusUpdateMsg_ReconcilesAttachedSessionViaDeferredCmd(t *testing.T) {
 	inst.CreatedAt = time.Now().Add(-2 * time.Second)
 	inst.Status = session.StatusRunning
 	setAttachReturnTestInstances(h, []*session.Instance{inst})
+	if err := h.storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("seed attached session runtime: %v", err)
+	}
 
 	hooksDir := session.GetHooksDir()
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {

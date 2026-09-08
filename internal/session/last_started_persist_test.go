@@ -47,7 +47,7 @@ func TestLastStartedAt_ToolDataPersistenceRoundTrip(t *testing.T) {
 
 // TestLastStartedAt_SQLiteRoundTrip is the boundary test finding #1/#2 of
 // the #1704 review demanded: prove LastStartedAt survives an actual
-// SaveWithGroups -> LoadWithGroups cycle through SQLite — the exact process
+// explicit insert -> LoadWithGroups cycle through SQLite — the exact process
 // boundary status_stale.go crosses — rather than being set directly on an
 // in-memory Instance literal the way the original heuristic tests did.
 func TestLastStartedAt_SQLiteRoundTrip(t *testing.T) {
@@ -60,8 +60,8 @@ func TestLastStartedAt_SQLiteRoundTrip(t *testing.T) {
 	inst.LastStartedAt = started
 
 	groupTree := NewGroupTreeWithGroups([]*Instance{inst}, nil)
-	if err := storage.SaveWithGroups([]*Instance{inst}, groupTree); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, groupTree); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	loaded, _, err := storage.LoadWithGroups()
@@ -81,8 +81,8 @@ func TestLastStartedAt_SQLiteRoundTrip(t *testing.T) {
 	fresh := NewInstance("never-started-roundtrip", "/tmp")
 	fresh.Tool = "shell"
 	groupTree2 := NewGroupTreeWithGroups([]*Instance{fresh}, nil)
-	if err := storage.SaveWithGroups([]*Instance{fresh}, groupTree2); err != nil {
-		t.Fatalf("SaveWithGroups (never-started): %v", err)
+	if err := storage.InsertSessionAndVerify(fresh, groupTree2); err != nil {
+		t.Fatalf("InsertSessionAndVerify (never-started): %v", err)
 	}
 	loaded2, _, err := storage.LoadWithGroups()
 	if err != nil {

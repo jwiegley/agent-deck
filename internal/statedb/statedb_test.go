@@ -200,6 +200,18 @@ func TestSaveInstancesPreservesFreshAutoNameFieldsFromStaleSnapshot(t *testing.T
 		t.Errorf("AutoNameDescription after stale SaveInstances = %q, want fresh DB value", got)
 	}
 
+	stale.AutoNameDescription = "older non-empty description"
+	if err := db.SaveInstances([]*InstanceRow{&stale}); err != nil {
+		t.Fatalf("stale non-empty SaveInstances: %v", err)
+	}
+	loaded, err = db.LoadInstances()
+	if err != nil {
+		t.Fatalf("LoadInstances after stale non-empty save: %v", err)
+	}
+	if got := loaded[0].AutoNameDescription; got != "Review SketchUp house models" {
+		t.Errorf("AutoNameDescription after stale non-empty SaveInstances = %q, want fresh DB value", got)
+	}
+
 	if _, err := db.DB().Exec(`UPDATE instances SET auto_name = 0 WHERE id = ?`, row.ID); err != nil {
 		t.Fatalf("clear auto_name directly: %v", err)
 	}

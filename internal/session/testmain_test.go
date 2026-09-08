@@ -232,6 +232,14 @@ func runTestMain(m *testing.M) int {
 	cleanupTmux := testutil.IsolateTmuxSocket()
 	defer cleanupTmux()
 
+	// The packaged runtime-lifecycle gate is deliberately SQLite-only. Keep
+	// the socket isolation above so even an accidentally included tmux test
+	// cannot reach the user's server, but avoid starting a bootstrap server.
+	if os.Getenv("AGENTDECK_RUNTIME_LIFECYCLE_ONLY") == "1" {
+		os.Setenv("AGENTDECK_PROFILE", "_test")
+		return m.Run()
+	}
+
 	// Bootstrap an idle detached tmux session in the isolated socket so
 	// `tmux list-sessions` succeeds for the lifetime of the test binary.
 	// Without this, regression tests that depend on a running tmux server

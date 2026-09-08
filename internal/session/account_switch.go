@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 )
 
 // Sentinel errors for the account-switch flow. Callers use errors.Is to tell
@@ -29,6 +28,9 @@ type AccountSwitchOptions struct {
 	// NoRestart leaves a previously-running session stopped after the switch
 	// instead of restarting it with `claude --resume`.
 	NoRestart bool
+	// Persist commits the account metadata before any replacement starts.
+	// Production callers must provide it; nil is supported for stopped unit fixtures.
+	Persist func() error
 }
 
 // AccountSwitchResult describes a completed switch. It is returned (non-nil)
@@ -103,38 +105,17 @@ func SwitchAccount(cfg *UserConfig, inst *Instance, account string, opts Account
 			ErrAccountSwitchUnsupported, inst.Tool)
 	}
 
-	// IDs are synced from tmux (same pattern as `stop`) BEFORE the ambiguity
-	// preflight below, since that check reads inst.ClaudeSessionID.
+	selection := inst.CaptureRuntimeSelection()
 	wasRunning := inst.Exists()
 	if wasRunning {
 		inst.SyncSessionIDsFromTmux()
 	}
 
-	// Capture the source dir BEFORE mutating the account field — afterwards
-	// the resolver would already return the target.
 	srcDir := GetClaudeConfigDirForInstance(inst)
-	// #1571: a pre-account-tracking session (empty account field) resolves to
-	// env/profile/global defaults, which can equal the target dir — the old
-	// code then declared "nothing to migrate" and the restarted resume died
-	// with "No conversation found". The disk is authoritative: scan every
-	// configured config dir for the conversation file and treat the dir that
-	// actually contains it as the source.
-	//
-	// Review finding on #1830: this ambiguity preflight runs BEFORE the
-	// running session is stopped below. Locating the conversation is a
-	// read-only disk scan that does not need the session dead, and running
-	// it first means an ambiguous-discovery abort leaves the session
-	// untouched instead of stopping it for a switch that never happens.
 	locatedDir, locatedSID, srcSize := LocateConversationConfigDir(cfg, inst, srcDir)
 	if locatedDir != "" {
 		srcDir = locatedDir
 		if inst.ClaudeSessionID == "" && locatedSID != "" {
-			// #1815: with no recorded id, this is "the newest conversation in
-			// the project dir" — a guess that a shared working directory can
-			// answer with a NEIGHBOURING session's transcript. Copying first
-			// and refusing to resume later is not good enough: the copy has
-			// already carried someone else's conversation into another
-			// account's config dir. Ambiguous discovery copies nothing.
 			return nil, fmt.Errorf(
 				"cannot identify %s's conversation: it has no recorded conversation id, and the only "+
 					"candidate is the newest transcript in its working directory (%s), which may belong "+
@@ -146,75 +127,93 @@ func SwitchAccount(cfg *UserConfig, inst *Instance, account string, opts Account
 		}
 	}
 
-	// Stop a running session so its conversation file is final before the
-	// copy, now that the ambiguity preflight above has passed.
-	if wasRunning {
-		if err := inst.Kill(); err != nil {
-			return nil, fmt.Errorf("failed to stop session before switch: %w", err)
-		}
-		// Re-locate for the final, post-stop size: Kill flushes the
-		// transcript, so the preflight's size snapshot may be stale.
-		if locatedDir != "" {
+	result := &AccountSwitchResult{NewAccount: account}
+	accountCommitted := false
+	var migrated string
+	var migErr error
+	commit := func() error {
+		if wasRunning && locatedDir != "" {
 			if freshDir, _, freshSize := LocateConversationConfigDir(cfg, inst, srcDir); freshDir != "" {
 				locatedDir, srcDir, srcSize = freshDir, freshDir, freshSize
 			}
 		}
-	}
-
-	migrated, migErr := MigrateConversationFrom(inst, srcDir, targetDir)
-	if migErr != nil && !errors.Is(migErr, ErrNoConversation) {
-		// Conversation intact in the source account; account field unchanged.
-		return nil, fmt.Errorf("conversation migration failed, account not switched: %w", migErr)
-	}
-
-	// Post-switch verification (#1571): when a source conversation demonstrably
-	// exists on disk, the target dir must contain it (size within ~1%) before
-	// the account field flips. Fresh sessions (no conversation anywhere) keep
-	// the lenient path.
-	if locatedDir != "" {
-		if verifyErr := VerifyConversationInDir(inst, targetDir, srcSize); verifyErr != nil {
-			return nil, fmt.Errorf("conversation not verified in target config dir, account not switched: %w", verifyErr)
+		migrated, migErr = MigrateConversationFrom(inst, srcDir, targetDir)
+		if migErr != nil && !errors.Is(migErr, ErrNoConversation) {
+			return fmt.Errorf("conversation migration failed, account not switched: %w", migErr)
 		}
+		if locatedDir != "" {
+			if err := VerifyConversationInDir(inst, targetDir, srcSize); err != nil {
+				return fmt.Errorf("conversation not verified in target config dir, account not switched: %w", err)
+			}
+		}
+		if blocked, why := AccountSwitchRestartUnsafe(inst, locatedDir, wasRunning, opts.NoRestart); blocked {
+			return fmt.Errorf("conversation verification failed for %s: %s", inst.Title, why)
+		}
+		if err := PreAcceptClaudeTrust(filepath.Join(targetDir, ".claude.json"), inst.EffectiveWorkingDir()); err != nil {
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("could not pre-accept folder trust in target config dir: %v", err))
+		}
+		oldAccount, err := commitSwitchAccount(inst, account, opts.Persist)
+		if err != nil {
+			return err
+		}
+		result.OldAccount = oldAccount
+		result.MigratedPath = migrated
+		result.Conversation = describeMigration(migrated, migErr, locatedDir)
+		accountCommitted = true
+		return nil
 	}
 
-	// #1815 Guard 2: a failed transcript verification must STOP the sequence,
-	// not annotate it.
-	if blocked, why := AccountSwitchRestartUnsafe(inst, locatedDir, wasRunning, opts.NoRestart); blocked {
-		return nil, fmt.Errorf("conversation verification failed for %s: %s", inst.Title, why)
+	restartRequested := wasRunning && !opts.NoRestart
+	if opts.Persist == nil {
+		if wasRunning {
+			return nil, errors.New("account switch persistence callback required for running session")
+		}
+		if err := commit(); err != nil {
+			return nil, err
+		}
+		return result, nil
 	}
 
-	result := &AccountSwitchResult{NewAccount: account, MigratedPath: migrated}
-
-	// Pre-seed the folder-trust entry for (target config dir, project path)
-	// (#1571 root cause 4): the first launch of a fresh (config_dir, cwd)
-	// pair blocks interactively on "Do you trust this folder?", stalling the
-	// restarted session. Best-effort — a warning must not abort the switch.
-	if trustErr := PreAcceptClaudeTrust(filepath.Join(targetDir, ".claude.json"), inst.EffectiveWorkingDir()); trustErr != nil {
-		result.Warnings = append(result.Warnings,
-			fmt.Sprintf("could not pre-accept folder trust in target config dir: %v", trustErr))
+	runtime, switchErr := inst.SwitchAccountRuntime(selection, restartRequested, commit)
+	_, failure, warning := ConsumePhysicalRuntimeResult(inst, runtime, switchErr, nil)
+	if warning != "" {
+		result.Warnings = append(result.Warnings, warning)
 	}
+	if !accountCommitted {
+		return nil, failure
+	}
+	if failure != nil {
+		return result, fmt.Errorf("%w: %v (start it manually with: agent-deck session start %s)",
+			ErrAccountSwitchRestartFailed, failure, inst.Title)
+	}
+	result.Restarted = restartRequested
+	return result, nil
+}
 
-	oldAccount, postCommit, setErr := SetField(inst, FieldAccount, account, nil)
-	if setErr != nil {
-		return nil, setErr
+func commitSwitchAccount(inst *Instance, account string, persist func() error) (string, error) {
+	oldAccount, postCommit, err := SetField(inst, FieldAccount, account, nil)
+	if err != nil {
+		return oldAccount, err
 	}
 	if postCommit != nil {
 		postCommit()
 	}
-	result.OldAccount = oldAccount
-	result.Conversation = describeMigration(migrated, migErr, locatedDir)
-
-	if wasRunning && !opts.NoRestart {
-		if startErr := inst.Start(); startErr != nil {
-			// The account IS switched and the conversation IS migrated; the
-			// caller must still persist that. Signal the partial state.
-			return result, fmt.Errorf("%w: %v (start it manually with: agent-deck session start %s)",
-				ErrAccountSwitchRestartFailed, startErr, inst.Title)
-		}
-		inst.LastStartedAt = time.Now()
-		result.Restarted = true
+	if persist == nil {
+		return oldAccount, nil
 	}
-	return result, nil
+	if err := persist(); err == nil {
+		return oldAccount, nil
+	} else {
+		_, rollbackPostCommit, rollbackErr := SetField(inst, FieldAccount, oldAccount, nil)
+		if rollbackPostCommit != nil {
+			rollbackPostCommit()
+		}
+		if rollbackErr != nil {
+			return oldAccount, fmt.Errorf("failed to save session state: %v; failed to restore account: %w", err, rollbackErr)
+		}
+		return oldAccount, fmt.Errorf("failed to save session state: %w", err)
+	}
 }
 
 // describeMigration renders the human summary of what happened to the

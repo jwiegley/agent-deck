@@ -48,8 +48,8 @@ func TestB5_ParentRemovedMidFlight_DeadLettersWithReasonAndLogs(t *testing.T) {
 		Status:          StatusWaiting,
 		CreatedAt:       now,
 	}
-	if err := storage.SaveWithGroups([]*Instance{child}, nil); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(child, nil); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	n := NewTransitionNotifier()

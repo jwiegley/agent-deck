@@ -102,9 +102,9 @@ func TestRestartWithArchiveTransitionDoesNotRestartWhenUnarchivePersistenceFails
 
 func TestRestartFreshWithArchiveTransitionUnarchivesBeforeRestart(t *testing.T) {
 	archivedAt := time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC)
-	inst := &session.Instance{ID: "archived-fresh", ArchivedAt: archivedAt}
-	home := NewHome()
-	home.instanceByID[inst.ID] = inst
+	inst := session.NewInstance("archived-fresh", t.TempDir())
+	inst.ArchivedAt = archivedAt
+	home := &Home{instanceByID: map[string]*session.Instance{inst.ID: inst}}
 	var events []string
 
 	cmd := home.restartSessionFreshWith(inst, func(current *session.Instance) error {
@@ -136,9 +136,9 @@ func TestRestartFreshWithArchiveTransitionUnarchivesBeforeRestart(t *testing.T) 
 
 func TestRestartFreshWithArchiveTransitionRestoresArchiveOnFailure(t *testing.T) {
 	archivedAt := time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC)
-	inst := &session.Instance{ID: "archived-fresh", ArchivedAt: archivedAt}
-	home := NewHome()
-	home.instanceByID[inst.ID] = inst
+	inst := session.NewInstance("archived-fresh", t.TempDir())
+	inst.ArchivedAt = archivedAt
+	home := &Home{instanceByID: map[string]*session.Instance{inst.ID: inst}}
 	var persisted []time.Time
 	restartErr := errors.New("fresh spawn failed")
 
@@ -164,9 +164,8 @@ func TestRestartFreshWithArchiveTransitionRestoresArchiveOnFailure(t *testing.T)
 }
 
 func TestRestartFreshWithArchiveTransitionActiveSessionSkipsPersistence(t *testing.T) {
-	inst := &session.Instance{ID: "active-fresh"}
-	home := NewHome()
-	home.instanceByID[inst.ID] = inst
+	inst := session.NewInstance("active-fresh", t.TempDir())
+	home := &Home{instanceByID: map[string]*session.Instance{inst.ID: inst}}
 	persisted := false
 	restarted := false
 

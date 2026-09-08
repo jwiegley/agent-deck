@@ -592,7 +592,10 @@ func main() {
 	if err == nil {
 		if db := earlyStorage.GetDB(); db != nil {
 			statedb.SetGlobal(db)
-			_ = db.RegisterInstance(false)
+			if err := db.RegisterInstance(false); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: failed to register runtime writer: %v\n", err)
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -2113,7 +2116,7 @@ func handleAdd(profile string, args []string) {
 		groupTree.CreateGroupPath(newInstance.GroupPath)
 	}
 
-	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
+	if err := storage.InsertSessionAndVerify(newInstance, groupTree); err != nil {
 		fmt.Printf("Error: failed to save session: %v\n", err)
 		os.Exit(1)
 	}
@@ -2160,9 +2163,14 @@ func handleAdd(profile string, args []string) {
 			out.Error("--attach is not supported with --ssh (remote sessions); session was created", ErrCodeInvalidOperation)
 			os.Exit(3)
 		}
-		if err := newInstance.Start(); err != nil {
-			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
+		runtime, startErr := newInstance.StartRuntime()
+		startErr, persistenceWarning := consumeRuntimeResult(newInstance, runtime, startErr)
+		if startErr != nil {
+			out.Error(fmt.Sprintf("failed to start session: %v", startErr), ErrCodeInvalidOperation)
 			os.Exit(1)
+		}
+		if persistenceWarning != "" && !quietMode {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
 		}
 		newInstance.PostStartSync(3 * time.Second)
 		if err := storage.SaveWithGroups(instances, groupTree); err != nil {
@@ -2635,42 +2643,36 @@ func handleRemove(profile string, args []string) {
 		}
 		os.Exit(1)
 	}
+	selection := inst.CaptureRuntimeSelection()
 
 	removedID := inst.ID
 	removedTitle := inst.Title
 
-	// Snapshot service-unit ownership BEFORE teardown (issue #1721): the
-	// pid of the tmux server generation this session belongs to is only
-	// observable while the session is still live, and it is what proves
-	// the unit we may stop later is the one we actually retired.
-	serviceUnitOwnership := inst.ServiceUnitOwnership()
-
-	// Always attempt to kill the tmux session, even if Exists() returns false.
-	// The saved status may be stale (e.g., "error" in DB but tmux session still alive).
-	// KillAndWait is safe to call on non-existent sessions (returns error which we handle).
-	// Uses the synchronous variant so the SIGTERM→SIGKILL escalation finishes
-	// before this short-lived CLI exits — otherwise SIGHUP-immune claude
-	// processes survive as orphans (issue #59, v1.7.68).
-	if err := inst.KillAndWait(); err != nil {
-		// Only warn if the session actually existed (ignore "not found" errors)
-		if inst.Exists() && !*jsonOutput {
-			fmt.Printf("Warning: failed to kill tmux session: %v\n", err)
-			fmt.Println("Session removed from Agent Deck but may still be running in tmux")
-		}
+	// Stop and conditionally delete exactly the runtime selected above. A stale
+	// DeleteAndWaitCaptured also snapshots and conditionally retires any proven
+	// exclusive service unit so every parent-deleting surface shares one policy.
+	if err := inst.DeleteAndWaitCaptured(selection); err != nil {
+		out.Error(fmt.Sprintf("failed to remove selected runtime: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
 	}
 
-	// v1.7.21+: if this session was spawned via LaunchAs=service, the
-	// transient systemd-user service unit survives a plain `tmux
-	// kill-server` (Restart=on-failure would respawn it). Best-effort
-	// stop + reset-failed the unit here so `agent-deck remove` is truly
-	// terminal. No-op on non-service-mode sessions and on non-systemd
-	// hosts.
-	//
-	// Gated on proven exclusive ownership (issue #1721): the unit
-	// supervises a tmux SERVER, which on the default socket is shared by
-	// every sibling session, so an unconditional stop could kill sessions
-	// this removal was never allowed to touch.
-	_ = inst.RetireServiceUnit(serviceUnitOwnership)
+	// Persist only group ordering after the runtime-aware delete; never issue a
+	// second unconditional delete that could remove a recreated generation.
+	newInstances := make([]*session.Instance, 0, len(instances)-1)
+	for _, s := range instances {
+		if s.ID != removedID {
+			newInstances = append(newInstances, s)
+		}
+	}
+	groupTree := session.NewGroupTreeWithGroups(newInstances, groups)
+	if err := storage.SaveGroupsOnly(groupTree); err != nil {
+		out.Error(fmt.Sprintf("failed to save session groups: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if exists, err := storage.InstanceExists(removedID); err != nil || exists {
+		out.Error(fmt.Sprintf("failed to verify conditional removal: exists=%v err=%v", exists, err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
 
 	// Clean up worktree directory if this is a worktree session
 	if inst.IsWorktree() {
@@ -2684,29 +2686,6 @@ func handleRemove(profile string, args []string) {
 		} else if !*jsonOutput {
 			fmt.Printf("Warning: failed to initialize VCS for worktree cleanup: %v\n", err)
 		}
-	}
-
-	// Rebuild instance list without the deleted session and persist groups.
-	// v1.9.1 (#909): the rm path now uses RemoveSessionAndVerify which
-	//   1. issues a targeted DELETE (busy-retried in statedb),
-	//   2. saves groups WITHOUT rewriting the instances table (SaveGroupsOnly,
-	//      not SaveWithGroups — the latter's load-modify-write INSERT OR
-	//      REPLACE was the structural source of the silent-loss race), and
-	//   3. verifies the row is actually gone, retrying the DELETE on
-	//      resurrection by a concurrent SaveInstances rewrite.
-	// On persistent failure the CLI exits 1 instead of falsely printing
-	// "✓ Removed".
-	newInstances := make([]*session.Instance, 0, len(instances)-1)
-	for _, s := range instances {
-		if s.ID != removedID {
-			newInstances = append(newInstances, s)
-		}
-	}
-	groupTree := session.NewGroupTreeWithGroups(newInstances, groups)
-
-	if err := storage.RemoveSessionAndVerify(removedID, newInstances, groupTree); err != nil {
-		out.Error(fmt.Sprintf("failed to remove session: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
 	}
 
 	// Best-effort post-removal cleanup for transition-notifier state

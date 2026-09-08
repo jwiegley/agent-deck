@@ -67,7 +67,7 @@ func handleSessionSwitchAccount(profile string, args []string) {
 
 	userConfig, _ := session.LoadUserConfig()
 
-	storage, instances, groups, err := loadSessionData(profile)
+	storage, instances, _, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
 		os.Exit(1)
@@ -81,9 +81,11 @@ func handleSessionSwitchAccount(profile string, args []string) {
 		os.Exit(1)
 		return // unreachable, satisfies staticcheck SA5011
 	}
-
 	result, switchErr := session.SwitchAccount(userConfig, inst, account, session.AccountSwitchOptions{
 		NoRestart: *noRestart,
+		Persist: func() error {
+			return storage.Save([]*session.Instance{inst})
+		},
 	})
 	if result == nil {
 		// Every abort path leaves the instance untouched, so there is nothing
@@ -93,11 +95,6 @@ func handleSessionSwitchAccount(profile string, args []string) {
 	}
 	for _, warning := range result.Warnings {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", warning)
-	}
-
-	if err := saveSessionData(storage, instances, groups); err != nil {
-		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
 	}
 
 	if switchErr != nil {

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // Tests for the codex subagent-thread rebind gate and restart safety net
@@ -284,6 +286,7 @@ func seedCodexRolloutCwd(t *testing.T, codexHome, sid, threadSource, cwd string)
 
 func TestResolveCodexDetectionCandidateRejectsSubagent(t *testing.T) {
 	inst, codexHome := newCodexGateInstance(t)
+	installFreshCodexOwnershipSnapshot(t)
 	userSID := uniqueSID(t)
 	subSID := uniqueSID(t)
 	seedCodexRolloutCwd(t, codexHome, userSID, "user", inst.ProjectPath)
@@ -292,6 +295,25 @@ func TestResolveCodexDetectionCandidateRejectsSubagent(t *testing.T) {
 	if got := inst.resolveCodexDetectionCandidate(subSID, nil); got != userSID {
 		t.Fatalf("async candidate resolution = %q, want user thread %q", got, userSID)
 	}
+}
+
+func installFreshCodexOwnershipSnapshot(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(2 * codexOwnershipRefreshTimeout)
+	for codexOwnershipRefresh.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if codexOwnershipRefresh.Load() {
+		t.Fatal("Codex ownership refresh did not quiesce")
+	}
+	previous := codexOwnershipSnapshot.Swap(&codexOwnershipSnapshotData{
+		loadedAt:  time.Now(),
+		sourceKey: os.Getenv("PATH") + "\x00" + tmux.DefaultSocketName(),
+		idsByTmux: map[string]string{},
+		ownedIDs:  map[string]int{},
+		complete:  true,
+	})
+	t.Cleanup(func() { codexOwnershipSnapshot.Store(previous) })
 }
 
 func TestRejectedSubagentProbePreservesIncompleteResult(t *testing.T) {
@@ -332,6 +354,10 @@ func TestRejectedSubagentProbePreservesIncompleteResult(t *testing.T) {
 func TestUpdateCodexSession_DiskScan_PrefersUserOverSubagent(t *testing.T) {
 	inst, codexHome := newCodexGateInstance(t)
 	inst.lastCodexProbeAt = time.Now().Add(time.Hour) // This test isolates disk selection.
+	storage := runtimeBindingTestStorage(t)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(inst.ProjectPath, 0o755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
 	}
@@ -343,7 +369,7 @@ func TestUpdateCodexSession_DiskScan_PrefersUserOverSubagent(t *testing.T) {
 	seedCodexRolloutCwd(t, codexHome, userSID, "user", inst.ProjectPath)
 	seedCodexRolloutCwd(t, codexHome, subSID, "subagent", inst.ProjectPath)
 
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(map[string]bool{})
 
 	if inst.CodexSessionID == subSID {
 		t.Fatalf("disk scan adopted the subagent thread %q — codex refuses user "+
@@ -364,7 +390,10 @@ func TestUpdateCodexSession_DiskScan_RejectsLoneSubagent(t *testing.T) {
 	subSID := uniqueSID(t)
 	seedCodexRolloutCwd(t, codexHome, subSID, "subagent", inst.ProjectPath)
 
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(map[string]bool{})
+	if inst.lastCodexScanAt.IsZero() {
+		t.Fatal("disk scan did not run")
+	}
 
 	if inst.CodexSessionID != "" {
 		t.Fatalf("disk scan must leave the session unbound when only a subagent "+

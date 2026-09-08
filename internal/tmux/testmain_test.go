@@ -106,6 +106,14 @@ func runTestMain(m *testing.M) int {
 	cleanupTmux := testutil.IsolateTmuxSocket()
 	defer cleanupTmux()
 
+	// The packaged runtime-lifecycle gate installs a deliberately failing fake
+	// tmux binary. Preserve socket isolation, but do not spend the bootstrap
+	// retry window trying to start a server that this focused gate never uses.
+	if os.Getenv("AGENTDECK_RUNTIME_LIFECYCLE_ONLY") == "1" {
+		os.Setenv("AGENTDECK_PROFILE", "_test")
+		return m.Run()
+	}
+
 	// Bootstrap an idle tmux server in the isolated socket so the tests that
 	// depend on `tmux list-sessions` succeeding (#618 cleanup-attach OSC,
 	// etc.) actively run rather than silent-skipping on cold-boot. Registered

@@ -28,9 +28,12 @@ func TestStress_StaleFullSavePreservesStickyGenericID(t *testing.T) {
 	inst.Tool = "shell"
 	inst.Color = "#ff00aa"
 	// First save: no generic id yet.
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatalf("initial save: %v", err)
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
+	snapshots, _, err := storage.LoadWithGroups()
+	if err != nil || len(snapshots) != 1 {
+		t.Fatalf("load stale snapshot: len=%d err=%v", len(snapshots), err)
 	}
+	stale := snapshots[0]
 
 	// Live capture path: targeted write while in-memory snapshot stays empty.
 	detected := time.Unix(1_700_000_200, 0).UTC()
@@ -39,7 +42,6 @@ func TestStress_StaleFullSavePreservesStickyGenericID(t *testing.T) {
 	}
 
 	// Stale full-table save: Instance still has empty GenericSessionID.
-	stale := inst
 	stale.Color = "#00ff00" // unrelated field change
 	stale.GenericSessionID = ""
 	stale.GenericDetectedAt = time.Time{}
@@ -72,9 +74,7 @@ func TestStress_ExplicitClearViaBindingThenLoad(t *testing.T) {
 	inst.Tool = "shell"
 	inst.GenericSessionID = "to-be-cleared"
 	inst.GenericDetectedAt = time.Now()
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	if err := storage.db.WriteGenericSessionBinding(inst.ID, "", inst.Tool, inst.Command, LocationOf(inst).String(), time.Time{}); err != nil {
 		t.Fatalf("clear binding: %v", err)
@@ -111,9 +111,7 @@ func TestStress_SetFieldClearThenSave_StickyHole(t *testing.T) {
 	inst.Tool = "shell"
 	inst.GenericSessionID = "must-clear"
 	inst.GenericDetectedAt = time.Now()
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	// Simulate CLI: SetField then SaveWithGroups. GetGlobal is nil here (same
 	// as pure `agent-deck session set` without TUI SetGlobal).
@@ -155,9 +153,7 @@ func TestStress_RawEmptySaveWithoutClearFlag_PreservesSticky(t *testing.T) {
 	inst.Tool = "shell"
 	inst.GenericSessionID = "zombie-id"
 	inst.GenericDetectedAt = time.Now()
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	inst.GenericSessionID = ""
 	inst.GenericDetectedAt = time.Time{}
@@ -186,9 +182,7 @@ func TestStress_WriteBindingDoesNotClobberOtherToolDataKeys(t *testing.T) {
 	inst.ClaudeDetectedAt = time.Unix(1_700_000_000, 0).UTC()
 	inst.Color = "#abcdef"
 	inst.LastStartedAt = time.Unix(1_700_000_050, 0).UTC()
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	if err := storage.db.WriteGenericSessionBinding(inst.ID, "generic-1", inst.Tool, inst.Command, LocationOf(inst).String(), time.Unix(1_700_000_100, 0).UTC()); err != nil {
 		t.Fatal(err)
@@ -244,9 +238,7 @@ func TestStress_DetectedAtZeroVsNonZero(t *testing.T) {
 
 	inst := NewInstance("detected-at", "/tmp")
 	inst.Tool = "shell"
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	before := time.Now().Add(-2 * time.Second)
 	if err := storage.db.WriteGenericSessionBinding(inst.ID, "id-zero-at", inst.Tool, inst.Command, LocationOf(inst).String(), time.Time{}); err != nil {
@@ -309,9 +301,7 @@ func TestStress_RapidAlternateWrites_LastWriteWins(t *testing.T) {
 
 	inst := NewInstance("race-ids", "/tmp")
 	inst.Tool = "shell"
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	const n = 40
 	var wg sync.WaitGroup
@@ -411,9 +401,7 @@ func TestStress_ClaudeAndGenericIndependent(t *testing.T) {
 	inst.ClaudeDetectedAt = time.Unix(100, 0).UTC()
 	inst.GenericSessionID = "generic-BBB"
 	inst.GenericDetectedAt = time.Unix(200, 0).UTC()
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	if err := storage.db.WriteGenericSessionBinding(inst.ID, "generic-CCC", inst.Tool, inst.Command, LocationOf(inst).String(), time.Unix(300, 0).UTC()); err != nil {
 		t.Fatal(err)
@@ -429,8 +417,19 @@ func TestStress_ClaudeAndGenericIndependent(t *testing.T) {
 		t.Fatalf("generic id=%q", loaded[0].GenericSessionID)
 	}
 
-	if err := storage.db.WriteClaudeSessionBinding(inst.ID, "claude-DDD", time.Unix(400, 0).UTC()); err != nil {
-		t.Fatal(err)
+	state, found, err := storage.db.ReadRuntimeState(inst.ID)
+	if err != nil || !found {
+		t.Fatalf("ReadRuntimeState: found=%v err=%v", found, err)
+	}
+	binding, found, err := storage.db.ReadRuntimeBinding(inst.ID, "claude")
+	if err != nil || !found {
+		t.Fatalf("ReadRuntimeBinding(claude): found=%v err=%v", found, err)
+	}
+	if _, applied, err := storage.db.WriteRuntimeBindingIfVersion(
+		inst.ID, inst.PersistenceIncarnation(), state.Generation, "claude",
+		binding.Revision, "claude-DDD", time.Unix(400, 0).UTC(),
+	); err != nil || !applied {
+		t.Fatalf("WriteRuntimeBindingIfVersion(claude): applied=%v err=%v", applied, err)
 	}
 	loaded2, _, err := storage.LoadWithGroups()
 	if err != nil {
@@ -479,18 +478,14 @@ func TestStress_ProfileIsolation_SeparateStateDBs(t *testing.T) {
 	iDef := NewInstance("shared-title", "/tmp")
 	iDef.Tool = "shell"
 	iDef.GenericSessionID = "default-sid"
-	if err := def.SaveWithGroups([]*Instance{iDef}, NewGroupTreeWithGroups([]*Instance{iDef}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, def, []*Instance{iDef}, NewGroupTreeWithGroups([]*Instance{iDef}, nil))
 
 	iWork := NewInstance("shared-title", "/tmp")
 	iWork.Tool = "shell"
 	iWork.GenericSessionID = "work-sid"
 	// Force same instance ID to prove DBs are isolated even on id collision.
 	iWork.ID = iDef.ID
-	if err := work.SaveWithGroups([]*Instance{iWork}, NewGroupTreeWithGroups([]*Instance{iWork}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, work, []*Instance{iWork}, NewGroupTreeWithGroups([]*Instance{iWork}, nil))
 
 	ld, _, err := def.LoadWithGroups()
 	if err != nil {

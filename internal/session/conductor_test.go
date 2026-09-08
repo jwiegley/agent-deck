@@ -2629,7 +2629,7 @@ func TestGetConductorLastActivity_NoManagedSessions(t *testing.T) {
 	// Register the conductor session itself (no children).
 	conductorInst := NewInstance("conductor-alpha", "/tmp")
 	conductorInst.IsConductor = true
-	if err := storage.Save([]*Instance{conductorInst}); err != nil {
+	if err := storage.InsertSessionAndVerify(conductorInst, nil); err != nil {
 		t.Fatalf("save conductor instance: %v", err)
 	}
 
@@ -2666,8 +2666,10 @@ func TestGetConductorLastActivity_ExcludesConductorWindow(t *testing.T) {
 	// Unparented watched profile session; must contribute to activity scope.
 	unparented := NewInstance("other-session", "/tmp/other")
 
-	if err := storage.Save([]*Instance{conductorInst, managed, unparented}); err != nil {
-		t.Fatalf("save instances: %v", err)
+	for _, inst := range []*Instance{conductorInst, managed, unparented} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert %s: %v", inst.ID, err)
+		}
 	}
 
 	// We can't call tmux in a unit test, so just verify the function proceeds
@@ -2700,8 +2702,10 @@ func TestGetConductorLastActivity_IncludesUnparentedWatchedSessions(t *testing.T
 	conductorInst.IsConductor = true
 	watched := NewInstance("preexisting-worker", "/tmp/work")
 
-	if err := storage.Save([]*Instance{conductorInst, watched}); err != nil {
-		t.Fatalf("save instances: %v", err)
+	for _, inst := range []*Instance{conductorInst, watched} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert %s: %v", inst.ID, err)
+		}
 	}
 
 	got, err := GetConductorLastActivity("delta", "default")
@@ -2744,8 +2748,10 @@ func TestGetConductorLastActivity_TransitiveScan(t *testing.T) {
 	// Unrelated session — must not appear in the scan.
 	unrelated := NewInstance("other", "/tmp/other")
 
-	if err := storage.Save([]*Instance{conductorInst, managed, subSession, unrelated}); err != nil {
-		t.Fatalf("save instances: %v", err)
+	for _, inst := range []*Instance{conductorInst, managed, subSession, unrelated} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert %s: %v", inst.ID, err)
+		}
 	}
 
 	// Without a live tmux server all window_activity queries fail silently;

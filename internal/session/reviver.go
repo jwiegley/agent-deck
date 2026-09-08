@@ -1,9 +1,11 @@
 package session
 
 import (
+	"errors"
 	"log/slog"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -11,6 +13,8 @@ import (
 //
 //   - ClassAlive    — tmux session exists AND our control pipe is alive.
 //     The session is healthy; no action needed.
+//   - ClassStarting — tmux exists but its control pipe is still inside the
+//     generation's post-start readiness window. No reconnect is attempted.
 //   - ClassErrored  — tmux session exists but the control pipe is dead (or
 //     Status == StatusError). Likely cause: SSH logout killed our inherited
 //     pipe but the tmux server survived under its own user scope. Revivable.
@@ -22,14 +26,22 @@ type RevivalClass int
 
 const (
 	ClassAlive RevivalClass = iota
+	ClassStarting
 	ClassErrored
 	ClassDead
 )
+
+// A new runtime gets the same window to establish its control pipe that the
+// spawn watcher uses to decide whether startup survived. One readiness budget
+// therefore governs both observers instead of two drifting magic numbers.
+const reviverControlPipeReadyGrace = spawnFastDeathWindow
 
 func (c RevivalClass) String() string {
 	switch c {
 	case ClassAlive:
 		return "alive"
+	case ClassStarting:
+		return "starting"
 	case ClassErrored:
 		return "errored"
 	case ClassDead:
@@ -53,6 +65,10 @@ type ReviveOutcome struct {
 	// cannot authenticate (see auth_hold.go). Distinct from CircuitOpen: this is
 	// not futility to back off from, it is a condition only a human can clear.
 	AuthHeld bool
+	// Stale is true when a newer runtime generation or status revision won
+	// while this observation was in flight. Stale work is reloaded, never
+	// reported as a successful revive.
+	Stale bool
 }
 
 // Reviver walks storage and re-establishes dead control pipes for instances
@@ -70,8 +86,24 @@ type Reviver struct {
 	TmuxExists   func(name, socketName string) bool
 	PipeAlive    func(name string) bool
 	ReviveAction func(*Instance) error
-	Stagger      time.Duration
-	Log          *slog.Logger
+	// ReviveActionIfCurrent is the generation-aware production action. Tests
+	// that construct Reviver literals may keep using ReviveAction as a small
+	// legacy seam; NewReviver always installs this fenced variant.
+	ReviveActionIfCurrent func(*Instance, statedb.RuntimeState, string) error
+	// ConnectPipe is isolated so lifecycle tests can place a barrier between
+	// the pre-connect and post-connect generation checks without real tmux.
+	ConnectPipe func(name, socketName string) error
+	// Acquire serializes the final recheck/action/publication with physical
+	// start, restart, stop, and kill operations for the same logical instance.
+	Acquire func(instanceID string) (func(), error)
+	// Now drives the post-start readiness policy. nil means time.Now.
+	Now func() time.Time
+	// ReadinessGrace is the maximum post-start interval in which an absent
+	// control pipe still means "starting". Non-positive values use the shared
+	// spawn readiness budget.
+	ReadinessGrace time.Duration
+	Stagger        time.Duration
+	Log            *slog.Logger
 	// Breaker bounds futile reconnect storms on a wedged tmux server (#1579).
 	// nil disables the breaker entirely — exact legacy behavior, relied on by
 	// unit tests that construct Reviver{} directly.
@@ -86,12 +118,16 @@ type Reviver struct {
 // Defaults: 500ms stagger between revives to avoid thundering herd on Claude
 // cold-start rate limits when many sessions are errored simultaneously.
 func NewReviver() *Reviver {
-	return &Reviver{
-		TmuxExists:   defaultTmuxExists,
-		PipeAlive:    defaultPipeAlive,
-		ReviveAction: defaultReviveAction,
-		Stagger:      500 * time.Millisecond,
-		Log:          sessionLog,
+	r := &Reviver{
+		TmuxExists:     defaultTmuxExists,
+		PipeAlive:      defaultPipeAlive,
+		ReviveAction:   defaultReviveAction,
+		ConnectPipe:    defaultReviveConnectPipe,
+		Acquire:        acquireInstanceSpawnLock,
+		Now:            time.Now,
+		ReadinessGrace: reviverControlPipeReadyGrace,
+		Stagger:        500 * time.Millisecond,
+		Log:            sessionLog,
 		// Process-global breaker: the TUI builds a fresh Reviver every 60s
 		// sweep (internal/ui/home.go), so per-sweep state would never
 		// accumulate. The breaker must outlive the Reviver to detect a
@@ -100,6 +136,8 @@ func NewReviver() *Reviver {
 		Breaker:  globalReviveBreaker,
 		AuthHeld: defaultBootAuthHeld,
 	}
+	r.ReviveActionIfCurrent = r.defaultReviveActionIfCurrent
+	return r
 }
 
 // Classify decides which bucket an instance falls into at scan time.
@@ -117,8 +155,15 @@ func NewReviver() *Reviver {
 // data-loss-critical half (revive never clobbering concurrently-added rows)
 // is fixed via Storage.PersistRevivedInstances.
 func (r *Reviver) Classify(inst *Instance) RevivalClass {
-	name := instanceTmuxName(inst)
-	tmuxAlive := r.TmuxExists(name, inst.TmuxSocketName)
+	return r.classify(inst, inst.runtimeStateSnapshot())
+}
+
+func (r *Reviver) classify(inst *Instance, observed statedb.RuntimeState) RevivalClass {
+	name := observed.TmuxSession
+	if name == "" {
+		name = inst.Title
+	}
+	tmuxAlive := r.TmuxExists(name, observed.TmuxSocketName)
 	// Read the pipe whenever the server is up, even when the stored status alone
 	// already settles the verdict: the READING is the evidence #1705 asked for, and
 	// a log line that omits it cannot answer "was the session actually dead?" after
@@ -132,10 +177,12 @@ func (r *Reviver) Classify(inst *Instance) RevivalClass {
 	switch {
 	case !tmuxAlive:
 		class = ClassDead
-	case inst.Status == StatusError || !pipeAlive:
+	case !pipeAlive && !observed.LastStartedAt.IsZero() && r.now().Before(observed.LastStartedAt.Add(r.readinessGrace())):
+		class = ClassStarting
+	case Status(observed.Status) == StatusError || !pipeAlive:
 		class = ClassErrored
 	}
-	r.logClassify(inst, name, tmuxAlive, pipeAlive, class)
+	r.logClassify(inst, observed, name, tmuxAlive, pipeAlive, class)
 	return class
 }
 
@@ -148,7 +195,7 @@ func (r *Reviver) Classify(inst *Instance) RevivalClass {
 // control-pipe reading, the stored status it was judged against, and when. Alive
 // verdicts stay at debug level; they are the overwhelming majority and carry no
 // diagnostic value.
-func (r *Reviver) logClassify(inst *Instance, name string, tmuxAlive, pipeAlive bool, class RevivalClass) {
+func (r *Reviver) logClassify(inst *Instance, observed statedb.RuntimeState, name string, tmuxAlive, pipeAlive bool, class RevivalClass) {
 	if r.Log == nil {
 		return
 	}
@@ -158,9 +205,11 @@ func (r *Reviver) logClassify(inst *Instance, name string, tmuxAlive, pipeAlive 
 		slog.String("tmux_session", name),
 		slog.Bool("tmux_alive", tmuxAlive),
 		slog.Bool("pipe_alive", pipeAlive),
-		slog.String("stored_status", string(inst.Status)),
+		slog.String("stored_status", observed.Status),
+		slog.Uint64("runtime_generation", observed.Generation),
+		slog.Uint64("status_revision", observed.StatusRevision),
 		slog.String("class", class.String()),
-		slog.Time("sampled_at", time.Now()),
+		slog.Time("sampled_at", r.now()),
 	}
 	if class == ClassAlive {
 		r.Log.Debug("reviver_classify", attrs...)
@@ -210,11 +259,25 @@ func (r *Reviver) ReviveOne(inst *Instance) ReviveOutcome {
 // firstRevive is a pointer so the caller can reset it across a batch: the
 // first actual revive runs immediately; subsequent ones sleep Stagger first.
 func (r *Reviver) reviveOneInternal(inst *Instance, firstRevive *bool) ReviveOutcome {
-	class := r.Classify(inst)
+	inst.mu.RLock()
+	observed := inst.runtimeStateSnapshotLocked()
+	incarnation := inst.persistenceIncarnation
+	inst.mu.RUnlock()
 	out := ReviveOutcome{
 		InstanceID: inst.ID,
 		Title:      inst.Title,
-		Class:      class,
+	}
+	if err := r.revalidate(inst, observed, incarnation); err != nil {
+		out.Err = err
+		out.Stale = true
+		return out
+	}
+	class := r.classify(inst, observed)
+	out.Class = class
+	if err := r.revalidate(inst, observed, incarnation); err != nil {
+		out.Err = err
+		out.Stale = true
+		return out
 	}
 
 	// Feed the classification to the breaker every sweep (not just for
@@ -222,8 +285,8 @@ func (r *Reviver) reviveOneInternal(inst *Instance, firstRevive *bool) ReviveOut
 	// and so futility from a prior sweep's revive is judged before we decide
 	// whether to attempt another one.
 	attempt := true
-	if r.Breaker != nil {
-		attempt = r.Breaker.OnClassify(inst.ID, inst.Title, class)
+	if r.Breaker != nil && class != ClassStarting {
+		attempt = r.Breaker.OnClassifyVersion(inst.ID, inst.Title, observed.Generation, class)
 	}
 
 	if class != ClassErrored {
@@ -261,11 +324,36 @@ func (r *Reviver) reviveOneInternal(inst *Instance, firstRevive *bool) ReviveOut
 	}
 	*firstRevive = false
 
-	if err := r.ReviveAction(inst); err != nil {
+	release := func() {}
+	if r.Acquire != nil {
+		var err error
+		release, err = r.Acquire(inst.ID)
+		if err != nil {
+			out.Err = err
+			return out
+		}
+	}
+	defer release()
+	if err := r.revalidate(inst, observed, incarnation); err != nil {
 		out.Err = err
-		if r.Breaker != nil {
+		out.Stale = true
+		return out
+	}
+
+	generationAwareAction := r.ReviveActionIfCurrent != nil
+	var err error
+	if generationAwareAction {
+		err = r.ReviveActionIfCurrent(inst, observed, incarnation)
+	} else if r.ReviveAction != nil {
+		err = r.ReviveAction(inst)
+	}
+	if err != nil {
+		out.Err = err
+		out.Stale = errors.Is(err, statedb.ErrRuntimeGenerationConflict) || errors.Is(err, statedb.ErrStatusRevisionConflict) ||
+			errors.Is(err, statedb.ErrInstanceParentConflict)
+		if r.Breaker != nil && !out.Stale {
 			// A failed action is immediately futile — count it toward the trip.
-			r.Breaker.AfterRevive(inst.ID, inst.Title, err)
+			r.Breaker.AfterReviveVersion(inst.ID, inst.Title, observed.Generation, err)
 		}
 		if r.Log != nil {
 			r.Log.Warn("reviver_action_failed",
@@ -274,10 +362,33 @@ func (r *Reviver) reviveOneInternal(inst *Instance, firstRevive *bool) ReviveOut
 		}
 		return out
 	}
+	current := inst.runtimeStateSnapshot()
+	if !sameReviverRuntime(observed, current) {
+		out.Err = statedb.ErrRuntimeGenerationConflict
+		out.Stale = true
+		if r.Acquire != nil {
+			_ = inst.adoptDurableRuntimeLocked()
+		} else {
+			_ = inst.adoptDurableRuntime()
+		}
+		return out
+	}
+	expected := current
+	if !generationAwareAction {
+		// A legacy action may hold a status candidate in memory for
+		// PersistRevivedInstances. Revalidate the observation it was based on;
+		// the candidate is not authoritative until its later status CAS.
+		expected = observed
+	}
+	if err := r.revalidate(inst, expected, incarnation); err != nil {
+		out.Err = err
+		out.Stale = true
+		return out
+	}
 	if r.Breaker != nil {
 		// Action "succeeded"; mark pending so the next sweep can tell whether
 		// the session actually stabilized or is still errored (futile).
-		r.Breaker.AfterRevive(inst.ID, inst.Title, nil)
+		r.Breaker.AfterReviveVersion(inst.ID, inst.Title, observed.Generation, nil)
 	}
 	out.Revived = true
 	if r.Log != nil {
@@ -286,6 +397,66 @@ func (r *Reviver) reviveOneInternal(inst *Instance, firstRevive *bool) ReviveOut
 			slog.String("instance_id", inst.ID))
 	}
 	return out
+}
+
+func (r *Reviver) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
+}
+
+func (r *Reviver) readinessGrace() time.Duration {
+	if r.ReadinessGrace > 0 {
+		return r.ReadinessGrace
+	}
+	return reviverControlPipeReadyGrace
+}
+
+func sameReviverRuntime(left, right statedb.RuntimeState) bool {
+	return left.InstanceID == right.InstanceID &&
+		left.Generation == right.Generation &&
+		left.TmuxSession == right.TmuxSession &&
+		left.TmuxSocketName == right.TmuxSocketName &&
+		left.LastStartedAt.Equal(right.LastStartedAt)
+}
+
+func reviverConflict(observed, current statedb.RuntimeState) error {
+	if !sameReviverRuntime(observed, current) {
+		return statedb.ErrRuntimeGenerationConflict
+	}
+	return statedb.ErrStatusRevisionConflict
+}
+
+// revalidate compares both runtime generation and same-generation status
+// revision with the authoritative row. A loser adopts the winner before the
+// caller returns, so stale objects are not published after a skipped action.
+func (r *Reviver) revalidate(inst *Instance, observed statedb.RuntimeState, incarnation string) error {
+	current := inst.runtimeStateSnapshot()
+	db := inst.restartPersistenceDB()
+	if db != nil {
+		if err := db.ValidateInstanceIncarnation(inst.ID, incarnation); err != nil {
+			return err
+		}
+		var found bool
+		var err error
+		current, found, err = db.ReadRuntimeState(inst.ID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return statedb.ErrRuntimeGenerationConflict
+		}
+	}
+	if sameReviverRuntime(observed, current) &&
+		observed.StatusRevision == current.StatusRevision &&
+		observed.Status == current.Status {
+		return nil
+	}
+	if db != nil {
+		inst.adoptRuntimeState(current)
+	}
+	return reviverConflict(observed, current)
 }
 
 // instanceTmuxName extracts the tmux session name from an Instance. Falls
@@ -314,6 +485,61 @@ func defaultPipeAlive(name string) bool {
 		return false
 	}
 	return pm.IsConnected(name)
+}
+
+func defaultReviveConnectPipe(name, socketName string) error {
+	pm := tmux.GetPipeManager()
+	if pm == nil {
+		return nil
+	}
+	return pm.Connect(name, socketName)
+}
+
+// defaultReviveActionIfCurrent performs the production reconnect and status
+// heal while the caller holds the per-instance physical-runtime lock. It
+// checks the captured version on both sides of the potentially slow pipe
+// connection, then publishes StatusRunning through the status CAS before
+// changing the in-memory object.
+func (r *Reviver) defaultReviveActionIfCurrent(inst *Instance, observed statedb.RuntimeState, incarnation string) error {
+	if err := r.revalidate(inst, observed, incarnation); err != nil {
+		return err
+	}
+	name := observed.TmuxSession
+	if name == "" {
+		name = inst.Title
+	}
+	if r.ConnectPipe != nil {
+		if err := r.ConnectPipe(name, observed.TmuxSocketName); err != nil {
+			return err
+		}
+	}
+	if err := r.revalidate(inst, observed, incarnation); err != nil {
+		return err
+	}
+	if Status(observed.Status) != StatusError {
+		return nil
+	}
+
+	db := inst.restartPersistenceDB()
+	if db != nil {
+		applied, err := db.WriteStatusIfVersion(inst.ID, incarnation, observed.Generation, observed.StatusRevision, string(StatusRunning))
+		if err != nil {
+			return err
+		}
+		if !applied {
+			return statedb.ErrStatusRevisionConflict
+		}
+	}
+
+	inst.mu.Lock()
+	if inst.RuntimeGeneration != observed.Generation || inst.StatusRevision != observed.StatusRevision {
+		inst.mu.Unlock()
+		return statedb.ErrStatusRevisionConflict
+	}
+	inst.Status = StatusRunning
+	inst.StatusRevision++
+	inst.mu.Unlock()
+	return nil
 }
 
 // defaultReviveAction re-establishes the control pipe for an errored instance.

@@ -28,9 +28,7 @@ func TestAttack_ClearedFlagConsumedAfterSave(t *testing.T) {
 	inst.Tool = "shell"
 	inst.GenericSessionID = "first-id"
 	inst.GenericDetectedAt = time.Now()
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	if _, _, err := SetField(inst, FieldToolSessionID, "", nil); err != nil {
 		t.Fatal(err)
@@ -154,9 +152,7 @@ func TestAttack_StickyVsClearContracts(t *testing.T) {
 	inst.Tool = "shell"
 	inst.GenericSessionID = "bind-A"
 	inst.GenericDetectedAt = time.Now()
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	// (1) Sticky: full save with empty id + cleared=false preserves A.
 	stale := inst
@@ -237,9 +233,7 @@ func TestAttack_WhitespaceOnlyNoResume(t *testing.T) {
 	inst := NewInstance("ws-db", "/tmp")
 	inst.ID = "ws-db"
 	inst.Tool = "shell"
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 	if err := storage.db.WriteGenericSessionBinding(inst.ID, "   ", inst.Tool, inst.Command, LocationOf(inst).String(), time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -296,9 +290,7 @@ func TestAttack_TwoSeatsIndependentAfterLoad(t *testing.T) {
 	b.GenericSessionID = "id-B"
 	b.GenericDetectedAt = time.Now()
 
-	if err := storage.SaveWithGroups([]*Instance{a, b}, NewGroupTreeWithGroups([]*Instance{a, b}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{a, b}, NewGroupTreeWithGroups([]*Instance{a, b}, nil))
 	loaded, _, err := storage.LoadWithGroups()
 	if err != nil {
 		t.Fatal(err)
@@ -334,9 +326,7 @@ func TestAttack_PersistNilSafeAndSiblings(t *testing.T) {
 	inst.Tool = "claude"
 	inst.ClaudeSessionID = "claude-keep"
 	inst.Color = "#abc"
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 	if err := storage.db.WriteGenericSessionBinding(inst.ID, "g1", inst.Tool, inst.Command, LocationOf(inst).String(), time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -377,9 +367,7 @@ func TestAttack_JSONRoundTripSpecialChars(t *testing.T) {
 		inst.GenericDetectedAt = time.Now()
 		instances = append(instances, inst)
 	}
-	if err := storage.SaveWithGroups(instances, NewGroupTreeWithGroups(instances, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, instances, NewGroupTreeWithGroups(instances, nil))
 	loaded, _, err := storage.LoadWithGroups()
 	if err != nil {
 		t.Fatal(err)

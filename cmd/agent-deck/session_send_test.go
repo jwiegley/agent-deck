@@ -84,8 +84,8 @@ func TestShouldSkipConductorHeartbeatSend_ZeroLastActivitySends(t *testing.T) {
 	}
 	conductor := session.NewInstance("conductor-ops", "/tmp")
 	conductor.IsConductor = true
-	if err := storage.Save([]*session.Instance{conductor}); err != nil {
-		t.Fatalf("save conductor instance: %v", err)
+	if err := storage.InsertSessionAndVerify(conductor, nil); err != nil {
+		t.Fatalf("insert conductor instance: %v", err)
 	}
 
 	if shouldSkipConductorHeartbeatSend(conductor, session.ConductorHeartbeatMessagePrefix+" check") {
@@ -141,8 +141,10 @@ func TestShouldSkipConductorHeartbeatSend_SkipsWhenIdleExceeded(t *testing.T) {
 	conductor.IsConductor = true
 	worker := session.NewInstance("worker-1", "/tmp/work")
 	worker.ParentSessionID = conductor.ID
-	if err := storage.Save([]*session.Instance{conductor, worker}); err != nil {
-		t.Fatalf("save instances: %v", err)
+	for _, inst := range []*session.Instance{conductor, worker} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert instance: %v", err)
+		}
 	}
 
 	// Worker last produced activity 11 minutes ago — past the 10-minute gate.
@@ -184,8 +186,10 @@ func TestShouldSkipConductorHeartbeatSend_DoesNotSkipWithinIdleWindow(t *testing
 	conductor.IsConductor = true
 	worker := session.NewInstance("worker-1", "/tmp/work")
 	worker.ParentSessionID = conductor.ID
-	if err := storage.Save([]*session.Instance{conductor, worker}); err != nil {
-		t.Fatalf("save instances: %v", err)
+	for _, inst := range []*session.Instance{conductor, worker} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert instance: %v", err)
+		}
 	}
 
 	// Worker last produced activity 5 minutes ago — well within the 10-minute gate.
@@ -223,8 +227,10 @@ func TestShouldSkipConductorHeartbeatSend_DisabledThresholdNeverSkips(t *testing
 	conductor.IsConductor = true
 	worker := session.NewInstance("worker-1", "/tmp/work")
 	worker.ParentSessionID = conductor.ID
-	if err := storage.Save([]*session.Instance{conductor, worker}); err != nil {
-		t.Fatalf("save instances: %v", err)
+	for _, inst := range []*session.Instance{conductor, worker} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert instance: %v", err)
+		}
 	}
 
 	writeHookStatusForTest(t, worker.ID, 24*time.Hour)

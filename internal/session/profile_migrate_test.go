@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,6 +91,11 @@ func TestMigrateSessionsToProfile_PreservesAllFields(t *testing.T) {
 	src, dst := migrateTestSetup(t, "src", "dst")
 	row := makeRow("sess-1", "Project One", DefaultGroupPath)
 	seedSession(t, src.GetDB(), row)
+	const lastSentAt int64 = 1700002000
+	if _, err := src.GetDB().DB().Exec(`UPDATE instances
+		SET last_sent_at = ?, acknowledged = 1 WHERE id = ?`, lastSentAt, row.ID); err != nil {
+		t.Fatalf("seed hidden metadata: %v", err)
+	}
 
 	result, err := MigrateSessionsToProfile("src", "dst", []string{"sess-1"}, ProfileMigrateOptions{})
 	if err != nil {
@@ -138,6 +144,16 @@ func TestMigrateSessionsToProfile_PreservesAllFields(t *testing.T) {
 	}
 	if got.TitleLocked != row.TitleLocked {
 		t.Errorf("TitleLocked: want %v got %v", row.TitleLocked, got.TitleLocked)
+	}
+	var gotLastSentAt int64
+	var gotAcknowledged int
+	if err := dst.GetDB().DB().QueryRow(`SELECT last_sent_at, acknowledged
+		FROM instances WHERE id = ?`, row.ID).Scan(&gotLastSentAt, &gotAcknowledged); err != nil {
+		t.Fatalf("read hidden target metadata: %v", err)
+	}
+	if gotLastSentAt != lastSentAt || gotAcknowledged != 1 {
+		t.Errorf("hidden metadata: want last_sent_at=%d acknowledged=1, got %d/%d",
+			lastSentAt, gotLastSentAt, gotAcknowledged)
 	}
 	// tool_data must round-trip key-by-key. We don't assert byte equality
 	// because INSERT OR REPLACE may re-serialize the JSON.
@@ -341,6 +357,644 @@ func TestMigrateSessionsToProfile_Idempotent(t *testing.T) {
 	got, _ := dst.GetDB().LoadInstanceByID("sess-idem")
 	if got == nil {
 		t.Fatal("dst row vanished on idempotent re-run")
+	}
+}
+
+func seedTransferredMigrationCore(t *testing.T, src, dst *statedb.StateDB, id string) {
+	t.Helper()
+	snapshot, err := src.LoadMigrationSnapshot(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot == nil {
+		t.Fatalf("source migration snapshot %s is missing", id)
+	}
+	if _, err := dst.InsertInstanceRowForMigration(snapshot); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeLifecycle_MigrateSessionsToProfile_RejectsDestinationRuntimeMismatch(t *testing.T) {
+	src, dst := migrateTestSetup(t, "src", "dst")
+	seedSession(t, src.GetDB(), makeRow("sess-conflict", "Conflict", DefaultGroupPath))
+	seedTransferredMigrationCore(t, src.GetDB(), dst.GetDB(), "sess-conflict")
+	var plan []statedb.RuntimeBindingTransition
+	for _, kind := range []string{"claude", "copilot", "codex", "gemini", "opencode"} {
+		binding, found, err := dst.GetDB().ReadRuntimeBinding("sess-conflict", kind)
+		if err != nil {
+			t.Fatalf("read seeded %s binding: %v", kind, err)
+		}
+		if found {
+			plan = append(plan, statedb.RuntimeBindingTransition{
+				Kind: kind, ExpectedRevision: binding.Revision,
+				NextValue: binding.Value, DetectedAt: binding.DetectedAt,
+			})
+		}
+	}
+	target, err := dst.GetDB().LoadInstanceByID("sess-conflict")
+	if err != nil || target == nil {
+		t.Fatalf("load destination incarnation: row=%#v err=%v", target, err)
+	}
+	if err := dst.GetDB().CommitRuntimeTransitionWithBindingPlan(0, target.Incarnation, statedb.RuntimeState{
+		InstanceID: "sess-conflict", Generation: 1, TmuxSession: "dst-g1", Status: "stopped",
+	}, plan); err != nil {
+		t.Fatal(err)
+	}
+	_, err = MigrateSessionsToProfile("src", "dst", []string{"sess-conflict"}, ProfileMigrateOptions{})
+	if !errors.Is(err, ErrProfileRuntimeConflict) {
+		t.Fatalf("error = %v, want ErrProfileRuntimeConflict", err)
+	}
+	if row, _ := src.GetDB().LoadInstanceByID("sess-conflict"); row == nil {
+		t.Fatal("source runtime was deleted after mismatch")
+	}
+	if row, _ := dst.GetDB().LoadInstanceByID("sess-conflict"); row == nil || row.RuntimeGeneration != 1 {
+		t.Fatalf("destination runtime changed after mismatch: %#v", row)
+	}
+}
+
+func TestMigrateSessionsToProfile_RejectsDestinationMetadataMismatch(t *testing.T) {
+	src, dst := migrateTestSetup(t, "src", "dst")
+	const id = "sess-metadata-conflict"
+	seedSession(t, src.GetDB(), makeRow(id, "source-title", DefaultGroupPath))
+	seedTransferredMigrationCore(t, src.GetDB(), dst.GetDB(), id)
+	target, err := dst.GetDB().LoadInstanceByID(id)
+	if err != nil || target == nil {
+		t.Fatalf("load transferred target: row=%#v err=%v", target, err)
+	}
+	target.Title = "different-target-title"
+	if err := dst.GetDB().SaveInstance(target); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = MigrateSessionsToProfile("src", "dst", []string{id}, ProfileMigrateOptions{})
+	if !errors.Is(err, ErrProfileRuntimeConflict) {
+		t.Fatalf("error = %v, want ErrProfileRuntimeConflict", err)
+	}
+	if row, _ := src.GetDB().LoadInstanceByID(id); row == nil || row.Title != "source-title" {
+		t.Fatalf("source metadata changed after mismatch: %#v", row)
+	}
+	if row, _ := dst.GetDB().LoadInstanceByID(id); row == nil || row.Title != "different-target-title" {
+		t.Fatalf("destination metadata changed after mismatch: %#v", row)
+	}
+}
+
+func TestMigrateSessionsToProfile_RejectsDivergentEventCollisions(t *testing.T) {
+	t.Run("cost id", func(t *testing.T) {
+		src, dst := migrateTestSetup(t, "src", "dst")
+		const id = "sess-cost-collision"
+		seedSession(t, src.GetDB(), makeRow(id, id, DefaultGroupPath))
+		seedTransferredMigrationCore(t, src.GetDB(), dst.GetDB(), id)
+		if err := src.GetDB().InsertCostEventRow(&statedb.CostEventRow{
+			ID: "a-cost-inserted", SessionID: id, Timestamp: "2026-08-07T11:00:00Z", Model: "inserted-first",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := src.GetDB().InsertCostEventRow(&statedb.CostEventRow{
+			ID: "z-cost-conflict", SessionID: id, Timestamp: "2026-08-07T12:00:00Z", Model: "source-model",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := dst.GetDB().InsertCostEventRow(&statedb.CostEventRow{
+			ID: "z-cost-conflict", SessionID: id, Timestamp: "2026-08-07T12:00:00Z", Model: "target-model",
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := MigrateSessionsToProfile("src", "dst", []string{id}, ProfileMigrateOptions{})
+		if !errors.Is(err, statedb.ErrMigrationSnapshotConflict) {
+			t.Fatalf("error = %v, want snapshot conflict", err)
+		}
+		if row, _ := src.GetDB().LoadInstanceByID(id); row == nil {
+			t.Fatal("source instance deleted after cost collision")
+		}
+		if rows, _ := src.GetDB().LoadCostEventsForSession(id); len(rows) != 2 {
+			t.Fatalf("source cost changed: %+v", rows)
+		}
+		if rows, _ := dst.GetDB().LoadCostEventsForSession(id); len(rows) != 1 || rows[0].Model != "target-model" {
+			t.Fatalf("target cost changed: %+v", rows)
+		}
+	})
+
+	t.Run("watcher dedup", func(t *testing.T) {
+		src, dst := migrateTestSetup(t, "src", "dst")
+		const id = "sess-watcher-collision"
+		const watcherID = "collision-watcher"
+		seedSession(t, src.GetDB(), makeRow(id, id, DefaultGroupPath))
+		seedTransferredMigrationCore(t, src.GetDB(), dst.GetDB(), id)
+		for _, db := range []*statedb.StateDB{src.GetDB(), dst.GetDB()} {
+			if err := db.SaveWatcher(&statedb.WatcherRow{
+				ID: watcherID, Name: "collision-watch", Type: "github", ConfigPath: "/tmp/watch.toml",
+				Status: "stopped", CreatedAt: time.Unix(1700000000, 0), UpdatedAt: time.Unix(1700000000, 0),
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := src.GetDB().InsertWatcherEventRow(&statedb.WatcherEventRow{
+			WatcherID: watcherID, DedupKey: "inserted-first", SessionID: id,
+			Body: "inserted-first", CreatedAt: time.Unix(1700000000, 0),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := src.GetDB().InsertWatcherEventRow(&statedb.WatcherEventRow{
+			WatcherID: watcherID, DedupKey: "same-dedup", SessionID: id,
+			Body: "source-body", CreatedAt: time.Unix(1700000001, 0),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := dst.GetDB().InsertWatcherEventRow(&statedb.WatcherEventRow{
+			WatcherID: watcherID, DedupKey: "same-dedup", SessionID: id,
+			Body: "target-body", CreatedAt: time.Unix(1700000001, 0),
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := MigrateSessionsToProfile("src", "dst", []string{id}, ProfileMigrateOptions{})
+		if !errors.Is(err, statedb.ErrMigrationSnapshotConflict) {
+			t.Fatalf("error = %v, want snapshot conflict", err)
+		}
+		if row, _ := src.GetDB().LoadInstanceByID(id); row == nil {
+			t.Fatal("source instance deleted after watcher collision")
+		}
+		if rows, _ := src.GetDB().LoadWatcherEventsForSession(id); len(rows) != 2 {
+			t.Fatalf("source watcher event changed: %+v", rows)
+		}
+		if rows, _ := dst.GetDB().LoadWatcherEventsForSession(id); len(rows) != 1 || rows[0].Body != "target-body" {
+			t.Fatalf("target watcher event changed: %+v", rows)
+		}
+	})
+}
+
+func TestMigrateSessionsToProfile_CompletesVerifiedPartialCopy(t *testing.T) {
+	src, dst := migrateTestSetup(t, "src", "dst")
+	const id = "sess-verified-partial"
+	const watcherID = "verified-watcher"
+	seedSession(t, src.GetDB(), makeRow(id, id, DefaultGroupPath))
+	seedTransferredMigrationCore(t, src.GetDB(), dst.GetDB(), id)
+	for _, db := range []*statedb.StateDB{src.GetDB(), dst.GetDB()} {
+		if err := db.SaveWatcher(&statedb.WatcherRow{
+			ID: watcherID, Name: "verified-watch", Type: "github", ConfigPath: "/tmp/verified.toml",
+			Status: "stopped", CreatedAt: time.Unix(1700000000, 0), UpdatedAt: time.Unix(1700000000, 0),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.InsertCostEventRow(&statedb.CostEventRow{
+			ID: "verified-cost", SessionID: id, Timestamp: "2026-08-07T12:00:00Z",
+			Model: "same", CostMicrodollars: 42,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Give the equal target event a different auto-increment ID. Watcher event
+	// identity across profiles is the watcher/dedup pair, not the local row ID.
+	if err := dst.GetDB().InsertWatcherEventRow(&statedb.WatcherEventRow{
+		WatcherID: watcherID, DedupKey: "target-id-offset", CreatedAt: time.Unix(1700000000, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	event := &statedb.WatcherEventRow{
+		WatcherID: watcherID, DedupKey: "verified-dedup", SessionID: id,
+		Body: "same-body", CreatedAt: time.Unix(1700000001, 0),
+	}
+	if err := src.GetDB().InsertWatcherEventRow(event); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.GetDB().InsertWatcherEventRow(event); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := MigrateSessionsToProfile("src", "dst", []string{id}, ProfileMigrateOptions{}); err != nil {
+		t.Fatalf("complete verified partial copy: %v", err)
+	}
+	if row, _ := src.GetDB().LoadInstanceByID(id); row != nil {
+		t.Fatalf("verified source core was not removed: %#v", row)
+	}
+	if rows, _ := dst.GetDB().LoadCostEventsForSession(id); len(rows) != 1 || rows[0].Model != "same" {
+		t.Fatalf("verified target cost changed: %+v", rows)
+	}
+	if rows, _ := dst.GetDB().LoadWatcherEventsForSession(id); len(rows) != 1 || rows[0].Body != "same-body" {
+		t.Fatalf("verified target watcher changed: %+v", rows)
+	}
+}
+
+func profileMigrationRaceRow(id string) *statedb.InstanceRow {
+	row := makeRow(id, id, DefaultGroupPath)
+	row.ToolData = json.RawMessage(`{"notes":"profile migration race"}`)
+	row.RuntimeBindings = map[string]statedb.RuntimeBinding{}
+	return row
+}
+
+func advanceProfileMigrationRuntime(t *testing.T, db *statedb.StateDB, id, suffix string) statedb.RuntimeState {
+	t.Helper()
+	current, found, err := db.ReadRuntimeState(id)
+	if err != nil || !found {
+		t.Fatalf("read %s runtime: found=%v err=%v", id, found, err)
+	}
+	row, err := db.LoadInstanceByID(id)
+	if err != nil || row == nil || row.Incarnation == "" {
+		t.Fatalf("read %s incarnation: row=%#v err=%v", id, row, err)
+	}
+	next := statedb.RuntimeState{
+		InstanceID:     id,
+		Generation:     current.Generation + 1,
+		TmuxSession:    "tmux-" + suffix,
+		TmuxSocketName: "socket-" + suffix,
+		Status:         "running",
+		LastStartedAt:  time.Unix(1700002000, 123).UTC(),
+	}
+	if err := db.CommitRuntimeTransition(current.Generation, row.Incarnation, next); err != nil {
+		t.Fatalf("advance %s runtime: %v", id, err)
+	}
+	return next
+}
+
+func profileMigrationLockError(id string) error {
+	release, acquired, err := defaultTryAcquireInstanceSpawnLock(id)
+	if err != nil {
+		return err
+	}
+	if acquired {
+		release()
+		return fmt.Errorf("instance spawn lock for %q was not held", id)
+	}
+	return nil
+}
+
+func TestRuntimeLifecycle_ProfileMigrationSourceCASPreservesNewRuntime(t *testing.T) {
+	src, dst := migrateTestSetup(t, "src", "dst")
+	const id = "source-cas-race"
+	seedSession(t, src.GetDB(), profileMigrationRaceRow(id))
+	if err := src.GetDB().InsertCostEventRow(&statedb.CostEventRow{
+		ID: "source-cost", SessionID: id, Timestamp: time.Now().UTC().Format(time.RFC3339), Model: "m",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reached := make(chan error)
+	resume := make(chan struct{})
+	oldSourceHook := profileMigrateBeforeSourceDeleteFn
+	profileMigrateBeforeSourceDeleteFn = func(gotID string) {
+		reached <- profileMigrationLockError(gotID)
+		<-resume
+	}
+	t.Cleanup(func() {
+		profileMigrateBeforeSourceDeleteFn = oldSourceHook
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := MigrateSessionsToProfile("src", "dst", []string{id}, ProfileMigrateOptions{})
+		done <- err
+	}()
+	if err := <-reached; err != nil {
+		t.Fatalf("migration did not hold instance lock before source delete: %v", err)
+	}
+	want := advanceProfileMigrationRuntime(t, src.GetDB(), id, "source-g1")
+	close(resume)
+	if err := <-done; !errors.Is(err, statedb.ErrMigrationSnapshotConflict) {
+		t.Fatalf("migration error = %v, want snapshot conflict", err)
+	}
+
+	got, found, err := src.GetDB().ReadRuntimeState(id)
+	if err != nil || !found || got != want {
+		t.Fatalf("source runtime = %+v found=%v err=%v, want %+v", got, found, err, want)
+	}
+	if rows, err := src.GetDB().LoadCostEventsForSession(id); err != nil || len(rows) != 1 {
+		t.Fatalf("source costs after CAS conflict = %d err=%v, want 1", len(rows), err)
+	}
+	if row, err := dst.GetDB().LoadInstanceByID(id); err != nil || row != nil {
+		t.Fatalf("target rollback left row=%+v err=%v", row, err)
+	}
+	if rows, err := dst.GetDB().LoadCostEventsForSession(id); err != nil || len(rows) != 0 {
+		t.Fatalf("target costs after rollback = %d err=%v, want 0", len(rows), err)
+	}
+}
+
+func TestRuntimeLifecycle_ProfileMigrationFullSnapshotCAS(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*statedb.StateDB, string, string) error
+		verify func(*testing.T, *statedb.StateDB, string)
+	}{
+		{
+			name: "metadata update",
+			mutate: func(db *statedb.StateDB, id, _ string) error {
+				_, err := db.DB().Exec(`UPDATE instances
+					SET last_sent_at = 42, acknowledged = 1 WHERE id = ?`, id)
+				return err
+			},
+			verify: func(t *testing.T, db *statedb.StateDB, id string) {
+				var lastSent int64
+				var acknowledged int
+				if err := db.DB().QueryRow(`SELECT last_sent_at, acknowledged
+					FROM instances WHERE id = ?`, id).Scan(&lastSent, &acknowledged); err != nil {
+					t.Fatal(err)
+				}
+				if lastSent != 42 || acknowledged != 1 {
+					t.Fatalf("metadata mutation did not survive: last_sent_at=%d acknowledged=%d", lastSent, acknowledged)
+				}
+			},
+		},
+		{
+			name: "binding update",
+			mutate: func(db *statedb.StateDB, id, _ string) error {
+				_, err := db.DB().Exec(`UPDATE instance_runtime_binding
+					SET binding_revision = binding_revision + 1, binding_value = 'claude-new'
+					WHERE instance_id = ? AND binding_kind = 'claude'`, id)
+				return err
+			},
+			verify: func(t *testing.T, db *statedb.StateDB, id string) {
+				binding, found, err := db.ReadRuntimeBinding(id, "claude")
+				if err != nil || !found || binding.Value != "claude-new" || binding.Revision != 1 {
+					t.Fatalf("binding mutation did not survive: %+v found=%v err=%v", binding, found, err)
+				}
+			},
+		},
+		{
+			name: "cost append",
+			mutate: func(db *statedb.StateDB, id, _ string) error {
+				return db.InsertCostEventRow(&statedb.CostEventRow{
+					ID: "source-cost-new", SessionID: id, Timestamp: "2026-08-07T12:01:00Z", Model: "new",
+				})
+			},
+			verify: func(t *testing.T, db *statedb.StateDB, id string) {
+				rows, _ := db.LoadCostEventsForSession(id)
+				if len(rows) != 2 {
+					t.Fatalf("cost append did not survive: %+v", rows)
+				}
+			},
+		},
+		{
+			name: "watcher update",
+			mutate: func(db *statedb.StateDB, id, _ string) error {
+				_, err := db.DB().Exec(`UPDATE watcher_events SET body = 'new-body' WHERE session_id = ?`, id)
+				return err
+			},
+			verify: func(t *testing.T, db *statedb.StateDB, id string) {
+				rows, _ := db.LoadWatcherEventsForSession(id)
+				if len(rows) != 1 || rows[0].Body != "new-body" {
+					t.Fatalf("watcher update did not survive: %+v", rows)
+				}
+			},
+		},
+		{
+			name: "watcher append",
+			mutate: func(db *statedb.StateDB, id, watcherID string) error {
+				return db.InsertWatcherEventRow(&statedb.WatcherEventRow{
+					WatcherID: watcherID, DedupKey: "source-watch-new", SessionID: id,
+					Body: "new", CreatedAt: time.Unix(1700000010, 0),
+				})
+			},
+			verify: func(t *testing.T, db *statedb.StateDB, id string) {
+				rows, _ := db.LoadWatcherEventsForSession(id)
+				if len(rows) != 2 {
+					t.Fatalf("watcher append did not survive: %+v", rows)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			src, dst := migrateTestSetup(t, "src", "dst")
+			const id = "full-snapshot-race"
+			const watcherID = "snapshot-watcher"
+			seedSession(t, src.GetDB(), makeRow(id, id, DefaultGroupPath))
+			for _, db := range []*statedb.StateDB{src.GetDB(), dst.GetDB()} {
+				if err := db.SaveWatcher(&statedb.WatcherRow{
+					ID: watcherID, Name: "snapshot-watch", Type: "github", ConfigPath: "/tmp/watch.toml",
+					Status: "stopped", CreatedAt: time.Unix(1700000000, 0), UpdatedAt: time.Unix(1700000000, 0),
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := src.GetDB().InsertCostEventRow(&statedb.CostEventRow{
+				ID: "source-cost-old", SessionID: id, Timestamp: "2026-08-07T12:00:00Z", Model: "old",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := dst.GetDB().InsertCostEventRow(&statedb.CostEventRow{
+				ID: "target-cost-preexisting", SessionID: id, Timestamp: "2026-08-07T11:00:00Z", Model: "keep",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := src.GetDB().InsertWatcherEventRow(&statedb.WatcherEventRow{
+				WatcherID: watcherID, DedupKey: "source-watch-old", SessionID: id,
+				Body: "old-body", CreatedAt: time.Unix(1700000001, 0),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := dst.GetDB().InsertWatcherEventRow(&statedb.WatcherEventRow{
+				WatcherID: watcherID, DedupKey: "target-watch-preexisting", SessionID: id,
+				Body: "keep-body", CreatedAt: time.Unix(1700000002, 0),
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			reached := make(chan error)
+			resume := make(chan struct{})
+			oldHook := profileMigrateBeforeSourceDeleteFn
+			profileMigrateBeforeSourceDeleteFn = func(gotID string) {
+				reached <- profileMigrationLockError(gotID)
+				<-resume
+			}
+			t.Cleanup(func() { profileMigrateBeforeSourceDeleteFn = oldHook })
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := MigrateSessionsToProfile("src", "dst", []string{id}, ProfileMigrateOptions{})
+				done <- err
+			}()
+			lockErr := <-reached
+			mutationErr := test.mutate(src.GetDB(), id, watcherID)
+			close(resume)
+			if lockErr != nil {
+				t.Fatalf("migration did not hold instance lock: %v", lockErr)
+			}
+			if mutationErr != nil {
+				t.Fatalf("apply concurrent mutation: %v", mutationErr)
+			}
+			if err := <-done; !errors.Is(err, statedb.ErrMigrationSnapshotConflict) {
+				t.Fatalf("migration error = %v, want snapshot conflict", err)
+			}
+
+			if row, err := src.GetDB().LoadInstanceByID(id); err != nil || row == nil {
+				t.Fatalf("source instance was deleted: row=%+v err=%v", row, err)
+			}
+			test.verify(t, src.GetDB(), id)
+			if row, err := dst.GetDB().LoadInstanceByID(id); err != nil || row != nil {
+				t.Fatalf("inserted target instance survived rollback: row=%+v err=%v", row, err)
+			}
+			costs, err := dst.GetDB().LoadCostEventsForSession(id)
+			if err != nil || len(costs) != 1 || costs[0].ID != "target-cost-preexisting" {
+				t.Fatalf("target pre-existing costs changed: %+v err=%v", costs, err)
+			}
+			watchers, err := dst.GetDB().LoadWatcherEventsForSession(id)
+			if err != nil || len(watchers) != 1 || watchers[0].DedupKey != "target-watch-preexisting" {
+				t.Fatalf("target pre-existing watcher events changed: %+v err=%v", watchers, err)
+			}
+		})
+	}
+}
+
+func TestRuntimeLifecycle_ProfileMigrationRevalidatesTargetBeforeSourceDelete(t *testing.T) {
+	src, dst := migrateTestSetup(t, "src", "dst")
+	const id = "target-revalidation-race"
+	seedSession(t, src.GetDB(), profileMigrationRaceRow(id))
+
+	reached := make(chan error)
+	resume := make(chan struct{})
+	oldHook := profileMigrateBeforeSourceDeleteFn
+	profileMigrateBeforeSourceDeleteFn = func(gotID string) {
+		reached <- profileMigrationLockError(gotID)
+		<-resume
+	}
+	t.Cleanup(func() { profileMigrateBeforeSourceDeleteFn = oldHook })
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := MigrateSessionsToProfile("src", "dst", []string{id}, ProfileMigrateOptions{})
+		done <- err
+	}()
+	if err := <-reached; err != nil {
+		t.Fatalf("migration did not hold instance lock: %v", err)
+	}
+	// Model an uncoordinated old writer that bypasses Storage.DeleteInstance:
+	// remove the transferred core and install a distinct winner before the
+	// migration performs its final destination-authority check.
+	if err := dst.GetDB().DeleteInstance(id); err != nil {
+		t.Fatal(err)
+	}
+	winner := profileMigrationRaceRow(id)
+	winner.Title = "replacement-winner"
+	seedSession(t, dst.GetDB(), winner)
+	close(resume)
+
+	if err := <-done; !errors.Is(err, ErrProfileRuntimeConflict) {
+		t.Fatalf("migration error = %v, want target snapshot conflict", err)
+	}
+	if row, err := src.GetDB().LoadInstanceByID(id); err != nil || row == nil || row.Title != id {
+		t.Fatalf("source was not preserved: row=%+v err=%v", row, err)
+	}
+	if row, err := dst.GetDB().LoadInstanceByID(id); err != nil || row == nil || row.Title != winner.Title {
+		t.Fatalf("replacement winner was damaged: row=%+v err=%v", row, err)
+	}
+}
+
+func TestRuntimeLifecycle_StorageDeleteInstanceUsesLifecycleLock(t *testing.T) {
+	storage, _ := migrateTestSetup(t, "src", "dst")
+	const id = "locked-storage-delete"
+	seedSession(t, storage.GetDB(), profileMigrationRaceRow(id))
+
+	entered := make(chan struct{})
+	allow := make(chan struct{})
+	released := make(chan struct{})
+	var allowOnce sync.Once
+	unblock := func() { allowOnce.Do(func() { close(allow) }) }
+	t.Cleanup(unblock)
+	oldAcquire := instanceSpawnLockAcquireFn
+	instanceSpawnLockAcquireFn = func(gotID string) (func(), error) {
+		if gotID != id {
+			return nil, fmt.Errorf("locked id = %q, want %q", gotID, id)
+		}
+		close(entered)
+		<-allow
+		return func() { close(released) }, nil
+	}
+	t.Cleanup(func() { instanceSpawnLockAcquireFn = oldAcquire })
+
+	done := make(chan error, 1)
+	go func() { done <- storage.DeleteInstance(id) }()
+	<-entered
+	if row, err := storage.GetDB().LoadInstanceByID(id); err != nil || row == nil {
+		unblock()
+		t.Fatalf("delete ran before lifecycle lock acquisition completed: row=%+v err=%v", row, err)
+	}
+	unblock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	<-released
+	if row, err := storage.GetDB().LoadInstanceByID(id); err != nil || row != nil {
+		t.Fatalf("locked delete result: row=%+v err=%v", row, err)
+	}
+}
+
+func TestRuntimeLifecycle_ProfileMigrationTargetRollbackCASPreservesNewRuntime(t *testing.T) {
+	src, dst := migrateTestSetup(t, "src", "dst")
+	const id = "target-cas-race"
+	seedSession(t, src.GetDB(), profileMigrationRaceRow(id))
+	if err := src.GetDB().InsertCostEventRow(&statedb.CostEventRow{
+		ID: "target-cost", SessionID: id, Timestamp: time.Now().UTC().Format(time.RFC3339), Model: "m",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sourceReached := make(chan error)
+	sourceResume := make(chan struct{})
+	rollbackReached := make(chan error)
+	rollbackResume := make(chan struct{})
+	oldSourceHook := profileMigrateBeforeSourceDeleteFn
+	oldRollbackHook := profileMigrateBeforeTargetRollbackFn
+	profileMigrateBeforeSourceDeleteFn = func(gotID string) {
+		sourceReached <- profileMigrationLockError(gotID)
+		<-sourceResume
+	}
+	profileMigrateBeforeTargetRollbackFn = func(gotID string) {
+		rollbackReached <- profileMigrationLockError(gotID)
+		<-rollbackResume
+	}
+	t.Cleanup(func() {
+		profileMigrateBeforeSourceDeleteFn = oldSourceHook
+		profileMigrateBeforeTargetRollbackFn = oldRollbackHook
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := MigrateSessionsToProfile("src", "dst", []string{id}, ProfileMigrateOptions{})
+		done <- err
+	}()
+	if err := <-sourceReached; err != nil {
+		t.Fatalf("migration did not hold instance lock before source delete: %v", err)
+	}
+	advanceProfileMigrationRuntime(t, src.GetDB(), id, "source-g1")
+	close(sourceResume)
+	if err := <-rollbackReached; err != nil {
+		t.Fatalf("migration released instance lock before rollback: %v", err)
+	}
+	want := advanceProfileMigrationRuntime(t, dst.GetDB(), id, "target-g1")
+	close(rollbackResume)
+	if err := <-done; !errors.Is(err, statedb.ErrMigrationSnapshotConflict) {
+		t.Fatalf("migration error = %v, want snapshot conflict", err)
+	}
+
+	got, found, err := dst.GetDB().ReadRuntimeState(id)
+	if err != nil || !found || got != want {
+		t.Fatalf("target runtime = %+v found=%v err=%v, want %+v", got, found, err, want)
+	}
+	if rows, err := dst.GetDB().LoadCostEventsForSession(id); err != nil || len(rows) != 1 {
+		t.Fatalf("target costs after rollback CAS conflict = %d err=%v, want 1", len(rows), err)
+	}
+	if rows, err := src.GetDB().LoadCostEventsForSession(id); err != nil || len(rows) != 1 {
+		t.Fatalf("source costs after source CAS conflict = %d err=%v, want 1", len(rows), err)
+	}
+}
+
+func TestRuntimeLifecycle_ProfileMigrationLegacyRowWithoutRuntime(t *testing.T) {
+	src, dst := migrateTestSetup(t, "src", "dst")
+	const id = "legacy-no-runtime"
+	seedSession(t, src.GetDB(), profileMigrationRaceRow(id))
+	if _, err := src.GetDB().DB().Exec(`DELETE FROM instance_runtime_state WHERE instance_id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := MigrateSessionsToProfile("src", "dst", []string{id}, ProfileMigrateOptions{}); err != nil {
+		t.Fatalf("migrate legacy row: %v", err)
+	}
+	if row, err := src.GetDB().LoadInstanceByID(id); err != nil || row != nil {
+		t.Fatalf("legacy source row=%+v err=%v, want removed", row, err)
+	}
+	if runtime, found, err := dst.GetDB().ReadRuntimeState(id); err != nil || !found || runtime.Generation != 0 {
+		t.Fatalf("migrated legacy runtime=%+v found=%v err=%v", runtime, found, err)
 	}
 }
 
@@ -605,10 +1259,8 @@ func TestMigrateGroupToProfile_EmptyGroupIsNoOp(t *testing.T) {
 	}
 }
 
-// TestRollbackTargetWrites_PreservesPreexistingRows ensures fix #4: if the
-// migration is rerun and the destination already has the session row + its
-// associated cost/watcher rows from a prior partial run, a source-delete
-// failure must NOT bulk-delete those rows at the destination.
+// TestRollbackTargetWrites_PreservesPreexistingRows ensures rollback never
+// bulk-deletes a pre-existing destination core or event rows.
 func TestRollbackTargetWrites_PreservesPreexistingRows(t *testing.T) {
 	_, dst := migrateTestSetup(t, "src", "dst")
 
@@ -621,13 +1273,11 @@ func TestRollbackTargetWrites_PreservesPreexistingRows(t *testing.T) {
 		t.Fatalf("seed dst cost: %v", err)
 	}
 
-	// Simulate rollback with targetAlreadyHadInstance=true: must NOT delete
-	// the pre-existing cost row.
-	rollbackTargetWrites(dst.GetDB(), "preexist", true)
+	rollbackTargetWrites(dst.GetDB(), "preexist", nil, nil, nil)
 
 	costs, _ := dst.GetDB().LoadCostEventsForSession("preexist")
 	if len(costs) != 1 {
-		t.Errorf("rollback with targetAlreadyHadInstance=true clobbered pre-existing cost rows: have %d, want 1", len(costs))
+		t.Errorf("rollback clobbered pre-existing cost rows: have %d, want 1", len(costs))
 	}
 	inst, _ := dst.GetDB().LoadInstanceByID("preexist")
 	if inst == nil {

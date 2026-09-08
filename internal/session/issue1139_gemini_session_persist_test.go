@@ -103,9 +103,7 @@ func TestRebindPersistsGeminiSessionIDToDB(t *testing.T) {
 		CreatedAt:   now,
 		ToolData:    json.RawMessage(`{"gemini_session_id":"` + oldID + `"}`),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	inst.GeminiSessionID = oldID
 	if got := readGeminiSessionIDFromDB(t, db, inst.ID); got != oldID {
@@ -162,9 +160,7 @@ func TestBindPersistsGeminiSessionIDToDB(t *testing.T) {
 		CreatedAt:   time.Now(),
 		ToolData:    json.RawMessage(`{}`),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	inst.UpdateHookStatus(&HookStatus{
 		Status:    "running",
@@ -256,9 +252,7 @@ func TestGeminiRebindPreservesUnrelatedToolDataKeys(t *testing.T) {
 		CreatedAt:   time.Now(),
 		ToolData:    json.RawMessage(seedJSON),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	inst.GeminiSessionID = ""
 	inst.UpdateHookStatus(&HookStatus{

@@ -199,7 +199,7 @@ func TestSyncOnce_DoesNotRebindStoppedSession(t *testing.T) {
 	if err := os.MkdirAll(inst.ProjectPath, 0o755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
 	}
-	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -555,7 +555,7 @@ func TestSyncOnce_StillRebindsLiveSession(t *testing.T) {
 	// Attach the live tmux session the same way the TUI does on cold start, so
 	// inst.Exists() resolves true against the real tmux server.
 	inst.SetTmuxSessionForTest(tmux.ReconnectSessionLazy(sessName, inst.ID, projectPath, "claude", "running"))
-	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 

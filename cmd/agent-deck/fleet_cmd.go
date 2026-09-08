@@ -466,6 +466,9 @@ func formatFleetRecover(s fleet.Summary, plan bool) string {
 		default:
 			fmt.Fprintf(&b, "  skipped    %-40s %s\n", truncateFleetTitle(r.Title, 40), r.Reason)
 		}
+		if r.Warning != "" {
+			fmt.Fprintf(&b, "             warning: %s\n", r.Warning)
+		}
 	}
 
 	fmt.Fprintf(&b, "\n%s\n", s.Format())
@@ -521,6 +524,9 @@ func fleetRecoverJSON(s fleet.Summary, plan bool) map[string]interface{} {
 		}
 		if r.Reason != "" {
 			entry["reason"] = r.Reason
+		}
+		if r.Warning != "" {
+			entry["warning"] = r.Warning
 		}
 		if r.Outcome == fleet.OutcomeRecovered || r.Outcome == fleet.OutcomeUnverified {
 			entry["pane_alive"] = r.Report.PaneAlive

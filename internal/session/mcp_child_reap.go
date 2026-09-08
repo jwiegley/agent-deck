@@ -1,11 +1,12 @@
 package session
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -56,6 +57,18 @@ func mcpReapMinDepth(paneLeaderComm string) int {
 // issue #1086.
 const mcpReapVerifyTimeout = 2 * time.Second
 
+var (
+	mcpCaptureProcessIdentityFn   = tmux.CaptureProcessIdentity
+	mcpCaptureProcessIdentitiesFn = tmux.CaptureProcessIdentities
+	mcpCloseProcessIdentitiesFn   = tmux.CloseProcessIdentities
+	mcpProcessIdentityMatchesFn   = tmux.ProcessIdentityMatches
+	mcpReapProcessIdentitiesFn    = tmux.ReapProcessIdentities
+	mcpReadPanePIDFn              = func(i *Instance) int { return i.readPanePID() }
+	mcpProcessTableSnapshotFn     = func() ([]byte, error) {
+		return exec.Command("ps", "-eo", "pid=,ppid=,comm=").Output()
+	}
+)
+
 // RegisterMCPChild records the OS PID of a stdio MCP child spawned for
 // this session. Session stop iterates these PIDs and signals each
 // (SIGTERM → SIGKILL) to prevent the issue-#965 orphan accumulation
@@ -66,14 +79,62 @@ func (i *Instance) RegisterMCPChild(pid int) {
 	if pid <= 0 {
 		return
 	}
+	identity, err := mcpCaptureProcessIdentityFn(pid)
+	if err != nil {
+		mcpLog.Debug("mcp_child_identity_capture_failed",
+			slog.Int("pid", pid), slog.Any("error", err))
+		return
+	}
+	i.RegisterMCPChildIdentity(identity)
+}
+
+// RegisterMCPChildIdentity consumes an identity captured while the PID was
+// still known to be a descendant of this session. It intentionally does not
+// recapture by PID: callers carrying children across tmux teardown transfer
+// the retained pre-mutation handle. Invalid identities are also consumed.
+func (i *Instance) RegisterMCPChildIdentity(identity tmux.ProcessIdentity) {
+	if !identity.Valid() {
+		_ = identity.Close()
+		return
+	}
 	i.mcpPIDsMu.Lock()
 	defer i.mcpPIDsMu.Unlock()
+	found := false
 	for _, existing := range i.TrackedMCPPIDs {
-		if existing == pid {
-			return
+		if existing == identity.PID {
+			found = true
+			break
 		}
 	}
-	i.TrackedMCPPIDs = append(i.TrackedMCPPIDs, pid)
+	if !found {
+		i.TrackedMCPPIDs = append(i.TrackedMCPPIDs, identity.PID)
+	}
+	if i.trackedMCPChildIdentities == nil {
+		i.trackedMCPChildIdentities = make(map[int]tmux.ProcessIdentity)
+	}
+	if existing, ok := i.trackedMCPChildIdentities[identity.PID]; ok && existing != identity {
+		_ = existing.Close()
+	}
+	i.trackedMCPChildIdentities[identity.PID] = identity
+}
+
+// TrackedMCPChildIdentities returns the identities captured for this
+// instance's tracked children. Persisted raw PIDs without an in-process birth
+// token are omitted and therefore can never authorize a signal.
+func (i *Instance) TrackedMCPChildIdentities() []tmux.ProcessIdentity {
+	i.mcpPIDsMu.Lock()
+	defer i.mcpPIDsMu.Unlock()
+	identities := make([]tmux.ProcessIdentity, 0, len(i.trackedMCPChildIdentities))
+	for _, pid := range i.TrackedMCPPIDs {
+		if identity, ok := i.trackedMCPChildIdentities[pid]; ok {
+			// Observers receive metadata, not a shared close capability. Handle
+			// ownership remains with the instance until unregister or reap.
+			identities = append(identities, tmux.ProcessIdentity{
+				PID: identity.PID, StartToken: identity.StartToken,
+			})
+		}
+	}
+	return identities
 }
 
 // UnregisterMCPChild removes a previously registered MCP child PID,
@@ -91,51 +152,74 @@ func (i *Instance) UnregisterMCPChild(pid int) {
 		}
 	}
 	i.TrackedMCPPIDs = out
+	if identity, ok := i.trackedMCPChildIdentities[pid]; ok {
+		_ = identity.Close()
+	}
+	delete(i.trackedMCPChildIdentities, pid)
+	if len(i.trackedMCPChildIdentities) == 0 {
+		i.trackedMCPChildIdentities = nil
+	}
 }
 
-// discoverMCPChildrenFromPaneTree walks this Instance's tmux pane
-// process tree and registers depth >= 2 descendants as tracked MCP
-// children. Stdio MCP servers are spawned by claude/codex/gemini
-// reading .mcp.json — agent-deck never holds the exec.Cmd handle
-// directly, so this discovery is the only point at which their PIDs
-// become known to a per-session lifecycle hook.
-//
-// Filtering rules:
-//   - Pane PID itself is skipped: tmux teardown signals it directly.
-//   - The tool process (claude/codex/gemini) is skipped: tmux's
-//     pgroup-wide kill-session is the right path for it, and
-//     pre-empting that with SIGTERM causes the session to
-//     auto-destroy before kill-session runs, which surfaces a
-//     cosmetic teardown error.
-//   - Everything deeper IS registered: this is where stdio MCPs and
-//     their helpers (uvx, python, node, bun) live. Some MCPs setsid
-//     into their own session, escaping tmux's pgroup kill — those
-//     are exactly the leakers from issue #965.
-//
-// Which depth holds the tool process depends on how the pane was
-// spawned, so it is read from the pane leader rather than assumed —
-// see mcpReapMinDepth.
-//
-// Issue #965 wiring follow-up to PR #1000. Hardened in issue #1086
-// to use a single ps snapshot (was: two snapshots, which could
-// disagree under load on CI runners and skip a depth-2 child whose
-// intermediate parent had just exec-optimized).
-func (i *Instance) discoverMCPChildrenFromPaneTree() {
-	if i.tmuxSession == nil || !i.tmuxSession.Exists() {
-		return
+// captureMCPChildrenFromPaneTree retains depth >= 2 descendants after two
+// matching process-tree snapshots. Pane and direct tool-process PIDs remain
+// owned by tmux teardown; deeper stdio MCP helpers may escape that process group.
+// The caller owns returned handles.
+func (i *Instance) captureMCPChildrenFromPaneTree() ([]tmux.ProcessIdentity, error) {
+	if i.tmuxSession == nil {
+		return nil, nil
 	}
-	panePID := i.readPanePID()
-	if panePID <= 0 {
-		return
+	panePID, children, err := i.mcpDescendantSnapshot()
+	if err != nil {
+		return nil, err
 	}
+	if len(children) == 0 {
+		return nil, nil
+	}
+	identities, err := mcpCaptureProcessIdentitiesFn(children)
+	if err != nil {
+		return nil, err
+	}
+	owned := true
+	defer func() {
+		if owned {
+			mcpCloseProcessIdentitiesFn(identities)
+		}
+	}()
+	if !identityPIDsMatch(identities, children) {
+		return nil, errors.New("MCP process tree changed during identity capture")
+	}
+	afterPanePID, afterChildren, err := i.mcpDescendantSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	if panePID != afterPanePID || !sameProcessPIDSet(children, afterChildren) {
+		return nil, errors.New("MCP process tree changed during identity capture")
+	}
+	for _, identity := range identities {
+		if !mcpProcessIdentityMatchesFn(identity) {
+			return nil, errors.New("MCP process identity exited during tree revalidation")
+		}
+	}
+	owned = false
+	return identities, nil
+}
 
-	procTable, err := exec.Command("ps", "-eo", "pid=,ppid=,comm=").Output()
-	if err != nil || len(procTable) == 0 {
-		return
+func (i *Instance) mcpDescendantSnapshot() (int, []int, error) {
+	panePID := mcpReadPanePIDFn(i)
+	if panePID <= 0 {
+		return 0, nil, errors.New("MCP pane PID unavailable")
+	}
+	procTable, err := mcpProcessTableSnapshotFn()
+	if err != nil {
+		return 0, nil, fmt.Errorf("snapshot MCP process tree: %w", err)
+	}
+	if len(procTable) == 0 {
+		return 0, nil, errors.New("empty MCP process table")
 	}
 	childrenByParent, parseErr := parsePSParentChildMap(procTable)
-	if parseErr != nil || len(childrenByParent) == 0 {
-		return
+	if parseErr != nil {
+		return 0, nil, fmt.Errorf("parse MCP process table: %w", parseErr)
 	}
 	// Same snapshot, so the leader identity cannot disagree with the tree.
 	minDepth := mcpReapMinDepth(parsePSCommandNames(procTable)[panePID])
@@ -152,6 +236,7 @@ func (i *Instance) discoverMCPChildrenFromPaneTree() {
 	}
 	seen := map[int]bool{panePID: true}
 	queue := []queued{{pid: panePID, depth: 0}}
+	var descendants []int
 	for len(queue) > 0 {
 		node := queue[0]
 		queue = queue[1:]
@@ -163,11 +248,44 @@ func (i *Instance) discoverMCPChildrenFromPaneTree() {
 			seen[child] = true
 			childDepth := node.depth + 1
 			if childDepth >= minDepth {
-				i.RegisterMCPChild(child)
+				descendants = append(descendants, child)
 			}
 			queue = append(queue, queued{pid: child, depth: childDepth})
 		}
 	}
+	return panePID, descendants, nil
+}
+
+func identityPIDsMatch(identities []tmux.ProcessIdentity, pids []int) bool {
+	if len(identities) != len(pids) {
+		return false
+	}
+	got := make(map[int]struct{}, len(identities))
+	for _, identity := range identities {
+		got[identity.PID] = struct{}{}
+	}
+	for _, pid := range pids {
+		if _, ok := got[pid]; !ok {
+			return false
+		}
+	}
+	return len(got) == len(pids)
+}
+
+func sameProcessPIDSet(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	pids := make(map[int]struct{}, len(left))
+	for _, pid := range left {
+		pids[pid] = struct{}{}
+	}
+	for _, pid := range right {
+		if _, ok := pids[pid]; !ok {
+			return false
+		}
+	}
+	return len(pids) == len(left)
 }
 
 // readPanePID returns the pane PID for this Instance's tmux session,
@@ -218,62 +336,27 @@ func (i *Instance) reapTrackedMCPChildren() {
 	i.mcpPIDsMu.Lock()
 	pids := append([]int(nil), i.TrackedMCPPIDs...)
 	i.TrackedMCPPIDs = nil
+	identities := make([]tmux.ProcessIdentity, 0, len(i.trackedMCPChildIdentities))
+	for _, pid := range pids {
+		if identity, ok := i.trackedMCPChildIdentities[pid]; ok {
+			identities = append(identities, identity)
+			delete(i.trackedMCPChildIdentities, pid)
+		}
+	}
+	// Preserve handle ownership even if an inconsistent persisted PID slice
+	// omitted an in-memory identity. Clearing the map must not leak it.
+	for _, identity := range i.trackedMCPChildIdentities {
+		identities = append(identities, identity)
+	}
+	i.trackedMCPChildIdentities = nil
 	i.mcpPIDsMu.Unlock()
 
-	if len(pids) == 0 {
+	if len(identities) == 0 {
 		return
 	}
-
-	for _, pid := range pids {
-		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
-			mcpLog.Debug("mcp_child_sigterm_failed", slog.Int("pid", pid), slog.Any("error", err))
-		}
-	}
-
-	if waitPIDsGone(pids, mcpReapGracePeriod) {
-		return
-	}
-
-	for _, pid := range pids {
-		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-			mcpLog.Debug("mcp_child_sigkill_failed", slog.Int("pid", pid), slog.Any("error", err))
-		}
-	}
-
-	if !waitPIDsGone(pids, mcpReapVerifyTimeout) {
-		var survivors []int
-		for _, pid := range pids {
-			if syscall.Kill(pid, syscall.Signal(0)) == nil {
-				survivors = append(survivors, pid)
-			}
-		}
-		if len(survivors) > 0 {
-			mcpLog.Warn("mcp_child_sigkill_unverified",
-				slog.Any("survivors", survivors),
-				slog.Duration("waited", mcpReapVerifyTimeout))
-		}
-	}
-}
-
-// waitPIDsGone polls until every PID in the slice is gone (ESRCH on
-// signal-0 probe) or the deadline elapses. Returns true when all PIDs
-// are confirmed gone, false on timeout.
-func waitPIDsGone(pids []int, within time.Duration) bool {
-	deadline := time.Now().Add(within)
-	for {
-		anyAlive := false
-		for _, pid := range pids {
-			if syscall.Kill(pid, syscall.Signal(0)) == nil {
-				anyAlive = true
-				break
-			}
-		}
-		if !anyAlive {
-			return true
-		}
-		if !time.Now().Before(deadline) {
-			return false
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	mcpReapProcessIdentitiesFn(identities, tmux.ProcessReapTiming{
+		TermGrace:    mcpReapGracePeriod,
+		KillWait:     mcpReapVerifyTimeout,
+		PollInterval: 20 * time.Millisecond,
+	})
 }

@@ -75,8 +75,8 @@ func TestArchivedAtStorageRoundTrip(t *testing.T) {
 		CreatedAt:   time.Now(),
 		ArchivedAt:  archivedAt,
 	}
-	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	loaded, _, err := storage.LoadWithGroups()

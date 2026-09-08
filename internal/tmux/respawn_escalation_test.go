@@ -5,8 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"strconv"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -29,17 +27,9 @@ import (
 //
 // Two things about the command are load-bearing, both learned the hard way:
 //
-// bash, not sh: the respawn path consults isOurProcess (tmux.go), whose narrow
-// allowlist matches "bash" but not the "dash" that /bin/sh is on Debian/Ubuntu.
-//
 // A LOOP, not a bare `sleep 30`: bash exec-optimizes `bash -c '<single
-// command>'` into the command itself, replacing the process — so the child's
-// comm becomes "sleep", which isOurProcess does not match, and the escalation
-// skips it. Whether that fires depends on the bash version (5.0 kept bash
-// resident, the CI runner's newer bash did not), so it flipped between
-// developer machines and CI. The loop keeps a real bash in place everywhere.
-// isOurProcessLoose (ensure_pids_dead.go) carries "sleep"/"dash" in its
-// allowlist for this same harness hazard.
+// command>'` into the command itself, replacing the process. The loop keeps a
+// real bash resident so the test's TERM trap remains installed everywhere.
 func startSigtermImmuneChild(t *testing.T) int {
 	t.Helper()
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
@@ -68,22 +58,19 @@ func startSigtermImmuneChild(t *testing.T) int {
 		t.Fatalf("setup: child %d not alive", pid)
 	}
 
-	// Guard the guard. Every assertion below reduces to "did ensureProcessesDead
-	// signal this PID", and it only signals PIDs isOurProcess vouches for — so if
-	// the child is not recognized, the survival tests pass while proving nothing
-	// and the reap test fails for a reason that looks nothing like its message.
-	// Both happened here before this check existed.
-	comm, psErr := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
-	if psErr != nil {
-		t.Skipf("ps unavailable (%v): isOurProcess cannot classify anything on this "+
-			"host, so the escalation is a no-op by construction and nothing here is testable", psErr)
-	}
-	if !isOurProcess(pid) {
-		t.Fatalf("setup: child comm is %q, which isOurProcess does not match — the "+
-			"escalation would skip it and every assertion in this file would be vacuous",
-			strings.TrimSpace(string(comm)))
-	}
 	return pid
+}
+
+func captureIdentitiesForTest(t *testing.T, pids ...int) []ProcessIdentity {
+	t.Helper()
+	identities, err := CaptureProcessIdentities(pids)
+	if err != nil {
+		t.Fatalf("capture process identities: %v", err)
+	}
+	if len(identities) != len(pids) {
+		t.Fatalf("captured %d identities for %d live pids", len(identities), len(pids))
+	}
+	return identities
 }
 
 func pidIsAlive(pid int) bool {
@@ -132,7 +119,7 @@ func TestEscalateAfterRespawn_SkipsEscalationWhenPanePIDUnknown(t *testing.T) {
 	s := deadSessionForEscalation()
 	// probeErr non-nil == the bounded pane probe timed out or failed, so the
 	// new process tree is unknown (nil).
-	s.escalateAfterRespawn([]int{pid}, nil, errors.New("signal: killed"))
+	s.escalateAfterRespawn(captureIdentitiesForTest(t, pid), nil, errors.New("signal: killed"))
 
 	if waitForDeath(pid, survivalGrace) {
 		t.Fatal("escalation killed a process while the new pane PID was unknown: " +
@@ -147,7 +134,7 @@ func TestEscalateAfterRespawn_SparesTheNewPaneProcess(t *testing.T) {
 	pid := startSigtermImmuneChild(t)
 
 	s := deadSessionForEscalation()
-	s.escalateAfterRespawn([]int{pid}, []int{pid}, nil)
+	s.escalateAfterRespawn(captureIdentitiesForTest(t, pid), []int{pid}, nil)
 
 	if waitForDeath(pid, survivalGrace) {
 		t.Fatal("escalation killed the process it was told is the new pane process")
@@ -164,7 +151,7 @@ func TestEscalateAfterRespawn_SparesEveryPIDInTheNewTree(t *testing.T) {
 
 	s := deadSessionForEscalation()
 	// Both appear in the stale tree AND in the fresh one — the collision case.
-	s.escalateAfterRespawn([]int{paneLike, childLike}, []int{paneLike, childLike}, nil)
+	s.escalateAfterRespawn(captureIdentitiesForTest(t, paneLike, childLike), []int{paneLike, childLike}, nil)
 
 	if waitForDeath(childLike, survivalGrace) {
 		t.Fatal("escalation killed a descendant of the freshly respawned process: " +
@@ -176,16 +163,24 @@ func TestEscalateAfterRespawn_SparesEveryPIDInTheNewTree(t *testing.T) {
 }
 
 // Negative control: with a resolved pane PID that is genuinely not in the old
-// tree, the escalation must still do its job — the SIGHUP-immune-agent reap
-// (Claude Code 2.1.27+) is why this code exists at all.
-func TestEscalateAfterRespawn_StillReapsSurvivorsWhenPanePIDKnown(t *testing.T) {
+// tree, Linux escalation must still do its job — the SIGHUP-immune-agent reap
+// (Claude Code 2.1.27+) is why this code exists at all. Darwin must leave the
+// survivor untouched because it has no supported identity-bound signal.
+func TestRuntimeLifecycle_EscalateAfterRespawnStillReapsSurvivorsWhenPanePIDKnown(t *testing.T) {
 	pid := startSigtermImmuneChild(t)
 
 	s := deadSessionForEscalation()
 	// os.Getpid() is a live PID that is certainly not the child.
-	s.escalateAfterRespawn([]int{pid}, []int{os.Getpid()}, nil)
+	s.escalateAfterRespawn(captureIdentitiesForTest(t, pid), []int{os.Getpid()}, nil)
 
-	if !waitForDeath(pid, 2*time.Second) {
+	dead := waitForDeath(pid, 2*time.Second)
+	if runtime.GOOS == "darwin" {
+		if dead {
+			t.Fatal("Darwin escalation signaled a survivor without identity-bound signal support")
+		}
+		return
+	}
+	if !dead {
 		t.Fatal("escalation left a SIGTERM-immune survivor alive")
 	}
 }
