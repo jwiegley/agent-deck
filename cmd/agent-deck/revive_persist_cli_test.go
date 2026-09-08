@@ -48,8 +48,8 @@ func stubReviverHealingErrored(t *testing.T) *session.Reviver {
 // command-level regression guard for the lost-update race. It drives
 // reviveAndPersist — the exact seam handleSessionRevive uses — instead of
 // poking storage directly, so a future regression that swaps the persist back
-// to saveSessionData / SaveWithGroups / SaveInstances (the DELETE-NOT-IN sweep
-// path) IS caught here, not just in the storage unit test.
+// to the sweeping SaveInstances path is caught here, not just in the storage
+// unit test.
 //
 // Sequence (production order):
 //  1. revive loads its snapshot (only the pre-existing errored session).
@@ -59,8 +59,8 @@ func stubReviverHealingErrored(t *testing.T) *session.Reviver {
 // Invariant: the concurrently-added session survives, and the errored session
 // is now running.
 func TestReviveCLI_PersistViaTargetedPath_DoesNotClobberConcurrentAdd(t *testing.T) {
-	// Own profile: saves are upsert-only (#1551), so rows written by other
-	// tests in the shared _test profile would leak into this test's snapshot.
+	// Own profile: routine saves are update-only (#1551), so rows written by
+	// other tests in the shared _test profile would leak into this snapshot.
 	t.Setenv("AGENTDECK_PROFILE", "_test_revive_clobber")
 	reviveStorage := newReviveCLIStorage(t)
 
@@ -74,10 +74,8 @@ func TestReviveCLI_PersistViaTargetedPath_DoesNotClobberConcurrentAdd(t *testing
 		Status:      session.StatusError,
 		CreatedAt:   time.Now().Add(-2 * time.Minute),
 	}
-	require.NoError(t, reviveStorage.SaveWithGroups(
-		[]*session.Instance{existing},
-		session.NewGroupTree([]*session.Instance{existing}),
-	))
+	require.NoError(t, reviveStorage.InsertSessionAndVerify(
+		existing, session.NewGroupTree([]*session.Instance{existing})))
 
 	// Step 1: revive loads its (now-stale-once-add-happens) snapshot.
 	snapshot, _, err := reviveStorage.LoadWithGroups()
@@ -124,8 +122,8 @@ func TestReviveCLI_PersistViaTargetedPath_DoesNotClobberConcurrentAdd(t *testing
 // REPLACE from revive's stale snapshot would clobber that edit; the targeted
 // status UPDATE must leave it intact.
 func TestReviveCLI_TargetedUpdate_PreservesConcurrentEditToRevivedRow(t *testing.T) {
-	// Own profile: saves are upsert-only (#1551), so rows written by other
-	// tests in the shared _test profile would leak into this test's snapshot.
+	// Own profile: routine saves are update-only (#1551), so rows written by
+	// other tests in the shared _test profile would leak into this snapshot.
 	t.Setenv("AGENTDECK_PROFILE", "_test_revive_edit")
 	reviveStorage := newReviveCLIStorage(t)
 
@@ -139,24 +137,22 @@ func TestReviveCLI_TargetedUpdate_PreservesConcurrentEditToRevivedRow(t *testing
 		Status:      session.StatusError,
 		CreatedAt:   time.Now().Add(-2 * time.Minute),
 	}
-	require.NoError(t, reviveStorage.SaveWithGroups(
-		[]*session.Instance{existing},
-		session.NewGroupTree([]*session.Instance{existing}),
-	))
+	require.NoError(t, reviveStorage.InsertSessionAndVerify(
+		existing, session.NewGroupTree([]*session.Instance{existing})))
 
 	// revive loads its snapshot — Title is still "original-title" here.
 	snapshot, _, err := reviveStorage.LoadWithGroups()
 	require.NoError(t, err)
 	require.Len(t, snapshot, 1)
 
-	// A concurrent process renames the SAME row via the targeted single-row
+	// A concurrent process renames the SAME row through the routine update-only
 	// path, after revive's snapshot was taken.
 	editStorage := newReviveCLIStorage(t)
 	editInstances, editGroups, err := editStorage.LoadWithGroups()
 	require.NoError(t, err)
 	editInstances[0].Title = "renamed-concurrently"
-	require.NoError(t, editStorage.InsertSessionAndVerify(
-		editInstances[0], session.NewGroupTreeWithGroups(editInstances, editGroups)))
+	require.NoError(t, editStorage.SaveWithGroups(
+		editInstances, session.NewGroupTreeWithGroups(editInstances, editGroups)))
 
 	// revive heals + persists from its stale snapshot (Title="original-title").
 	_, err = reviveAndPersist(reviveStorage, snapshot, stubReviverHealingErrored(t))

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // TestIssue1607_CreateSessionTitleLock verifies that the full create-dialog
@@ -15,6 +16,10 @@ import (
 // title reconciliation that originally replaced the title with a worktree
 // folder basename.
 func TestIssue1607_CreateSessionTitleLock(t *testing.T) {
+	previousDB := statedb.GetGlobal()
+	statedb.SetGlobal(nil)
+	t.Cleanup(func() { statedb.SetGlobal(previousDB) })
+
 	tests := []struct {
 		name       string
 		title      string

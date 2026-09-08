@@ -53,7 +53,14 @@ func TestRm_ParallelDoesNotLoseRemovals(t *testing.T) {
 			CreatedAt:   time.Now(),
 		}
 	}
-	require.NoError(t, seed.SaveWithGroups(initial, NewGroupTree(initial)))
+	groupTree := NewGroupTree(initial)
+	for i, inst := range initial {
+		var groups *GroupTree
+		if i == len(initial)-1 {
+			groups = groupTree
+		}
+		require.NoError(t, seed.InsertSessionAndVerify(inst, groups))
+	}
 
 	// Fire N parallel "rm"s. Each goroutine simulates one agent-deck CLI
 	// process: open its own Storage, load, filter, remove, save groups,

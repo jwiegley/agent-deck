@@ -28,8 +28,8 @@ import (
 //
 // This test drives that sequence deterministically against a shared SQLite
 // file. It FAILS before the #1550 fix (B's row is gone) and PASSES once
-// SaveWithGroups is upsert-only (statedb.UpsertInstances, no sweep).
-func TestSaveWithGroupsDoesNotClobberConcurrentlyAddedSession(t *testing.T) {
+// SaveWithGroups is update-only (statedb.UpdateInstances, no sweep or insert).
+func TestRuntimeLifecycle_SaveWithGroupsDoesNotClobberConcurrentlyAddedSession(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "state.db")
 
@@ -55,8 +55,7 @@ func TestSaveWithGroupsDoesNotClobberConcurrentlyAddedSession(t *testing.T) {
 		Status:      StatusIdle,
 		CreatedAt:   time.Now().Add(-2 * time.Minute),
 	}
-	require.NoError(t, tuiA.SaveWithGroups(
-		[]*Instance{existing}, NewGroupTree([]*Instance{existing})))
+	require.NoError(t, tuiA.InsertSessionAndVerify(existing, NewGroupTree([]*Instance{existing})))
 
 	// Step 1: TUI A loads its snapshot (only knows about sess-existing).
 	snapshot, _, err := tuiA.LoadWithGroups()
@@ -94,4 +93,56 @@ func TestSaveWithGroupsDoesNotClobberConcurrentlyAddedSession(t *testing.T) {
 		"session created by a concurrent TUI must survive another TUI's stale full-snapshot save (issue #1550)")
 	assert.Equal(t, "existing-renamed", ids["sess-existing"],
 		"TUI A's own edit must still persist")
+}
+
+func TestRuntimeLifecycle_SaveWithGroupsDoesNotResurrectConcurrentlyDeletedSession(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	openStorage := func() *Storage {
+		db, err := statedb.Open(dbPath)
+		require.NoError(t, err)
+		require.NoError(t, db.Migrate())
+		t.Cleanup(func() { _ = db.Close() })
+		return &Storage{db: db, dbPath: dbPath, profile: "_test"}
+	}
+
+	staleWriter := openStorage()
+	deleteWriter := openStorage()
+	inst := &Instance{
+		ID: "deleted-between-load-and-save", Title: "stale", ProjectPath: "/tmp/stale",
+		GroupPath: "test", Tool: "claude", Status: StatusStopped,
+		CreatedAt: time.Unix(1, 0).UTC(),
+	}
+	require.NoError(t, staleWriter.InsertSessionAndVerify(inst, nil))
+	_, err := staleWriter.db.CommitRuntimeBinding(inst.ID, inst.PersistenceIncarnation(), 0, "claude", 0, "conversation")
+	require.NoError(t, err)
+
+	stale, _, err := staleWriter.LoadWithGroups()
+	require.NoError(t, err)
+	require.Len(t, stale, 1)
+	require.NoError(t, deleteWriter.DeleteInstance(inst.ID))
+
+	stale[0].Title = "must not return"
+	require.ErrorContains(t, staleWriter.SaveWithGroups(stale, nil), "deletion conflict")
+	row, err := staleWriter.db.LoadInstanceByID(inst.ID)
+	require.NoError(t, err)
+	assert.Nil(t, row)
+	_, found, err := staleWriter.db.ReadRuntimeState(inst.ID)
+	require.NoError(t, err)
+	assert.False(t, found, "routine save recreated deleted runtime")
+	_, found, err = staleWriter.db.ReadRuntimeBinding(inst.ID, "claude")
+	require.NoError(t, err)
+	assert.False(t, found, "routine save recreated deleted binding")
+
+	explicit := &Instance{
+		ID: "explicit-create", Title: "explicit", ProjectPath: "/tmp/explicit",
+		GroupPath: "test", Tool: "pi", Status: StatusStopped,
+		CreatedAt: time.Unix(2, 0).UTC(),
+	}
+	require.NoError(t, staleWriter.InsertSessionAndVerify(explicit, nil))
+	row, err = staleWriter.db.LoadInstanceByID(explicit.ID)
+	require.NoError(t, err)
+	assert.NotNil(t, row, "explicit creation did not insert parent")
+	_, found, err = staleWriter.db.ReadRuntimeState(explicit.ID)
+	require.NoError(t, err)
+	assert.True(t, found, "explicit creation did not insert runtime")
 }

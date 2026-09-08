@@ -43,11 +43,9 @@ func addTestSession(t *testing.T, home, workPath, title string) string {
 }
 
 // forceSetStatus opens storage directly under the isolated HOME and writes
-// the target status onto the named instance. We can't use `agent-deck
+// the target status through the runtime authority. We can't use `agent-deck
 // session set` because it doesn't accept status as a settable field (see
-// handleSessionSet validFields map). Direct storage mutation is the
-// standard test pattern for driving the registry into a specific state
-// without racing the status worker.
+// handleSessionSet validFields map).
 func forceSetStatus(t *testing.T, home, id string, status session.Status) {
 	t.Helper()
 	t.Setenv("HOME", home)
@@ -57,25 +55,9 @@ func forceSetStatus(t *testing.T, home, id string, status session.Status) {
 	if err != nil {
 		t.Fatalf("open storage: %v", err)
 	}
-	instances, groups, err := storage.LoadWithGroups()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	var target *session.Instance
-	for _, inst := range instances {
-		if inst.ID == id {
-			target = inst
-			break
-		}
-	}
-	if target == nil {
-		t.Fatalf("instance %s not found (had %d instances)", id, len(instances))
-		return
-	}
-	target.Status = status
-	tree := session.NewGroupTreeWithGroups(instances, groups)
-	if err := storage.SaveWithGroups(instances, tree); err != nil {
-		t.Fatalf("save: %v", err)
+	t.Cleanup(func() { _ = storage.Close() })
+	if err := storage.GetDB().WriteStatus(id, string(status), "claude"); err != nil {
+		t.Fatalf("write status: %v", err)
 	}
 }
 

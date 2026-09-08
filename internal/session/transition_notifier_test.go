@@ -249,8 +249,10 @@ func TestDispatchDropsEventWhenChildNoTransitionNotify(t *testing.T) {
 		CreatedAt:   now,
 	}
 
-	if err := storage.SaveWithGroups([]*Instance{child, parent}, nil); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	for _, inst := range []*Instance{parent, child} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert %s: %v", inst.ID, err)
+		}
 	}
 
 	notifier := NewTransitionNotifier()

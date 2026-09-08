@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // recorder captures the full interleaving of a sweep's side effects, so the
@@ -272,6 +273,133 @@ func TestRecoverHaltsAfterConsecutiveRestartFailures(t *testing.T) {
 		if res.Outcome != OutcomeSkipped {
 			t.Errorf("result %q outcome = %q, want skipped", res.Title, res.Outcome)
 		}
+	}
+}
+
+func TestRecoverContinuesAfterRestartPartialSuccess(t *testing.T) {
+	r := &recorder{}
+	rec := newTestRecoverer(r, func(*session.Instance) VerifyReport { return bootedReport() })
+	rec.Restart = func(inst *session.Instance) error {
+		r.restarts = append(r.restarts, inst.Title)
+		r.log("restart %s", inst.Title)
+		return &session.RestartPartialSuccessError{
+			InstanceID: inst.ID,
+			Err:        errors.New("database is locked"),
+		}
+	}
+	rec.MaxFailures = 1
+
+	sum := rec.Recover(downAssessment("a", "b"))
+
+	if sum.Failed != 0 || sum.Halted {
+		t.Fatalf("summary = %+v, want no failed restarts and no halt", sum)
+	}
+	if sum.Recovered != 2 {
+		t.Fatalf("Recovered = %d, want both completed restarts verified", sum.Recovered)
+	}
+	if len(r.verified) != 2 || len(r.persists) != 4 {
+		t.Fatalf("verified = %v, persists = %v, want both partial successes verified and persisted", r.verified, r.persists)
+	}
+}
+
+func TestRuntimeLifecycle_FleetAppliesReturnedState(t *testing.T) {
+	r := &recorder{}
+	as := downAssessment("one")
+	inst := as.Candidates[0].Instance
+	started := time.Unix(1700000000, 123).UTC()
+	want := statedb.RuntimeState{
+		InstanceID: inst.ID, Generation: 7, StatusRevision: 3,
+		TmuxSession: "agentdeck-one-g7", TmuxSocketName: "fleet-test",
+		Status: string(session.StatusRunning), LastStartedAt: started,
+	}
+
+	rec := newTestRecoverer(r, func(got *session.Instance) VerifyReport {
+		if state := got.RuntimeState(); state != want {
+			t.Fatalf("runtime at verify = %+v, want %+v", state, want)
+		}
+		return bootedReport()
+	})
+	rec.RestartRuntime = func(*session.Instance) (statedb.RuntimeState, error) {
+		r.restarts = append(r.restarts, inst.Title)
+		return want, nil
+	}
+
+	sum := rec.Recover(as)
+	if sum.Recovered != 1 || sum.Failed != 0 {
+		t.Fatalf("summary = %+v, want one recovered runtime", sum)
+	}
+	if got := sum.Results[0].Runtime; got != want {
+		t.Fatalf("result runtime = %+v, want %+v", got, want)
+	}
+}
+
+func TestRuntimeLifecycle_FleetPreservesPartialCandidateWithoutRespawn(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	r := &recorder{}
+	as := downAssessment("one")
+	inst := as.Candidates[0].Instance
+	want := statedb.RuntimeState{
+		InstanceID: inst.ID, Generation: 4, StatusRevision: 1,
+		TmuxSession: "agentdeck-one-g4", TmuxSocketName: "fleet-test",
+		Status: string(session.StatusStarting), LastStartedAt: time.Unix(1700000000, 0).UTC(),
+	}
+	restarts := 0
+	rec := newTestRecoverer(r, func(got *session.Instance) VerifyReport {
+		if state := got.RuntimeState(); state != want {
+			t.Fatalf("partial runtime at verify = %+v, want %+v", state, want)
+		}
+		return bootedReport()
+	})
+	rec.RestartRuntime = func(*session.Instance) (statedb.RuntimeState, error) {
+		restarts++
+		return want, &session.RestartPartialSuccessError{
+			InstanceID: inst.ID, Runtime: want, NeedsReconciliation: true,
+			Err: errors.New("database is locked"),
+		}
+	}
+
+	sum := rec.Recover(as)
+	if restarts != 1 {
+		t.Fatalf("restart calls = %d, want exactly one physical spawn", restarts)
+	}
+	if sum.Recovered != 1 || sum.Failed != 0 || sum.Halted {
+		t.Fatalf("summary = %+v, partial physical success must not fail or halt", sum)
+	}
+	if got := sum.Results[0].Runtime; got != want {
+		t.Fatalf("preserved runtime = %+v, want %+v", got, want)
+	}
+	if warning := sum.Results[0].Warning; !strings.Contains(warning, "durability reconciliation failed") {
+		t.Fatalf("warning = %q, want incomplete durability reconciliation", warning)
+	}
+}
+
+func TestRuntimeLifecycle_FleetKeepsEqualGenerationWinner(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	inst := &session.Instance{ID: "one", Status: session.StatusIdle}
+	winner := statedb.RuntimeState{
+		InstanceID: inst.ID, Generation: 3, StatusRevision: 2,
+		TmuxSession: "winner", TmuxSocketName: "socket-winner", Status: "running",
+	}
+	loser := winner
+	loser.TmuxSession = "loser"
+	loser.TmuxSocketName = "socket-loser"
+	if !inst.ApplyRuntimeState(winner) {
+		t.Fatal("winner apply was rejected")
+	}
+	partial := &session.RestartPartialSuccessError{
+		InstanceID: inst.ID, Runtime: loser, NeedsReconciliation: true,
+		Err: errors.New("lost runtime CAS"),
+	}
+	got, failure, warning := consumeRestartRuntime(inst, loser, partial)
+	if failure != nil || warning == "" {
+		t.Fatalf("failure=%v warning=%q", failure, warning)
+	}
+	if got != winner || inst.RuntimeState() != winner {
+		t.Fatalf("fleet restored loser: returned=%#v canonical=%#v want=%#v",
+			got, inst.RuntimeState(), winner)
 	}
 }
 

@@ -12,16 +12,14 @@ import (
 	"time"
 )
 
-// EnsurePIDsDead must synchronously reap SIGHUP-immune children by the
-// time it returns. Previously the (unexported) ensureProcessesDead ran
-// in a goroutine. In a short-lived CLI process such as `agent-deck
-// session remove`, the CLI exits before the goroutine finishes —
-// leaving an orphan claude process behind.
+// On Linux, EnsurePIDsDead must synchronously reap SIGHUP-immune children by
+// the time it returns. Darwin has no supported identity-bound signal primitive,
+// so the same auxiliary reap must fail closed and leave the child untouched.
 //
 // Observed 2026-04-22 on the maintainer's host: PID 321456, 33-hour
 // orphan with AGENTDECK_INSTANCE_ID set, no corresponding agent-deck
 // session record. Root cause #59.
-func TestEnsurePIDsDead_SynchronouslyKillsSigHupImmuneChild(t *testing.T) {
+func TestRuntimeLifecycle_EnsurePIDsDeadUsesPlatformIdentitySignalContract(t *testing.T) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skipf("posix signal semantics only; GOOS=%s", runtime.GOOS)
 	}
@@ -59,12 +57,24 @@ func TestEnsurePIDsDead_SynchronouslyKillsSigHupImmuneChild(t *testing.T) {
 		t.Fatalf("setup: pid %d not alive: %v", pid, err)
 	}
 
-	// The contract: when this call returns, the pid is dead. No polling,
-	// no sleep-loops in the caller. 3s timeout is well above the
-	// SIGTERM→SIGKILL escalation window (~1.5s) inside EnsurePIDsDead.
-	EnsurePIDsDead([]int{pid}, 3*time.Second)
+	// Linux must complete the reap before returning. Darwin must return after
+	// its bounded grace without signaling this PID through a racy raw handle.
+	err := EnsurePIDsDead([]int{pid}, 3*time.Second)
 
-	if err := syscall.Kill(pid, syscall.Signal(0)); err == nil {
+	alive := syscall.Kill(pid, syscall.Signal(0)) == nil
+	if runtime.GOOS == "darwin" {
+		if !alive {
+			t.Fatalf("Darwin auxiliary reap signaled pid %d without identity-bound signal support", pid)
+		}
+		if err == nil || !strings.Contains(err.Error(), "death unverified") {
+			t.Fatalf("live Darwin child must report unverified death, got %v", err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if alive {
 		name, _ := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
 		t.Errorf("pid %d (comm=%q) still alive after EnsurePIDsDead — must be synchronous",
 			pid, strings.TrimSpace(string(name)))
@@ -79,13 +89,17 @@ func TestKillAndWait_RoutesKillToSessionSocket(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "tmux-argv.log")
 	t.Setenv("TMUX_KILL_LOG", logPath)
-	writeFakeTmux(t, dir, `printf '%s\n' "$*" >> "$TMUX_KILL_LOG"
-exit 1`)
+	writeFakeTmux(t, dir, `printf '%s\n' "$*" >> "$TMUX_KILL_LOG"`)
+	oldCapture := captureStableSessionProcessTreeFn
+	captureStableSessionProcessTreeFn = func(s *Session) (stableSessionTarget, []ProcessIdentity, error) {
+		return stableSessionTargetForTest(s.Name, s.SocketName), nil, nil
+	}
+	t.Cleanup(func() { captureStableSessionProcessTreeFn = oldCapture })
 
 	socket := "kill-and-wait-custom-socket"
 	s := &Session{Name: "kill-and-wait-target", SocketName: socket}
 	if err := s.KillAndWait(); err != nil {
-		t.Fatalf("KillAndWait on shim-reported absent session: %v", err)
+		t.Fatalf("KillAndWait on captured session: %v", err)
 	}
 
 	data, err := os.ReadFile(logPath)
@@ -93,23 +107,14 @@ exit 1`)
 		t.Fatalf("read fake tmux argv log: %v", err)
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		fields := strings.Fields(line)
-		killAt := -1
-		for idx, field := range fields {
-			if field == "kill-session" {
-				killAt = idx
-				break
-			}
+		if !strings.HasPrefix(line, "-u -L "+socket+" ") {
+			t.Fatalf("tmux argv %q did not target -L %q", line, socket)
 		}
-		if killAt < 0 {
-			continue
+		if strings.Contains(line, "'kill-session' '-t' '$7'") {
+			return
 		}
-		if killAt < 2 || fields[killAt-2] != "-L" || fields[killAt-1] != socket {
-			t.Fatalf("kill-session argv %q did not target -L %q", line, socket)
-		}
-		return
 	}
-	t.Fatalf("fake tmux never received kill-session; argv log: %q", data)
+	t.Fatalf("fake tmux never received stable-ID kill-session; argv log: %q", data)
 }
 
 // A nil/empty PID list must be a no-op, returning immediately. Callers

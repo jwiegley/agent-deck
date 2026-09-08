@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -36,6 +37,13 @@ type Result struct {
 	Outcome Outcome
 	// Err is the restart error for OutcomeFailed (nil otherwise).
 	Err error
+	// Warning records a completed physical restart whose durability
+	// reconciliation was needed or remains incomplete. It never changes the
+	// outcome to failed and must never trigger another spawn.
+	Warning string
+	// Runtime is the exact state returned by, or reconciled after, the
+	// physical restart.
+	Runtime statedb.RuntimeState
 	// Report is the verification reading (zero value for skipped/planned).
 	Report VerifyReport
 	// WaitedBefore is the spacing actually slept before this boot.
@@ -77,7 +85,11 @@ func (s Summary) Format() string {
 // Recoverer restarts down sessions one at a time, verifying each before moving
 // on. Every side effect is an injectable field; see the package doc for why.
 type Recoverer struct {
-	// Restart performs the actual restart of one session.
+	// RestartRuntime performs the actual restart and returns its exact runtime
+	// tuple. Production always uses this result-aware path.
+	RestartRuntime func(*session.Instance) (statedb.RuntimeState, error)
+	// Restart is the legacy error-only test seam. It is used only when
+	// RestartRuntime is nil.
 	Restart func(*session.Instance) error
 	// StillDown re-probes a candidate immediately before its restart. A sweep
 	// over 65 sessions runs for minutes, so the assessment is stale by the time
@@ -88,11 +100,11 @@ type Recoverer struct {
 	StillDown func(*session.Instance) bool
 	// Verify proves (or fails to prove) that a restarted session booted.
 	Verify func(*session.Instance) VerifyReport
-	// Persist durably records the sessions a boot mutated. It is called with a
-	// ONE-element slice after each attempt so a sweep interrupted at session 40
-	// of 65 leaves the first 39 persisted. Wire it to a targeted, sweep-free
-	// write (see session.Storage.PersistRecoveredInstances) — never to a
-	// whole-table save from a stale snapshot (2026-06-04).
+	// Persist validates the authoritative runtime tuple already committed by a
+	// boot. It is called with a ONE-element slice after each attempt. Wire it to
+	// session.Storage.PersistRecoveredInstances, which is retained under that
+	// compatibility name but performs no metadata write; never replay the
+	// sweep's stale instance snapshot (2026-06-04).
 	Persist func([]*session.Instance) error
 	// Progress, when set, is called before each attempt (1-based index) so the
 	// CLI can stream a line per session during a multi-minute sweep.
@@ -139,7 +151,9 @@ type Recoverer struct {
 func NewRecoverer() *Recoverer {
 	v := NewVerifier()
 	return &Recoverer{
-		Restart: func(inst *session.Instance) error { return inst.Restart() },
+		RestartRuntime: func(inst *session.Instance) (statedb.RuntimeState, error) {
+			return inst.RestartRuntime()
+		},
 		StillDown: func(inst *session.Instance) bool {
 			return !tmux.HasSessionOnSocket(inst.TmuxSocketName, TmuxName(inst))
 		},
@@ -172,7 +186,8 @@ func NewRecoverer() *Recoverer {
 //     (MaxFailures), and so does a run of boots that came up with the pane
 //     already gone (MaxDeadBoots) — sessions exiting on boot is how a
 //     credential outage actually presents.
-//  6. Each mutated session is persisted immediately, individually.
+//  6. Each authoritative restart publication is validated immediately and
+//     individually, without replaying the assessment's metadata snapshot.
 func (r *Recoverer) Recover(as Assessment) Summary {
 	sum := Summary{Assessment: as, DryRun: r.DryRun}
 
@@ -262,30 +277,38 @@ func (r *Recoverer) Recover(as Assessment) Summary {
 		attempts++
 		sum.Attempted++
 
-		if err := r.restart(c.Instance); err != nil {
+		runtime, restartErr := r.restart(c.Instance)
+		runtime, restartErr, res.Warning = consumeRestartRuntime(c.Instance, runtime, restartErr)
+		res.Runtime = runtime
+		if res.Warning != "" && r.Log != nil {
+			r.Log.Warn("fleet_recover_restart_persistence_warning",
+				slog.String("instance_id", c.ID()),
+				slog.String("title", c.Title()),
+				slog.String("warning", res.Warning))
+		}
+		if restartErr != nil {
 			res.Outcome = OutcomeFailed
-			res.Err = err
+			res.Err = restartErr
 			sum.Failed++
 			consecutiveFailures++
-			r.logf("fleet_recover_restart_failed", c, slog.String("error", err.Error()))
+			r.logf("fleet_recover_restart_failed", c, slog.String("error", restartErr.Error()))
 			if r.AuthGate != nil {
-				r.AuthGate.Observe(c.Instance, VerifyReport{}, err)
+				r.AuthGate.Observe(c.Instance, VerifyReport{}, restartErr)
 			}
 			sum.Results = append(sum.Results, res)
 			if consecutiveFailures >= r.maxFailures() {
 				sum.Halted = true
 				sum.HaltReason = fmt.Sprintf(
 					"%d consecutive restarts failed — halting instead of failing through the rest of the fleet (last error: %v)",
-					consecutiveFailures, err)
+					consecutiveFailures, restartErr)
 				r.logHalt(sum.HaltReason)
 			}
 			continue
 		}
 
-		// The restart succeeded, so the session mutated (status, tmux name,
-		// tool session id). Persist before verifying: verification can take
-		// tens of seconds and an interrupt in that window must not lose the
-		// fact that this session was restarted.
+		// RestartRuntime already committed the authoritative tuple. Validate that
+		// durable result before verification without replaying the sweep's stale
+		// metadata snapshot.
 		r.persist(c.Instance)
 
 		rep := r.verify(c.Instance)
@@ -334,8 +357,8 @@ func (r *Recoverer) Recover(as Assessment) Summary {
 			}
 		}
 
-		// Verification may have refined the status (starting → running/waiting);
-		// persist again so storage reflects the settled state.
+		// Verification may have refined status through the same authoritative
+		// status path; validate the settled tuple again.
 		r.persist(c.Instance)
 
 		sum.Results = append(sum.Results, res)
@@ -344,11 +367,22 @@ func (r *Recoverer) Recover(as Assessment) Summary {
 	return sum
 }
 
-func (r *Recoverer) restart(inst *session.Instance) error {
-	if r.Restart == nil {
-		return fmt.Errorf("recoverer has no Restart action configured")
+func (r *Recoverer) restart(inst *session.Instance) (statedb.RuntimeState, error) {
+	if r.RestartRuntime != nil {
+		return r.RestartRuntime(inst)
 	}
-	return r.Restart(inst)
+	if r.Restart != nil {
+		err := r.Restart(inst)
+		return inst.RuntimeState(), err
+	}
+	return statedb.RuntimeState{}, fmt.Errorf("recoverer has no Restart action configured")
+}
+
+// consumeRestartRuntime applies one physical restart result. Partial success
+// is reconciled using durability-only logic and is returned as a warning, not
+// a failure, because retrying the spawn would destroy the replacement pane.
+func consumeRestartRuntime(inst *session.Instance, runtime statedb.RuntimeState, err error) (statedb.RuntimeState, error, string) {
+	return session.ConsumePhysicalRuntimeResult(inst, runtime, err, nil)
 }
 
 func (r *Recoverer) verify(inst *session.Instance) VerifyReport {
@@ -358,8 +392,9 @@ func (r *Recoverer) verify(inst *session.Instance) VerifyReport {
 	return r.Verify(inst)
 }
 
-// persist is best-effort and never aborts a sweep: a storage hiccup on session
-// 3 must not strand the other 62 down sessions. The failure is logged loudly.
+// persist validates the already-authoritative restart publication. It remains
+// best-effort so a storage hiccup on session 3 does not strand the other 62
+// down sessions; the failure is logged loudly.
 func (r *Recoverer) persist(inst *session.Instance) {
 	if r.Persist == nil || inst == nil {
 		return

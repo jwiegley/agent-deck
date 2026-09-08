@@ -561,32 +561,32 @@ func handleWorktreeCleanup(profile string, args []string) {
 
 	// Remove orphaned sessions
 	removedSessions := 0
+	removedIDs := make(map[string]bool, len(orphanedSessions))
+	selections := make(map[string]session.RuntimeSelection, len(orphanedSessions))
 	for _, inst := range orphanedSessions {
-		// Kill tmux session if it exists
-		if inst.Exists() {
-			if err := inst.Kill(); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to kill tmux session %s: %v\n", inst.Title, err)
-			}
+		selections[inst.ID] = inst.CaptureRuntimeSelection()
+	}
+	for _, inst := range orphanedSessions {
+		if err := inst.DeleteAndWaitCaptured(selections[inst.ID]); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: conditional removal aborted for %s: %v\n", inst.Title, err)
+			continue
 		}
 		removedSessions++
+		removedIDs[inst.ID] = true
 		fmt.Printf("Removed session: %s\n", inst.Title)
 	}
 
 	// Filter out removed sessions from instances
 	if removedSessions > 0 {
 		var remaining []*session.Instance
-		removedIDs := make(map[string]bool)
-		for _, inst := range orphanedSessions {
-			removedIDs[inst.ID] = true
-		}
 		for _, inst := range instances {
 			if !removedIDs[inst.ID] {
 				remaining = append(remaining, inst)
 			}
 		}
 
-		// Save updated session data
-		if err := saveSessionData(storage, remaining, groups); err != nil {
+		groupTree := session.NewGroupTreeWithGroups(remaining, groups)
+		if err := storage.SaveGroupsOnly(groupTree); err != nil {
 			out.Error(fmt.Sprintf("failed to save session data: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
@@ -760,6 +760,7 @@ func handleWorktreeFinish(profile string, args []string) {
 		}
 		fmt.Println()
 	}
+	selection := inst.CaptureRuntimeSelection()
 
 	// Step 1: Merge (if requested)
 	if !*noMerge {
@@ -786,6 +787,11 @@ func handleWorktreeFinish(profile string, args []string) {
 		fmt.Printf("  %s Merged successfully\n", successSymbol)
 	}
 
+	if err := inst.DeleteAndWaitCaptured(selection); err != nil {
+		out.Error(fmt.Sprintf("session changed before finish: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
 	// Step 2: Remove worktree
 	if _, statErr := os.Stat(worktreePath); !os.IsNotExist(statErr) {
 		fmt.Printf("Removing worktree at %s...\n", FormatPath(worktreePath))
@@ -807,25 +813,15 @@ func handleWorktreeFinish(profile string, args []string) {
 		}
 	}
 
-	// Step 4: Kill tmux session
-	if inst.Exists() {
-		if err := inst.Kill(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to kill tmux session: %v\n", err)
-		}
-	}
-
-	// Step 5: Remove session from agent-deck.
-	//
-	// #1396: this must use the targeted RemoveSessionAndVerify path (the same
-	// one `session remove` uses), NOT saveSessionData/SaveWithGroups.
-	// Historically SaveWithGroups(remaining) with an empty `remaining` tripped
-	// the S1 empty-sweep guard AFTER the irreversible git steps, orphaning the
-	// row; since #1550 SaveWithGroups is upsert-only and would not delete the
-	// row at all. Either way, removal requires the targeted DELETE.
+	// Step 4: Persist group ordering after the conditional runtime-aware delete.
 	remaining := dropInstance(instances, inst.ID)
 	groupTree := session.NewGroupTreeWithGroups(remaining, groups)
-	if err := storage.RemoveSessionAndVerify(inst.ID, remaining, groupTree); err != nil {
+	if err := storage.SaveGroupsOnly(groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save session data: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if exists, err := storage.InstanceExists(inst.ID); err != nil || exists {
+		out.Error(fmt.Sprintf("failed to verify conditional removal: exists=%v err=%v", exists, err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 

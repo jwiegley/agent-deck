@@ -67,8 +67,8 @@ func setupDeferTest(t *testing.T, profile string) *session.Instance {
 		// a foreign ephemeral.
 		ClaudeSessionID: "sid-defer-1578",
 	}
-	if err := storage.Save([]*session.Instance{inst}); err != nil {
-		t.Fatalf("seed save: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("seed insert: %v", err)
 	}
 	return inst
 }

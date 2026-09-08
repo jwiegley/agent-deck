@@ -68,6 +68,9 @@ func TestConductor_Restart_DoesNotAdoptDiscoveredTranscript_1815(t *testing.T) {
 	home := isolatedHomeDir(t)
 	argvLog := setupStubClaudeOnPATH(t, home)
 	inst := newClaudeInstanceForDispatch(t, home)
+	// The fixture replaces Instance.ID after construction; keep the physical
+	// session owner identical so exact-candidate respawn authority remains valid.
+	inst.tmuxSession.InstanceID = inst.ID
 
 	// Custom-command preconditions: wrapper bypasses happy-path capture.
 	inst.Command = writeCustomWrapperScript(t, home)

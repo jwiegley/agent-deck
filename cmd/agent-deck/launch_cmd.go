@@ -734,8 +734,8 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		fmt.Fprintf(os.Stderr, "Warning: loadout: %s\n", w)
 	}
 
-	// Add to instances list (in-memory only — used for downstream
-	// group cap math and the second SaveWithGroups after PostStartSync).
+	// Add to instances list (in-memory only — used for group cap math and
+	// construction of the group tree persisted at the creation boundary).
 	instances = append(instances, newInstance)
 
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
@@ -743,6 +743,13 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	groupTree.DefaultMaxConcurrent = launchCfg.GroupDefaults.MaxConcurrent
 	if newInstance.GroupPath != "" {
 		groupTree.CreateGroupPath(newInstance.GroupPath)
+	}
+	maxC := session.GroupMaxConcurrent(groupTree, newInstance.GroupPath)
+	shouldQueue := session.ShouldQueue(instances, newInstance.GroupPath, maxC)
+	if shouldQueue {
+		// Persist the queued runtime as part of the one explicit creation.
+		// A later update-only metadata write cannot initialize runtime state.
+		newInstance.Status = session.StatusQueued
 	}
 
 	// v1.9.x issue #1031: targeted single-row insert + verify, NOT the
@@ -785,24 +792,12 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// v1.9.1 group concurrency cap: if the target group is at its
 	// max_concurrent cap, mark this session queued instead of starting.
 	// Groups with max_concurrent<=0 (legacy default) skip this check.
-	tree := session.NewGroupTreeWithGroups(instances, groups)
-	maxC := session.GroupMaxConcurrent(tree, newInstance.GroupPath)
-	if session.ShouldQueue(instances, newInstance.GroupPath, maxC) {
+	if shouldQueue {
 		if creationRollback != nil {
 			err := creationRollback.run("queue startup query", func() error {
 				return fmt.Errorf("startup query cannot be queued; retry when group capacity is available")
 			})
 			out.Error(err.Error(), ErrCodeInvalidOperation)
-			os.Exit(1)
-		}
-
-		newInstance.Status = session.StatusQueued
-		// v1.9.x issue #1031: same targeted single-row pattern as the
-		// initial insert above — saveSessionData → SaveWithGroups is
-		// the load-modify-write rewrite that loses sibling launches'
-		// rows under concurrency.
-		if err := storage.InsertSessionAndVerify(newInstance, tree); err != nil {
-			out.Error(fmt.Sprintf("failed to save queued state: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 		queuedJSON := map[string]interface{}{
@@ -870,36 +865,39 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// either: the process is already answering by the time it exists, so
 	// --no-wait loses nothing.
 	promptRidesArgv := initialMessage != "" && newInstance.PromptRidesCommandLine()
+	persistenceWarning := ""
 
 	if initialMessage != "" && (!*noWait || promptRidesArgv) {
-		if err := creationRollback.run("start session", func() error { return newInstance.StartWithMessage(initialMessage) }); err != nil {
+		if err := creationRollback.run("start session", func() error {
+			runtime, startErr := newInstance.StartWithMessageRuntime(initialMessage)
+			startErr, persistenceWarning = consumeRuntimeResult(newInstance, runtime, startErr)
+			return startErr
+		}); err != nil {
 			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 	} else {
-		if err := creationRollback.run("start session", newInstance.Start); err != nil {
+		if err := creationRollback.run("start session", func() error {
+			runtime, startErr := newInstance.StartRuntime()
+			startErr, persistenceWarning = consumeRuntimeResult(newInstance, runtime, startErr)
+			return startErr
+		}); err != nil {
 			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
+	}
+	if persistenceWarning != "" && !*jsonOutput && !quietMode {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
 	}
 
 	// Capture session ID from tmux
 	newInstance.PostStartSync(3 * time.Second)
 
-	// v1.9.x issue #1031: third save point — fields populated by
-	// PostStartSync (tmux session name, ClaudeSessionID once detected)
-	// land on `newInstance`. Same targeted single-row insert/upsert
-	// pattern as the two saves above; the load-modify-write
-	// saveSessionData → SaveWithGroups path would let a sibling
-	// launch's row be silently DELETE'd by this rewrite's
-	// `DELETE FROM instances WHERE id NOT IN (...)` step.
-	postStartTree := session.NewGroupTreeWithGroups(instances, groups)
-	postStartCfg, _ := session.LoadUserConfig()
-	postStartTree.DefaultMaxConcurrent = postStartCfg.GroupDefaults.MaxConcurrent
-	if newInstance.GroupPath != "" {
-		postStartTree.CreateGroupPath(newInstance.GroupPath)
-	}
-	if err := creationRollback.run("save started session", func() error { return storage.InsertSessionAndVerify(newInstance, postStartTree) }); err != nil {
+	// PostStartSync mutates an already-created session. Keep this singleton
+	// metadata write update-only so a concurrent delete remains authoritative.
+	if err := creationRollback.run("save started session", func() error {
+		return storage.SaveWithGroups([]*session.Instance{newInstance}, nil)
+	}); err != nil {
 		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
@@ -968,6 +966,9 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		"tool":       newInstance.Tool,
 		"group":      newInstance.GroupPath,
 		"profile":    storage.Profile(),
+	}
+	if persistenceWarning != "" {
+		jsonData["warning"] = persistenceWarning
 	}
 	if sessionCommandInput != "" {
 		jsonData["command"] = sessionCommandInput

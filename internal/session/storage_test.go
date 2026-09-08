@@ -41,6 +41,9 @@ func TestStorageUpdatedAtTimestamp(t *testing.T) {
 			CreatedAt:   time.Now(),
 		},
 	}
+	if err := s.InsertSessionAndVerify(instances[0], nil); err != nil {
+		t.Fatalf("InsertSessionAndVerify failed: %v", err)
+	}
 
 	// Save data
 	beforeSave := time.Now()
@@ -133,9 +136,10 @@ func TestLoadLite(t *testing.T) {
 		},
 	}
 
-	err := s.SaveWithGroups(instances, nil)
-	if err != nil {
-		t.Fatalf("SaveWithGroups failed: %v", err)
+	for _, inst := range instances {
+		if err := s.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("InsertSessionAndVerify failed: %v", err)
+		}
 	}
 
 	instData, groupData, err := s.LoadLite()
@@ -185,7 +189,7 @@ func TestLoadLiteEmptyDB(t *testing.T) {
 	}
 }
 
-func TestStorageSaveWithGroups_DedupsClaudeSessionIDs(t *testing.T) {
+func TestStorageSaveWithGroups_DoesNotGuessClaudeOwnership(t *testing.T) {
 	s := newTestStorage(t)
 	now := time.Now()
 
@@ -224,8 +228,21 @@ func TestStorageSaveWithGroups_DedupsClaudeSessionIDs(t *testing.T) {
 		CreatedAt:   now,
 	}
 
-	// Intentionally unsorted to ensure dedup logic does not rely on caller order.
+	// CreatedAt order is not ownership proof; the compatibility helper must not
+	// clear either claim.
 	instances := []*Instance{newer, otherTool, older}
+	UpdateClaudeSessionsWithDedup(instances)
+	if older.ClaudeSessionID != "shared-session-id" || newer.ClaudeSessionID != "shared-session-id" {
+		t.Fatalf("heuristic dedup mutated claims: old=%q new=%q", older.ClaudeSessionID, newer.ClaudeSessionID)
+	}
+
+	// Persist a valid unique-owner fixture.
+	newer.ClaudeSessionID = "newer-session-id"
+	for _, inst := range instances {
+		if err := s.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("InsertSessionAndVerify failed: %v", err)
+		}
+	}
 	if err := s.SaveWithGroups(instances, nil); err != nil {
 		t.Fatalf("SaveWithGroups failed: %v", err)
 	}
@@ -233,8 +250,8 @@ func TestStorageSaveWithGroups_DedupsClaudeSessionIDs(t *testing.T) {
 	if older.ClaudeSessionID != "shared-session-id" {
 		t.Fatalf("older session should keep shared ID, got %q", older.ClaudeSessionID)
 	}
-	if newer.ClaudeSessionID != "" {
-		t.Fatalf("newer duplicate should be cleared, got %q", newer.ClaudeSessionID)
+	if newer.ClaudeSessionID != "newer-session-id" {
+		t.Fatalf("newer session ID changed, got %q", newer.ClaudeSessionID)
 	}
 
 	loaded, _, err := s.LoadLite()
@@ -252,8 +269,8 @@ func TestStorageSaveWithGroups_DedupsClaudeSessionIDs(t *testing.T) {
 	if byID["old"].ClaudeSessionID != "shared-session-id" {
 		t.Fatalf("db old session ID = %q, want shared-session-id", byID["old"].ClaudeSessionID)
 	}
-	if byID["new"].ClaudeSessionID != "" {
-		t.Fatalf("db newer session ID = %q, want empty", byID["new"].ClaudeSessionID)
+	if byID["new"].ClaudeSessionID != "newer-session-id" {
+		t.Fatalf("db newer session ID = %q, want newer-session-id", byID["new"].ClaudeSessionID)
 	}
 }
 
@@ -262,20 +279,24 @@ func TestStorageSaveWithGroups_PersistsSandboxConfig(t *testing.T) {
 
 	cpu := "2.0"
 	mem := "4g"
-	instances := []*Instance{
-		{
-			ID:               "sandboxed-1",
-			Title:            "Sandboxed Session",
-			ProjectPath:      "/tmp/sandboxed",
-			GroupPath:        "grp",
-			Command:          "claude --dangerously-skip-permissions",
-			Tool:             "claude",
-			Status:           StatusIdle,
-			CreatedAt:        time.Now(),
-			Sandbox:          &SandboxConfig{Enabled: true, Image: "ghcr.io/example/sandbox:latest", CPULimit: &cpu, MemoryLimit: &mem},
-			SandboxContainer: "agent-deck-sandbox-sandboxed-1",
-		},
+	inst := &Instance{
+		ID:          "sandboxed-1",
+		Title:       "Sandboxed Session",
+		ProjectPath: "/tmp/sandboxed",
+		GroupPath:   "grp",
+		Command:     "claude --dangerously-skip-permissions",
+		Tool:        "claude",
+		Status:      StatusIdle,
+		CreatedAt:   time.Now(),
 	}
+	instances := []*Instance{inst}
+	// Insert the same object that the routine save will update: the explicit
+	// creation boundary attaches its durable incarnation to this instance.
+	if err := s.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("InsertSessionAndVerify failed: %v", err)
+	}
+	inst.Sandbox = &SandboxConfig{Enabled: true, Image: "ghcr.io/example/sandbox:latest", CPULimit: &cpu, MemoryLimit: &mem}
+	inst.SandboxContainer = "agent-deck-sandbox-sandboxed-1"
 
 	if err := s.SaveWithGroups(instances, nil); err != nil {
 		t.Fatalf("SaveWithGroups failed: %v", err)
@@ -347,6 +368,16 @@ func TestStorageSaveWithGroups_PersistsTitleLocked(t *testing.T) {
 			CreatedAt:   time.Now(),
 		},
 	}
+	for _, inst := range instances {
+		wantTitleLocked := inst.TitleLocked
+		inst.TitleLocked = false
+		// Keep the inserted object so SaveWithGroups carries the incarnation
+		// attached by the explicit creation boundary.
+		if err := s.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("InsertSessionAndVerify failed: %v", err)
+		}
+		inst.TitleLocked = wantTitleLocked
+	}
 
 	if err := s.SaveWithGroups(instances, nil); err != nil {
 		t.Fatalf("SaveWithGroups failed: %v", err)
@@ -385,13 +416,10 @@ func TestStorageSaveWithGroups_PersistsTitleLocked(t *testing.T) {
 	}
 }
 
-// TestStorageSaveWithGroups_PersistsAutoName locks that the AutoName flag and
-// its captured description survive Save → Load via the real SQLite path (the
-// path the app actually uses on reopen), through both LoadWithGroups (canonical)
-// and LoadLite (CLI fast-path). This is the regression that made auto-named
-// quick sessions revert to their random handle on reopen: the flag and
-// description lived only in memory and were never written to / read from the DB.
-func TestStorageSaveWithGroups_PersistsAutoName(t *testing.T) {
+// TestStorageSaveWithGroups_PreservesAutoName locks that an explicitly created
+// AutoName flag and captured description survive a routine save and reload via
+// both LoadWithGroups (canonical) and LoadLite (CLI fast-path).
+func TestStorageSaveWithGroups_PreservesAutoName(t *testing.T) {
 	s := newTestStorage(t)
 
 	auto := &Instance{
@@ -416,6 +444,12 @@ func TestStorageSaveWithGroups_PersistsAutoName(t *testing.T) {
 		Tool:        "claude",
 		Status:      StatusIdle,
 		CreatedAt:   time.Now(),
+	}
+	if err := s.InsertSessionAndVerify(auto, nil); err != nil {
+		t.Fatalf("InsertSessionAndVerify auto failed: %v", err)
+	}
+	if err := s.InsertSessionAndVerify(plain, nil); err != nil {
+		t.Fatalf("InsertSessionAndVerify plain failed: %v", err)
 	}
 
 	if err := s.SaveWithGroups([]*Instance{auto, plain}, nil); err != nil {
@@ -511,6 +545,11 @@ func TestSaveSessionData_PreservesGroupSortOrder(t *testing.T) {
 		{Name: "infra", Path: "infra", Expanded: true, Order: 0},
 		{Name: "frontend", Path: "frontend", Expanded: true, Order: 1},
 		{Name: "backend", Path: "backend", Expanded: false, Order: 2},
+	}
+	for _, inst := range instances {
+		if err := s.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("InsertSessionAndVerify failed: %v", err)
+		}
 	}
 
 	// Save using NewGroupTreeWithGroups (the fixed path).

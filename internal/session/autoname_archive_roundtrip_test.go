@@ -6,7 +6,7 @@ import (
 )
 
 // TestAutoNameDescription_SurvivesSaveLoad confirms the auto_name_description
-// column round-trips through SaveWithGroups/LoadWithGroups. If this regresses,
+// column round-trips through explicit insert and LoadWithGroups. If this regresses,
 // an archived auto-named session would reload wearing its bare random handle
 // instead of the captured Claude task description (the user-reported "loses the
 // auto generated name").
@@ -32,8 +32,8 @@ func TestAutoNameDescription_SurvivesSaveLoad(t *testing.T) {
 
 	insts := []*Instance{inst}
 	tree := NewGroupTree(insts)
-	if err := storage.SaveWithGroups(insts, tree); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, tree); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	loaded, _, err := storage.LoadWithGroups()

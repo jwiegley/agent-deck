@@ -2,12 +2,15 @@ package session
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // These tests pin the notify-daemon runtime-hang fix. The daemon's Run loop is
@@ -39,13 +42,13 @@ func withBlockingProbe(t *testing.T, blockIDs ...string) (block chan struct{}, o
 	}
 
 	origSeam := updateInstanceStatus.Load().(statusProbeFunc)
-	updateInstanceStatus.Store(statusProbeFunc(func(inst *Instance) error {
+	updateInstanceStatus.Store(statusProbeFunc(func(_ context.Context, inst *Instance, observed statedb.RuntimeState, _ string) (statedb.RuntimeState, error) {
 		if blocked[inst.ID] {
 			<-block // model a status probe that never returns
-			return nil
+			return observed, nil
 		}
 		otherProbed.Add(1)
-		return nil
+		return observed, nil
 	}))
 
 	origBudget := statusProbeBudget
@@ -87,8 +90,10 @@ func saveInstances(t *testing.T, storage *Storage, ids ...string) {
 			CreatedAt:   time.Now().Add(-time.Hour), // past the tmux init grace window
 		})
 	}
-	if err := storage.SaveWithGroups(insts, nil); err != nil {
-		t.Fatalf("save: %v", err)
+	for _, inst := range insts {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert %s: %v", inst.ID, err)
+		}
 	}
 }
 

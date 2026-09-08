@@ -123,25 +123,35 @@ func handleTry(profile string, args []string) {
 	// equal exp.Path would otherwise be adopted and started (#1852 site 5).
 	for _, inst := range localSessionsAtPath(instances, exp.Path) {
 		{
+			persistenceWarning := ""
 			// Session exists - just start it if not running
 			if !inst.Exists() {
-				if err := inst.Start(); err != nil {
-					out.Error(fmt.Sprintf("starting session: %v", err), ErrCodeInvalidOperation)
+				runtime, startErr := inst.StartRuntime()
+				startErr, persistenceWarning = consumeRuntimeResult(inst, runtime, startErr)
+				if startErr != nil {
+					out.Error(fmt.Sprintf("starting session: %v", startErr), ErrCodeInvalidOperation)
 					os.Exit(1)
+				}
+				if persistenceWarning != "" && !*jsonOutput && !quietMode {
+					fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
 				}
 				inst.PostStartSync(3 * time.Second)
 				// Save updated state with session ID
 				_ = saveSessionData(storage, instances, groups)
 			}
+			result := map[string]interface{}{
+				"action":  "existing",
+				"session": inst.Title,
+				"id":      inst.ID[:8],
+				"path":    exp.Path,
+				"tool":    inst.Tool,
+			}
+			if persistenceWarning != "" {
+				result["warning"] = persistenceWarning
+			}
 			out.Print(
 				fmt.Sprintf("Session: %s (%s)\nPath: %s\n", inst.Title, inst.ID[:8], exp.Path),
-				map[string]interface{}{
-					"action":  "existing",
-					"session": inst.Title,
-					"id":      inst.ID[:8],
-					"path":    exp.Path,
-					"tool":    inst.Tool,
-				},
+				result,
 			)
 			return
 		}
@@ -159,16 +169,22 @@ func handleTry(profile string, args []string) {
 
 	instances = append(instances, newInst)
 
-	// Save using helper (rebuilds group tree including "experiments" group from instance)
-	if err := saveSessionData(storage, instances, groups); err != nil {
+	// This is the creation boundary. Routine saves are update-only and cannot
+	// initialize a missing parent/runtime pair.
+	if err := insertTrySession(storage, newInst, instances, groups); err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
 	// Start the session
-	if err := newInst.Start(); err != nil {
-		out.Error(fmt.Sprintf("starting session: %v", err), ErrCodeInvalidOperation)
+	runtime, startErr := newInst.StartRuntime()
+	startErr, persistenceWarning := consumeRuntimeResult(newInst, runtime, startErr)
+	if startErr != nil {
+		out.Error(fmt.Sprintf("starting session: %v", startErr), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+	if persistenceWarning != "" && !*jsonOutput && !quietMode {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
 	}
 
 	// Capture session ID and re-save (first save at line above was before Start)
@@ -180,17 +196,31 @@ func handleTry(profile string, args []string) {
 		action = "Found"
 	}
 
+	result := map[string]interface{}{
+		"action":  strings.ToLower(action),
+		"name":    exp.Name,
+		"path":    exp.Path,
+		"session": newInst.Title,
+		"id":      newInst.ID[:8],
+		"tool":    selectedTool,
+	}
+	if persistenceWarning != "" {
+		result["warning"] = persistenceWarning
+	}
 	out.Success(
 		fmt.Sprintf("%s experiment: %s", action, exp.Name),
-		map[string]interface{}{
-			"action":  strings.ToLower(action),
-			"name":    exp.Name,
-			"path":    exp.Path,
-			"session": newInst.Title,
-			"id":      newInst.ID[:8],
-			"tool":    selectedTool,
-		},
+		result,
 	)
+}
+
+func insertTrySession(
+	storage *session.Storage,
+	newInst *session.Instance,
+	instances []*session.Instance,
+	groups []*session.GroupData,
+) error {
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+	return storage.InsertSessionAndVerify(newInst, groupTree)
 }
 
 // handleTryList lists experiments with optional fuzzy search

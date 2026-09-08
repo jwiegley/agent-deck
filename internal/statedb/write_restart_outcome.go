@@ -39,29 +39,9 @@ func (w WriteStamps) SoleWriterSince(loadedAt, currentAt int64) bool {
 	return w.After != 0 && w.Before <= loadedAt && w.After == currentAt
 }
 
-// touchStamp records a modification and returns the value written along with
-// the one it replaced, so a caller can identify its own bump afterwards.
-func (s *StateDB) touchStamp() (WriteStamps, error) {
-	before, err := s.LastModified()
-	if err != nil {
-		return WriteStamps{}, err
-	}
-	after := time.Now().UnixNano()
-	// A clock that has not advanced (or has gone backwards) must not produce a
-	// stamp that another writer could already have used; step past it instead.
-	if after <= before {
-		after = before + 1
-	}
-	if err := withBusyRetry(func() error {
-		return s.SetMeta("last_modified", fmt.Sprintf("%d", after))
-	}); err != nil {
-		return WriteStamps{}, err
-	}
-	return WriteStamps{Before: before, After: after}, nil
-}
-
-// WriteRestartOutcome atomically records what a restart produced for one
-// instance: the tmux session name it minted and the status it ended in.
+// WriteRestartOutcome acknowledges the exact physical runtime a restart
+// already committed and emits the change-detection stamp peers use to reload
+// it.
 //
 // A restart mints a NEW tmux session name — tmux.NewSession appends a fresh
 // short id unconditionally — and that name exists only on the in-memory
@@ -71,7 +51,7 @@ func (s *StateDB) touchStamp() (WriteStamps, error) {
 // longer existed and reported `error` for a process that was running fine,
 // while the live tmux session was orphaned because nothing knew its name.
 //
-// It is a targeted two-column UPDATE, and specifically NOT a snapshot save.
+// It is a targeted compare-and-update, and specifically NOT a snapshot save.
 // The alternative — pushing a whole preloaded instance list back through
 // SaveWithGroups — makes a process that loaded its rows before a slow restart
 // revert every unrelated change anything else made in between: an archive, a
@@ -79,37 +59,95 @@ func (s *StateDB) touchStamp() (WriteStamps, error) {
 // repository's data-loss incidents, and it is a far worse failure than the
 // stale tmux name it would be curing.
 //
-// Status travels with the name because the two are one fact about the restart
-// and are read together: a row naming a live pane but still marked `error`
-// misreports the session just as badly as a row naming a dead one. Writing them
-// separately would also leave a window where the DB describes a session that
-// never existed.
+// The authoritative runtime transition writes the name, socket, status, and
+// generation together before this method runs. Rewriting those fields here
+// would either race that transition or bypass its generation CAS. Instead this
+// method proves that the same generation and physical identity are still
+// current, updates only the legacy acknowledgement projection, and bumps
+// last_modified in the same immediate transaction. Concurrent metadata edits
+// (including a tool change) are left untouched. A concurrent status update
+// is allowed: it does not change physical identity, and its earlier stamp is
+// retained in Before so the TUI cannot mistake the combined history for its
+// restart write alone.
 //
 // A zero-row UPDATE returns ErrInstanceNotStored rather than nil, so a caller
 // can tell "recorded" from "silently dropped" (the instance was never saved, or
 // another process deleted it mid-restart).
-func (s *StateDB) WriteRestartOutcome(id, tmuxSession, status, tool string) (WriteStamps, error) {
-	var affected int64
-	if err := withBusyRetry(func() error {
-		res, err := s.db.Exec(
-			`UPDATE instances
-			   SET tmux_session = ?, status = ?, tool = ?,
-			       acknowledged = CASE WHEN ? = 'running' THEN 0 ELSE acknowledged END
-			 WHERE id = ?`,
-			tmuxSession, status, tool, status, id,
-		)
-		if err != nil {
-			return err
-		}
-		affected, err = res.RowsAffected()
-		return err
-	}); err != nil {
+func (s *StateDB) WriteRestartOutcome(expected RuntimeState, expectedIncarnation string) (WriteStamps, error) {
+	if expected.InstanceID == "" || expected.TmuxSession == "" {
+		return WriteStamps{}, ErrRuntimeGenerationConflict
+	}
+	var stamps WriteStamps
+	err := withBusyRetry(func() error {
+		stamps = WriteStamps{}
+		return s.withImmediateTransaction(func(tx *immediateTransaction) error {
+			if err := s.requireRuntimeWriterCompatibility(tx, time.Now()); err != nil {
+				return err
+			}
+			var parentExists int
+			if err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM instances WHERE id = ?)`, expected.InstanceID).Scan(&parentExists); err != nil {
+				return err
+			}
+			if parentExists == 0 {
+				return fmt.Errorf("record restart outcome for %q: %w", expected.InstanceID, ErrInstanceNotStored)
+			}
+			if err := requireRuntimeIncarnation(tx, expected.InstanceID, expectedIncarnation); err != nil {
+				return err
+			}
+
+			result, err := tx.Exec(`UPDATE instances
+			SET acknowledged = CASE WHEN (
+			        SELECT status FROM instance_runtime_state WHERE instance_id = ?
+			    ) = 'running' THEN 0 ELSE acknowledged END
+			WHERE id = ? AND EXISTS (
+			    SELECT 1 FROM instance_runtime_state
+			    WHERE instance_id = ? AND runtime_generation = ?
+			      AND tmux_session = ? AND tmux_socket_name = ?
+			      AND last_started_at = ?
+			)`,
+				expected.InstanceID, expected.InstanceID, expected.InstanceID,
+				expected.Generation, expected.TmuxSession, expected.TmuxSocketName,
+				runtimeUnix(expected.LastStartedAt))
+			if err != nil {
+				return err
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if affected != 1 {
+				return ErrRuntimeGenerationConflict
+			}
+
+			var beforeText string
+			if err := tx.QueryRow(`SELECT COALESCE((
+			    SELECT value FROM metadata WHERE key = 'last_modified'
+			), '')`).Scan(&beforeText); err != nil {
+				return err
+			}
+			var before int64
+			if beforeText != "" {
+				if _, err := fmt.Sscan(beforeText, &before); err != nil {
+					return err
+				}
+			}
+			after := time.Now().UnixNano()
+			if after <= before {
+				after = before + 1
+			}
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO metadata (key, value)
+			VALUES ('last_modified', ?)`, fmt.Sprintf("%d", after)); err != nil {
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			stamps = WriteStamps{Before: before, After: after}
+			return nil
+		})
+	})
+	if err != nil {
 		return WriteStamps{}, err
 	}
-	if affected == 0 {
-		return WriteStamps{}, fmt.Errorf("record restart outcome for %q: %w", id, ErrInstanceNotStored)
-	}
-	// Peers poll last_modified; without the bump a running TUI keeps serving
-	// the dead name from its own snapshot.
-	return s.touchStamp()
+	return stamps, nil
 }

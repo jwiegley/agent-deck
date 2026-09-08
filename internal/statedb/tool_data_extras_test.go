@@ -213,9 +213,8 @@ func TestSaveInstance_PreservesClearOnCompactExtra(t *testing.T) {
 		t.Fatalf("manual write did not land: tool_data=%s", afterManual.String)
 	}
 
-	// Now agent-deck saves the row again with a typed-only blob (e.g., a
-	// new claude_session_id from a fresh detection). Pre-fix this would
-	// wipe clear_on_compact; post-fix it must be preserved.
+	// An ordinary metadata save cannot replace the runtime-owned conversation
+	// binding. Targeted binding CAS is the only owner of that value.
 	row.ToolData = json.RawMessage(`{"claude_session_id":"def"}`)
 	if err := db.SaveInstance(row); err != nil {
 		t.Fatalf("second SaveInstance failed: %v", err)
@@ -229,8 +228,8 @@ func TestSaveInstance_PreservesClearOnCompactExtra(t *testing.T) {
 	if err := json.Unmarshal([]byte(afterReSave.String), &afterReSaveMap); err != nil {
 		t.Fatalf("parse re-save tool_data: %v", err)
 	}
-	if string(afterReSaveMap["claude_session_id"]) != `"def"` {
-		t.Errorf("typed update lost: claude_session_id = %s", afterReSaveMap["claude_session_id"])
+	if string(afterReSaveMap["claude_session_id"]) != `"abc"` {
+		t.Errorf("metadata save replaced runtime binding: claude_session_id = %s", afterReSaveMap["claude_session_id"])
 	}
 	if v, ok := afterReSaveMap["clear_on_compact"]; !ok || string(v) != "false" {
 		t.Errorf("regression: clear_on_compact wiped on re-save (got %q, present=%v)", v, ok)

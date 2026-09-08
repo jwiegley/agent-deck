@@ -56,6 +56,25 @@ func withTempGlobalStateDB(t *testing.T) *statedb.StateDB {
 	return db
 }
 
+// saveHookBindingTestInstance mirrors the production new-instance boundary:
+// constructors pre-mint the incarnation before any runtime observation, and
+// the first parent insert preserves that exact token. A hand-written blank
+// InstanceRow would make SQLite mint a different logical insertion and the
+// hook publisher must then reject this Instance as stale.
+func saveHookBindingTestInstance(t *testing.T, db *statedb.StateDB, inst *Instance, row *statedb.InstanceRow) {
+	t.Helper()
+	row.Incarnation = inst.PersistenceIncarnation()
+	if row.Incarnation == "" {
+		t.Fatal("new hook-binding instance has no pre-minted incarnation")
+	}
+	if err := db.SaveInstance(row); err != nil {
+		t.Fatalf("SaveInstance seed: %v", err)
+	}
+	if row.Incarnation != inst.PersistenceIncarnation() {
+		t.Fatalf("seed incarnation = %q, instance = %q", row.Incarnation, inst.PersistenceIncarnation())
+	}
+}
+
 // readClaudeSessionIDFromDB returns tool_data.claude_session_id for the
 // given instance, reading via a fresh query (no in-memory caching) so
 // the assertion reflects what a DB-direct consumer like claudopticon
@@ -125,9 +144,7 @@ func TestRebindPersistsClaudeSessionIDToDB(t *testing.T) {
 		CreatedAt:   now,
 		ToolData:    json.RawMessage(`{"claude_session_id":"` + oldID + `"}`),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	// /clear shape: old rich session, smaller-but-fresh candidate.
 	// Mtime gap >= clearRebindMtimeGrace makes the rebind branch fire
@@ -208,9 +225,7 @@ func TestBindPersistsClaudeSessionIDToDB(t *testing.T) {
 		// No claude_session_id yet — cold start.
 		ToolData: json.RawMessage(`{}`),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	inst.UpdateHookStatus(&HookStatus{
 		Status:    "running",
@@ -323,9 +338,7 @@ func TestRebindPreservesUnrelatedToolDataKeys(t *testing.T) {
 		CreatedAt:   time.Now(),
 		ToolData:    json.RawMessage(seedJSON),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	// Trigger the cold-start bind branch (simpler than the rebind
 	// branch — no JSONL/mtime setup needed — and the persistence path

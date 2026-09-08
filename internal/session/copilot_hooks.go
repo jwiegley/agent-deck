@@ -247,26 +247,41 @@ func (i *Instance) detectCopilotSessionAsync() {
 	// Wait for copilot to initialize and write session.start
 	time.Sleep(2 * time.Second)
 
-	cwd := i.EffectiveWorkingDir()
-	startedAfter := time.Now().Add(-30 * time.Second) // generous window
-	if i.CopilotStartedAt > 0 {
-		startedAfter = time.UnixMilli(i.CopilotStartedAt).Add(-2 * time.Second)
-	}
-
 	delays := []time.Duration{0, 2 * time.Second, 3 * time.Second}
 	for attempt, delay := range delays {
 		if delay > 0 {
 			time.Sleep(delay)
 		}
 
+		observation := i.CaptureRuntimeBindingObservation("copilot")
+		i.mu.RLock()
+		isCopilot := i.Tool == "copilot"
+		cwd := i.EffectiveWorkingDir()
+		startedAt := i.CopilotStartedAt
+		i.mu.RUnlock()
+		if !isCopilot {
+			return
+		}
+		startedAfter := time.Now().Add(-30 * time.Second) // generous window
+		if startedAt > 0 {
+			startedAfter = time.UnixMilli(startedAt).Add(-2 * time.Second)
+		}
 		sessionID := detectCopilotSessionFromDisk(cwd, startedAfter)
 		if sessionID != "" {
-			i.CopilotSessionID = sessionID
-			i.CopilotDetectedAt = time.Now()
+			if err := i.PublishRuntimeBindingObservation(observation, sessionID, time.Now()); err != nil {
+				sessionLog.Warn("copilot_binding_rejected",
+					slog.String("session_id", sessionID),
+					slog.String("error", err.Error()),
+				)
+				return
+			}
 
 			// Propagate to tmux env for restart
-			if i.tmuxSession != nil {
-				if err := i.tmuxSession.SetEnvironment("COPILOT_SESSION_ID", sessionID); err != nil {
+			i.mu.RLock()
+			tmuxSession := i.tmuxSession
+			i.mu.RUnlock()
+			if tmuxSession != nil {
+				if err := tmuxSession.SetEnvironment("COPILOT_SESSION_ID", sessionID); err != nil {
 					sessionLog.Warn("copilot_set_env_failed", slog.String("error", err.Error()))
 				}
 			}

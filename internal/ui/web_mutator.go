@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/vcs"
 	"github.com/asheshgoplani/agent-deck/internal/vcsbackend"
 	"github.com/asheshgoplani/agent-deck/internal/web"
@@ -26,7 +28,13 @@ var _ web.SessionMutator = (*WebMutator)(nil)
 // in-memory stack in Home; the web stack is kept here so that web
 // deletes/undos don't race with the Tea Update goroutine.
 type WebMutator struct {
-	h *Home
+	h                  *Home
+	startRuntimeFn     func(*session.Instance) (statedb.RuntimeState, error)
+	restartRuntimeFn   func(*session.Instance) (statedb.RuntimeState, error)
+	reconcileRestartFn func(*session.Instance, error) error
+	archiveAfterKillFn func(statedb.RuntimeState)
+	beforeUndoInsertFn func()
+	requestReloadFn    func()
 
 	undoMu     sync.Mutex
 	undoStack  []webDeletedEntry
@@ -42,14 +50,63 @@ type WebMutator struct {
 }
 
 type webDeletedEntry struct {
-	instance  *session.Instance
-	deletedAt time.Time
+	instance    *session.Instance
+	deletedAt   time.Time
+	deleteToken uint64
 }
 
 // NewWebMutator returns a WebMutator backed by the given Home. The undo
 // window defaults to web.DefaultUndoWindow (30s).
 func NewWebMutator(h *Home) *WebMutator {
 	return &WebMutator{h: h, undoWindow: web.DefaultUndoWindow}
+}
+
+func (m *WebMutator) startRuntime(inst *session.Instance) (statedb.RuntimeState, error) {
+	if m.startRuntimeFn != nil {
+		return m.startRuntimeFn(inst)
+	}
+	return inst.StartRuntime()
+}
+
+func (m *WebMutator) restartRuntime(inst *session.Instance) (statedb.RuntimeState, error) {
+	if m.restartRuntimeFn != nil {
+		return m.restartRuntimeFn(inst)
+	}
+	return inst.RestartRuntime()
+}
+
+func (m *WebMutator) consumeRuntime(inst *session.Instance, runtime statedb.RuntimeState, err error) (statedb.RuntimeState, error, string) {
+	reconcile := m.reconcileRestartFn
+	if reconcile == nil {
+		reconcile = (*session.Instance).ReconcileRestartResult
+	}
+	return consumePhysicalRuntimeResult(inst, runtime, err, reconcile)
+}
+
+func rollbackWebSeed(storage *session.Storage, seed statedb.InstanceSeedToken, cause error) error {
+	if err := storage.RollbackSessionSeed(seed); err != nil {
+		return errors.Join(cause, fmt.Errorf("rollback session seed: %w", err))
+	}
+	return cause
+}
+
+func (m *WebMutator) requestReload() {
+	if m.requestReloadFn != nil {
+		m.requestReloadFn()
+		return
+	}
+	if m.h != nil && m.h.storageWatcher != nil {
+		m.h.storageWatcher.TriggerReload()
+	}
+}
+
+func (m *WebMutator) clearDeleteTokenAndReload(id string, token uint64) {
+	m.h.durableDeleteMu.Lock()
+	if current, ok := m.h.durableDeleteTombstones[id]; ok && current.sequence == token {
+		delete(m.h.durableDeleteTombstones, id)
+	}
+	m.h.durableDeleteMu.Unlock()
+	m.requestReload()
 }
 
 // WithUndoWindow overrides the undo grace period (useful for tests that
@@ -126,15 +183,25 @@ func (m *WebMutator) CreateSession(title, tool, projectPath, groupPath, modelID,
 		}
 	}
 
-	if err := inst.Start(); err != nil {
-		return "", fmt.Errorf("start session: %w", err)
-	}
-
 	storage, err := session.NewStorageWithProfile(m.h.profile)
 	if err != nil {
 		return "", fmt.Errorf("open storage: %w", err)
 	}
 	defer storage.Close()
+	token := m.h.beginSessionTransitionFor(inst)
+	defer m.h.finishSessionTransition(inst.ID, token)
+	seed, err := storage.InsertSessionIfAbsent(inst)
+	if err != nil {
+		return "", fmt.Errorf("seed session: %w", err)
+	}
+	runtime, startErr := m.startRuntime(inst)
+	_, startErr, warning := m.consumeRuntime(inst, runtime, startErr)
+	if startErr != nil {
+		return "", rollbackWebSeed(storage, seed, fmt.Errorf("start session: %w", startErr))
+	}
+	if warning != "" {
+		uiLog.Warn("web_create_partial_success", "warning", warning, "instance_id", inst.ID)
+	}
 
 	m.h.instancesMu.RLock()
 	existing := make([]*session.Instance, len(m.h.instances))
@@ -142,7 +209,7 @@ func (m *WebMutator) CreateSession(title, tool, projectPath, groupPath, modelID,
 	m.h.instancesMu.RUnlock()
 
 	allInstances := append(existing, inst) //nolint:gocritic
-	if err := storage.SaveWithGroups(allInstances, m.h.groupTree); err != nil {
+	if err := m.h.saveWithGroups(storage, allInstances, m.h.groupTree); err != nil {
 		return "", fmt.Errorf("save session: %w", err)
 	}
 	return inst.ID, nil
@@ -161,7 +228,14 @@ func (m *WebMutator) StartSession(id string) error {
 	if inst == nil {
 		return fmt.Errorf("session not found: %s", id)
 	}
-	return inst.Start()
+	token := m.h.beginSessionTransitionFor(inst)
+	defer m.h.finishSessionTransition(inst.ID, token)
+	runtime, startErr := m.startRuntime(inst)
+	_, startErr, warning := m.consumeRuntime(inst, runtime, startErr)
+	if warning != "" {
+		uiLog.Warn("web_start_partial_success", "warning", warning, "instance_id", inst.ID)
+	}
+	return startErr
 }
 
 // StopSession kills (stops) a running session by ID.
@@ -177,7 +251,7 @@ func (m *WebMutator) StopSession(id string) error {
 	if inst == nil {
 		return fmt.Errorf("session not found: %s", id)
 	}
-	return inst.Kill()
+	return inst.KillCaptured(inst.CaptureRuntimeSelection())
 }
 
 // RestartSession restarts a session by ID.
@@ -193,7 +267,14 @@ func (m *WebMutator) RestartSession(id string) error {
 	if inst == nil {
 		return fmt.Errorf("session not found: %s", id)
 	}
-	return inst.Restart()
+	token := m.h.beginSessionTransitionFor(inst)
+	defer m.h.finishSessionTransition(inst.ID, token)
+	runtime, restartErr := m.restartRuntime(inst)
+	_, restartErr, warning := m.consumeRuntime(inst, runtime, restartErr)
+	if warning != "" {
+		uiLog.Warn("web_restart_partial_success", "warning", warning, "instance_id", inst.ID)
+	}
+	return restartErr
 }
 
 // DeleteSession kills a session and removes it from persistent storage.
@@ -212,19 +293,31 @@ func (m *WebMutator) DeleteSession(id string) error {
 		return fmt.Errorf("session not found: %s", id)
 	}
 
-	// Kill the tmux session (ignore errors — may already be stopped)
-	_ = inst.Kill()
-
-	storage, err := session.NewStorageWithProfile(m.h.profile)
-	if err != nil {
-		return fmt.Errorf("open storage: %w", err)
+	selection := inst.CaptureRuntimeSelection()
+	deletedIncarnation := inst.PersistenceIncarnation()
+	var deleteToken uint64
+	if m.h.IsHeadless() {
+		if err := inst.DeleteCaptured(selection); err != nil {
+			return err
+		}
+		m.h.removeFailedSeededInstance(id)
+	} else {
+		m.h.durableDeleteMu.Lock()
+		if err := inst.DeleteCaptured(selection); err != nil {
+			m.h.durableDeleteMu.Unlock()
+			return err
+		}
+		if m.h.durableDeleteTombstones == nil {
+			m.h.durableDeleteTombstones = make(map[string]durableDeleteTombstone)
+		}
+		m.h.durableDeleteSeq++
+		deleteToken = m.h.durableDeleteSeq
+		m.h.durableDeleteTombstones[id] = durableDeleteTombstone{
+			sequence: deleteToken, incarnation: deletedIncarnation,
+		}
+		m.h.durableDeleteMu.Unlock()
 	}
-	defer storage.Close()
-
-	if err := storage.DeleteInstance(id); err != nil {
-		return err
-	}
-	m.pushUndo(inst)
+	m.pushUndo(inst, deleteToken)
 	return nil
 }
 
@@ -246,7 +339,7 @@ func (m *WebMutator) CloseSession(id string) error {
 	if inst == nil {
 		return fmt.Errorf("session not found: %s", id)
 	}
-	return inst.Kill()
+	return inst.KillCaptured(inst.CaptureRuntimeSelection())
 }
 
 // ArchiveSession stops the session process and marks it archived so it
@@ -263,13 +356,22 @@ func (m *WebMutator) ArchiveSession(id string) error {
 	if inst == nil {
 		return fmt.Errorf("session not found: %s", id)
 	}
-	if err := inst.Kill(); err != nil {
+	selection := inst.CaptureRuntimeSelection()
+	runtime, err := inst.KillCapturedRuntime(selection)
+	if err != nil {
 		return fmt.Errorf("failed to stop session: %w", err)
 	}
+	if m.archiveAfterKillFn != nil {
+		m.archiveAfterKillFn(runtime)
+	}
+	archivedAt := time.Now().UTC()
+	if err := m.h.persistArchivedIfRuntime(runtime, selection.Incarnation, archivedAt); err != nil {
+		return fmt.Errorf("failed to persist archive: %w", err)
+	}
 	m.h.instancesMu.Lock()
-	inst.ArchivedAt = time.Now().UTC()
+	inst.ArchivedAt = archivedAt
 	m.h.instancesMu.Unlock()
-	return m.persistAllInstances()
+	return nil
 }
 
 // UnarchiveSession clears the archive flag without starting tmux.
@@ -290,9 +392,17 @@ func (m *WebMutator) UnarchiveSession(id string) error {
 		m.h.instancesMu.Unlock()
 		return fmt.Errorf("session is not archived: %s", id)
 	}
-	inst.ArchivedAt = time.Time{}
 	m.h.instancesMu.Unlock()
-	return m.persistAllInstances()
+	incarnation := inst.PersistenceIncarnation()
+	if err := m.h.persistArchivedIncarnation(id, incarnation, time.Time{}); err != nil {
+		return fmt.Errorf("failed to persist unarchive: %w", err)
+	}
+	m.h.instancesMu.Lock()
+	if current := m.h.instanceByID[id]; current != nil && current.MatchesPersistenceIncarnation(incarnation) {
+		current.ArchivedAt = time.Time{}
+	}
+	m.h.instancesMu.Unlock()
+	return nil
 }
 
 func (m *WebMutator) persistAllInstances() error {
@@ -307,7 +417,7 @@ func (m *WebMutator) persistAllInstances() error {
 	copy(instances, m.h.instances)
 	m.h.instancesMu.RUnlock()
 
-	if err := storage.SaveWithGroups(instances, m.h.groupTree); err != nil {
+	if err := m.h.saveWithGroups(storage, instances, m.h.groupTree); err != nil {
 		return fmt.Errorf("save sessions: %w", err)
 	}
 	return nil
@@ -335,15 +445,6 @@ func (m *WebMutator) UndoDelete() (string, error) {
 		return "", web.ErrUndoExpired
 	}
 
-	// Restart the session and re-persist alongside the rest of the
-	// current in-memory list. Note: Restart() may not succeed for every
-	// tool (e.g. a tool the user has since uninstalled). Bubble the
-	// error up so the handler returns 500; the entry has already been
-	// popped, mirroring the TUI's ctrl+z semantics.
-	if err := entry.instance.Restart(); err != nil {
-		return "", fmt.Errorf("restart session: %w", err)
-	}
-
 	// #1397: hydrate + serialize before reading/persisting the in-memory list so
 	// the restored row is appended to the CURRENT registry (in headless mode the
 	// list would otherwise be empty, dropping every other session) and so this
@@ -353,32 +454,64 @@ func (m *WebMutator) UndoDelete() (string, error) {
 		return "", err
 	}
 	defer unlock()
-
 	storage, err := session.NewStorageWithProfile(m.h.profile)
 	if err != nil {
 		return "", fmt.Errorf("open storage: %w", err)
 	}
 	defer storage.Close()
+	token := m.h.beginSessionTransitionFor(entry.instance)
+	defer m.h.finishSessionTransition(entry.instance.ID, token)
+	if m.beforeUndoInsertFn != nil {
+		m.beforeUndoInsertFn()
+	}
+	seed, err := storage.ReinsertDeletedSession(entry.instance)
+	if err != nil {
+		if !m.h.IsHeadless() && errors.Is(err, session.ErrSessionAlreadyExists) {
+			m.clearDeleteTokenAndReload(entry.instance.ID, entry.deleteToken)
+		}
+		return "", fmt.Errorf("seed session: %w", err)
+	}
+	runtime, restartErr := m.restartRuntime(entry.instance)
+	_, restartErr, warning := m.consumeRuntime(entry.instance, runtime, restartErr)
+	if restartErr != nil {
+		rollbackErr := rollbackWebSeed(storage, seed, fmt.Errorf("restart session: %w", restartErr))
+		if !m.h.IsHeadless() && (errors.Is(rollbackErr, statedb.ErrRuntimeGenerationConflict) ||
+			errors.Is(rollbackErr, statedb.ErrStatusRevisionConflict) ||
+			errors.Is(rollbackErr, statedb.ErrInstanceParentConflict)) {
+			m.clearDeleteTokenAndReload(entry.instance.ID, entry.deleteToken)
+		}
+		return "", rollbackErr
+	}
+	if warning != "" {
+		uiLog.Warn("web_undo_restart_partial_success", "warning", warning, "instance_id", entry.instance.ID)
+	}
 
-	m.h.instancesMu.RLock()
-	existing := make([]*session.Instance, len(m.h.instances))
-	copy(existing, m.h.instances)
-	m.h.instancesMu.RUnlock()
-	allInstances := append(existing, entry.instance) //nolint:gocritic
-	if err := storage.SaveWithGroups(allInstances, m.h.groupTree); err != nil {
-		return "", fmt.Errorf("save session: %w", err)
+	if m.h.IsHeadless() {
+		canonical, added := m.h.publishCompletedInstance(entry.instance, runtime)
+		if added && m.h.groupTree != nil {
+			m.h.groupTree.AddSession(canonical)
+		}
+		if m.h.search != nil {
+			m.h.search.SetItems(m.h.instances)
+		}
+		if m.h.groupTree != nil {
+			m.h.rebuildFlatItems()
+		}
+	} else {
+		m.clearDeleteTokenAndReload(entry.instance.ID, entry.deleteToken)
 	}
 	return entry.instance.ID, nil
 }
 
 // pushUndo records a freshly-deleted instance onto the web undo stack,
 // capped at 10 entries (FIFO eviction) to bound memory.
-func (m *WebMutator) pushUndo(inst *session.Instance) {
+func (m *WebMutator) pushUndo(inst *session.Instance, deleteToken uint64) {
 	m.undoMu.Lock()
 	defer m.undoMu.Unlock()
 	m.undoStack = append(m.undoStack, webDeletedEntry{
-		instance:  inst,
-		deletedAt: time.Now(),
+		instance:    inst,
+		deletedAt:   time.Now(),
+		deleteToken: deleteToken,
 	})
 	if len(m.undoStack) > 10 {
 		m.undoStack = m.undoStack[len(m.undoStack)-10:]
@@ -404,15 +537,25 @@ func (m *WebMutator) ForkSession(id string) (string, error) {
 		return "", fmt.Errorf("fork session: %w", err)
 	}
 
-	if err := forked.Start(); err != nil {
-		return "", fmt.Errorf("start forked session: %w", err)
-	}
-
 	storage, err := session.NewStorageWithProfile(m.h.profile)
 	if err != nil {
 		return "", fmt.Errorf("open storage: %w", err)
 	}
 	defer storage.Close()
+	token := m.h.beginSessionTransitionFor(forked)
+	defer m.h.finishSessionTransition(forked.ID, token)
+	seed, err := storage.InsertSessionIfAbsent(forked)
+	if err != nil {
+		return "", fmt.Errorf("seed forked session: %w", err)
+	}
+	runtime, startErr := m.startRuntime(forked)
+	_, startErr, warning := m.consumeRuntime(forked, runtime, startErr)
+	if startErr != nil {
+		return "", rollbackWebSeed(storage, seed, fmt.Errorf("start forked session: %w", startErr))
+	}
+	if warning != "" {
+		uiLog.Warn("web_fork_partial_success", "warning", warning, "instance_id", forked.ID)
+	}
 
 	m.h.instancesMu.RLock()
 	existing := make([]*session.Instance, len(m.h.instances))
@@ -420,7 +563,7 @@ func (m *WebMutator) ForkSession(id string) (string, error) {
 	m.h.instancesMu.RUnlock()
 
 	allInstances := append(existing, forked) //nolint:gocritic
-	if err := storage.SaveWithGroups(allInstances, m.h.groupTree); err != nil {
+	if err := m.h.saveWithGroups(storage, allInstances, m.h.groupTree); err != nil {
 		return "", fmt.Errorf("save forked session: %w", err)
 	}
 	return forked.ID, nil
@@ -500,7 +643,7 @@ func (m *WebMutator) UpdateSession(id string, updates map[string]string) ([]stri
 	copy(instances, m.h.instances)
 	m.h.instancesMu.RUnlock()
 
-	if err := storage.SaveWithGroups(instances, m.h.groupTree); err != nil {
+	if err := m.h.saveWithGroups(storage, instances, m.h.groupTree); err != nil {
 		return nil, false, fmt.Errorf("save session: %w", err)
 	}
 	return changed, restartRequired, nil
@@ -539,7 +682,7 @@ func (m *WebMutator) CreateGroup(name, parentPath string) (string, error) {
 	copy(instances, m.h.instances)
 	m.h.instancesMu.RUnlock()
 
-	if err := storage.SaveWithGroups(instances, m.h.groupTree); err != nil {
+	if err := m.h.saveWithGroups(storage, instances, m.h.groupTree); err != nil {
 		return "", fmt.Errorf("save group: %w", err)
 	}
 	return grp.Path, nil
@@ -567,7 +710,7 @@ func (m *WebMutator) RenameGroup(groupPath, newName string) error {
 	copy(instances, m.h.instances)
 	m.h.instancesMu.RUnlock()
 
-	return storage.SaveWithGroups(instances, m.h.groupTree)
+	return m.h.saveWithGroups(storage, instances, m.h.groupTree)
 }
 
 // FinishWorktree merges (or skips), removes the worktree, optionally
@@ -595,6 +738,7 @@ func (m *WebMutator) FinishWorktree(id string, opts web.WorktreeFinishOptions) (
 	repoRoot := inst.WorktreeRepoRoot
 	worktreePath := inst.WorktreePath
 	worktreeBranch := inst.WorktreeBranch
+	selection := inst.CaptureRuntimeSelection()
 
 	backend, err := vcsbackend.Detect(repoRoot)
 	if err != nil {
@@ -640,6 +784,10 @@ func (m *WebMutator) FinishWorktree(id string, opts web.WorktreeFinishOptions) (
 		}
 	}
 
+	if err := inst.DeleteCaptured(selection); err != nil {
+		return web.WorktreeFinishResult{}, fmt.Errorf("session changed before finish: %w", err)
+	}
+
 	if _, statErr := os.Stat(worktreePath); !os.IsNotExist(statErr) {
 		// Best-effort: log via error wrapping only if it bubbles. CLI
 		// treats this as a warning; we mirror that by swallowing here so
@@ -655,30 +803,15 @@ func (m *WebMutator) FinishWorktree(id string, opts web.WorktreeFinishOptions) (
 		}
 	}
 
-	if inst.Exists() {
-		_ = inst.Kill()
-	}
-
 	storage, err := session.NewStorageWithProfile(m.h.profile)
 	if err != nil {
 		return web.WorktreeFinishResult{}, fmt.Errorf("open storage: %w", err)
 	}
 	defer storage.Close()
 
-	m.h.instancesMu.RLock()
-	existing := make([]*session.Instance, 0, len(m.h.instances))
-	for _, x := range m.h.instances {
-		if x.ID != id {
-			existing = append(existing, x)
-		}
-	}
-	m.h.instancesMu.RUnlock()
-	// #1396: use the targeted RemoveSessionAndVerify path, NOT
-	// SaveWithGroups(existing, ...). Historically an empty `existing` tripped
-	// the S1 empty-sweep guard AFTER the irreversible git steps, orphaning the
-	// row; since #1550 SaveWithGroups is upsert-only and would not delete the
-	// row at all. Either way, removal requires the targeted DELETE.
-	if sErr := storage.RemoveSessionAndVerify(id, existing, m.h.groupTree); sErr != nil {
+	// The runtime-aware delete above already removed the row. Persist only group
+	// ordering here; never issue an unconditional second delete.
+	if sErr := storage.SaveGroupsOnly(m.h.groupTree); sErr != nil {
 		return web.WorktreeFinishResult{}, fmt.Errorf("save session data: %w", sErr)
 	}
 
@@ -727,5 +860,5 @@ func (m *WebMutator) DeleteGroup(groupPath string) error {
 	copy(instances, m.h.instances)
 	m.h.instancesMu.RUnlock()
 
-	return storage.SaveWithGroups(instances, m.h.groupTree)
+	return m.h.saveWithGroups(storage, instances, m.h.groupTree)
 }

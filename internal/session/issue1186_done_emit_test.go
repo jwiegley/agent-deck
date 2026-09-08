@@ -57,8 +57,10 @@ func seedDoneParentChild(t *testing.T, profile string) (parentID, childID string
 		Status:          StatusWaiting,
 		CreatedAt:       now,
 	}
-	if err := storage.SaveWithGroups([]*Instance{parent, child}, nil); err != nil {
-		t.Fatalf("save: %v", err)
+	for _, inst := range []*Instance{parent, child} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert %s: %v", inst.ID, err)
+		}
 	}
 	return parent.ID, child.ID
 }
