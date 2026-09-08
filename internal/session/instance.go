@@ -9120,7 +9120,7 @@ func (i *Instance) killInternalLocked(selection RuntimeSelection, sync, deleteRo
 	for _, identity := range discoveredChildren {
 		i.RegisterMCPChildIdentity(identity)
 	}
-	if i.Tool == "hermes" {
+	if i.GetToolThreadSafe() == "hermes" {
 		i.clearHermesHookArtifacts()
 	}
 
