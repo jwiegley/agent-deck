@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -32,8 +33,8 @@ func TestStatusCycle_ShellSessionWithCommand(t *testing.T) {
 	// After Start with command: should be StatusStarting
 	assert.Equal(t, StatusStarting, inst.Status, "after Start() with command, status should be starting")
 
-	// Wait past the 1.5s grace period
-	time.Sleep(2 * time.Second)
+	// End the tmux startup window independently of the login shell's prompt.
+	tmux.ExpireStartupWindowForTest(t, inst.GetTmuxSession())
 
 	err = inst.UpdateStatus()
 	require.NoError(t, err, "UpdateStatus() should succeed")
