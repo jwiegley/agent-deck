@@ -1446,6 +1446,11 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		// re-escaping of the nested single quotes.
 		tmuxArgs = append(tmuxArgs, bashBinary, "-c", command)
 	}
+	// Retain fast-exiting initial processes before tmux handles their exit.
+	// Applying this in a later client call can lose both pane and output.
+	if value, ok := s.OptionOverrides["remain-on-exit"]; ok {
+		tmuxArgs = append(tmuxArgs, ";", "set-option", "-t", "="+s.Name+":0", "remain-on-exit", value)
+	}
 
 	unitBase := serviceUnitBase(s.Name)
 
