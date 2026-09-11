@@ -472,8 +472,12 @@ func TestDeepSeekLifecycle_HeadlessRestartReplaysTask(t *testing.T) {
 		t.Fatal("CanRestart() = false for a headless session whose task is known")
 	}
 
+	generation := inst.RuntimeGeneration
 	if err := inst.Restart(); err != nil {
 		t.Fatalf("Restart(): %v", err)
+	}
+	if inst.RuntimeGeneration != generation+1 {
+		t.Fatalf("restart generation = %d, want %d", inst.RuntimeGeneration, generation+1)
 	}
 	// Replayed, not a usage error. The answer lives in the buffer; the 3-line
 	// preview tail belongs to tmux's dead-pane banner once the one-shot exits.

@@ -1589,6 +1589,11 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 			tmuxArgs = append(tmuxArgs, ";", "set-option", "-t", s.Name, "remain-on-exit", "on")
 		}
 	}
+	// Retain fast-exiting initial processes before tmux handles their exit.
+	// Applying this in a later client call can lose both pane and output.
+	if value, ok := s.OptionOverrides["remain-on-exit"]; ok {
+		tmuxArgs = append(tmuxArgs, ";", "set-option", "-t", "="+s.Name+":0", "remain-on-exit", value)
+	}
 
 	unitBase := serviceUnitBase(s.Name)
 

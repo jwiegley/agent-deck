@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -53,7 +54,7 @@ func TestLifecycle_StoppedRestartedRunningError(t *testing.T) {
 
 phase2:
 	// Phase 2: starting -> idle/running (UpdateStatus after grace period)
-	time.Sleep(2 * time.Second) // past 1.5s grace
+	tmux.ExpireStartupWindowForTest(t, inst.GetTmuxSession())
 	require.NoError(t, inst.UpdateStatus())
 	s := inst.GetStatusThreadSafe()
 	assert.NotEqual(t, StatusStarting, s, "should move past starting after grace")
