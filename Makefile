@@ -136,9 +136,9 @@ dev:
 	@which air > /dev/null || go install github.com/air-verse/air@latest
 	$(shell go env GOPATH)/bin/air
 
-# Run tests (with race detector)
+# Run tests with the race detector and isolated runtime state.
 test:
-	go test -race -v ./...
+	bash scripts/test.sh
 
 # Hermetic runtime-state race gate. Keep discovery here so package builds fail
 # when a package silently loses its lifecycle coverage, without duplicating a
