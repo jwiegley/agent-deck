@@ -30,7 +30,9 @@ if [[ $1 == env ]]; then
     exit
 fi
 [[ $1 == test && $GOENV == off ]]
-[[ $HOME == /tmp/agent-deck-tests.*/home && -d $HOME ]]
+tmp_root=$(cd /tmp && pwd -P)
+[[ $HOME == "$tmp_root"/agent-deck-tests.*/home && -d $HOME ]]
+[[ $HOME == "$(cd "$HOME" && pwd -P)" ]]
 [[ $USERPROFILE == "$HOME" && $TMP == "$TMPDIR" && $TEMP == "$TMPDIR" ]]
 [[ -d $TMPDIR && -d $TMUX_TMPDIR && $GOCACHE == "$GOMODCACHE" ]]
 for name in OPENAI_API_KEY CLAUDE_CONFIG_DIR CODEX_HOME AGENTDECK_INSTANCE_ID SSH_AUTH_SOCK TMUX TMUX_PANE XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_RUNTIME_DIR; do

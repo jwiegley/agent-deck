@@ -4104,10 +4104,12 @@ func (s *Session) ensureProcessesDead(oldIdentities []ProcessIdentity, newPIDs [
 		}
 		reap = append(reap, identity)
 	}
-	ReapProcessIdentities(reap, ProcessReapTiming{
+	if err := ReapProcessIdentities(reap, ProcessReapTiming{
 		InitialGrace: 500 * time.Millisecond,
 		TermGrace:    time.Second,
-	})
+	}); err != nil {
+		respawnLog.Warn("respawn_process_reap_failed", slog.Any("error", err))
+	}
 }
 
 // respawnPanePIDRetryDelay is how long escalateAfterRespawn waits before
