@@ -380,11 +380,9 @@ func runPackagedContendedCAS(
 	if outcome := lock.wait(t); outcome != "unlocked" {
 		t.Fatalf("lock helper = %q", outcome)
 	}
-	for _, child := range children {
-		child.releaseRetryBarrier(t)
-	}
 	results := make([]string, len(children))
 	for index, child := range children {
+		child.releaseRetryBarrier(t)
 		results[index] = child.wait(t)
 	}
 	return results
