@@ -274,6 +274,9 @@ func TestEditSessionDialogCommitRoutesAccountThroughSwitch(t *testing.T) {
 
 	inst := session.NewInstanceWithTool("acct-commit", t.TempDir(), "claude")
 	inst.Account = "personal"
+	if err := home.storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatal(err)
+	}
 	home.instancesMu.Lock()
 	home.instances = []*session.Instance{inst}
 	home.instanceByID[inst.ID] = inst

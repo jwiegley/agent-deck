@@ -6,6 +6,7 @@ gocache=$(go env GOCACHE)
 gomodcache=$(go env GOMODCACHE)
 sandbox=$(mktemp -d /tmp/agent-deck-tests.XXXXXX)
 trap 'rm -rf -- "$sandbox"' EXIT
+sandbox=$(cd "$sandbox" && pwd -P)
 mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/tmux"
 
 # Leave XDG unset so tests that replace HOME also isolate their XDG paths.
