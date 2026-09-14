@@ -190,9 +190,11 @@ func TestIssue2184_TurnFingerprint_StaleFallsThroughToFlipAndInstant(t *testing.
 // daemon derives a non-empty transcript signal for it, and returns the path.
 func attachTranscript(t *testing.T, f *restartFixture, body string) string {
 	t.Helper()
-	f.child.ClaudeSessionID = "0f0f0f0f-2184-4184-8184-000000002184"
-	if err := f.storage.SaveWithGroups([]*Instance{f.child, f.parent}, nil); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	observation := f.child.CaptureRuntimeBindingObservation("claude")
+	if err := f.child.PublishRuntimeBindingObservation(
+		observation, "0f0f0f0f-2184-4184-8184-000000002184", time.Now(),
+	); err != nil {
+		t.Fatalf("publish transcript binding: %v", err)
 	}
 	dir := filepath.Join(GetClaudeConfigDir(), "projects", ConvertToClaudeDirName(f.child.ProjectPath))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
