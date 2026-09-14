@@ -1012,11 +1012,10 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	addModelInfoJSON(jsonData, newInstance.LaunchModelInfo())
 	addEffortJSON(jsonData, newInstance)
 	addClaudeOptionsJSON(jsonData, newInstance)
-	tmuxName := ""
-	if sess := newInstance.GetTmuxSession(); sess != nil {
-		tmuxName = sess.Name
+	if err := addLaunchStateJSON(jsonData, storage, newInstance); err != nil {
+		out.Error(fmt.Sprintf("failed to read committed session state: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
 	}
-	addLaunchStateJSON(jsonData, newInstance, tmuxName)
 	if *sandbox {
 		jsonData["sandbox"] = true
 	}
@@ -1074,19 +1073,24 @@ func resolveLaunchPath(rawPathArg, groupSelector, profile string) (string, error
 	return os.Getwd()
 }
 
-// addLaunchStateJSON surfaces the session state as committed by the
-// post-start save. Issue #2209: that save merges with a concurrent detector's
-// liveness observation (status, detection stamp) instead of aborting, so the
-// reported status is the merged row's, and the spawn receipt (tmux session
-// name) the launch alone produced is echoed for the caller to verify.
-func addLaunchStateJSON(target map[string]interface{}, inst *session.Instance, tmuxName string) {
-	target["status"] = string(inst.Status)
-	if tmuxName != "" {
-		target["tmux_session"] = tmuxName
+// addLaunchStateJSON reports the authoritative runtime after the post-start
+// metadata save, including any concurrent detector's newer observation.
+func addLaunchStateJSON(target map[string]interface{}, storage *session.Storage, inst *session.Instance) error {
+	row, err := storage.GetDB().LoadInstanceByID(inst.ID)
+	if err != nil {
+		return err
 	}
-	if inst.ClaudeSessionID != "" {
-		target["claude_session_id"] = inst.ClaudeSessionID
+	if row == nil || row.Incarnation != inst.PersistenceIncarnation() {
+		return fmt.Errorf("session %s was deleted or replaced during launch", inst.ID)
 	}
+	target["status"] = row.Status
+	if row.TmuxSession != "" {
+		target["tmux_session"] = row.TmuxSession
+	}
+	if binding := row.RuntimeBindings["claude"]; binding.Value != "" {
+		target["claude_session_id"] = binding.Value
+	}
+	return nil
 }
 
 // sendErrOrSpawnDied returns a clear "pane exited before delivery" error when

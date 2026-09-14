@@ -93,6 +93,18 @@ func TestIssue2099_SpawnFailureStatusUsesRuntimeCAS(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Equal(t, after, durable)
+
+	// A replacement started after our failed verification must stay untouched.
+	replacement := after
+	replacement.Generation++
+	replacement.StatusRevision = 0
+	replacement.Status = string(session.StatusRunning)
+	require.NoError(t, storage.GetDB().CommitRuntimeTransition(after.Generation, inst.PersistenceIncarnation(), replacement))
+	require.ErrorIs(t, persistSpawnFailureStatus(storage, inst), statedb.ErrStatusRevisionConflict)
+	durable, found, err = storage.GetDB().ReadRuntimeState(inst.ID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, replacement, durable)
 }
 
 // issue2099HelperEnv marks the re-exec'd test binary that runs the real
