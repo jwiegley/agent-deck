@@ -283,6 +283,9 @@ func ExecuteHarnessSwitch(cfg *UserConfig, inst *Instance, opts HarnessSwitchOpt
 				resultErr = fmt.Errorf("%w; %s", resultErr, warning)
 			}
 		}
+		if resultErr == nil && result != nil && result.Committed && opts.Storage != nil {
+			resultErr = opts.Storage.CommitNativeHarnessSwitch(inst, result)
+		}
 	}()
 	if !sameDestructiveRuntime(authority.expected, selection.State) || sourceIdentity != nativeSwitchStorageIdentity(identityForInstance(inst)) {
 		return nil, fmt.Errorf("native switch source changed before runtime authority was acquired")
@@ -812,7 +815,7 @@ func startNativeSwitchInstance(inst *Instance, j *switchJournal) error {
 }
 
 func finishNativeSwitch(path string, j *switchJournal, result *HarnessSwitchResult) (*HarnessSwitchResult, error) {
-	result.nativeStorageAcknowledgement = j.runtime != nil && j.runtime.metadataCommitted
+	result.nativeStorageAcknowledgement = result.nativeStorageAcknowledgement || (j.runtime != nil && j.runtime.metadataCommitted)
 	j.State = switchCommitted
 	if err := harnessSwitchJournalWrite(path, j); err != nil {
 		return result, fmt.Errorf("persist native lifecycle outcome: %w", err)
@@ -858,7 +861,9 @@ func commitNativeSwitchAccount(path string, j *switchJournal, inst *Instance, ac
 		_, rollbackErr := switchFailedAfterStop(path, j, inst, wasRunning, err)
 		return false, rollbackErr
 	}
-	if storage == nil {
+	// Durable lifecycle authority already owns both the forward CAS and its
+	// rollback. Optional Storage acknowledges it after the lifecycle finishes.
+	if storage == nil || (j.runtime != nil && j.runtime.metadataCommitted) {
 		return false, nil
 	}
 	stub := nativeHarnessSwitchResult(&HarnessSwitchResult{Committed: true}, j.Source, identityForInstance(inst))

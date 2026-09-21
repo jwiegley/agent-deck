@@ -116,6 +116,11 @@ func (i *Instance) PublishRuntimeBindingObservation(observation RuntimeBindingOb
 		return i.runtimeBindingPublishError(observation.kind, observation.generation, observation.revision, err)
 	}
 	defer release()
+	return i.publishRuntimeBindingObservationLocked(observation, value, detectedAt)
+}
+
+// publishRuntimeBindingObservationLocked requires the instance spawn lock, not i.mu.
+func (i *Instance) publishRuntimeBindingObservationLocked(observation RuntimeBindingObservation, value string, detectedAt time.Time) error {
 
 	i.mu.RLock()
 	current := i.runtimeBindingObservationLocked(observation.kind)
@@ -398,6 +403,7 @@ func (i *Instance) applyRuntimeBindingLocked(binding statedb.RuntimeBinding) err
 		i.CopilotSessionID, i.CopilotDetectedAt = binding.Value, binding.DetectedAt
 	case "codex":
 		i.CodexSessionID, i.CodexDetectedAt = binding.Value, binding.DetectedAt
+		i.recordCodexOwnership(binding.Value)
 	case "gemini":
 		i.GeminiSessionID, i.GeminiDetectedAt = binding.Value, binding.DetectedAt
 	case "opencode":

@@ -268,12 +268,15 @@ func TestCodexExclusionAuthoritativeBindingAfterSnapshot(t *testing.T) {
 			t.Setenv("CODEX_SCAN_EMPTY", "1")
 			t.Setenv("CODEX_HOME", t.TempDir())
 			var pass StatusUpdatePass
-			a := &Instance{Tool: "codex", tmuxSession: &tmux.Session{Name: "agentdeck_scan_0"}}
+			a := &Instance{ID: "scan-authoritative", Tool: "codex", tmuxSession: &tmux.Session{Name: "agentdeck_scan_0"}}
 			b := &Instance{Tool: "codex", tmuxSession: &tmux.Session{Name: "agentdeck_scan_1"}}
 			b.codexExclusions(&pass)
 			sid := uniqueSID(t)
 			if source == "hook" {
-				a.bindCodexSessionFromHook(sid, "agent-turn-complete")
+				observation := a.CaptureRuntimeBindingObservation("codex")
+				a.mu.Lock()
+				a.bindCodexSessionFromHook(observation, sid, "agent-turn-complete", HookStatusFingerprint{})
+				a.mu.Unlock()
 			} else if got := a.resolveCodexDetectionCandidate(sid, nil); got != sid {
 				t.Fatalf("probe candidate=%q", got)
 			}

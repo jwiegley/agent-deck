@@ -85,10 +85,7 @@ func (i *Instance) writeRestartOutcome(runtime statedb.RuntimeState, incarnation
 	// The instance's profile database is authoritative. The process-wide
 	// fallback exists for unsaved/legacy callers, but must not redirect a
 	// loaded instance when another profile happens to be globally active.
-	db := i.restartDB.Load()
-	if db == nil {
-		db = i.restartPersistenceDB()
-	}
+	db := i.restartPersistenceDB()
 	if db == nil {
 		return statedb.WriteStamps{}, errNoStateDB
 	}

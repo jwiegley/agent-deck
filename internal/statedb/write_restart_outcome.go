@@ -119,30 +119,13 @@ func (s *StateDB) WriteRestartOutcome(expected RuntimeState, expectedIncarnation
 				return ErrRuntimeGenerationConflict
 			}
 
-			var beforeText string
-			if err := tx.QueryRow(`SELECT COALESCE((
-			    SELECT value FROM metadata WHERE key = 'last_modified'
-			), '')`).Scan(&beforeText); err != nil {
-				return err
-			}
-			var before int64
-			if beforeText != "" {
-				if _, err := fmt.Sscan(beforeText, &before); err != nil {
-					return err
-				}
-			}
-			after := time.Now().UnixNano()
-			if after <= before {
-				after = before + 1
-			}
-			if _, err := tx.Exec(`INSERT OR REPLACE INTO metadata (key, value)
-			VALUES ('last_modified', ?)`, fmt.Sprintf("%d", after)); err != nil {
+			stamps, err = writeModificationStamp(tx)
+			if err != nil {
 				return err
 			}
 			if err := tx.Commit(); err != nil {
 				return err
 			}
-			stamps = WriteStamps{Before: before, After: after}
 			return nil
 		})
 	})
@@ -150,4 +133,29 @@ func (s *StateDB) WriteRestartOutcome(expected RuntimeState, expectedIncarnation
 		return WriteStamps{}, err
 	}
 	return stamps, nil
+}
+
+// writeModificationStamp records a writer's exact change within its transaction.
+func writeModificationStamp(tx *immediateTransaction) (WriteStamps, error) {
+	var beforeText string
+	if err := tx.QueryRow(`SELECT COALESCE((
+	    SELECT value FROM metadata WHERE key = 'last_modified'
+	), '')`).Scan(&beforeText); err != nil {
+		return WriteStamps{}, err
+	}
+	var before int64
+	if beforeText != "" {
+		if _, err := fmt.Sscan(beforeText, &before); err != nil {
+			return WriteStamps{}, err
+		}
+	}
+	after := time.Now().UnixNano()
+	if after <= before {
+		after = before + 1
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO metadata (key, value)
+	VALUES ('last_modified', ?)`, fmt.Sprintf("%d", after)); err != nil {
+		return WriteStamps{}, err
+	}
+	return WriteStamps{Before: before, After: after}, nil
 }

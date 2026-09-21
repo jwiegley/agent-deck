@@ -36,8 +36,8 @@ config_dir = "~/.claude-seminno"
 
 	originalRunning, originalStop, originalStart := nativeSwitchRunning, nativeSwitchStop, nativeSwitchStart
 	nativeSwitchRunning = func(*Instance) bool { return false }
-	nativeSwitchStop = func(*Instance) error { return nil }
-	nativeSwitchStart = func(*Instance) error { return nil }
+	nativeSwitchStop = func(*Instance, *runtimeTransitionAuthority) error { return nil }
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error { return nil }
 	restoreLifecycle = func() {
 		nativeSwitchRunning, nativeSwitchStop, nativeSwitchStart = originalRunning, originalStop, originalStart
 	}
@@ -165,7 +165,7 @@ func TestSwitchStaleDestination_FailedJournalDoesNotBlockRetry(t *testing.T) {
 	// exact request generation. wasRunning must be true for the start path to
 	// even run.
 	nativeSwitchRunning = func(*Instance) bool { return true }
-	nativeSwitchStart = func(*Instance) error { return errors.New("injected start failure") }
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error { return errors.New("injected start failure") }
 	_, err := ExecuteHarnessSwitch(cfg, inst, HarnessSwitchOptions{Target: SwitchPreviewTarget{Harness: "claude", Account: "seminno"}})
 	require.Error(t, err)
 	require.Equal(t, "personal", inst.Account, "a failed switch must restore the source account")
@@ -181,7 +181,7 @@ func TestSwitchStaleDestination_FailedJournalDoesNotBlockRetry(t *testing.T) {
 	// The exact same request must now succeed instead of "previous switch
 	// failed" — archiving the failed journal happens as part of processing
 	// this fresh attempt, not immediately after the failure.
-	nativeSwitchStart = func(*Instance) error { return nil }
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error { return nil }
 	result, err := ExecuteHarnessSwitch(cfg, inst, HarnessSwitchOptions{Target: SwitchPreviewTarget{Harness: "claude", Account: "seminno"}})
 	require.NoError(t, err, "a failed journal must never block a fresh retry of the same request")
 	require.True(t, result.Committed)
