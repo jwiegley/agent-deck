@@ -487,7 +487,6 @@ type instanceStorageSnapshot struct {
 }
 
 func (s *Storage) rememberInstanceSnapshot(inst *Instance, original, stored *statedb.InstanceRow) {
-	inst.restartDB.Store(s.db)
 	inst.storageSnapshot = &instanceStorageSnapshot{
 		dbPath:   s.dbPath,
 		original: statedb.CloneInstanceRow(original),
@@ -630,7 +629,7 @@ func (s *Storage) DeleteInstance(id string) error {
 func (s *Storage) DeleteInstanceDeferredCleanup(id string) (func(), error) {
 	release, err := acquireInstanceSpawnLock(id)
 	if err != nil {
-		return fmt.Errorf("lock instance %s for deletion: %w", id, err)
+		return nil, fmt.Errorf("lock instance %s for deletion: %w", id, err)
 	}
 	defer release()
 

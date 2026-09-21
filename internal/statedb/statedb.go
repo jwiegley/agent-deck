@@ -2378,13 +2378,24 @@ func (s *StateDB) SetAcknowledgedStamped(id string, ack bool) (WriteStamps, erro
 	if ack {
 		v = 1
 	}
-	if err := withBusyRetry(func() error {
-		_, err := s.db.Exec("UPDATE instances SET acknowledged = ? WHERE id = ?", v, id)
-		return err
-	}); err != nil {
+	var stamps WriteStamps
+	err := withBusyRetry(func() error {
+		return s.withImmediateTransaction(func(tx *immediateTransaction) error {
+			if _, err := tx.Exec("UPDATE instances SET acknowledged = ? WHERE id = ?", v, id); err != nil {
+				return err
+			}
+			var err error
+			stamps, err = writeModificationStamp(tx)
+			if err != nil {
+				return err
+			}
+			return tx.Commit()
+		})
+	})
+	if err != nil {
 		return WriteStamps{}, err
 	}
-	return s.touchStamp()
+	return stamps, nil
 }
 
 // SetArchived sets or clears the archive timestamp for a single instance via a

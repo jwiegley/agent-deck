@@ -6,9 +6,13 @@ import (
 )
 
 func TestRuntimeLifecycle_LaunchPersistenceUsesOneCreationBoundary(t *testing.T) {
-	body := sourceFunctionBody(t, "launch_cmd.go", "handleLaunch")
+	wrapper := sourceFunctionBody(t, "launch_cmd.go", "handleLaunch")
+	if !strings.Contains(wrapper, "handleLaunchCommand(profile, args, nil)") {
+		t.Fatal("handleLaunch must delegate to the checked creation path")
+	}
+	body := sourceFunctionBody(t, "launch_cmd.go", "handleLaunchCommand")
 	if got := strings.Count(body, "InsertSessionAndVerify("); got != 1 {
-		t.Fatalf("handleLaunch has %d insert-capable writes, want exactly the initial creation", got)
+		t.Fatalf("handleLaunchCommand has %d insert-capable writes, want exactly the initial creation", got)
 	}
 	requireCallOrder(t, body, "newInstance.Status = session.StatusQueued", "InsertSessionAndVerify(")
 	requireCallOrder(t, body, "InsertSessionAndVerify(", "newInstance.PostStartSync(")

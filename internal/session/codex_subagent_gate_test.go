@@ -318,21 +318,15 @@ func TestResolveCodexDetectionCandidateRejectsSubagent(t *testing.T) {
 
 func installFreshCodexOwnershipSnapshot(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(2 * codexOwnershipRefreshTimeout)
-	for codexOwnershipRefresh.Load() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	resetCodexOwnershipCache(t)
+	codexOwnershipCache.Lock()
+	codexOwnershipCache.bySocket[tmux.DefaultSocketName()] = codexOwnershipSnapshot{
+		at: time.Now(),
+		claims: &codexOwnershipClaims{
+			bySession: map[string]string{},
+		},
 	}
-	if codexOwnershipRefresh.Load() {
-		t.Fatal("Codex ownership refresh did not quiesce")
-	}
-	previous := codexOwnershipSnapshot.Swap(&codexOwnershipSnapshotData{
-		loadedAt:  time.Now(),
-		sourceKey: os.Getenv("PATH") + "\x00" + tmux.DefaultSocketName(),
-		idsByTmux: map[string]string{},
-		ownedIDs:  map[string]int{},
-		complete:  true,
-	})
-	t.Cleanup(func() { codexOwnershipSnapshot.Store(previous) })
+	codexOwnershipCache.Unlock()
 }
 
 func TestRejectedSubagentProbePreservesIncompleteResult(t *testing.T) {

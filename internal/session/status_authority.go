@@ -144,6 +144,7 @@ func (i *Instance) finalizeCommittedStatus(state statedb.RuntimeState) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if sameStatusRuntime(state, i.runtimeStateLocked()) {
+		i.statusSampledLive = true
 		i.releaseAuthHoldIfHealthyLocked()
 	}
 }

@@ -817,6 +817,7 @@ type instancePollingState struct {
 	lastIdleCheck              time.Time
 	lastKnownActivity          int64
 	tmuxFlipFromRunningPending bool
+	statusSampledLive          bool
 	lastSessionMetaSync        time.Time
 	validatedHookBindings      map[string]validatedHookRuntimeBinding
 
@@ -906,6 +907,7 @@ func (i *Instance) pollingStateForIdentity(identity instancePollingIdentity) ins
 		lastIdleCheck:              i.lastIdleCheck,
 		lastKnownActivity:          i.lastKnownActivity,
 		tmuxFlipFromRunningPending: i.tmuxFlipFromRunningPending,
+		statusSampledLive:          i.statusSampledLive,
 		lastSessionMetaSync:        i.lastSessionMetaSync,
 		validatedHookBindings:      maps.Clone(i.validatedHookBindings),
 		hermesGatewayCheckedAt:     i.hermesGatewayCheckedAt,
@@ -949,6 +951,7 @@ func (i *Instance) restorePollingState(state instancePollingState) bool {
 	i.lastIdleCheck = state.lastIdleCheck
 	i.lastKnownActivity = state.lastKnownActivity
 	i.tmuxFlipFromRunningPending = state.tmuxFlipFromRunningPending
+	i.statusSampledLive = state.statusSampledLive
 	i.lastSessionMetaSync = state.lastSessionMetaSync
 	i.validatedHookBindings = maps.Clone(state.validatedHookBindings)
 	i.hermesGatewayCheckedAt = state.hermesGatewayCheckedAt
@@ -4372,15 +4375,31 @@ func (i *Instance) updateCodexSession(excludeIDs map[string]bool, forceProbe boo
 }
 
 func (i *Instance) updateCodexSessionForPass(excludeIDs map[string]bool, forceProbe bool, pass *StatusUpdatePass) string {
+	// Match restart's lock order: instance authority before bootstrap claims.
+	release, err := acquireInstanceSpawnLock(i.ID)
+	if err != nil {
+		sessionLog.Debug("codex_binding_lock_failed", slog.String("error", err.Error()))
+		return ""
+	}
+	defer release()
 	observation := i.CaptureRuntimeBindingObservation("codex")
+	if observation.value == "" {
+		if pass == nil {
+			pass = &StatusUpdatePass{}
+		}
+		if excludeIDs == nil {
+			i.codexExclusions(pass)
+		}
+		codexBootstrapMu.Lock()
+		defer codexBootstrapMu.Unlock()
+	}
 	candidate := i.queryCodexSessionCandidateForPass(excludeIDs, forceProbe, observation.value, pass)
 	if candidate.id != "" {
-		if err := i.PublishRuntimeBindingObservation(observation, candidate.id, time.Now()); err != nil {
+		if err := i.publishRuntimeBindingObservationLocked(observation, candidate.id, time.Now()); err != nil {
 			sessionLog.Debug("codex_binding_rejected",
 				slog.String("session_id", candidate.id), slog.String("source", candidate.source),
 				slog.String("error", err.Error()))
 		} else {
-			i.recordCodexOwnership(candidate.id)
 			i.syncPublishedCodexCandidate(candidate, observation.value)
 		}
 	}
@@ -6729,7 +6748,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 			// the pane is busy again, absorbCompletedTurnSample reverts the
 			// flip in the same pass.
 			if IsClaudeCompatible(i.Tool) && i.noteHookLagSampleLocked() {
-				i.Status = StatusWaiting
+				candidate = StatusWaiting
 				i.hookLagFlipped = true
 			}
 		case "waiting":
