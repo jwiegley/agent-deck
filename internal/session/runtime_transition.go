@@ -154,10 +154,25 @@ func (i *Instance) mergeReloaded(loaded *Instance, mergeMetadata, mergeRuntime b
 	}
 	current := i.runtimeStateSnapshotLocked()
 	if mergeMetadata {
+		toolChanged := i.Tool != loaded.Tool || i.Command != loaded.Command
 		currentSandboxContainer := i.SandboxContainer
 		currentLoadedMCPNames := append([]string(nil), i.LoadedMCPNames...)
 		i.mergeReloadedMetadataLocked(loaded)
 		i.storageSnapshot = incomingStorageSnapshot
+		if toolChanged {
+			// The physical pane can be unchanged while its declared tool is
+			// corrected. Its old wrapper still contains the previous command,
+			// tool detection and environment caches; a status poll would otherwise
+			// restore the old tool. Reconnect lazily without touching the pane.
+			i.tmuxSession = nil
+			i.adoptRuntimeStateLocked(current)
+			i.hookStatus = ""
+			i.hookEvent = ""
+			i.hookSessionID = ""
+			i.hookLastUpdate = time.Time{}
+			i.hookFingerprint = HookStatusFingerprint{}
+			i.validatedHookBindings = nil
+		}
 		if !mergeRuntime {
 			i.SandboxContainer = currentSandboxContainer
 			i.LoadedMCPNames = currentLoadedMCPNames

@@ -274,17 +274,28 @@ func restampRuntimeBindingCleanup(target runtimeBindingCleanupTarget) error {
 	)
 }
 
-// publishHookRuntimeBindingObservation avoids revalidating an unchanged
-// cached hook file on every status tick. A changed source fingerprint or
-// binding token deliberately misses this cache and takes the durable publisher
-// above. Timestamp is intentionally excluded: hook payloads have whole-second
-// timestamp granularity and distinct events can share one value.
+// publishHookRuntimeBindingObservation avoids repeating durable binding checks
+// for an unchanged cached hook file on every status tick. A changed source
+// fingerprint or binding token deliberately misses this cache and takes the
+// durable publisher above. Timestamp is intentionally excluded: hook payloads
+// have whole-second granularity and distinct events can share one value.
 func (i *Instance) publishHookRuntimeBindingObservation(observation RuntimeBindingObservation, value string, fingerprint HookStatusFingerprint) error {
-	i.mu.RLock()
+	i.mu.Lock()
+	// Cached hook IDs can predate their rollout metadata or the watcher's
+	// ownership check. Recheck before even the unchanged-fingerprint fast path:
+	// accepting a hook earlier does not make a subsequently identified child
+	// thread an authoritative binding for its parent.
+	if observation.kind == "codex" && i.shouldRejectCodexSubagentRebind(value) {
+		i.clearRejectedCodexHookLocked(value)
+		delete(i.validatedHookBindings, observation.kind)
+		i.mu.Unlock()
+		return i.runtimeBindingPublishError(observation.kind, observation.generation, observation.revision,
+			errors.New("hook candidate is a Codex subagent thread"))
+	}
 	validated, ok := i.validatedHookBindings[observation.kind]
 	current := i.runtimeBindingObservationLocked(observation.kind)
 	db := i.owningDB
-	i.mu.RUnlock()
+	i.mu.Unlock()
 	if fingerprint.valid() && ok && validated.fingerprint == fingerprint &&
 		validated.incarnation == observation.incarnation &&
 		validated.generation == observation.generation && validated.revision == observation.revision &&
@@ -323,6 +334,19 @@ func (i *Instance) publishHookRuntimeBindingObservation(observation RuntimeBindi
 	}
 	i.mu.Unlock()
 	return nil
+}
+
+// clearRejectedCodexHookLocked discards only cached evidence from the rejected
+// child. A valid parent's previously accepted hook must remain intact.
+func (i *Instance) clearRejectedCodexHookLocked(sessionID string) {
+	if i.hookSessionID != sessionID {
+		return
+	}
+	i.hookStatus, i.hookEvent, i.hookSessionID = "", "", ""
+	i.hookLastUpdate = time.Time{}
+	i.hookFingerprint = HookStatusFingerprint{}
+	i.codexStartedGeneration, i.codexCompletedGeneration = "", ""
+	i.codexStartedSessionID, i.codexCompletedSessionID = "", ""
 }
 
 // publishRuntimeBinding is reserved for explicit operator mutations, whose

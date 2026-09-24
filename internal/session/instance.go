@@ -6682,10 +6682,17 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 		i.lastKnownActivity = currentTS
 	}
 
+	// Discard older cached child evidence before calculating or publishing status.
+	if IsCodexCompatible(i.Tool) && i.hookSessionID != "" &&
+		i.shouldRejectCodexSubagentRebind(i.hookSessionID) {
+		i.clearRejectedCodexHookLocked(i.hookSessionID)
+	}
+
 	// COLD LOAD: CLI doesn't run StatusFileWatcher, so hookStatus is always empty.
 	// Read the hook file from disk once to give CLI the same fast path as the TUI.
 	if i.hookStatus == "" && HookStatusTool(i.Tool) {
-		if hs := readHookStatusFile(i.ID); hs != nil && !i.codexHookFromForeignThread(hs) {
+		if hs := readHookStatusFile(i.ID); hs != nil && !i.codexHookFromForeignThread(hs) &&
+			(!IsCodexCompatible(i.Tool) || !i.shouldRejectCodexSubagentRebind(hs.SessionID)) {
 			i.hookStatus = hs.Status
 			i.hookEvent = hs.Event
 			i.hookLastUpdate = hs.UpdatedAt
@@ -7042,7 +7049,7 @@ func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState
 	}
 	detectedTool := tmuxSession.DetectTool()
 	i.mu.Lock()
-	if !sameStatusRuntime(committed, i.runtimeStateLocked()) {
+	if i.tmuxSession != tmuxSession || !sameStatusRuntime(committed, i.runtimeStateLocked()) {
 		i.mu.Unlock()
 		return
 	}
@@ -7214,6 +7221,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 	prevHookStatus, prevHookEvent, prevHookLastUpdate := i.hookStatus, i.hookEvent, i.hookLastUpdate
 	prevStartedGen, prevCompletedGen := i.codexStartedGeneration, i.codexCompletedGeneration
 	prevStartedSID, prevCompletedSID := i.codexStartedSessionID, i.codexCompletedSessionID
+	prevInvalidatingGen := i.codexInvalidatingGeneration
 	prevHookFingerprint := i.hookFingerprint
 	// rejected tracks whether this event was rolled back by restoreHook below.
 	// A rejected candidate must never be read as evidence that the agent is
@@ -7433,6 +7441,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 		// into a main turn that is still running.
 		if i.shouldRejectCodexSubagentRebind(sessionID) {
 			restoreHook()
+			i.clearRejectedCodexHookLocked(sessionID)
 			_ = WriteSessionIDLifecycleEvent(SessionIDLifecycleEvent{
 				InstanceID: i.ID, Tool: i.Tool, Action: "reject",
 				Source: hookSource, OldID: i.CodexSessionID, Candidate: sessionID,
