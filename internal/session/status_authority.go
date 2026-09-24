@@ -115,6 +115,18 @@ func (i *Instance) reloadStatusWinner(db *statedb.StateDB, incarnation string) (
 	if db == nil {
 		return i.runtimeStateSnapshot(), nil
 	}
+	// A physical replacement can be live before its generation is committed.
+	// Defer reconciliation while a transition owns the runtime: waiting here
+	// would also exceed the status probe's deadline. A later poll can reread the
+	// durable winner once the transition has released authority.
+	release, acquired, err := tryAcquireInstanceSpawnLock(i.ID)
+	if err != nil {
+		return i.runtimeStateSnapshot(), err
+	}
+	if !acquired {
+		return i.runtimeStateSnapshot(), statedb.ErrRuntimeGenerationConflict
+	}
+	defer release()
 	if err := db.ValidateInstanceIncarnation(i.ID, incarnation); err != nil {
 		return i.runtimeStateSnapshot(), err
 	}
@@ -170,7 +182,8 @@ func (i *Instance) acquireStatusProbe(ctx context.Context) (func(), error) {
 
 // UpdateStatusObserved is the single status authority. The caller captures the
 // exact runtime tuple before probing; the candidate remains private until its
-// durable CAS succeeds, and every loser adopts the durable winner.
+// durable CAS succeeds. Losers adopt the durable winner unless a physical
+// transition is still in flight, in which case reconciliation waits for a later poll.
 func (i *Instance) UpdateStatusObserved(ctx context.Context, observed statedb.RuntimeState, incarnation string) (statedb.RuntimeState, error) {
 	if ctx == nil {
 		ctx = context.Background()
