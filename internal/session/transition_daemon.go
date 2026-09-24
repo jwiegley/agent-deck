@@ -142,6 +142,8 @@ type TransitionDaemon struct {
 	// global so tests get a fresh trigger per daemon.
 	recallBackfillMu      sync.Mutex
 	recallBackfillStarted bool
+	// Join the worker before tests replace its shared configuration.
+	recallBackfillWG sync.WaitGroup
 
 	// pollState carries process-local status caches and throttles across
 	// LoadWithGroups calls. Each load constructs fresh Instance and tmux.Session
