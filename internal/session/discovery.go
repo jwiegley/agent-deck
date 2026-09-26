@@ -1,10 +1,12 @@
 package session
 
 import (
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -51,6 +53,14 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 			groupPath = "recovered"
 		}
 
+		// DiscoverAllTmuxSessions lists DefaultSocketName() but leaves each
+		// wrapper's SocketName unset. Name the server the session was found on,
+		// or every later probe, the stored runtime and the ownership stamp
+		// below would address the native default server instead.
+		if sess.SocketName == "" {
+			sess.SocketName = tmux.DefaultSocketName()
+		}
+
 		// Create instance for discovered session
 		projectPath := sess.WorkDir
 		if projectPath == "" {
@@ -77,6 +87,16 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 		// DiscoverAllTmuxSessions builds bare wrappers; configure this one the
 		// way storage load does before touching the live session with it.
 		inst.configureTmuxWrapperLocked(sess)
+		// Importing is the user's grant of ownership: stamp the session so
+		// stop, restart and delete can prove it is this instance's runtime.
+		// A session that cannot be stamped is still imported; its lifecycle
+		// operations refuse with the manual remedy instead.
+		if err := inst.grantImportedRuntimeOwnership(); err != nil {
+			sessionLog.Warn("import_ownership_stamp_failed",
+				slog.String("instance_id", inst.ID),
+				slog.String("tmux_session", logging.SanitizeValue(sess.Name)),
+				slog.String("error", err.Error()))
+		}
 
 		// Enable mouse mode for proper scrolling in imported sessions
 		// Ignore errors - non-fatal, older tmux versions may not support all options

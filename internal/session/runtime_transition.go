@@ -1010,11 +1010,17 @@ func stampRuntimeCandidate(session *tmux.Session, next statedb.RuntimeState, bin
 	if session == nil {
 		return fmt.Errorf("tmux session not initialized")
 	}
+	// An imported runtime has no start time Agent Deck recorded. Stamp zero,
+	// which reads as unknown, rather than the zero time's overflowed nanos.
+	startedUnixNano := int64(0)
+	if !next.LastStartedAt.IsZero() {
+		startedUnixNano = next.LastStartedAt.UnixNano()
+	}
 	stamps := [][2]string{
 		{"AGENTDECK_INSTANCE_ID", next.InstanceID},
 		{"AGENTDECK_RUNTIME_STATUS_REVISION", strconv.FormatUint(next.StatusRevision, 10)},
 		{"AGENTDECK_RUNTIME_STATUS", next.Status},
-		{"AGENTDECK_RUNTIME_STARTED_UNIX_NANO", strconv.FormatInt(next.LastStartedAt.UnixNano(), 10)},
+		{"AGENTDECK_RUNTIME_STARTED_UNIX_NANO", strconv.FormatInt(startedUnixNano, 10)},
 		{"AGENTDECK_RUNTIME_BINDING_KIND", bindingKind},
 		{"AGENTDECK_RUNTIME_BINDING_VALUE", bindingValue},
 	}
