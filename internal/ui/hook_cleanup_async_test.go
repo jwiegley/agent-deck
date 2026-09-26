@@ -19,8 +19,9 @@ import (
 // deletion: they claim the captured runtime, delete its row, and prune hook
 // artifacts under the instance lifecycle lock before reporting the result. So
 // the key handlers must only dispatch that command, the row must be gone
-// before cleanup starts, and undo becomes available only once the reported
-// deletion (cleanup included) has been applied.
+// before cleanup starts, the handler that applies the report must neither
+// block nor schedule work of its own, and undo becomes available only once
+// the reported deletion (cleanup included) has been applied.
 func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -58,20 +59,50 @@ func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 			require.NoError(t, syscall.Mkfifo(fifo, 0600))
 			// Nonblocking writer open succeeds only when cleanup has opened the
 			// read end. This handshake avoids guessing when the command is ready.
-			openWriter := func() *os.File {
+			// A command that reports on the reported channel first never
+			// reached cleanup; its report is returned instead of a writer.
+			openWriter := func(reported <-chan tea.Msg) (*os.File, tea.Msg) {
 				deadline := time.Now().Add(5 * time.Second)
 				for {
 					fd, err := syscall.Open(fifo, syscall.O_WRONLY|syscall.O_NONBLOCK, 0600)
 					if err == nil {
-						return os.NewFile(uintptr(fd), fifo)
+						return os.NewFile(uintptr(fd), fifo), nil
 					}
 					require.ErrorIs(t, err, syscall.ENXIO)
+					select {
+					case msg := <-reported:
+						return nil, msg
+					default:
+					}
 					if time.Now().After(deadline) {
 						t.Fatal("cleanup did not open the delayed registry")
 					}
 					time.Sleep(time.Millisecond)
 				}
 			}
+			// UI handlers run under the same bound whether they handle the
+			// confirming key or the reported deletion. A handler stuck on the
+			// registry is released so the failure is reported, not a hang.
+			update := func(msg tea.Msg) tea.Cmd {
+				returned := make(chan tea.Cmd, 1)
+				go func() { _, cmd := h.Update(msg); returned <- cmd }()
+				select {
+				case cmd := <-returned:
+					return cmd
+				case <-time.After(time.Second):
+					writer, _ := openWriter(nil)
+					_, _ = writer.Write([]byte(`{"instances":[]}`))
+					_ = writer.Close()
+					select {
+					case <-returned:
+					case <-time.After(5 * time.Second):
+						t.Fatal("deletion did not recover after cleanup was released")
+					}
+					t.Fatal("UI deletion handler blocked on hook cleanup")
+					return nil
+				}
+			}
+			const outsideAuthority = "deletion handler scheduled work outside lifecycle authority"
 			// Confirming the deletion is the UI handler; it must only dispatch.
 			var keys []tea.KeyMsg
 			if tc.finish {
@@ -89,26 +120,19 @@ func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 			for _, key := range keys[:len(keys)-1] {
 				h.Update(key)
 			}
-			returned := make(chan tea.Cmd, 1)
-			go func() { _, cmd := h.Update(keys[len(keys)-1]); returned <- cmd }()
-			var cmd tea.Cmd
-			select {
-			case cmd = <-returned:
-			case <-time.After(time.Second):
-				writer := openWriter()
-				_, _ = writer.Write([]byte(`{"instances":[]}`))
-				_ = writer.Close()
-				select {
-				case <-returned:
-				case <-time.After(5 * time.Second):
-					t.Fatal("deletion did not recover after cleanup was released")
-				}
-				t.Fatal("UI deletion handler blocked on hook cleanup")
-			}
+			cmd := update(keys[len(keys)-1])
 			require.NotNil(t, cmd, "deletion must dispatch its lifecycle command")
 			result := make(chan tea.Msg, 1)
 			go func() { result <- cmd() }()
-			writer := openWriter()
+			writer, early := openWriter(result)
+			if writer == nil {
+				// The command reported without reaching cleanup, so cleanup
+				// was left to someone else. Apply the report as production
+				// would: a handler that cleans up itself blocks or schedules
+				// work and fails with its own message.
+				require.Nil(t, update(early), outsideAuthority)
+				t.Fatal("deletion reported before hook cleanup ran")
+			}
 			defer writer.Close()
 			select {
 			case <-result:
@@ -163,7 +187,10 @@ func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 				require.True(t, ok, "delete reported %T", deleted)
 				require.NoError(t, reported.killErr)
 			}
-			h.Update(deleted)
+			// The command already deleted the row and pruned the hooks; a
+			// handler that deletes or cleans up again does so outside the
+			// lifecycle lock, where it can hit a same-ID replacement.
+			require.Nil(t, update(deleted), outsideAuthority)
 			require.Nil(t, h.getInstanceByID(inst.ID), "reported deletion must leave the session list")
 			if tc.undo {
 				// A deliberately invalid account makes Restart return before any
