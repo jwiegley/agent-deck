@@ -3,6 +3,7 @@ package tmux
 import (
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,6 +17,30 @@ import (
 // tests in runtime_binding_candidates_test.go.
 
 const runtimeRespawnClaimGeneration = 4
+
+// trackRuntimeGenerationEscalationsForTest makes every candidate respawn's
+// post-respawn escalation observable. An escalation outlives its respawn by
+// the retry delay and reap grace while it reads the process-tree and
+// process-identity seams other tests replace, so no test may return while one
+// runs. The returned wait blocks until every escalation started so far has
+// finished; cleanup waits the same way before restoring the launcher.
+func trackRuntimeGenerationEscalationsForTest(t *testing.T) (wait func()) {
+	t.Helper()
+	var escalations sync.WaitGroup
+	launch := runtimeGenerationEscalationGoFn
+	runtimeGenerationEscalationGoFn = func(escalate func()) {
+		escalations.Add(1)
+		launch(func() {
+			defer escalations.Done()
+			escalate()
+		})
+	}
+	t.Cleanup(func() {
+		escalations.Wait()
+		runtimeGenerationEscalationGoFn = launch
+	})
+	return escalations.Wait
+}
 
 // startRuntimeGenerationSession starts an inert pane stamped with complete
 // generation authority, in the order stampRuntimeCandidate publishes it: the
