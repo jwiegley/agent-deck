@@ -33,6 +33,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/asheshgoplani/agent-deck/internal/ctxinspect"
 )
@@ -70,9 +71,10 @@ var FixedNow = time.Date(2026, time.July, 1, 12, 0, 0, 0, time.UTC)
 const RootPlaceholder = "<FIXTURE_ROOT>"
 
 // RootKeyPlaceholder stands in for Claude Code's path-derived project key.
-// Claude replaces path separators with dashes when naming the auto-memory
-// directory, so replacing only the ordinary absolute path leaves the random
-// fixture parent embedded in golden documents.
+// Claude replaces every character that is not a letter or a digit, separators
+// included, with a dash when naming the auto-memory directory, so replacing
+// only the ordinary absolute path leaves the random fixture parent embedded in
+// golden documents.
 const RootKeyPlaceholder = "<FIXTURE_ROOT_KEY>"
 
 // Expect states what a case is supposed to prove, independently of what the
@@ -337,7 +339,7 @@ func Redact(text, root string) string {
 	}
 	// Replace the derived form first: replacing the ordinary root would not
 	// touch it, but doing this first makes both forms deterministic.
-	rootKey := strings.ReplaceAll(root, "/", "-")
+	rootKey := claudeProjectKey(root)
 	out := strings.ReplaceAll(text, rootKey, RootKeyPlaceholder)
 	out = strings.ReplaceAll(out, root, RootPlaceholder)
 	// A JSON document escapes nothing in a POSIX path, but a Windows-style
@@ -347,6 +349,26 @@ func Redact(text, root string) string {
 		out = strings.ReplaceAll(out, strings.ReplaceAll(alt, `\`, `\\`), RootPlaceholder)
 	}
 	return out
+}
+
+// claudeProjectKey derives Claude Code's project key for path the way the
+// harness does, independently of the adapter under test: every UTF-16 unit
+// that is not an ASCII letter or digit becomes a dash, so a temporary parent
+// such as /tmp/agent-deck-tests.X1 keys as -tmp-agent-deck-tests-X1, dot and
+// all. A fixed-length root is far below the 200 units at which Claude would
+// truncate the key and append a hash.
+func claudeProjectKey(path string) string {
+	units := utf16.Encode([]rune(path))
+	key := make([]byte, len(units))
+	for i, u := range units {
+		switch {
+		case u >= '0' && u <= '9', u >= 'A' && u <= 'Z', u >= 'a' && u <= 'z':
+			key[i] = byte(u)
+		default:
+			key[i] = '-'
+		}
+	}
+	return string(key)
 }
 
 // copyEmbedded writes an embedded subtree to disk.
