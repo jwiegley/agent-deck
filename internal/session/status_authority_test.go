@@ -130,8 +130,9 @@ func TestRuntimeLifecycle_StatusAuthority_NoVerdictFinalizesNothing(t *testing.T
 // verdict: inside the tmux grace window every status the window leaves
 // unchanged (running, idle, queued, and starting itself) is kept while the
 // spawn has no session yet, and with no tmux session at all a stopped or
-// queued session keeps its operator intent. Finalizing such a keep marked the
-// status sampled live and, for a healthy status (starting counts as one),
+// queued session keeps its operator intent. The grace window keeps a stop as
+// well, rather than publish starting over it. Finalizing such a keep marked
+// the status sampled live and, for a healthy status (starting counts as one),
 // released the cross-process auth hold on no evidence. The exits that change
 // the status, another status read as starting inside the window and a death's
 // classification, remain verdicts.
@@ -146,6 +147,7 @@ func TestRuntimeLifecycle_StatusProbe_UnobservedKeepsFormNoVerdict(t *testing.T)
 		{"grace window keeps running", StatusRunning, true, StatusRunning, true},
 		{"grace window keeps queued", StatusQueued, true, StatusQueued, true},
 		{"grace window keeps starting", StatusStarting, true, StatusStarting, true},
+		{"grace window keeps stopped", StatusStopped, true, StatusStopped, true},
 		{"no tmux session keeps stopped", StatusStopped, false, StatusStopped, true},
 		{"no tmux session keeps queued", StatusQueued, false, StatusQueued, true},
 		{"grace window reads starting (verdict)", StatusError, true, StatusStarting, false},
