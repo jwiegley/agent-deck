@@ -3472,6 +3472,7 @@ type statusCounts struct {
 	idle    int
 	err     int
 	stopped int
+	queued  int
 	total   int
 }
 
@@ -3499,6 +3500,10 @@ func countByStatus(instances []*session.Instance) statusCounts {
 			counts.err++
 		case session.StatusStopped:
 			counts.stopped++
+		case session.StatusQueued:
+			// Status probes keep a queued session queued (operator intent), so
+			// it needs its own bucket for the counts to sum to total.
+			counts.queued++
 		}
 		counts.total++
 	}
@@ -3585,7 +3590,7 @@ func handleStatus(profile string, args []string) {
 
 	if len(instances) == 0 {
 		if *jsonOutput {
-			fmt.Println(`{"waiting": 0, "running": 0, "idle": 0, "error": 0, "stopped": 0, "total": 0}`)
+			fmt.Println(`{"waiting": 0, "running": 0, "idle": 0, "error": 0, "stopped": 0, "queued": 0, "total": 0}`)
 		} else if *quiet || *quietShort {
 			fmt.Println("0")
 		} else {
@@ -3623,6 +3628,7 @@ func handleStatus(profile string, args []string) {
 			Idle     int                 `json:"idle"`
 			Error    int                 `json:"error"`
 			Stopped  int                 `json:"stopped"`
+			Queued   int                 `json:"queued"`
 			Total    int                 `json:"total"`
 			Sessions []statusSessionJSON `json:"sessions,omitempty"`
 		}
@@ -3632,6 +3638,7 @@ func handleStatus(profile string, args []string) {
 			Idle:    counts.idle,
 			Error:   counts.err,
 			Stopped: counts.stopped,
+			Queued:  counts.queued,
 			Total:   counts.total,
 		}
 		if *verbose || *verboseShort {
@@ -3693,6 +3700,7 @@ func handleStatus(profile string, args []string) {
 		printStatusGroup("RUNNING", "●", session.StatusRunning)
 		printStatusGroup("IDLE", "○", session.StatusIdle)
 		printStatusGroup("STOPPED", "■", session.StatusStopped)
+		printStatusGroup("QUEUED", "○", session.StatusQueued)
 		printStatusGroup("ERROR", "✕", session.StatusError)
 
 		fmt.Printf("Total: %d sessions in profile '%s'\n", counts.total, storage.Profile())
