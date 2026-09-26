@@ -85,7 +85,7 @@ func RunRuntimeLifecycleContenderHelper(config RuntimeLifecycleHelperConfig) (Ru
 			panic(fmt.Sprintf("await runtime lifecycle contender barrier: %v", err))
 		}
 	}
-	runtimeCandidateExistsFn = func(*tmux.Session) bool { return true }
+	runtimeCandidateExistsFn = func(*tmux.Session) (bool, error) { return true, nil }
 	runtimeCandidateInventoryFn = func(socketName, instanceID string) ([]tmux.RuntimeCandidate, error) {
 		candidates, err := readRuntimeLifecycleInventory(config.InventoryPath)
 		if err != nil {
@@ -230,7 +230,7 @@ func RunRuntimeLifecycleCrashHelper(config RuntimeLifecycleHelperConfig) error {
 
 	agentDeckDirOverride = config.LockRoot
 	runtimeTransitionObservedFn = func() {}
-	runtimeCandidateExistsFn = func(*tmux.Session) bool { return true }
+	runtimeCandidateExistsFn = func(*tmux.Session) (bool, error) { return true, nil }
 	// The helper's JSON inventory is the physical oracle. Do not shell out to
 	// the deliberately empty private PATH to revalidate its synthetic panes.
 	runtimeCandidateRevalidateFn = func(candidate tmux.RuntimeCandidate) (tmux.RuntimeCandidate, error) {

@@ -71,7 +71,7 @@ func TestRuntimeLifecycle_StatusReloadDefersDuringPhysicalReplacement(t *testing
 			// Fallback recreation has succeeded, but the new pane has not yet
 			// been stamped or committed. The old durable tmux name is absent.
 			setRuntimeTestCandidate(inst, "replacement")
-			runtimeCandidateExistsFn = func(s *tmux.Session) bool { return s.Name == "replacement" }
+			runtimeCandidateExistsFn = func(s *tmux.Session) (bool, error) { return s.Name == "replacement", nil }
 			stamped := ""
 			runtimeCandidateStampFn = func(s *tmux.Session, _ statedb.RuntimeState, _, _ string) error {
 				stamped = s.Name
