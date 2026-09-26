@@ -690,6 +690,11 @@ type Instance struct {
 	// Not serialized; long-lived pollers that reload instances must carry it in
 	// process so the recheck interval survives the reload.
 	lastErrorCheck time.Time
+	// lastErrorCheckGeneration is the runtime generation lastErrorCheck
+	// confirmed absent. The throttle covers only that runtime: a newer
+	// generation, such as one another process started and this one adopted,
+	// names another tmux session and is probed at once.
+	lastErrorCheckGeneration uint64
 
 	// Tiered polling: skip expensive checks for idle sessions with no activity
 	lastIdleCheck     time.Time // When we last did a full check for an idle session
@@ -821,11 +826,12 @@ type instancePollingState struct {
 	lastJSONLPath      string
 	cachedPrompt       string
 
-	lastErrorCheck        time.Time
-	lastIdleCheck         time.Time
-	lastKnownActivity     int64
-	lastSessionMetaSync   time.Time
-	validatedHookBindings map[string]validatedHookRuntimeBinding
+	lastErrorCheck           time.Time
+	lastErrorCheckGeneration uint64
+	lastIdleCheck            time.Time
+	lastKnownActivity        int64
+	lastSessionMetaSync      time.Time
+	validatedHookBindings    map[string]validatedHookRuntimeBinding
 
 	hermesGatewayCheckedAt time.Time
 	hermesGatewayOK        bool
@@ -900,22 +906,23 @@ func (i *Instance) pollingStateForIdentity(identity instancePollingIdentity) ins
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return instancePollingState{
-		identity:               identity,
-		tmuxSession:            i.tmuxSession,
-		lastOpenCodeScanAt:     i.lastOpenCodeScanAt,
-		lastCodexScanAt:        i.lastCodexScanAt,
-		lastCodexProbeAt:       i.lastCodexProbeAt,
-		lastPromptModTime:      i.lastPromptModTime,
-		lastJSONLSize:          i.lastJSONLSize,
-		lastJSONLPath:          i.lastJSONLPath,
-		cachedPrompt:           i.cachedPrompt,
-		lastErrorCheck:         i.lastErrorCheck,
-		lastIdleCheck:          i.lastIdleCheck,
-		lastKnownActivity:      i.lastKnownActivity,
-		lastSessionMetaSync:    i.lastSessionMetaSync,
-		validatedHookBindings:  maps.Clone(i.validatedHookBindings),
-		hermesGatewayCheckedAt: i.hermesGatewayCheckedAt,
-		hermesGatewayOK:        i.hermesGatewayOK,
+		identity:                 identity,
+		tmuxSession:              i.tmuxSession,
+		lastOpenCodeScanAt:       i.lastOpenCodeScanAt,
+		lastCodexScanAt:          i.lastCodexScanAt,
+		lastCodexProbeAt:         i.lastCodexProbeAt,
+		lastPromptModTime:        i.lastPromptModTime,
+		lastJSONLSize:            i.lastJSONLSize,
+		lastJSONLPath:            i.lastJSONLPath,
+		cachedPrompt:             i.cachedPrompt,
+		lastErrorCheck:           i.lastErrorCheck,
+		lastErrorCheckGeneration: i.lastErrorCheckGeneration,
+		lastIdleCheck:            i.lastIdleCheck,
+		lastKnownActivity:        i.lastKnownActivity,
+		lastSessionMetaSync:      i.lastSessionMetaSync,
+		validatedHookBindings:    maps.Clone(i.validatedHookBindings),
+		hermesGatewayCheckedAt:   i.hermesGatewayCheckedAt,
+		hermesGatewayOK:          i.hermesGatewayOK,
 	}
 }
 
@@ -952,6 +959,7 @@ func (i *Instance) restorePollingState(state instancePollingState) bool {
 	i.lastJSONLPath = state.lastJSONLPath
 	i.cachedPrompt = state.cachedPrompt
 	i.lastErrorCheck = state.lastErrorCheck
+	i.lastErrorCheckGeneration = state.lastErrorCheckGeneration
 	i.lastIdleCheck = state.lastIdleCheck
 	i.lastKnownActivity = state.lastKnownActivity
 	i.lastSessionMetaSync = state.lastSessionMetaSync
@@ -6682,7 +6690,9 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 	// Optimization: Skip expensive Exists() check for sessions already in error/stopped status
 	// Ghost sessions (in JSON but not in tmux) only get rechecked every 30 seconds
 	// This reduces subprocess spawns from 74/sec to ~5/sec for 28 ghost sessions
+	// The skip trusts only the generation that check confirmed absent.
 	if (candidate == StatusError || candidate == StatusStopped || candidate == StatusQueued) && !i.lastErrorCheck.IsZero() &&
+		i.lastErrorCheckGeneration == observed.Generation &&
 		time.Since(i.lastErrorCheck) < errorRecheckInterval {
 		recordStatusNoVerdict(ctx)
 		return candidate, ctx.Err() // Skip - still in error/stopped/queued, checked recently
@@ -6733,6 +6743,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 			i.refreshAuthHoldOnDeathLocked()
 		}
 		i.lastErrorCheck = time.Now() // Record when we confirmed error/stopped
+		i.lastErrorCheckGeneration = observed.Generation
 		return candidate, ctx.Err()
 	}
 

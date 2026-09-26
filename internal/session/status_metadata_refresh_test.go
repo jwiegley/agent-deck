@@ -282,6 +282,7 @@ func TestStatusProbe_EarlyExitsTakeNoPaneSample(t *testing.T) {
 			arrange: func(_ *testing.T, inst *Instance) {
 				inst.mu.Lock()
 				inst.lastErrorCheck = time.Now()
+				inst.lastErrorCheckGeneration = inst.RuntimeGeneration
 				inst.mu.Unlock()
 			},
 			want: StatusError, noVerdict: true},
