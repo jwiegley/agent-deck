@@ -41,6 +41,9 @@ const (
 	// that install could not prove stale. It is never a dead end.
 	ConfirmArchiveDestinationSwitch
 	ConfirmKillWindow
+	// ConfirmQuitWithWorktreeFinish asks before quitting while a worktree
+	// finish dismissed into the background (Esc) is still running.
+	ConfirmQuitWithWorktreeFinish
 )
 
 // ConfirmDialog handles confirmation for destructive actions
@@ -452,6 +455,17 @@ func (c *ConfirmDialog) ShowQuitWithPool(mcpCount int) {
 	c.focusedButton = 0 // default to "Keep running" (safe choice)
 }
 
+// ShowQuitWithWorktreeFinish shows confirmation for quitting while the finish
+// of the named worktree session is still running in the background.
+func (c *ConfirmDialog) ShowQuitWithWorktreeFinish(sessionTitle string) {
+	c.visible = true
+	c.confirmType = ConfirmQuitWithWorktreeFinish
+	c.targetID = ""
+	c.targetName = sessionTitle
+	c.buttonCount = 2
+	c.focusedButton = 1 // default to Cancel: a finish stopped partway cannot resume
+}
+
 // ShowCreateDirectory shows confirmation for creating a missing directory.
 func (c *ConfirmDialog) ShowCreateDirectory(
 	path string,
@@ -795,6 +809,17 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Shut down", ColorRed, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
 			hintStyle.Render(glueHintGroups("k keep · s shut down · ←/→ navigate · Enter select · Esc")))
+
+	case ConfirmQuitWithWorktreeFinish:
+		title = "Worktree Finish Running"
+		warning = fmt.Sprintf("Still finishing worktree:\n\n  \"%s\"", c.targetName)
+		details = "Quitting stops the finish partway: a merge may land while the\nsession stays listed, or the session may be deleted while its\nworktree and branch remain."
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Quit anyway", ColorRed, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render(glueHintGroups("y quit anyway · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmCreateDirectory:
 		title = "📁  Directory Not Found"
