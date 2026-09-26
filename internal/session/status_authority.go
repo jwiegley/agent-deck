@@ -67,10 +67,15 @@ type statusProbeEvidenceKey struct{}
 // may refresh tool identity and session metadata after the commit.
 //
 // noVerdict is set when the probe took no observation at all: a session this
-// process cannot see from inside another tmux server, or a skip that trusts
-// the verdict an earlier sample settled. Such a pass is a no-op, as upstream's
-// early return is: nothing is committed or finalized, and no metadata refresh
-// follows.
+// process cannot see from inside another tmux server, a skip that trusts the
+// verdict an earlier sample settled, or an exit that keeps the last-known
+// status without looking. Inside the tmux grace window a running, idle or
+// queued status is kept while the session does not exist yet, and a stopped or
+// queued session with no tmux session keeps its operator intent. Such a pass
+// is a no-op, as upstream's early return is: nothing is committed or
+// finalized, and no metadata refresh follows. The exits that rewrite the
+// status are verdicts: starting inside the grace window, idle for a session
+// never started, and a death's classification.
 type statusProbeEvidence struct {
 	paneSampled atomic.Bool
 	noVerdict   atomic.Bool
