@@ -680,18 +680,36 @@ func (i *Instance) adoptRuntimeStateLocked(state statedb.RuntimeState) {
 		sess := tmux.ReconnectSessionLazy(state.TmuxSession, i.Title, i.EffectiveWorkingDir(), i.Command, statusToString(i.Status))
 		sess.SocketName = state.TmuxSocketName
 		sess.InstanceID = i.ID
-		applyTmuxSessionSettings(sess)
+		i.configureTmuxWrapperLocked(sess)
 		i.tmuxSession = sess
 	}
 }
 
+// configureTmuxWrapperLocked gives a wrapper around a live tmux session the
+// per-instance configuration a wrapper otherwise receives from Start: the
+// configured per-session settings, the group path published as
+// @agentdeck_group_path, and the [tmux].options overrides. Storage load,
+// runtime adoption (including a reload that corrects the tool) and discovery
+// all adopt a running session without Start. A wrapper missing the overrides
+// or the group path makes the next attach's EnsureConfigured push agent-deck's
+// status-bar and title defaults over the user's options and clear the group.
+// The caller holds i.mu or owns i exclusively; buildTmuxOptionOverrides takes
+// no Instance lock.
+func (i *Instance) configureTmuxWrapperLocked(sess *tmux.Session) {
+	applyTmuxSessionSettings(sess)
+	sess.SetGroupPath(i.GroupPath)
+	sess.OptionOverrides = i.buildTmuxOptionOverrides()
+}
+
 // applyTmuxSessionSettings copies the configured per-session tmux and terminal
 // options onto a wrapper this package is about to own. Every construction of an
-// Instance's wrapper goes through it (NewInstance, NewInstanceWithTool,
-// recreateTmuxSession, storage load and runtime adoption): the setters record
-// intent that EnsureConfigured and Start apply later, so a wrapper built without
-// them silently ignores inject_status_line, mouse, clear_on_restart, the Indic
-// zero-width-mark opt-in (#2334) and the terminal-chrome setting for its life.
+// Instance's wrapper goes through it: NewInstance, NewInstanceWithTool and
+// recreateTmuxSession directly (Start and Restart add the overrides), and
+// storage load, runtime adoption and discovery through
+// configureTmuxWrapperLocked. The setters record intent that EnsureConfigured
+// and Start apply later, so a wrapper built without them silently ignores
+// inject_status_line, mouse, clear_on_restart, the Indic zero-width-mark
+// opt-in (#2334) and the terminal-chrome setting for its life.
 func applyTmuxSessionSettings(sess *tmux.Session) {
 	settings := GetTmuxSettings()
 	sess.SetInjectStatusLine(settings.GetInjectStatusLine())

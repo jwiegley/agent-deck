@@ -1912,7 +1912,6 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			}
 			// Pass instance ID for activity hooks (enables real-time status updates)
 			tmuxSess.InstanceID = instData.ID
-			applyTmuxSessionSettings(tmuxSess)
 			// Note: EnableMouseMode and ConfigureStatusBar are deferred to EnsureConfigured()
 			// Called automatically when user attaches to session
 		}
@@ -1935,9 +1934,6 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 				slog.String("fallback_group", DefaultGroupPath),
 			)
 			groupPath = DefaultGroupPath
-		}
-		if tmuxSess != nil {
-			tmuxSess.GroupPath = groupPath
 		}
 
 		// Expand tilde in project path (handles paths like ~/project saved from UI)
@@ -2043,9 +2039,10 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 		}
 
 		// Set tmux option overrides so EnsureConfigured/ConfigureStatusBar
-		// respects user-defined keys (e.g. status = "2" for multi-line bar).
+		// respects user-defined keys (e.g. status = "2" for multi-line bar),
+		// along with the per-session settings and the group path.
 		if tmuxSess != nil {
-			tmuxSess.OptionOverrides = inst.buildTmuxOptionOverrides()
+			inst.configureTmuxWrapperLocked(tmuxSess)
 		}
 
 		// PERFORMANCE: Skip UpdateStatus at load time - use cached status from SQLite

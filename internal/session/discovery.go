@@ -57,10 +57,6 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 			projectPath = "~"
 		}
 
-		// Enable mouse mode for proper scrolling in imported sessions
-		// Ignore errors - non-fatal, older tmux versions may not support all options
-		_ = sess.EnableMouseMode()
-
 		// Determine tool type - for orphaned agent-deck sessions, assume claude (most common)
 		tool := detectToolFromName(title)
 		if isOrphaned && tool == "shell" {
@@ -78,6 +74,13 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 			TmuxSocketName:         sess.SocketName, // Inherit from the tmux session we discovered (#687)
 			tmuxSession:            sess,
 		}
+		// DiscoverAllTmuxSessions builds bare wrappers; configure this one the
+		// way storage load does before touching the live session with it.
+		inst.configureTmuxWrapperLocked(sess)
+
+		// Enable mouse mode for proper scrolling in imported sessions
+		// Ignore errors - non-fatal, older tmux versions may not support all options
+		_ = sess.EnableMouseMode()
 		_ = inst.UpdateStatus()
 		discovered = append(discovered, inst)
 	}
