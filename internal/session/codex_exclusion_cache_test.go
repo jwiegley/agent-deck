@@ -50,6 +50,11 @@ show-environment)
  *_unbound_*) exit 0 ;;
  esac
  printf 'CODEX_SESSION_ID=id-%s\n' "$3" ;;
+has-session|list-panes)
+ # With CODEX_SCAN_PANE_PID set, every session is live and its pane runs
+ # that process, so a forced process probe answers without error.
+ if [ -z "$CODEX_SCAN_PANE_PID" ]; then exit 1; fi
+ if [ "$1" = list-panes ]; then printf '%s\n' "$CODEX_SCAN_PANE_PID"; fi ;;
 *) exit 1 ;;
 esac
 `

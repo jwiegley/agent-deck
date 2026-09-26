@@ -2,6 +2,8 @@ package session
 
 import (
 	"os"
+	"os/exec"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -59,6 +61,66 @@ func TestCodexBootstrapClaimSkipsAuthoritativeEnvironmentRead(t *testing.T) {
 	if got := codexSessionIDForTest(inst); got != "id-agentdeck_scan_0" {
 		t.Fatalf("codex binding = %q, want the environment's id-agentdeck_scan_0", got)
 	}
+}
+
+// A restart's Codex fallback selects under the same claim as the status pass:
+// it waits for a peer that is mid-selection, then claims the rollout it chose
+// for its peers before releasing the lock. Scanning without the claim let a
+// restart and a peer's status-pass bootstrap in one project pick the same
+// rollout from one ownership snapshot.
+func TestCodexRestartFallbackSelectsUnderBootstrapClaim(t *testing.T) {
+	resetCodexOwnershipCache(t)
+	codexCountingTmux(t, 1)
+	t.Setenv("CODEX_SCAN_EMPTY", "1") // no tmux environment evidence anywhere
+	t.Setenv("CODEX_HOME", t.TempDir())
+	// The restart's forced process probe inspects a live pane running no Codex
+	// process, so detection goes on to the disk fallback.
+	pane := exec.Command("sleep", "30")
+	if err := pane.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pane.Process.Kill(); _ = pane.Wait() })
+	t.Setenv("CODEX_SCAN_PANE_PID", strconv.Itoa(pane.Process.Pid))
+	sid := uniqueSID(t)
+	seedCodexRolloutWithMeta(t, os.Getenv("CODEX_HOME"), sid, "", "", false)
+	inst := &Instance{ID: "codex-restart-fallback", Tool: "codex", ProjectPath: "/tmp/project",
+		CodexStartedAt: time.Now().Add(-time.Minute).UnixMilli(),
+		tmuxSession:    &tmux.Session{Name: "agentdeck_scan_0"}}
+	release := holdCodexBootstrapForTest(t)
+
+	done := make(chan codexSessionCandidate, 1)
+	go func() { done <- inst.adoptCodexSessionForRestart() }()
+	select {
+	case <-done:
+		t.Fatal("the restart's disk fallback selected while a peer held the bootstrap claim")
+	case <-time.After(300 * time.Millisecond):
+	}
+	release()
+	var candidate codexSessionCandidate
+	select {
+	case candidate = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the restart's disk fallback never finished after the peer released its claim")
+	}
+	if candidate.id != sid || candidate.source != "disk" || codexSessionIDForTest(inst) != sid {
+		t.Fatalf("restart selection = %+v (bound %q), want the rollout %s from disk", candidate, codexSessionIDForTest(inst), sid)
+	}
+	codexOwnershipCache.Lock()
+	claims := codexOwnershipCache.bySocket[""].claims
+	codexOwnershipCache.Unlock()
+	if claims == nil {
+		t.Fatal("the restart's selection left no ownership snapshot")
+	}
+	claims.Lock()
+	claimed := claims.bySession["agentdeck_scan_0"]
+	claims.Unlock()
+	if claimed != sid {
+		t.Fatalf("ownership claim for the restarting session = %q, want %s visible to peers", claimed, sid)
+	}
+	if !codexBootstrapMu.TryLock() {
+		t.Fatal("the restart kept the bootstrap claim after publishing its selection")
+	}
+	codexBootstrapMu.Unlock()
 }
 
 // The disk fallback still selects under the claim: it waits for a peer's
