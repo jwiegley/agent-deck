@@ -1440,9 +1440,8 @@ func (h *Home) actionKey(action string) string {
 
 // deletedSessionEntry holds a deleted session for undo restore
 type deletedSessionEntry struct {
-	instance    *session.Instance
-	deletedAt   time.Time
-	cleanupDone <-chan struct{}
+	instance  *session.Instance
+	deletedAt time.Time
 }
 
 // getLayoutMode returns the current layout mode based on terminal width
@@ -26669,24 +26668,6 @@ func (h *Home) fetchRemoteCreationCatalog(remoteName string) tea.Cmd {
 		defer cancel()
 		catalog, err := runner.FetchCreationCatalog(ctx)
 		return remoteCreationCatalogFetchedMsg{remoteName: remoteName, catalog: catalog, err: err}
-	}
-}
-
-// hookCleanupCmd keeps best-effort filesystem cleanup outside Update. Registry
-// failures return nil cleanup, preserving the handler's existing error logging.
-func hookCleanupCmd(cleanup func(), done chan struct{}) tea.Cmd {
-	if cleanup == nil {
-		if done != nil {
-			close(done)
-		}
-		return nil
-	}
-	return func() tea.Msg {
-		if done != nil {
-			defer close(done)
-		}
-		cleanup()
-		return nil
 	}
 }
 
