@@ -207,6 +207,8 @@ func RunRuntimeLifecycleCrashHelper(config RuntimeLifecycleHelperConfig) error {
 	oldGenerationInventory := runtimeGenerationCandidateInventoryFn
 	oldTerminate := terminateCapturedRuntimeFn
 	oldSelectedExists := selectedRuntimeSessionExistsFn
+	oldForeign := destructionAbsenceIsForeignServerFn
+	oldSweep := runtimeDuplicateSweepFn
 	oldDiscoverChildren := discoverCapturedRuntimeChildrenFn
 	oldReserved := runtimeDestructionReservedFn
 	oldNow := nowFn
@@ -222,6 +224,8 @@ func RunRuntimeLifecycleCrashHelper(config RuntimeLifecycleHelperConfig) error {
 		runtimeGenerationCandidateInventoryFn = oldGenerationInventory
 		terminateCapturedRuntimeFn = oldTerminate
 		selectedRuntimeSessionExistsFn = oldSelectedExists
+		destructionAbsenceIsForeignServerFn = oldForeign
+		runtimeDuplicateSweepFn = oldSweep
 		discoverCapturedRuntimeChildrenFn = oldDiscoverChildren
 		runtimeDestructionReservedFn = oldReserved
 		nowFn = oldNow
@@ -282,6 +286,11 @@ func RunRuntimeLifecycleCrashHelper(config RuntimeLifecycleHelperConfig) error {
 		}
 		return false, nil
 	}
+	// The oracle is the one server this helper can see, so no absence it
+	// reports belongs to a foreign default server; the real guard would list
+	// whatever default server the helper's environment names.
+	destructionAbsenceIsForeignServerFn = func(statedb.RuntimeState) bool { return false }
+	runtimeDuplicateSweepFn = func(*Instance, ...string) {}
 	discoverCapturedRuntimeChildrenFn = func(*Instance, tmux.RuntimeGenerationCandidate) ([]tmux.ProcessIdentity, error) {
 		return nil, nil
 	}
