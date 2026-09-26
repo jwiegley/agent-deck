@@ -110,6 +110,60 @@ func TestGeminiHookBindAndRebindWriteRecallLink(t *testing.T) {
 	requireRecallLinks(t, db, inst.ID, "gemini", map[string]bool{first: false, second: true})
 }
 
+// The "already linked" mark must name the binding it was set for, not a bare
+// id. A peer (the web server, a CLI status refresh) that rebinds A to B links
+// B and demotes A. This process adopts B when its own publish of B loses the
+// CAS, and when the hook returns to A (codex resume) its rebind must link A
+// again: the mark its first link of A left says nothing about the link of the
+// A bound now. Trusting it left the binding at A and the authoritative link
+// at B, and every later equality tick trusted it too.
+func TestHookRebindBackToAPeerDemotedIdRelinksIt(t *testing.T) {
+	db := isolateHookRecallLinkHome(t)
+	inst := newHookRecallLinkInstance(t, db, "hook-codex-relink", "codex", `{}`)
+	const a = "7a3b9c10-0000-0000-0000-000000000b01"
+	const b = "7a3b9c10-0000-0000-0000-000000000b02"
+	at := time.Now()
+	hook := func(id, event string) {
+		t.Helper()
+		at = at.Add(time.Second)
+		inst.UpdateHookStatus(&HookStatus{Status: "running", SessionID: id, Event: event, UpdatedAt: at})
+	}
+
+	hook(a, "SessionStart")
+	requireRecallLinks(t, db, inst.ID, "codex", map[string]bool{a: true})
+
+	// The peer wins the hook rebind to B and links it.
+	durable, found, err := db.ReadRuntimeBinding(inst.ID, "codex")
+	if err != nil || !found || durable.Value != a {
+		t.Fatalf("durable codex binding = %+v found=%v err=%v, want %s", durable, found, err, a)
+	}
+	incarnation := inst.PersistenceIncarnation()
+	if _, err := db.CommitRuntimeBinding(inst.ID, incarnation, durable.Generation, "codex", durable.Revision, b); err != nil {
+		t.Fatalf("peer rebind to %s: %v", b, err)
+	}
+	if linked, err := db.LinkRuntimeBinding(inst.ID, incarnation, "codex", b); err != nil || !linked {
+		t.Fatalf("peer link of %s = %v, %v", b, linked, err)
+	}
+	requireRecallLinks(t, db, inst.ID, "codex", map[string]bool{a: false, b: true})
+
+	// This process sees the same hook, loses the CAS and adopts B.
+	hook(b, "UserPromptSubmit")
+	if inst.CodexSessionID != b {
+		t.Fatalf("losing publisher did not adopt the peer's %s (got %q)", b, inst.CodexSessionID)
+	}
+
+	hook(a, "UserPromptSubmit")
+	if inst.CodexSessionID != a || readCodexSessionIDFromDB(t, db, inst.ID) != a {
+		t.Fatalf("rebind back = memory %q durable %q, want %s",
+			inst.CodexSessionID, readCodexSessionIDFromDB(t, db, inst.ID), a)
+	}
+	requireRecallLinks(t, db, inst.ID, "codex", map[string]bool{a: true, b: false})
+
+	// The equality ticks that follow keep it that way.
+	hook(a, "Stop")
+	requireRecallLinks(t, db, inst.ID, "codex", map[string]bool{a: true, b: false})
+}
+
 // An identity bound by some other path (here the legacy tool_data a row was
 // saved with) reaches its first hook already equal. As for a minted Claude id,
 // that hook's vouch is what records the missing link.
@@ -152,6 +206,15 @@ func TestRecallLinkMarksTolerateRetractionOutsideTheInstanceLock(t *testing.T) {
 	const candidate = "22222222-2222-4222-8222-22222222aa02"
 	inst := newHookRecallLinkInstance(t, db, "hook-claude-link-marks", "claude", `{"claude_session_id":"`+bound+`"}`)
 	inst.ClaudeSessionID = bound
+	// A hook vouching for the bound id gives it the binding version the
+	// marks are keyed on; without one, confirmHookSessionLink never marks.
+	inst.UpdateHookStatus(&HookStatus{Status: "running", SessionID: bound, Event: "SessionStart", UpdatedAt: time.Now()})
+	inst.mu.RLock()
+	version, versioned := inst.recallLinkVersionLocked("claude", bound)
+	inst.mu.RUnlock()
+	if !versioned {
+		t.Fatalf("hook left no in-memory binding version for %s: %+v", bound, inst.RuntimeBindings)
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -172,6 +235,9 @@ func TestRecallLinkMarksTolerateRetractionOutsideTheInstanceLock(t *testing.T) {
 	}()
 	wg.Wait()
 	requireRecallLinks(t, db, inst.ID, "claude", map[string]bool{bound: true})
+	if !inst.linkedBindings.has("claude", version) {
+		t.Fatalf("the last confirmation of %s left no mark", bound)
+	}
 }
 
 // A link write that fails leaves the published binding in place. The next
