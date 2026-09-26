@@ -1586,8 +1586,11 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 	// Retain fast-exiting initial processes before tmux handles their exit.
 	// A one-shot can exit before Start's later option pass reaches tmux, so
 	// applying this in a later client call can lose both pane and output.
+	// The target keeps exact-name matching but selects the window with ^, not
+	// an index: under a user's base-index 1 there is no window 0, and a failed
+	// target fails the whole new-session call.
 	if value, ok := s.OptionOverrides["remain-on-exit"]; ok {
-		tmuxArgs = append(tmuxArgs, ";", "set-option", "-t", "="+s.Name+":0", "remain-on-exit", value)
+		tmuxArgs = append(tmuxArgs, ";", "set-option", "-t", "="+s.primaryWindowTarget(), "remain-on-exit", value)
 	}
 
 	unitBase := serviceUnitBase(s.Name)
@@ -3385,8 +3388,9 @@ func (s *Session) ExistsCached() bool {
 
 // IsPaneDead returns true if the session's pane process has exited.
 // Uses the cached pane info (refreshed once per tick) for zero-cost lookups.
-// Falls back to a direct tmux query targeting pane 0.0 (the primary pane)
-// to avoid false positives in multi-pane layouts.
+// Falls back to a direct tmux query of the session's first window, addressed
+// by ^ rather than index 0 so a user's base-index or pane-base-index cannot
+// make the probe miss (and so read every dead pane as alive).
 func (s *Session) IsPaneDead() bool {
 	if info, ok := GetCachedPaneInfo(s.Name); ok {
 		return info.Dead
@@ -3399,7 +3403,7 @@ func (s *Session) IsPaneDead() bool {
 	// live pane as dead would flip the session to an error state.
 	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
 	defer cancel()
-	out, err := commandOutput(s.tmuxCmdContext(ctx, "list-panes", "-t", s.Name+":0.0", "-F", "#{pane_dead}"))
+	out, err := commandOutput(s.tmuxCmdContext(ctx, "list-panes", "-t", "="+s.primaryWindowTarget(), "-F", "#{pane_dead}"))
 	if err != nil {
 		return false
 	}
@@ -3419,10 +3423,12 @@ func (s *Session) IsPaneDead() bool {
 // treating every terminated pane as an error.
 func (s *Session) PaneDeadExitStatus() (int, bool) {
 	// Bounded like IsPaneDead: this runs on the notify-daemon poll loop, so a
-	// wedged tmux server must not stall it.
+	// wedged tmux server must not stall it. Targeted like IsPaneDead too: an
+	// index-0 target misses under base-index 1, and every clean one-shot exit
+	// would then be classified without its exit code.
 	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
 	defer cancel()
-	out, err := commandOutput(s.tmuxCmdContext(ctx, "list-panes", "-t", s.Name+":0.0", "-F", "#{pane_dead}|#{pane_dead_status}"))
+	out, err := commandOutput(s.tmuxCmdContext(ctx, "list-panes", "-t", "="+s.primaryWindowTarget(), "-F", "#{pane_dead}|#{pane_dead_status}"))
 	if err != nil {
 		return 0, false
 	}

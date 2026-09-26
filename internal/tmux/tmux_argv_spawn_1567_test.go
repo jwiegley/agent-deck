@@ -117,7 +117,27 @@ func TestIssue1567_ArgvSpawnSurvivesHostileShell(t *testing.T) {
 }
 
 func TestStartCommandSpecRetainsImmediateExit(t *testing.T) {
+	assertStartCommandSpecRetainsImmediateExit(t, hostileShellServer(t))
+}
+
+// TestStartCommandSpecRetainsImmediateExitUnderBaseIndexOne runs the same
+// spawn on a server numbering windows and panes from 1, a common ~/.tmux.conf
+// setting that a new agent-deck server loads. Window 0 does not exist there:
+// a spawn-queue option aimed at it fails the whole new-session call, tearing
+// the one-shot down with its output, and a probe aimed at pane 0.0 can never
+// report the retained exit status.
+func TestStartCommandSpecRetainsImmediateExitUnderBaseIndexOne(t *testing.T) {
 	socket := hostileShellServer(t)
+	for _, option := range []string{"base-index", "pane-base-index"} {
+		if out, err := exec.Command("tmux", "-L", socket, "set-option", "-g", option, "1").CombinedOutput(); err != nil {
+			t.Fatalf("set %s: %v: %s", option, err, out)
+		}
+	}
+	assertStartCommandSpecRetainsImmediateExit(t, socket)
+}
+
+func assertStartCommandSpecRetainsImmediateExit(t *testing.T, socket string) {
+	t.Helper()
 	for n := 0; n < 5; n++ {
 		s := &Session{
 			Name: fmt.Sprintf("one-shot-%d", n), SocketName: socket,
@@ -142,7 +162,7 @@ func TestStartCommandSpecRetainsImmediateExit(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		for {
-			out, err := exec.Command("tmux", "-L", socket, "capture-pane", "-p", "-S", "-", "-t", "="+s.Name+":0.0").CombinedOutput()
+			out, err := exec.Command("tmux", "-L", socket, "capture-pane", "-p", "-S", "-", "-t", "="+s.primaryWindowTarget()).CombinedOutput()
 			if err == nil && strings.Contains(string(out), "one-shot answer") {
 				break
 			}
