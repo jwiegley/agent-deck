@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -95,12 +96,67 @@ func TestRuntimeLifecycle_CLIKeepsEqualGenerationWinner(t *testing.T) {
 
 // F6: a start whose pane is live but whose initial message never reached it
 // keeps exit 0 but must not claim the message was sent. `session start` (both
-// paths) and `launch` share this wording.
-func TestInitialMessageOutcome(t *testing.T) {
-	if got := initialMessageOutcome(false); got != "(message sent)" {
-		t.Fatalf("delivered = %q", got)
+// paths) and `launch` render their verdict through renderStartSuccess, which
+// the routing matrix requires each of them to call.
+func TestRenderStartSuccess(t *testing.T) {
+	type fields = map[string]interface{}
+	// `session start` echoes its spawn receipt; launch reports the committed
+	// row's tmux name and Claude id itself (addLaunchStateJSON).
+	start := startSuccess{verb: "Started", id: "id-1", title: "alpha", tmux: "agentdeck_alpha", claudeSessionID: "claude-1"}
+	launch := startSuccess{verb: "Launched", id: "id-1", title: "alpha"}
+	with := func(base startSuccess, edit func(*startSuccess)) startSuccess {
+		edit(&base)
+		return base
 	}
-	if got := initialMessageOutcome(true); got != "(message not delivered)" {
-		t.Fatalf("undelivered = %q", got)
+	merged := func(base fields, extra fields) fields {
+		out := fields{}
+		for k, v := range base {
+			out[k] = v
+		}
+		for k, v := range extra {
+			out[k] = v
+		}
+		return out
+	}
+	startJSON := fields{"success": true, "id": "id-1", "title": "alpha", "tmux": "agentdeck_alpha", "claude_session_id": "claude-1"}
+	launchJSON := fields{"success": true, "id": "id-1", "title": "alpha"}
+	sent := fields{"message": "hi", "message_pending": false}
+	pending := fields{"message": "hi", "message_pending": true}
+
+	tests := []struct {
+		name     string
+		in       startSuccess
+		wantLine string
+		wantJSON fields
+	}{
+		{"start", start, "Started session: alpha", startJSON},
+		{"start with warning", with(start, func(s *startSuccess) { s.warning = "reconciliation failed" }),
+			"Started session: alpha", merged(startJSON, fields{"warning": "reconciliation failed"})},
+		{"start delivered", with(start, func(s *startSuccess) { s.message = "hi" }),
+			"Started session: alpha (message sent)", merged(startJSON, sent)},
+		{"start undelivered", with(start, func(s *startSuccess) { s.message, s.messageUndelivered = "hi", true }),
+			"Started session: alpha (message not delivered)", merged(startJSON, pending)},
+		{"launch delivered", with(launch, func(s *startSuccess) { s.message = "hi" }),
+			"Launched session: alpha (message sent)", merged(launchJSON, sent)},
+		{"launch undelivered", with(launch, func(s *startSuccess) { s.message, s.messageUndelivered = "hi", true }),
+			"Launched session: alpha (message not delivered)", merged(launchJSON, pending)},
+		{"launch --no-wait", with(launch, func(s *startSuccess) { s.message, s.messageDeferred = "hi", true }),
+			"Launched session: alpha (message sent with --no-wait)", merged(launchJSON, pending)},
+		{"launch --no-wait undelivered", with(launch, func(s *startSuccess) {
+			s.message, s.messageDeferred, s.messageUndelivered = "hi", true, true
+		}), "Launched session: alpha (message not delivered)", merged(launchJSON, pending)},
+		{"launch --no-wait without message", with(launch, func(s *startSuccess) { s.messageDeferred = true }),
+			"Launched session: alpha", launchJSON},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := fields{}
+			if line := renderStartSuccess(tt.in, got); line != tt.wantLine {
+				t.Errorf("line = %q, want %q", line, tt.wantLine)
+			}
+			if !reflect.DeepEqual(got, tt.wantJSON) {
+				t.Errorf("json = %#v, want %#v", got, tt.wantJSON)
+			}
+		})
 	}
 }

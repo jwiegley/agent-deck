@@ -112,27 +112,13 @@ func cliSessionStart(profile string, args []string) {
 		printEnvelope(res)
 		return
 	}
-	jsonData := map[string]interface{}{
-		"success": true,
-		"id":      started.ID,
-		"title":   started.Title,
-	}
-	if started.Warning != "" {
-		jsonData["warning"] = started.Warning
-	}
-	if started.Tmux != "" {
-		jsonData["tmux"] = started.Tmux
-	}
-	if started.ClaudeSessionID != "" {
-		jsonData["claude_session_id"] = started.ClaudeSessionID
-	}
-	if started.Message != "" {
-		jsonData["message"] = started.Message
-		jsonData["message_pending"] = started.MessagePending
-		out.Success(fmt.Sprintf("Started session: %s %s", started.Title, initialMessageOutcome(started.MessagePending)), jsonData)
-	} else {
-		out.Success(fmt.Sprintf("Started session: %s", started.Title), jsonData)
-	}
+	jsonData := map[string]interface{}{}
+	line := renderStartSuccess(startSuccess{
+		verb: "Started", id: started.ID, title: started.Title, warning: started.Warning,
+		tmux: started.Tmux, claudeSessionID: started.ClaudeSessionID,
+		message: started.Message, messageUndelivered: started.MessagePending,
+	}, jsonData)
+	out.Success(line, jsonData)
 }
 
 func cliSessionStop(profile string, args []string) {

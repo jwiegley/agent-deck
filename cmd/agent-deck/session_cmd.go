@@ -416,27 +416,17 @@ func handleSessionStart(profile string, args []string) {
 	}
 
 	// Output success
-	jsonData := map[string]interface{}{
-		"success": true,
-		"id":      inst.ID,
-		"title":   inst.Title,
-	}
-	if persistenceWarning != "" {
-		jsonData["warning"] = persistenceWarning
-	}
+	tmuxName := ""
 	if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
-		jsonData["tmux"] = tmuxSess.Name
+		tmuxName = tmuxSess.Name
 	}
-	if inst.ClaudeSessionID != "" {
-		jsonData["claude_session_id"] = inst.ClaudeSessionID
-	}
-	if initialMessage != "" {
-		jsonData["message"] = initialMessage
-		jsonData["message_pending"] = messageUndelivered
-		out.Success(fmt.Sprintf("Started session: %s %s", inst.Title, initialMessageOutcome(messageUndelivered)), jsonData)
-	} else {
-		out.Success(fmt.Sprintf("Started session: %s", inst.Title), jsonData)
-	}
+	jsonData := map[string]interface{}{}
+	line := renderStartSuccess(startSuccess{
+		verb: "Started", id: inst.ID, title: inst.Title, warning: persistenceWarning,
+		tmux: tmuxName, claudeSessionID: inst.ClaudeSessionID,
+		message: initialMessage, messageUndelivered: messageUndelivered,
+	}, jsonData)
+	out.Success(line, jsonData)
 }
 
 // spawnVerifyWait bounds how long `session start`/`restart` wait for a

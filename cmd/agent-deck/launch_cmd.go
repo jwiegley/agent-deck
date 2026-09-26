@@ -958,19 +958,14 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// spawn loops, shell scripts) don't have to fall back to diffing
 	// `agent-deck list --json` before/after — that diff was unsafe
 	// under the launch-race the structural fix above also closes.
-	// The legacy `id` key is kept for backward compatibility.
+	// The legacy `id` key is kept for backward compatibility. success, id,
+	// title, warning and the message outcome come from renderStartSuccess.
 	jsonData := map[string]interface{}{
-		"success":    true,
-		"id":         newInstance.ID,
 		"session_id": newInstance.ID,
-		"title":      newInstance.Title,
 		"path":       path,
 		"tool":       newInstance.Tool,
 		"group":      newInstance.GroupPath,
 		"profile":    storage.Profile(),
-	}
-	if persistenceWarning != "" {
-		jsonData["warning"] = persistenceWarning
 	}
 	if sessionCommandInput != "" {
 		jsonData["command"] = sessionCommandInput
@@ -981,10 +976,6 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		if sessionCommandNote != "" {
 			jsonData["command_note"] = sessionCommandNote
 		}
-	}
-	if initialMessage != "" {
-		jsonData["message"] = initialMessage
-		jsonData["message_pending"] = *noWait || messageUndelivered
 	}
 	if len(mcpFlags) > 0 {
 		jsonData["mcps"] = mcpFlags
@@ -1013,14 +1004,10 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		jsonData["sandbox"] = true
 	}
 
-	msg := fmt.Sprintf("Launched session: %s", newInstance.Title)
-	if initialMessage != "" {
-		if *noWait && !messageUndelivered {
-			msg += " (message sent with --no-wait)"
-		} else {
-			msg += " " + initialMessageOutcome(messageUndelivered)
-		}
-	}
+	msg := renderStartSuccess(startSuccess{
+		verb: "Launched", id: newInstance.ID, title: newInstance.Title, warning: persistenceWarning,
+		message: initialMessage, messageUndelivered: messageUndelivered, messageDeferred: *noWait,
+	}, jsonData)
 	out.Success(msg, jsonData)
 }
 
