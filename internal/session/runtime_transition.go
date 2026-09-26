@@ -680,8 +680,25 @@ func (i *Instance) adoptRuntimeStateLocked(state statedb.RuntimeState) {
 		sess := tmux.ReconnectSessionLazy(state.TmuxSession, i.Title, i.EffectiveWorkingDir(), i.Command, statusToString(i.Status))
 		sess.SocketName = state.TmuxSocketName
 		sess.InstanceID = i.ID
+		applyTmuxSessionSettings(sess)
 		i.tmuxSession = sess
 	}
+}
+
+// applyTmuxSessionSettings copies the configured per-session tmux and terminal
+// options onto a wrapper this package is about to own. Every construction of an
+// Instance's wrapper goes through it (NewInstance, NewInstanceWithTool,
+// recreateTmuxSession, storage load and runtime adoption): the setters record
+// intent that EnsureConfigured and Start apply later, so a wrapper built without
+// them silently ignores inject_status_line, mouse, clear_on_restart, the Indic
+// zero-width-mark opt-in (#2334) and the terminal-chrome setting for its life.
+func applyTmuxSessionSettings(sess *tmux.Session) {
+	settings := GetTmuxSettings()
+	sess.SetInjectStatusLine(settings.GetInjectStatusLine())
+	sess.SetMouse(settings.GetMouse())
+	sess.SetIndicZeroWidthMarks(settings.IndicZeroWidthMarks)
+	sess.SetClearOnRestart(settings.ClearOnRestart)
+	sess.SetTerminalChromeEnabled(GetTerminalSettings().GetITermBadge())
 }
 
 func (i *Instance) adoptRuntimeSnapshot(state statedb.RuntimeState, bindings map[string]statedb.RuntimeBinding) {

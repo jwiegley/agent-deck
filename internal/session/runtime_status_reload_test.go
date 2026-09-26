@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -226,6 +227,82 @@ esac
 	}
 	if canonical.Tool != "codex" {
 		t.Fatalf("in-flight old detector restored tool %q after reload", canonical.Tool)
+	}
+}
+
+// Every construction of an Instance's tmux wrapper carries the configured
+// per-session options. Runtime adoption (a reload that corrects the tool, or a
+// durable winner under another tmux name) built its wrapper bare, so the
+// adopted session ignored inject_status_line, mouse, clear_on_restart, the
+// Indic zero-width-mark opt-in (#2334) and the terminal-chrome setting until
+// the process restarted.
+func TestRuntimeLifecycle_EveryTmuxWrapperConstructionAppliesSettings(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+	// Every value differs from the wrapper's own default.
+	inject, mouse, badge := false, false, true
+	if err := SaveUserConfig(&UserConfig{
+		Tmux:     TmuxSettings{InjectStatusLine: &inject, Mouse: &mouse, IndicZeroWidthMarks: true, ClearOnRestart: true},
+		Terminal: TerminalSettings{ITermBadge: &badge},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sites := map[string]func(t *testing.T) *tmux.Session{
+		"NewInstance": func(*testing.T) *tmux.Session {
+			return NewInstance("settings", home).tmuxSession
+		},
+		"NewInstanceWithTool": func(*testing.T) *tmux.Session {
+			return NewInstanceWithTool("settings", home, "claude").tmuxSession
+		},
+		"recreateTmuxSession": func(*testing.T) *tmux.Session {
+			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, TmuxSocketName: "isolated"}
+			inst.recreateTmuxSession()
+			return inst.tmuxSession
+		},
+		"storage load": func(t *testing.T) *tmux.Session {
+			instances, _, err := (&Storage{}).convertToInstances(&StorageData{Instances: []*InstanceData{{
+				ID: "settings", Title: "settings", Tool: "claude", ProjectPath: home, TmuxSession: "agentdeck_settings",
+			}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return instances[0].tmuxSession
+		},
+		"runtime adoption": func(*testing.T) *tmux.Session {
+			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, Tool: "claude", Command: "claude"}
+			inst.adoptRuntimeState(statedb.RuntimeState{
+				InstanceID: "settings", Generation: 2, TmuxSession: "agentdeck_settings_g2", TmuxSocketName: "isolated",
+				Status: string(StatusRunning),
+			})
+			return inst.tmuxSession
+		},
+	}
+	for name, build := range sites {
+		t.Run(name, func(t *testing.T) {
+			sess := build(t)
+			if sess == nil {
+				t.Fatal("no tmux wrapper was constructed")
+			}
+			if sess.GetMouse() {
+				t.Error("mouse = true, want the configured false")
+			}
+			fields := reflect.ValueOf(sess).Elem()
+			for field, want := range map[string]bool{
+				"injectStatusLine":       false,
+				"indicZeroWidthMarks":    true,
+				"indicZeroWidthMarksSet": true,
+				"clearOnRestart":         true,
+				"terminalChromeEnabled":  true,
+			} {
+				if got := fields.FieldByName(field).Bool(); got != want {
+					t.Errorf("%s = %v, want the configured %v", field, got, want)
+				}
+			}
+		})
 	}
 }
 
