@@ -13937,12 +13937,16 @@ func (h *Home) tryQuit() (tea.Model, tea.Cmd) {
 	return h.tryQuitWithPool()
 }
 
+// mcpPoolRunningCount is session.GetGlobalPoolRunningCount, a seam for tests
+// that need a running pool without starting MCP servers.
+var mcpPoolRunningCount = session.GetGlobalPoolRunningCount
+
 // tryQuitWithPool quits, first offering to keep a running MCP pool alive.
 func (h *Home) tryQuitWithPool() (tea.Model, tea.Cmd) {
 	// Check if pool is enabled and has running MCPs
 	userConfig, _ := session.LoadUserConfig()
 	if userConfig != nil && userConfig.MCPPool.Enabled {
-		runningCount := session.GetGlobalPoolRunningCount()
+		runningCount := mcpPoolRunningCount()
 		if runningCount > 0 {
 			// Show quit confirmation dialog
 			h.confirmDialog.ShowQuitWithPool(runningCount)
