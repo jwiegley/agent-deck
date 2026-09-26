@@ -280,26 +280,46 @@ func RevalidateRuntimeCandidate(candidate RuntimeCandidate) (RuntimeCandidate, e
 	return verified, nil
 }
 
-// SelectedRuntimeSessionExists asks the server on socketName whether the exact
-// tmux session a durable runtime tuple names still answers has-session. The
-// "=" target disables tmux's prefix and pattern matching, so a similarly named
-// neighbour never answers for it. Only a successful exit is presence. tmux's
-// canonical missing-session answer and the empty-server exits the runtime
-// inventories already read as empty are absence. Anything else is
-// indeterminate and returned as an error, so a destructive caller refuses
-// rather than recording a live process stopped.
-func SelectedRuntimeSessionExists(socketName, sessionName string) (bool, error) {
+// ProbeExactSession asks the server on socketName whether the session named
+// exactly sessionName answers has-session. It is probeSessionExistence with an
+// "=" target, which disables tmux's prefix and pattern matching, so a
+// similarly named neighbour never answers for it. The answer is tri-state:
+// (true, nil) is presence, (false, nil) is absence proved by tmux's canonical
+// missing-session or no-server answer, and a non-nil error is indeterminate.
+// A missing socket file is indeterminate too (see isMissingTmuxSocketResult).
+func ProbeExactSession(socketName, sessionName string) (bool, error) {
 	if sessionName == "" {
-		return false, fmt.Errorf("tmux: empty selected runtime session name")
+		return false, fmt.Errorf("tmux: empty session name to probe")
 	}
-	_, err := runBoundedOutput(socketName, "has-session", "-t", "="+sessionName)
-	if err == nil {
+	switch state, err := probeSessionExistence(socketName, "="+sessionName); state {
+	case sessionExistencePresent:
 		return true, nil
+	case sessionExistenceAbsent:
+		return false, nil
+	default:
+		return false, fmt.Errorf("tmux: probe session %q on socket %q: %w", sessionName, socketName, err)
 	}
-	if isCanonicalMissingSessionResult(err, sessionName) || isEmptyTmuxServerResult(err) {
+}
+
+// SelectedRuntimeSessionExists asks whether the exact tmux session a durable
+// runtime tuple names still answers, for a destruction whose inventories hold
+// no provable candidate. It is ProbeExactSession with one deliberate
+// difference: a missing socket file also reads as absence, as it does for the
+// inventories that just came back empty (isEmptyTmuxServerResult). Where no
+// server has run since boot there is no socket file at all, and a stop or a
+// delete after a reboot must still complete. The cost is the trade-off
+// isMissingTmuxSocketResult records: a live server whose socket file was
+// unlinked (macOS's /tmp cleaner) or that runs under another TMUX_TMPDIR reads
+// as gone, so the destruction records stopped over processes this process
+// cannot reach. Every other failure is indeterminate and returned as an
+// error, so a destructive caller refuses rather than recording a live process
+// stopped.
+func SelectedRuntimeSessionExists(socketName, sessionName string) (bool, error) {
+	live, err := ProbeExactSession(socketName, sessionName)
+	if err != nil && isMissingTmuxSocketResult(err) {
 		return false, nil
 	}
-	return false, fmt.Errorf("tmux: probe selected runtime session %q on socket %q: %w", sessionName, socketName, err)
+	return live, err
 }
 
 // ListRuntimeCandidates inventories exact AGENTDECK_INSTANCE_ID matches on one

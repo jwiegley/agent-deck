@@ -543,9 +543,10 @@ func isNoTmuxServerResult(err error) bool {
 // lifecycle decision. The cost is that a live server behind an unlinked or
 // relocated socket reads as empty, so its sessions look gone to those
 // inventories' consumers (reserved-destruction completion, the `session
-// cleanup` purge). The foreign-server guard, which computes the default socket
-// while $TMUX names another server, does not accept that cost
-// (listDefaultServerSessions).
+// cleanup` purge) and to SelectedRuntimeSessionExists, which completes a
+// destruction those inventories found empty. Two probes do not accept that
+// cost: ProbeExactSession, and the foreign-server guard, which computes the
+// default socket while $TMUX names another server (listDefaultServerSessions).
 func isMissingTmuxSocketResult(err error) bool {
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {
@@ -3868,7 +3869,9 @@ const (
 
 // probeSessionExistence is deliberately tri-state. Only tmux's canonical
 // no-session/no-server answers prove absence; launch, permission, socket,
-// protocol, and timeout failures remain indeterminate.
+// protocol, and timeout failures remain indeterminate. An exact-name target
+// ("=name", see ProbeExactSession) is accepted: tmux names the session it
+// cannot find without the "=".
 func probeSessionExistence(socketName, target string) (sessionExistence, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
 	defer cancel()
@@ -3879,7 +3882,7 @@ func probeSessionExistence(socketName, target string) (sessionExistence, error) 
 	if ctx.Err() != nil {
 		return sessionExistenceIndeterminate, annotateDeadline(ctx.Err(), err)
 	}
-	if isCanonicalMissingSessionResult(err, target) {
+	if isCanonicalMissingSessionResult(err, strings.TrimPrefix(target, "=")) {
 		return sessionExistenceAbsent, nil
 	}
 	return sessionExistenceIndeterminate, err
