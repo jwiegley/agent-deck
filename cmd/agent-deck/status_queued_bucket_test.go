@@ -68,6 +68,12 @@ func TestQueuedGlyphAgreesBetweenStatusAndShow(t *testing.T) {
 	if row == nil {
 		t.Fatalf("status -v has no QUEUED row for codex queued:\n%s", stdout)
 	}
+	// Both surfaces take the glyph from StatusSymbol, so agreement alone
+	// would also hold if StatusSymbol lost its queued case and both drew
+	// "?". Pin the glyph the QUEUED section has always drawn.
+	if row[1] != "○" {
+		t.Fatalf("status -v draws queued as %q, want %q", row[1], "○")
+	}
 
 	stdout, stderr, exit = runGoldensStreamsIn(t, bin, env, home, []string{"-p", goldensProfile, "session", "show", "golden-sess-6"})
 	if exit != 0 {
