@@ -1,7 +1,9 @@
 package session
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -103,9 +105,40 @@ func TestPersistSpawnFailureStatusSparesLiveRuntime(t *testing.T) {
 		}}, nil
 	}
 
-	require.ErrorIs(t, PersistSpawnFailureStatus(storage, inst), statedb.ErrRuntimeGenerationConflict)
+	err := PersistSpawnFailureStatus(storage, inst)
+	require.ErrorIs(t, err, statedb.ErrRuntimeGenerationConflict)
+	require.ErrorContains(t, err, fmt.Sprintf("a live runtime (generation %d, tmux session %q) was found; not marking it errored",
+		durable.Generation, durable.TmuxSession))
 	got, found, err := storage.GetDB().ReadRuntimeState(inst.ID)
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Equal(t, durable, got)
+}
+
+// Reconciliation can prove the failed spawn itself live (verification gave up
+// on a probe that timed out) and adopt it. The refusal must say a live
+// runtime was kept, naming the generation it now holds, and that runtime keeps
+// its own status.
+func TestPersistSpawnFailureStatusSparesAdoptedLiveSpawn(t *testing.T) {
+	storage, inst, durable := persistSpawnFailureFixture(t, "_test_spawn_failure_adopted")
+	spawned := inst.RuntimeState()
+	runtimeCandidateInventoryFn = func(string, string) ([]tmux.RuntimeCandidate, error) {
+		return []tmux.RuntimeCandidate{{
+			SessionID: "$1", PaneID: "%1", SessionName: spawned.TmuxSession, SocketName: spawned.TmuxSocketName,
+			InstanceID: spawned.InstanceID, Generation: spawned.Generation, GenerationKnown: true, PanePID: 4242,
+			StatusRevision: 0, Status: string(StatusRunning),
+			LastStartedUnixNano: time.Unix(50, 0).UnixNano(), StateKnown: true,
+			BindingKind: activeRuntimeBindingKind(inst), BindingKnown: true,
+		}}, nil
+	}
+
+	err := PersistSpawnFailureStatus(storage, inst)
+	require.ErrorIs(t, err, statedb.ErrRuntimeGenerationConflict)
+	require.ErrorContains(t, err, fmt.Sprintf("a live runtime (generation %d, tmux session %q) was found; not marking it errored",
+		durable.Generation+1, spawned.TmuxSession))
+	got, found, err := storage.GetDB().ReadRuntimeState(inst.ID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, durable.Generation+1, got.Generation)
+	require.Equal(t, string(StatusRunning), got.Status, "the adopted live spawn must keep its own status")
 }

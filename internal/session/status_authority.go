@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -231,13 +232,14 @@ func PersistSelectedStatus(storage *Storage, inst *Instance, status Status) erro
 }
 
 // PersistSpawnFailureStatus durably marks a start or restart whose spawn
-// verification failed as errored. A pane that died before its generation was
-// committed leaves inst holding that uncommitted successor of the durable
-// generation: the partial success adopted it and reconciliation could not
-// prove it live. The verdict then belongs to the durable predecessor the
-// failed transition started from, so inst re-derives the canonical runtime
-// first; a live runtime found there is a replacement and never inherits the
-// error. A committed generation goes straight to PersistSelectedStatus.
+// verification failed as errored. A partial success whose generation was
+// never committed leaves inst holding that uncommitted successor of the
+// durable generation. The verdict then belongs to the canonical runtime, so
+// inst re-derives it first. Reconciliation may prove a runtime live there: a
+// replacement, or the very spawn verification gave up on (a probe that timed
+// out), which reconciliation has just adopted and committed. Neither inherits
+// the error; the refusal says a live runtime was kept. A committed generation
+// goes straight to PersistSelectedStatus.
 func PersistSpawnFailureStatus(storage *Storage, inst *Instance) error {
 	if storage == nil || storage.GetDB() == nil {
 		return errors.New("session: persist status: storage unavailable")
@@ -252,7 +254,8 @@ func PersistSpawnFailureStatus(storage *Storage, inst *Instance) error {
 			return err
 		}
 		if reconciled.Live {
-			return statedb.ErrRuntimeGenerationConflict
+			return fmt.Errorf("a live runtime (generation %d, tmux session %q) was found; not marking it errored: %w",
+				reconciled.State.Generation, reconciled.State.TmuxSession, statedb.ErrRuntimeGenerationConflict)
 		}
 	}
 	return PersistSelectedStatus(storage, inst, StatusError)
