@@ -7113,7 +7113,10 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 // session DetectTool's pane capture fails and reports "shell", which would
 // rename a stored claude, codex or gemini session. As upstream, only native
 // session-ID discovery is left to the poller (syncMetadata); read-only
-// listings still publish hook bindings and detect the tool.
+// listings still publish hook bindings and detect the tool. A listing never
+// waits for the instance spawn lock to publish, though: a start or restart can
+// hold it for the lock's whole budget, and a later uncontended pass publishes
+// the binding a contended listing skips.
 func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState, hookObservation RuntimeBindingObservation, paneSampled, syncMetadata bool, pass *StatusUpdatePass) {
 	i.mu.Lock()
 	if !sameStatusRuntime(committed, i.runtimeStateLocked()) {
@@ -7127,7 +7130,7 @@ func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState
 	i.mu.Unlock()
 
 	if hookSessionID != "" && runtimeBindingKindSupported(hookObservation.kind) {
-		if err := i.publishHookRuntimeBindingObservation(hookObservation, hookSessionID, hookFingerprint); err != nil {
+		if err := i.publishHookRuntimeBindingObservation(hookObservation, hookSessionID, hookFingerprint, syncMetadata); err != nil {
 			sessionLog.Debug("status_hook_binding_rejected",
 				slog.String("kind", hookObservation.kind), slog.String("session_id", hookSessionID),
 				slog.String("error", err.Error()))
@@ -7582,7 +7585,7 @@ func (i *Instance) publishObservedRuntimeBindingLocked(observation RuntimeBindin
 	// global lock order (spawn lock, then i.mu), so leave the instance critical
 	// section before entering the single CAS authority.
 	i.mu.Unlock()
-	err := i.publishHookRuntimeBindingObservation(observation, sessionID, fingerprint)
+	err := i.publishHookRuntimeBindingObservation(observation, sessionID, fingerprint, true)
 	i.mu.Lock()
 	if err != nil {
 		sessionLog.Warn("runtime_binding_persist_failed",

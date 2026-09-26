@@ -166,6 +166,60 @@ func TestStatusMetadataRefresh_StatusOnlyPassLeavesDiscoveryToPoller(t *testing.
 	}
 }
 
+// A read-only listing publishes a cached hook's binding without waiting for
+// the instance spawn lock: a start or restart can hold it for the lock's whole
+// 30-second budget, and a listing that waited would stall that long for every
+// such session. A contended listing still commits its verdict and skips the
+// binding, which the next uncontended pass publishes.
+func TestStatusMetadataRefresh_StatusOnlyPassSkipsHeldSpawnLock(t *testing.T) {
+	const hookSessionID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+	t.Setenv("HOME", t.TempDir())
+	storage, inst := loadStatusMetadataFixture(t, "claude", "agentdeck-status-spawn-lock", StatusRunning)
+	stageForeignServerGuard(t, func(*tmux.Session) bool { return false })
+	inst.mu.Lock()
+	inst.hookSessionID = hookSessionID
+	inst.mu.Unlock()
+	listing := func() error {
+		var pass StatusUpdatePass
+		return pass.UpdateStatusOnly(inst)
+	}
+
+	release, err := acquireInstanceSpawnLock(inst.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- listing() }()
+	select {
+	case err := <-done:
+		release()
+		if err != nil {
+			t.Fatalf("status-only pass: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		release()
+		<-done
+		t.Fatal("a status-only pass waited for the held instance spawn lock")
+	}
+	if got := inst.GetStatusThreadSafe(); got != StatusError {
+		t.Fatalf("status = %q, want the contended pass's verdict %q committed", got, StatusError)
+	}
+	if binding, bound, err := storage.db.ReadRuntimeBinding(inst.ID, "claude"); err != nil || bound && binding.Value == hookSessionID {
+		t.Fatalf("contended pass published the binding: %+v bound=%v err=%v", binding, bound, err)
+	}
+
+	// Once the error recheck is due again, an uncontended listing publishes it.
+	inst.mu.Lock()
+	inst.lastErrorCheck = time.Now().Add(-errorRecheckInterval)
+	inst.mu.Unlock()
+	if err := listing(); err != nil {
+		t.Fatalf("uncontended status-only pass: %v", err)
+	}
+	if binding, bound, err := storage.db.ReadRuntimeBinding(inst.ID, "claude"); err != nil || !bound || binding.Value != hookSessionID {
+		t.Fatalf("claude binding = %+v bound=%v err=%v, want the hook's %q published", binding, bound, err, hookSessionID)
+	}
+}
+
 // startEarlyExitPane starts a live tmux pane that prints frame and stays up,
 // and waits until the frame is on screen.
 func startEarlyExitPane(t *testing.T, name, frame string) {

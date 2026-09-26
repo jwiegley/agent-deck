@@ -166,7 +166,7 @@ func TestCodexHookPublication_RechecksPreviouslyUnflushedCandidate(t *testing.T)
 	}
 
 	seedCodexRolloutWithMeta(t, codexHome, childID, "subagent", uniqueSID(t), true)
-	err = inst.publishHookRuntimeBindingObservation(inst.captureActiveRuntimeBindingObservation(), childID, hs.Fingerprint)
+	err = inst.publishHookRuntimeBindingObservation(inst.captureActiveRuntimeBindingObservation(), childID, hs.Fingerprint, true)
 	if err == nil {
 		t.Fatal("unchanged fingerprint bypassed newly flushed subagent metadata")
 	}
