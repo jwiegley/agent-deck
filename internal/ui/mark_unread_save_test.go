@@ -8,23 +8,28 @@ import (
 )
 
 // Pressing `u` (mark unread) clears the acknowledged flag with a targeted
-// write, flips the in-memory status to waiting, and saves.
+// write, recomputes the status to waiting, and saves.
 //
 // The targeted write moves last_modified. The save's external-change guard
 // compares last_modified against the value captured at load, so without
 // adoptOwnWrite the guard fires on this TUI's OWN bump: the save aborts and
-// schedules a reload instead, the reload rebuilds acknowledged from the stored
-// status -- still "idle", because the aborted save was the one that would have
-// written "waiting" -- and the row goes straight back to gray. The key flashes
-// yellow and reverts, however many times it is pressed.
+// schedules a reload instead.
+//
+// Upstream's rationale, where the save persisted status: the reload rebuilt
+// acknowledged from the stored status -- still "idle", because the aborted
+// save was the one that would have written "waiting" -- so the row went
+// straight back to gray, however many times the key was pressed.
+//
+// Under runtime authority that half no longer applies: the handler's
+// UpdateStatus commits waiting through the status CAS before the save, and
+// snapshot saves drop runtime-owned status, so the stored status is the same
+// whether the save commits or aborts. The false positive still costs the
+// save itself: the snapshot it carries is discarded, and the TUI schedules a
+// reload for a change it made itself. The fixture publishes the probe result
+// the way the handler does and checks that the save committed.
 //
 // This exercises the same sequence as the `u` case in updateInner, minus the
 // tmux session it needs to reach that code.
-//
-// Under runtime authority the status flip is not an in-memory assignment that
-// the save persists: the handler's UpdateStatus recomputes waiting from the
-// cleared flag and commits it through the status CAS. The fixture publishes
-// that probe result the same way, then checks the save itself committed.
 func TestMarkUnread_SaveIsNotAbortedByItsOwnWrite(t *testing.T) {
 	h, storage := newHeadlessHomeForTest(t, "_test_mark_unread_save")
 
@@ -66,10 +71,10 @@ func TestMarkUnread_SaveIsNotAbortedByItsOwnWrite(t *testing.T) {
 	// --- end ---
 
 	// Status is runtime-owned, so the save above no longer carries it and the
-	// stored status alone cannot tell a committed save from an aborted one. A
+	// stored status cannot tell a committed save from an aborted one. A
 	// committed save stamps last_modified past the acknowledged write and
 	// advances this TUI's freshness marker to it; an abort leaves the marker
-	// behind and schedules the reload that restores a stale snapshot.
+	// behind and schedules a reload instead.
 	current, err := storage.GetFileMtime()
 	if err != nil {
 		t.Fatalf("GetFileMtime after save: %v", err)
@@ -77,19 +82,6 @@ func TestMarkUnread_SaveIsNotAbortedByItsOwnWrite(t *testing.T) {
 	if !current.After(time.Unix(0, stamps.After)) || !h.lastLoadMtime.Equal(current) {
 		t.Errorf("save aborted on this TUI's own acknowledged write: last_modified=%d marker=%d "+
 			"acknowledged-write=%d", current.UnixNano(), h.lastLoadMtime.UnixNano(), stamps.After)
-	}
-
-	rows, err := storage.GetDB().LoadInstances()
-	if err != nil {
-		t.Fatalf("LoadInstances: %v", err)
-	}
-	if len(rows) != 1 {
-		t.Fatalf("LoadInstances returned %d rows, want 1", len(rows))
-	}
-	if rows[0].Status != string(session.StatusWaiting) {
-		t.Errorf("stored status = %q, want %q: the save aborted on this TUI's own acknowledged "+
-			"write, so a reload restores the session as acknowledged (gray) and mark-unread "+
-			"appears to do nothing", rows[0].Status, session.StatusWaiting)
 	}
 }
 
