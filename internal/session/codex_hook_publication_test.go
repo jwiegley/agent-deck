@@ -13,10 +13,10 @@ import (
 // fixtures; no agent process is needed to reproduce the binding corruption.
 func TestCodexHookPublication(t *testing.T) {
 	for _, mode := range []string{"cold-child", "cached-child", "rejected-cached-child", "cold-root"} {
+		// Status-only callers (read-only listings) publish hook bindings too, as
+		// upstream's hook fast path binds whatever the caller; only native
+		// session-ID discovery is left to the poller.
 		for _, statusOnly := range []bool{false, true} {
-			if statusOnly && mode == "cold-root" {
-				continue // Status-only callers deliberately do not publish a new binding.
-			}
 			name := mode
 			if statusOnly {
 				name += "-status-only"
