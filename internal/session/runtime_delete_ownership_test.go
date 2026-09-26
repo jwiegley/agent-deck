@@ -420,7 +420,9 @@ func TestStoppedRuntime_StopsReadingLive(t *testing.T) {
 }
 
 // configureDefaultProfileForTest makes profile config.json's default_profile,
-// the profile a bare agent-deck command opens, and restores the file after.
+// the profile a bare agent-deck command falls back to when neither
+// AGENTDECK_PROFILE nor CLAUDE_CONFIG_DIR names one, and restores the file
+// after.
 func configureDefaultProfileForTest(t *testing.T, profile string) {
 	t.Helper()
 	path, err := GetConfigPath()
@@ -442,11 +444,12 @@ func configureDefaultProfileForTest(t *testing.T, profile string) {
 
 // A pre-stamp runtime that still holds its one-time migration record is
 // refused like any unproven one, and the refusal points at the adoption that
-// stamps it. The adoption names the refusing profile unless a bare command
-// already opens it: without -p it resolved the instance in the configured
-// default profile and failed with not-found. Without the record only the
-// manual remedy is offered, and so it is for a name legacy adoption does not
-// accept.
+// stamps it. The adoption always names the refusing profile, the configured
+// default included: a bare command resolves the instance in whatever profile
+// the operator's shell selects (AGENTDECK_PROFILE, which every Agent Deck pane
+// exports, then CLAUDE_CONFIG_DIR, then the configured default) and fails
+// with not-found in any other. Without the record only the manual remedy is
+// offered, and so it is for a name legacy adoption does not accept.
 func TestRuntimeLifecycle_UnprovenLegacyRuntimeRefusalOffersAdoption(t *testing.T) {
 	db, inst, state, _ := legacyRuntimeAdoptionFixture(t)
 	installRuntimeLifecycleTestSeams(t)
@@ -467,9 +470,9 @@ func TestRuntimeLifecycle_UnprovenLegacyRuntimeRefusalOffersAdoption(t *testing.
 		{name: "another profile", profile: "_test_adoption",
 			adoption: "agent-deck -p _test_adoption session adopt-runtime legacy-one --yes"},
 		{name: "the default profile", profile: DefaultProfile,
-			adoption: "agent-deck session adopt-runtime legacy-one --yes"},
+			adoption: "agent-deck -p default session adopt-runtime legacy-one --yes"},
 		{name: "the configured default profile", profile: "work", configuredDefault: "work",
-			adoption: "agent-deck session adopt-runtime legacy-one --yes"},
+			adoption: "agent-deck -p work session adopt-runtime legacy-one --yes"},
 		{name: "the default profile beside a configured default", profile: DefaultProfile, configuredDefault: "work",
 			adoption: "agent-deck -p default session adopt-runtime legacy-one --yes"},
 	} {
