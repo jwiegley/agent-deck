@@ -8,12 +8,25 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
+
+// isolateStatusFleetDB detaches the process-global state database for a fleet
+// of unsaved rows. Status publication falls back to that database, where these
+// rows have no persisted incarnation, so a Home left behind by an earlier test
+// would make every probe lose its commit instead of updating the row.
+func isolateStatusFleetDB(t *testing.T) {
+	t.Helper()
+	previous := statedb.GetGlobal()
+	statedb.SetGlobal(nil)
+	t.Cleanup(func() { statedb.SetGlobal(previous) })
+}
 
 // priorityFleet is 100 running rows behind a tmux shim that answers every
 // probe with exit 0; a polled row leaves StatusRunning, an unpolled one keeps it.
 func priorityFleet(t *testing.T) (*Home, func() []int) {
 	t.Helper()
+	isolateStatusFleetDB(t)
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)

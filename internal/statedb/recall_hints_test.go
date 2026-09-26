@@ -17,8 +17,9 @@ func TestRecallTables_NoSchemaVersionBump(t *testing.T) {
 	if err := db.DB().QueryRow(`SELECT value FROM metadata WHERE key = 'schema_version'`).Scan(&version); err != nil {
 		t.Fatalf("read schema_version: %v", err)
 	}
-	if version != strconv.Itoa(SchemaVersion) || SchemaVersion != 13 {
-		t.Fatalf("schema_version = %s, SchemaVersion = %d; want 13 (no bump for recall tables)", version, SchemaVersion)
+	// 18 is the runtime-lifecycle schema this tree carries; recall adds nothing.
+	if version != strconv.Itoa(SchemaVersion) || SchemaVersion != 18 {
+		t.Fatalf("schema_version = %s, SchemaVersion = %d; want 18 (no bump for recall tables)", version, SchemaVersion)
 	}
 	for _, table := range []string{"session_hints", "session_tags", "session_links"} {
 		var name string

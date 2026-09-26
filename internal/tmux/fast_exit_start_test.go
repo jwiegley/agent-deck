@@ -15,7 +15,7 @@ func TestStartCommandSpecRetainsFastExitInSpawnQueue(t *testing.T) {
 	if launcher != "tmux" {
 		t.Fatalf("launcher = %q, want tmux", launcher)
 	}
-	want := []string{";", "set-option", "-t", s.Name, "remain-on-exit", "on"}
+	want := []string{";", "set-option", "-t", "=" + s.Name + ":0", "remain-on-exit", "on"}
 	if len(args) < len(want) || !reflect.DeepEqual(args[len(args)-len(want):], want) {
 		t.Fatalf("fast-exit option must follow new-session in the same tmux call: %v", args)
 	}
