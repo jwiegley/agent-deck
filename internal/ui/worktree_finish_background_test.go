@@ -2,6 +2,7 @@ package ui
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -81,14 +82,59 @@ func TestQuitAsksBeforeAbandoningABackgroundWorktreeFinish(t *testing.T) {
 		require.True(t, h.worktreeFinishDialog.IsExecuting(), "cancelling the quit (%s) must leave the finish running", tc.name)
 	}
 
-	h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-	require.True(t, h.confirmDialog.IsVisible())
-	_, cmd := h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
-	require.False(t, h.confirmDialog.IsVisible())
-	require.True(t, h.isQuitting, "confirming must quit even though the finish still runs")
-	require.NotNil(t, cmd)
-	_, ok := cmd().(quitMsg)
-	require.True(t, ok, "confirming must schedule the ordinary quit")
+	// Confirming, with y or with Enter on "Quit anyway", goes on to the
+	// ordinary quit, including its MCP-pool prompt when a pool is running.
+	for _, confirm := range []struct {
+		name string
+		keys []tea.KeyMsg
+	}{
+		{"y", []tea.KeyMsg{{Type: tea.KeyRunes, Runes: []rune{'y'}}}},
+		{"Enter on Quit anyway", []tea.KeyMsg{{Type: tea.KeyLeft}, {Type: tea.KeyEnter}}},
+	} {
+		for _, poolRunning := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, MCP pool running %v", confirm.name, poolRunning), func(t *testing.T) {
+				h, running, _, pressFinish := newWorktreeFinishFixture(t)
+				if poolRunning {
+					runMCPPool(t, 2)
+				}
+				dismissFinishIntoBackground(t, h, running, pressFinish)
+				h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+				require.Equal(t, ConfirmQuitWithWorktreeFinish, h.confirmDialog.GetConfirmType())
+				var cmd tea.Cmd
+				for _, key := range confirm.keys {
+					_, cmd = h.Update(key)
+				}
+				want := quitMsg(true) // no pool to keep: the default clean exit
+				if poolRunning {
+					require.Nil(t, cmd, "the pool prompt comes before the quit")
+					require.False(t, h.isQuitting, "the pool prompt comes before the quit")
+					require.True(t, h.confirmDialog.IsVisible(), "confirming must go on to the MCP-pool prompt")
+					require.Equal(t, ConfirmQuitWithPool, h.confirmDialog.GetConfirmType())
+					require.Contains(t, stripAnsi(h.View()), "2 MCP servers are running in the pool.")
+					_, cmd = h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+					want = quitMsg(false) // keep the pool running
+				}
+				require.False(t, h.confirmDialog.IsVisible())
+				require.True(t, h.isQuitting, "confirming must quit even though the finish still runs")
+				require.True(t, h.worktreeFinishDialog.IsExecuting())
+				require.NotNil(t, cmd)
+				require.Equal(t, want, cmd(), "confirming must schedule the ordinary quit")
+			})
+		}
+	}
+}
+
+// runMCPPool enables [mcp_pool] in the fixture's config and has the pool
+// report running MCP servers, without starting any.
+func runMCPPool(t *testing.T, running int) {
+	t.Helper()
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
+	require.NoError(t, session.SaveUserConfig(&session.UserConfig{MCPPool: session.MCPPoolSettings{Enabled: true}}))
+	session.ClearUserConfigCache()
+	prev := mcpPoolRunningCount
+	mcpPoolRunningCount = func() int { return running }
+	t.Cleanup(func() { mcpPoolRunningCount = prev })
 }
 
 // The finish can report while its quit confirmation is open. The confirmation
