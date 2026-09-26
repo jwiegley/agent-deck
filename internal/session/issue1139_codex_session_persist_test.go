@@ -261,11 +261,12 @@ func TestCodexRebindNoOpWhenStateDBUnset(t *testing.T) {
 }
 
 // TestCodexRebindPreservesUnrelatedToolDataKeys pins the json_set
-// semantics of WriteCodexSessionBinding: only $.codex_session_id and
-// $.codex_detected_at may be rewritten — every other key in tool_data
-// must survive untouched. Prevents a future "let's just do
-// tool_data = ?" simplification from silently dropping unrelated state
-// on every Codex rebind.
+// semantics of the bind path's tool_data write (the runtime binding
+// CAS's projection, as upstream's WriteCodexSessionBinding was): only
+// $.codex_session_id and $.codex_detected_at may be rewritten — every
+// other key in tool_data must survive untouched. Prevents a future
+// "let's just do tool_data = ?" simplification from silently dropping
+// unrelated state on every Codex rebind.
 func TestCodexRebindPreservesUnrelatedToolDataKeys(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
