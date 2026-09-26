@@ -14,20 +14,28 @@ import (
 
 // A blocked legacy registry read stands in for arbitrarily slow cleanup IO.
 // Exercise the actual deletion handlers, without a replacement cleanup stub.
+//
+// Under runtime authority the delete and finish commands own the whole
+// deletion: they claim the captured runtime, delete its row, and prune hook
+// artifacts under the instance lifecycle lock before reporting the result. So
+// the key handlers must only dispatch that command, the row must be gone
+// before cleanup starts, and undo becomes available only once the reported
+// deletion (cleanup included) has been applied.
 func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		msg  tea.Msg
-		undo bool
+		name   string
+		finish bool
+		undo   bool
 	}{
-		{"delete", sessionDeletedMsg{deletedID: "gone"}, false},
-		{"finish", worktreeFinishResultMsg{sessionID: "gone", sessionTitle: "gone"}, false},
-		{"undo", sessionDeletedMsg{deletedID: "gone"}, true},
+		{"delete", false, false},
+		{"finish", true, false},
+		{"undo", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
 			t.Setenv("XDG_DATA_HOME", "")
 			t.Setenv("XDG_CONFIG_HOME", "")
+			detachGlobalStateDB(t) // NewHome registers its own, soon-closed database.
 			h := NewHome()
 			require.NotNil(t, h.storage)
 			t.Cleanup(func() { _ = h.storage.Close() })
@@ -64,8 +72,25 @@ func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 					time.Sleep(time.Millisecond)
 				}
 			}
+			// Confirming the deletion is the UI handler; it must only dispatch.
+			var keys []tea.KeyMsg
+			if tc.finish {
+				// A non-repository root keeps the finish's git steps inert.
+				h.worktreeFinishDialog.Show(inst.ID, inst.Title, "gone-branch", t.TempDir(), filepath.Join(t.TempDir(), "missing"), "main")
+				keys = []tea.KeyMsg{
+					{Type: tea.KeySpace, Runes: []rune{' '}}, // no merge
+					{Type: tea.KeyEnter},
+					{Type: tea.KeyRunes, Runes: []rune{'y'}},
+				}
+			} else {
+				h.confirmDialog.ShowDeleteSession(inst.ID, inst.Title, false, false)
+				keys = []tea.KeyMsg{{Type: tea.KeyRunes, Runes: []rune{'y'}}}
+			}
+			for _, key := range keys[:len(keys)-1] {
+				h.Update(key)
+			}
 			returned := make(chan tea.Cmd, 1)
-			go func() { _, cmd := h.Update(tc.msg); returned <- cmd }()
+			go func() { _, cmd := h.Update(keys[len(keys)-1]); returned <- cmd }()
 			var cmd tea.Cmd
 			select {
 			case cmd = <-returned:
@@ -80,29 +105,29 @@ func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 				}
 				t.Fatal("UI deletion handler blocked on hook cleanup")
 			}
-			require.NotNil(t, cmd, "deletion must schedule cleanup")
-			rows, _, err := h.storage.LoadLite()
-			require.NoError(t, err)
-			require.Empty(t, rows, "registry deletion must commit before returning")
-			done := make(chan struct{})
-			go func() { cmd(); close(done) }()
+			require.NotNil(t, cmd, "deletion must dispatch its lifecycle command")
+			result := make(chan tea.Msg, 1)
+			go func() { result <- cmd() }()
 			writer := openWriter()
 			defer writer.Close()
 			select {
-			case <-done:
+			case <-result:
 				t.Fatal("cleanup did not wait for the delayed registry")
 			default:
 			}
+			rows, _, err := h.storage.LoadLite()
+			require.NoError(t, err)
+			require.Empty(t, rows, "registry deletion must commit before cleanup")
 			// Input and rendering still work while the command waits on the registry.
 			h.Update(tea.WindowSizeMsg{Width: 110, Height: 35})
 			require.Equal(t, 110, h.width)
-			h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
-			require.True(t, h.search.IsVisible(), "search input must work while cleanup is blocked")
-			if !tc.undo {
-				// The undo case is also run against a pinned pre-fix revision
-				// (hooks-fd-macos.yml) whose search overlay renders
-				// differently; it must reach the undo assertion below, so the
-				// frame is pinned by the two cases that stop here.
+			if tc.finish {
+				// Finish stays modal until its command reports, cleanup included,
+				// just as it is during the merge and worktree steps before it.
+				require.Contains(t, stripAnsi(h.View()), "Finishing Worktree...")
+			} else {
+				h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+				require.True(t, h.search.IsVisible(), "search input must work while cleanup is blocked")
 				frame := stripAnsi(h.View())
 				if os.Getenv("UPDATE_GOLDEN") == "1" {
 					require.NoError(t, os.WriteFile("testdata/hook_cleanup_search.txt", []byte(frame), 0644))
@@ -112,33 +137,42 @@ func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 				require.Equal(t, string(golden), frame, "search frame while deletion cleanup is blocked")
 			}
 			require.FileExists(t, artifact)
-			var undoResult chan tea.Msg
 			if tc.undo {
-				// A deliberately invalid account makes Restart return before any
-				// process launch. Its error still reveals when Restart was attempted.
-				inst.Account = "missing-undo-test-account"
+				// The deletion has not been reported yet, so there is nothing a
+				// restart could race: undo must not be offered.
 				h.Update(tea.KeyMsg{Type: tea.KeyEsc})
 				_, undoCmd := h.Update(tea.KeyMsg{Type: tea.KeyCtrlZ})
-				require.NotNil(t, undoCmd)
-				undoResult = make(chan tea.Msg, 1)
-				go func() { undoResult <- undoCmd() }()
-				select {
-				case result := <-undoResult:
-					t.Error("undo restarted before hook cleanup completed")
-					undoResult <- result
-				case <-time.After(100 * time.Millisecond):
-				}
+				require.Nil(t, undoCmd, "undo offered before hook cleanup completed")
 			}
 			_, err = writer.Write([]byte(`{"instances":[]}`))
 			require.NoError(t, err)
 			require.NoError(t, writer.Close())
+			var deleted tea.Msg
 			select {
-			case <-done:
+			case deleted = <-result:
 			case <-time.After(5 * time.Second):
 				t.Fatal("background cleanup did not complete")
 			}
 			require.NoFileExists(t, artifact)
-			if undoResult != nil {
+			if tc.finish {
+				finished, ok := deleted.(worktreeFinishResultMsg)
+				require.True(t, ok, "finish reported %T", deleted)
+				require.NoError(t, finished.err)
+			} else {
+				reported, ok := deleted.(sessionDeletedMsg)
+				require.True(t, ok, "delete reported %T", deleted)
+				require.NoError(t, reported.killErr)
+			}
+			h.Update(deleted)
+			require.Nil(t, h.getInstanceByID(inst.ID), "reported deletion must leave the session list")
+			if tc.undo {
+				// A deliberately invalid account makes Restart return before any
+				// process launch. Its error still reveals when Restart was attempted.
+				inst.Account = "missing-undo-test-account"
+				_, undoCmd := h.Update(tea.KeyMsg{Type: tea.KeyCtrlZ})
+				require.NotNil(t, undoCmd)
+				undoResult := make(chan tea.Msg, 1)
+				go func() { undoResult <- undoCmd() }()
 				select {
 				case result := <-undoResult:
 					restored, ok := result.(sessionRestoredMsg)
