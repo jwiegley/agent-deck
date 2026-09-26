@@ -2510,7 +2510,7 @@
    "user_verified": "2026-06-11",
    "evidence": "evidence/cli/ev-CAP-CLI-008-CLI.txt",
    "status": "verified",
-   "notes": "status default prints '<w> waiting \u2022 <r> running \u2022 <i> idle'; -q prints only waiting count (script-friendly); -v grouped detail with model column; --json {waiting,running,idle,error,stopped,total}; --"
+   "notes": "status default prints '<w> waiting \u2022 <r> running \u2022 <i> idle'; -q prints only waiting count (script-friendly); -v grouped detail with model column; --json {waiting,running,idle,error,stopped,queued,total}; --"
   },
   {
    "id": "CAP-CLI-009",

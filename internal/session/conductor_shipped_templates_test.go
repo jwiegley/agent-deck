@@ -45,17 +45,19 @@ func loadShippedConductorTemplates(t *testing.T) []shippedConductorTemplate {
 }
 
 // TestShippedConductorTemplatesAreRecognizedAsGenerated proves, against the
-// templates that actually shipped (v1.15.0, v1.16.5, v1.16.8, v1.16.10 for
-// generation 0; v1.10.9, v1.10.10, v1.10.11 for generation 1; v1.11.0 as the
-// generation-0 boundary), that a conductor left on any released instructions
-// file is recognised as generated and migrated in place through the full
+// templates that actually shipped (v1.16.11-v1.16.17 for generation 0;
+// v1.15.0, v1.16.5, v1.16.8, v1.16.10 for generation 1; v1.10.9, v1.10.10,
+// v1.10.11 for generation 2; v1.11.0 as the generation-1 boundary), that a
+// conductor left on any released instructions file is recognised as
+// generated and migrated in place through the full
 // conductorInstructionsGenerations list, while a hand-written file is left
 // alone.
 //
-// Fixture rows span exactly 2 distinct blobs: v1.11.0-v1.16.10 share one
-// (the immediately previous generation), v1.10.9-v1.10.11 share the other
-// (one generation further back, predating #1814's substate-guidance row).
-// v1.9.73 and v1.9.70 are intentionally not covered; see the tsv header.
+// Fixture rows span exactly 3 distinct blobs: v1.16.11-v1.16.17 share one
+// (the immediately previous generation, before the fork documented the
+// queued count), v1.11.0-v1.16.10 share another, and v1.10.9-v1.10.11 the
+// third (predating #1814's substate-guidance row). v1.9.73 and v1.9.70 are
+// intentionally not covered; see the tsv header.
 func TestShippedConductorTemplatesAreRecognizedAsGenerated(t *testing.T) {
 	rows := loadShippedConductorTemplates(t)
 
@@ -65,10 +67,10 @@ func TestShippedConductorTemplatesAreRecognizedAsGenerated(t *testing.T) {
 		blobs[r.blob] = true
 		tags[r.tag] = true
 	}
-	if len(blobs) != 2 {
-		t.Fatalf("shipped templates span %d distinct blobs %v; conductorInstructionsGenerations reconstructs exactly 2 prior generations, update the fixture and the generation count together", len(blobs), blobs)
+	if len(blobs) != 3 {
+		t.Fatalf("shipped templates span %d distinct blobs %v; conductorInstructionsGenerations reconstructs exactly 3 prior generations, update the fixture and the generation count together", len(blobs), blobs)
 	}
-	for _, tag := range []string{"v1.15.0", "v1.16.5", "v1.16.8", "v1.16.10", "v1.11.0", "v1.10.9", "v1.10.10", "v1.10.11"} {
+	for _, tag := range []string{"v1.16.11", "v1.16.17", "v1.15.0", "v1.16.5", "v1.16.8", "v1.16.10", "v1.11.0", "v1.10.9", "v1.10.10", "v1.10.11"} {
 		if !tags[tag] {
 			t.Fatalf("fixture is missing shipped tag %s", tag)
 		}
