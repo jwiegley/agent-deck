@@ -12809,12 +12809,11 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					//
 					// Adopt the write: it moves last_modified, and without that
 					// the save below reads this TUI's OWN bump as an external
-					// change, aborts, and reloads instead. The reload rebuilds
-					// acknowledged from the stored status -- still "idle",
-					// precisely because the save that would have written
-					// "waiting" was the one that aborted -- so the row went
-					// straight back to gray and the key looked like it did
-					// nothing. Same self-inflicted false positive as #1868.
+					// change, aborts, discards its snapshot, and schedules a
+					// reload for a change this TUI made. Same self-inflicted
+					// false positive as #1868. The status itself is
+					// runtime-owned: UpdateStatus below commits it through the
+					// status CAS, and the save does not carry it.
 					if db := statedb.GetGlobal(); db != nil {
 						if stamps, err := db.SetAcknowledgedStamped(item.Session.ID, false); err == nil {
 							h.adoptOwnWrite(stamps, "mark_unread")
