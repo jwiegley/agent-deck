@@ -3,7 +3,9 @@ package session
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -109,6 +111,7 @@ func TestSpawnDiedBeforeCommit_StartPublishesNothingAndReturnsNil(t *testing.T) 
 	require.NoError(t, err, "tmux accepted the spawn")
 	require.Equal(t, before, runtime, "start reports the canonical runtime it kept")
 	require.Equal(t, before, durableRuntimeForTest(t, storage, inst.ID), "nothing was published")
+	require.Equal(t, before, inst.RuntimeState(), "the instance holds the runtime start reports, not its starting status")
 	canonical, failure, warning := ConsumePhysicalRuntimeResult(inst, runtime, err, nil)
 	require.NoError(t, failure)
 	require.Empty(t, warning, "there is no durability to reconcile")
@@ -140,7 +143,10 @@ func TestSpawnDiedBeforeCommit_StartWithMessageReportsMessageUndelivered(t *test
 
 // A restart whose replacement died before publication behaves the same way:
 // nil, the canonical runtime the transition kept (the stopped predecessor),
-// and no published successor.
+// and no published successor. The fallback recreate gave the instance a new
+// tmux name at the kept generation; the instance gives it back, so the result,
+// the instance and the durable row agree, and the error verdict spawn
+// verification then records lands on that same row.
 func TestSpawnDiedBeforeCommit_RestartPublishesNothingAndReturnsNil(t *testing.T) {
 	storage, inst := spawnOnPrivateSocket(t, "_test_spawn_died_restart")
 	require.NoError(t, inst.Start())
@@ -152,10 +158,52 @@ func TestSpawnDiedBeforeCommit_RestartPublishesNothingAndReturnsNil(t *testing.T
 	require.NoError(t, err, "tmux accepted the replacement spawn")
 	durable := durableRuntimeForTest(t, storage, inst.ID)
 	require.Equal(t, started.Generation, durable.Generation, "no successor was published")
+	require.Equal(t, started.TmuxSession, durable.TmuxSession)
 	require.Equal(t, durable, runtime, "restart reports the canonical runtime it kept")
-	_, failure, warning := ConsumePhysicalRuntimeResult(inst, runtime, err, nil)
+	require.Equal(t, durable, inst.RuntimeState(), "the instance gave back the replacement's uncommitted tmux name")
+	canonical, failure, warning := ConsumePhysicalRuntimeResult(inst, runtime, err, nil)
 	require.NoError(t, failure)
 	require.Empty(t, warning)
+	require.Equal(t, durable, canonical, "the consumed runtime is the durable row")
+	require.Equal(t, durable, inst.RuntimeState())
+
+	require.NoError(t, PersistSpawnFailureStatus(storage, inst))
+	want := durable
+	want.Status = string(StatusError)
+	want.StatusRevision++
+	require.Equal(t, want, durableRuntimeForTest(t, storage, inst.ID))
+	require.Equal(t, want, inst.RuntimeState(), "the row and the instance agree")
+}
+
+// A fresh restart whose replacement died before publication also gets back
+// the conversation binding prepareFresh cleared: nothing was published, so the
+// session still resumes the conversation it had.
+func TestSpawnDiedBeforeCommit_FreshRestartKeepsItsBinding(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	isolatedHomeDir(t)
+	previousDB := statedb.GetGlobal()
+	statedb.SetGlobal(nil)
+	t.Cleanup(func() { statedb.SetGlobal(previousDB) })
+	const conversation = "gemini-conversation-before-fresh-restart"
+	stub := filepath.Join(t.TempDir(), "gemini")
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\nsleep 30\n"), 0o755))
+	withConfig(t, &UserConfig{Gemini: GeminiSettings{Command: stub}})
+
+	socketName := fmt.Sprintf("adtest-fresh-gone-%d", time.Now().UnixNano())
+	t.Cleanup(func() { _ = exec.Command("tmux", "-L", socketName, "kill-server").Run() })
+	inst := NewInstanceWithTool("fresh gone", t.TempDir(), "gemini")
+	inst.Command = "gemini"
+	inst.tmuxSession.SocketName = socketName
+	inst.TmuxSocketName = socketName
+	require.NoError(t, inst.Start())
+	inst.GeminiSessionID = conversation
+	inst.GeminiDetectedAt = time.Now()
+	commitSeesSpawnGone(t)
+
+	runtime, err := inst.RestartFreshRuntime()
+	require.NoError(t, err, "tmux accepted the replacement spawn")
+	require.Equal(t, conversation, inst.GeminiSessionID, "the cleared binding came back")
+	require.Equal(t, runtime, inst.RuntimeState())
 }
 
 // A live spawn whose publication failed is a partial success, and its warning
