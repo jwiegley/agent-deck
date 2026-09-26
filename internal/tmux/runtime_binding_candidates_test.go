@@ -857,6 +857,142 @@ func TestRuntimeLifecycle_RespawnSameNameReplacementIsUntouched(t *testing.T) {
 	}
 }
 
+// TestRuntimeLifecycle_CandidateRespawnClaimSpansOnlyTheMutation pins the lock
+// scope without tmux: process-tree probes run outside session.mu (they fork
+// pgrep and must not stall pollers), the conditional respawn runs inside it,
+// and the new generation is published before the claim is released.
+func TestRuntimeLifecycle_CandidateRespawnClaimSpansOnlyTheMutation(t *testing.T) {
+	binding := runtimeBindingCandidateForTest()
+	candidate := runtimeGenerationCandidateFromBinding(binding)
+	stubRuntimeBindingCandidateProcessTreeForTest(t, binding)
+	stubCompleteRuntimeCleanupLocalOptions(t, binding)
+	session := &Session{
+		Name: candidate.SessionName, SocketName: candidate.SocketName, InstanceID: candidate.InstanceID,
+		startupTimedOut: true, lastStableStatus: "error",
+	}
+
+	stubbedTree := runtimeGenerationProcessTreeFn
+	probes := 0
+	runtimeGenerationProcessTreeFn = func(socketName, paneID string) ([]int, error) {
+		probes++
+		if !session.mu.TryLock() {
+			t.Errorf("process-tree probe %d ran under session.mu", probes)
+		} else {
+			session.mu.Unlock()
+		}
+		return stubbedTree(socketName, paneID)
+	}
+	oldMutation := runtimeBindingConditionalKillFn
+	t.Cleanup(func() { runtimeBindingConditionalKillFn = oldMutation })
+	mutations := 0
+	runtimeBindingConditionalKillFn = func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		mutations++
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("conditional respawn has no deadline")
+		}
+		if session.mu.TryLock() {
+			session.mu.Unlock()
+			t.Error("conditional respawn ran without the session's generation claim")
+		}
+		return nil, nil
+	}
+
+	before := time.Now()
+	if err := RespawnRuntimeGenerationCandidate(session, candidate, ""); err != nil {
+		t.Fatalf("candidate respawn: %v", err)
+	}
+	if mutations != 1 || probes != 3 {
+		t.Fatalf("conditional calls=%d tree probes=%d, want one respawn between capture and post-respawn probes", mutations, probes)
+	}
+	if !session.mu.TryLock() {
+		t.Fatal("candidate respawn left session.mu locked")
+	}
+	defer session.mu.Unlock()
+	if session.startupTimedOut || session.startupAt.Before(before) || session.lastStableStatus != "waiting" {
+		t.Fatalf("published generation: timedOut=%v startupAt=%v status=%q; want a fresh unclaimed startup",
+			session.startupTimedOut, session.startupAt, session.lastStableStatus)
+	}
+}
+
+// TestRuntimeLifecycle_CandidateRespawnDeadlineStartsAfterClaim: a restart can
+// wait behind expireStartupHandover, which holds session.mu across its own
+// bounded hold respawn. That wait must not spend the conditional's deadline.
+func TestRuntimeLifecycle_CandidateRespawnDeadlineStartsAfterClaim(t *testing.T) {
+	binding := runtimeBindingCandidateForTest()
+	candidate := runtimeGenerationCandidateFromBinding(binding)
+	stubRuntimeBindingCandidateProcessTreeForTest(t, binding)
+	stubCompleteRuntimeCleanupLocalOptions(t, binding)
+	oldTimeout := tmuxMutationTimeout
+	tmuxMutationTimeout = 200 * time.Millisecond
+	oldMutation := runtimeBindingConditionalKillFn
+	t.Cleanup(func() {
+		tmuxMutationTimeout = oldTimeout
+		runtimeBindingConditionalKillFn = oldMutation
+	})
+	var remaining time.Duration
+	runtimeBindingConditionalKillFn = func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		deadline, _ := ctx.Deadline()
+		remaining = time.Until(deadline)
+		return nil, nil
+	}
+	session := &Session{Name: candidate.SessionName, SocketName: candidate.SocketName, InstanceID: candidate.InstanceID}
+
+	session.mu.Lock() // a claim held for longer than the whole mutation budget
+	done := make(chan error, 1)
+	go func() { done <- RespawnRuntimeGenerationCandidate(session, candidate, "") }()
+	time.Sleep(2 * tmuxMutationTimeout)
+	session.mu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("candidate respawn after waiting for the claim: %v", err)
+	}
+	if remaining < tmuxMutationTimeout/2 {
+		t.Fatalf("conditional respawn deadline remaining = %v of %v; the claim wait spent it", remaining, tmuxMutationTimeout)
+	}
+}
+
+// TestRuntimeLifecycle_CandidateRespawnFailureLeavesGenerationUntouched: a
+// refused or failed conditional replaced nothing, so the current generation's
+// claim and clock stand, and the claim taken for the attempt is released.
+func TestRuntimeLifecycle_CandidateRespawnFailureLeavesGenerationUntouched(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  []byte
+		err  error
+	}{
+		{"mismatch", []byte("agent-deck-runtime-generation-candidate-changed\n"), nil},
+		{"tmux failure", nil, errors.New("server exited unexpectedly")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			binding := runtimeBindingCandidateForTest()
+			candidate := runtimeGenerationCandidateFromBinding(binding)
+			stubRuntimeBindingCandidateProcessTreeForTest(t, binding)
+			stubCompleteRuntimeCleanupLocalOptions(t, binding)
+			oldMutation := runtimeBindingConditionalKillFn
+			t.Cleanup(func() { runtimeBindingConditionalKillFn = oldMutation })
+			runtimeBindingConditionalKillFn = func(context.Context, string, ...string) ([]byte, error) {
+				return tc.out, tc.err
+			}
+			claimedAt := time.Now().Add(-time.Hour)
+			session := &Session{
+				Name: candidate.SessionName, SocketName: candidate.SocketName, InstanceID: candidate.InstanceID,
+				startupAt: claimedAt, startupTimedOut: true, lastStableStatus: "error",
+			}
+
+			if err := RespawnRuntimeGenerationCandidate(session, candidate, ""); !errors.Is(err, ErrRuntimeGenerationCandidateChanged) {
+				t.Fatalf("failed respawn error = %v, want candidate changed", err)
+			}
+			if !session.mu.TryLock() {
+				t.Fatal("failed candidate respawn left session.mu locked")
+			}
+			defer session.mu.Unlock()
+			if !session.startupTimedOut || !session.startupAt.Equal(claimedAt) || session.lastStableStatus != "error" {
+				t.Fatalf("failed respawn rewrote the current generation: timedOut=%v startupAt=%v status=%q",
+					session.startupTimedOut, session.startupAt, session.lastStableStatus)
+			}
+		})
+	}
+}
+
 func TestRuntimeLifecycle_RuntimeBindingCandidatesCaptureStableSessionAndPaneIdentity(t *testing.T) {
 	oldOutput := runtimeBindingCandidateOutputFn
 	t.Cleanup(func() { runtimeBindingCandidateOutputFn = oldOutput })

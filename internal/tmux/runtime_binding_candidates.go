@@ -632,6 +632,9 @@ func InvalidateRuntimeGenerationCandidate(candidate RuntimeGenerationCandidate) 
 // RespawnRuntimeGenerationCandidate invalidates the exact candidate's
 // completeness markers immediately before replacing its process. The physical
 // mutation targets the immutable pane ID, never the reusable session name.
+// Like Session.RespawnPane, it holds session.mu across the replacement and the
+// new pane generation's startup publication, which releases any startup
+// timeout claimed for the generation it replaced.
 func RespawnRuntimeGenerationCandidate(session *Session, candidate RuntimeGenerationCandidate, command string) error {
 	if session == nil || session.SocketName != candidate.SocketName ||
 		session.Name != candidate.SessionName || session.InstanceID != candidate.InstanceID {
@@ -674,6 +677,45 @@ func RespawnRuntimeGenerationCandidate(session *Session, candidate RuntimeGenera
 	}
 	mutations = append(mutations, respawnArgs)
 
+	// Serialize the conditional pane replacement and the new generation's
+	// publication with expireStartupHandover, as Session.RespawnPane does
+	// (#1892). A poll can then neither claim a timeout for, nor respawn the
+	// hold over, the replacement before its fresh startup clock is published,
+	// and a claim made for the generation this respawn ends cannot outlive it.
+	// The process-tree capture above and the probes below stay outside the
+	// lock; the conditional itself never takes session.mu.
+	session.mu.Lock()
+	if err := executeRuntimeGenerationRespawn(candidate, condition, mutations); err != nil {
+		session.mu.Unlock()
+		return err
+	}
+	session.startupAt = time.Now()
+	session.startupTimedOut = false
+	session.lastStableStatus = "waiting"
+	session.stateTracker = nil
+	session.cachedPromptDetector = nil
+	session.cachedPromptDetectorTool = ""
+	session.mu.Unlock()
+	if session.clearOnRestart {
+		respawnLog.Info("cleared_scrollback", slog.String("session", candidate.SessionName))
+	}
+
+	newPIDs, newTreeErr := runtimeGenerationProcessTreeFn(candidate.SocketName, candidate.PaneID)
+	identitiesOwned = false
+	go func() {
+		session.escalateAfterRespawn(oldIdentities, newPIDs, newTreeErr)
+	}()
+	// A control-mode client is attached to the session, not to the pane process,
+	// so respawn-pane does not require reconnecting it. More importantly, a
+	// reconnect by mutable session name after the conditional could disconnect
+	// or attach to a same-name replacement created in the meantime.
+	return nil
+}
+
+// executeRuntimeGenerationRespawn runs the candidate's marker invalidation and
+// pane replacement as one bounded tmux-server conditional. It reads no Session
+// state, so RespawnRuntimeGenerationCandidate can hold session.mu across it.
+func executeRuntimeGenerationRespawn(candidate RuntimeGenerationCandidate, condition string, mutations [][]string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), tmuxMutationTimeout)
 	defer cancel()
 	const mismatchMessage = "agent-deck-runtime-generation-candidate-changed"
@@ -693,26 +735,6 @@ func RespawnRuntimeGenerationCandidate(session *Session, candidate RuntimeGenera
 	if len(out) != 0 {
 		return ErrRuntimeGenerationCandidateChanged
 	}
-	if session.clearOnRestart {
-		respawnLog.Info("cleared_scrollback", slog.String("session", candidate.SessionName))
-	}
-
-	newPIDs, newTreeErr := runtimeGenerationProcessTreeFn(candidate.SocketName, candidate.PaneID)
-	identitiesOwned = false
-	go func() {
-		session.escalateAfterRespawn(oldIdentities, newPIDs, newTreeErr)
-	}()
-	// A control-mode client is attached to the session, not to the pane process,
-	// so respawn-pane does not require reconnecting it. More importantly, a
-	// reconnect by mutable session name after the conditional could disconnect
-	// or attach to a same-name replacement created in the meantime.
-	session.mu.Lock()
-	session.startupAt = time.Now()
-	session.lastStableStatus = "waiting"
-	session.stateTracker = nil
-	session.cachedPromptDetector = nil
-	session.cachedPromptDetectorTool = ""
-	session.mu.Unlock()
 	return nil
 }
 
