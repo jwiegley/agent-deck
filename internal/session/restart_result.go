@@ -62,6 +62,24 @@ func spawnedRuntimeGone(err error) bool {
 	return errors.Is(err, errSpawnedRuntimeGone)
 }
 
+// keepCanonicalRuntime gives i back the runtime its transition kept, after a
+// spawn proved gone before publication. The spawn may have left i holding a
+// tuple nobody committed: Start's starting status and start time, or a
+// fallback recreate's new tmux name at the kept generation. Nothing was
+// published, so i takes back the durable tuple and its bindings (the local
+// tuple without a store), and a fresh restart gets back the bindings
+// prepareFresh cleared. i.RuntimeState() then equals the runtime the call
+// reports, which ConsumePhysicalRuntimeResult returns as canonical and
+// PersistSpawnFailureStatus marks errored with a plain status CAS.
+func (a *runtimeTransitionAuthority) keepCanonicalRuntime(i *Instance) {
+	if a.durable {
+		i.adoptRuntimeSnapshot(a.expected, a.bindings)
+	} else {
+		i.adoptRuntimeState(a.expected)
+	}
+	a.restoreFresh(i)
+}
+
 func (e *RestartPartialSuccessError) Unwrap() error { return e.Err }
 
 func (e *RestartPartialSuccessError) RestartCompleted() bool { return true }

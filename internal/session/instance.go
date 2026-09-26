@@ -5647,6 +5647,7 @@ func (i *Instance) start(result *statedb.RuntimeState) error {
 	}
 	candidate, plan, committed, err := i.commitPhysicalRuntime(transition)
 	if spawnedRuntimeGone(err) {
+		transition.keepCanonicalRuntime(i)
 		captureRuntimeResult(result, transition.expected)
 		return nil
 	}
@@ -6012,6 +6013,7 @@ func (i *Instance) startWithMessage(message string, result *statedb.RuntimeState
 	i.Status = StatusStarting
 	candidate, plan, committed, err := i.commitPhysicalRuntime(transition)
 	if spawnedRuntimeGone(err) {
+		transition.keepCanonicalRuntime(i)
 		captureRuntimeResult(result, transition.expected)
 		if message != "" && !promptEmbeddedInCommand {
 			// The message had no live pane to go to; the call must not
@@ -10274,6 +10276,7 @@ func (i *Instance) restartWithTransition(transition *runtimeTransitionAuthority,
 		i.commitOwnershipAfterRestart(ownershipCommand)
 		candidate, plan, committed, persistErr := i.commitPhysicalRuntime(transition)
 		if spawnedRuntimeGone(persistErr) {
+			transition.keepCanonicalRuntime(i)
 			captureRuntimeResult(result, transition.expected)
 			return
 		}
