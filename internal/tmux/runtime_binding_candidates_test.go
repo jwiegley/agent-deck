@@ -65,18 +65,25 @@ func TestRuntimeLifecycle_RuntimeBindingAuthorityEnvironmentIsNeverWrittenGlobal
 	}
 }
 
+// The stable listing reads no authority. Its one option field, the effective
+// instance option, is a pre-filter that may be inherited, so it is the last
+// field and nothing else is read through format expansion; the local-option
+// batch decides (see ...RejectsInheritedGlobalsAndPartialLocalStamps).
 func TestRuntimeLifecycle_RuntimeCleanupInventoryUsesOnlySessionOptionAuthority(t *testing.T) {
 	format := runtimeCleanupCandidateFormat()
 	for _, forbidden := range []string{
 		"#{E:", "AGENTDECK_INSTANCE_ID", "AGENTDECK_RUNTIME_GENERATION",
 		"CLAUDE_SESSION_ID", "COPILOT_SESSION_ID", "CODEX_SESSION_ID",
 		"GEMINI_SESSION_ID", "OPENCODE_SESSION_ID",
-		runtimeCleanupInstanceOption, runtimeCleanupGenerationOption,
-		runtimeCleanupBindingKeyOption, runtimeCleanupBindingValOption,
+		runtimeCleanupGenerationOption, runtimeCleanupBindingKeyOption, runtimeCleanupBindingValOption,
 	} {
 		if strings.Contains(format, forbidden) {
 			t.Fatalf("stable cleanup inventory format %q reads inherited authority %q", format, forbidden)
 		}
+	}
+	if !strings.HasSuffix(format, tmuxFieldSep+"#{"+runtimeCleanupInstanceOption+"}") ||
+		strings.Count(format, runtimeCleanupInstanceOption) != 1 {
+		t.Fatalf("stable cleanup inventory format %q, want the instance pre-filter once, as its last field", format)
 	}
 }
 
@@ -1154,11 +1161,13 @@ func TestRuntimeLifecycle_RuntimeBindingCandidatesCaptureStableSessionAndPaneIde
 			if len(args) != 3 || args[1] != "-F" || args[2] != runtimeCleanupCandidateFormat() {
 				t.Fatalf("unexpected tmux command: %q", args)
 			}
-			return []byte(tmuxFmt("$7", "agentdeck_peer", "%9", "4242") + "\n" +
-				tmuxFmt("$8", "ordinary", "%10", "4343") + "\n"), nil
+			return []byte(tmuxFmt("$7", "agentdeck_peer", "%9", "4242", "peer-instance") + "\n" +
+				tmuxFmt("$8", "ordinary", "%10", "4343", "peer-instance") + "\n" +
+				tmuxFmt("$6", "no-option", "%8", "4141", "") + "\n"), nil
 		case "display-message":
-			// Every session's local options are read; only the stamp, never the
-			// name, separates the runtime from the ordinary session.
+			// Only the stamp, never the name, separates the runtime from the
+			// ordinary session whose option is inherited. A session whose
+			// option expands to nothing cannot be stamped and is never read.
 			candidate := runtimeBindingCandidateForTest()
 			return runtimeCleanupLocalOutputForTest(
 				[]RuntimeBindingCandidate{candidate, {SessionID: "$8"}},
@@ -1208,7 +1217,7 @@ func TestRuntimeLifecycle_RuntimeCleanupInventoryPreservesWhitespaceInstanceID(t
 			args[1] != "-F" || args[2] != runtimeCleanupCandidateFormat() {
 			t.Fatalf("unexpected inventory call: socket=%q args=%q", socketName, args)
 		}
-		return []byte(tmuxFmt(identity.SessionID, identity.SessionName, identity.PaneID, strconv.Itoa(identity.PanePID)) + "\n"), nil
+		return []byte(tmuxFmt(identity.SessionID, identity.SessionName, identity.PaneID, strconv.Itoa(identity.PanePID), rawInstanceID) + "\n"), nil
 	}
 
 	candidates, err := ListRuntimeGenerationCandidates("isolated", rawInstanceID)
@@ -1260,6 +1269,7 @@ func TestRuntimeLifecycle_RuntimeCleanupCandidateInventoryScalesTwoCallsForHundr
 				fmt.Sprintf("agentdeck_session_%03d", index),
 				fmt.Sprintf("%%%d", index+1),
 				strconv.Itoa(4000+index),
+				fmt.Sprintf("instance-%03d", index),
 			))
 		}
 		return []byte(output.String()), nil
@@ -1314,10 +1324,10 @@ func TestRuntimeLifecycle_RuntimeCleanupInventoryRejectsInheritedGlobalsAndParti
 					t.Fatalf("socket = %q", socketName)
 				}
 				if args[0] == "list-sessions" {
-					if strings.Contains(args[2], runtimeCleanupInstanceOption) {
-						t.Fatalf("stable inventory reads effective user options: %q", args[2])
-					}
-					return []byte(tmuxFmt("$7", "agentdeck_peer", "%9", "4242") + "\n"), nil
+					// The effective instance option expands the matching
+					// global value, so this session passes the pre-filter:
+					// only the local read below may reject it.
+					return []byte(tmuxFmt("$7", "agentdeck_peer", "%9", "4242", "peer-instance") + "\n"), nil
 				}
 				if slices.Contains(args, "-A") || slices.Contains(args, "-g") {
 					t.Fatalf("local-only query uses inherited/global flags: %q", args)
@@ -1334,6 +1344,83 @@ func TestRuntimeLifecycle_RuntimeCleanupInventoryRejectsInheritedGlobalsAndParti
 			}
 			if len(candidates) != 0 || calls != 2 {
 				t.Fatalf("candidates=%#v subprocesses=%d, want no authority and two bounded calls", candidates, calls)
+			}
+		})
+	}
+}
+
+// A session that closed between the stable listing and the local-option batch
+// can fail the batch for every other session on the socket, and with it every
+// stop, delete and sweep there. A failed batch re-lists once: the vanished
+// session is absent and the rest are read again. While every listed session
+// remains, the failure has another cause and is returned.
+func TestRuntimeLifecycle_RuntimeCleanupInventoryRelistsWhenASessionVanishes(t *testing.T) {
+	oldOutput := runtimeBindingCandidateOutputFn
+	oldLocal := runtimeCleanupLocalOptionsFn
+	t.Cleanup(func() {
+		runtimeBindingCandidateOutputFn = oldOutput
+		runtimeCleanupLocalOptionsFn = oldLocal
+	})
+	peer := tmuxFmt("$7", "agentdeck_peer", "%9", "4242", "peer-instance")
+	closing := tmuxFmt("$8", "agentdeck_closing", "%10", "4343", "closing-instance")
+	blocked := errors.New("can't find session: $8")
+	for _, test := range []struct {
+		name      string
+		relisted  string
+		wantReads [][]string
+		wantErr   error
+	}{
+		{name: "a listed session vanished", relisted: peer + "\n", wantReads: [][]string{{"$7", "$8"}, {"$7"}}},
+		{name: "every listed session remains", relisted: peer + "\n" + closing + "\n", wantReads: [][]string{{"$7", "$8"}}, wantErr: blocked},
+		{name: "the server exited with its last session", relisted: "", wantReads: [][]string{{"$7", "$8"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listings := 0
+			runtimeBindingCandidateOutputFn = func(socketName string, args ...string) ([]byte, error) {
+				if socketName != "isolated" || len(args) != 3 || args[0] != "list-sessions" || args[2] != runtimeCleanupCandidateFormat() {
+					t.Fatalf("inventory command = %q %q", socketName, args)
+				}
+				listings++
+				if listings == 1 {
+					return []byte(peer + "\n" + closing + "\n"), nil
+				}
+				return []byte(test.relisted), nil
+			}
+			var reads [][]string
+			runtimeCleanupLocalOptionsFn = func(_ string, candidates []RuntimeBindingCandidate) (map[string]map[string]runtimeCleanupLocalOption, error) {
+				ids := make([]string, 0, len(candidates))
+				for _, candidate := range candidates {
+					ids = append(ids, candidate.SessionID)
+				}
+				reads = append(reads, ids)
+				if len(reads) == 1 {
+					return nil, blocked
+				}
+				return map[string]map[string]runtimeCleanupLocalOption{
+					"$7": runtimeCleanupLocalOptionsForTest("peer-instance", 3, "", ""),
+				}, nil
+			}
+
+			inventory, err := ListRuntimeCleanupCandidates("isolated", "")
+			if !errors.Is(err, test.wantErr) || (test.wantErr == nil && err != nil) {
+				t.Fatalf("inventory error = %v, want %v", err, test.wantErr)
+			}
+			if listings != 2 || !reflect.DeepEqual(reads, test.wantReads) {
+				t.Fatalf("listings=%d local reads=%q, want 2 and %q", listings, reads, test.wantReads)
+			}
+			if test.wantErr != nil {
+				return
+			}
+			var names []string
+			for _, candidate := range inventory {
+				names = append(names, candidate.SessionName)
+			}
+			var want []string
+			if test.relisted != "" {
+				want = []string{"agentdeck_peer"}
+			}
+			if !reflect.DeepEqual(names, want) {
+				t.Fatalf("inventory after re-list = %q, want %q", names, want)
 			}
 		})
 	}
@@ -1368,7 +1455,7 @@ func TestRuntimeLifecycle_RuntimeGenerationCandidatePreservesNativeDefaultSocket
 		if len(args) != 3 || args[2] != runtimeCleanupCandidateFormat() {
 			t.Fatalf("inventory args = %q", args)
 		}
-		return []byte(tmuxFmt("$7", "agentdeck_native", "%9", "4242") + "\n"), nil
+		return []byte(tmuxFmt("$7", "agentdeck_native", "%9", "4242", "native-instance") + "\n"), nil
 	}
 	candidates, err := ListRuntimeGenerationCandidates("", "native-instance")
 	if err != nil || len(candidates) != 1 {
@@ -1584,8 +1671,8 @@ func TestRuntimeLifecycle_KillLowerGenerationSessionsReplacementOrNameReuseFails
 		if len(args) != 3 || args[0] != "list-sessions" || args[1] != "-F" || args[2] != runtimeCleanupCandidateFormat() {
 			t.Fatalf("unexpected tmux inventory command: %q", args)
 		}
-		return []byte(tmuxFmt("$7", "agentdeck_reused", "%9", "4242") + "\n" +
-			tmuxFmt("$8", "agentdeck_current", "%10", "4343") + "\n"), nil
+		return []byte(tmuxFmt("$7", "agentdeck_reused", "%9", "4242", "peer-instance") + "\n" +
+			tmuxFmt("$8", "agentdeck_current", "%10", "4343", "peer-instance") + "\n"), nil
 	}
 	runtimeGenerationProcessTreeFn = func(socketName, paneID string) ([]int, error) {
 		if socketName != "isolated" || paneID != "%9" {
@@ -1675,7 +1762,7 @@ func TestRuntimeLifecycle_KillLowerGenerationSessionsIncompleteIdentityPreserves
 			t.Fatalf("unexpected tmux inventory command: %q", args)
 		}
 		// Exact instance, but no generation: this is not kill authority.
-		return []byte(tmuxFmt("$7", "agentdeck_incomplete", "%9", "4242") + "\n"), nil
+		return []byte(tmuxFmt("$7", "agentdeck_incomplete", "%9", "4242", "peer-instance") + "\n"), nil
 	}
 
 	conditionalCalls := 0

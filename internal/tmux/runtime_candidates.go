@@ -42,11 +42,13 @@ type RuntimeCandidateSnapshot map[string]RuntimeCandidateSocketSnapshot
 
 var runtimeCandidateSnapshotOutputFn = runBoundedOutput
 
-const runtimeCandidateFormatFields = 11
+const runtimeCandidateFormatFields = 12
 
 func runtimeCandidateFormat() string {
 	// The binding value is deliberately last: it is the only free-text field,
-	// so SplitN preserves an embedded tmuxFieldSep byte.
+	// so SplitN preserves an embedded tmuxFieldSep byte. The effective
+	// instance option before it only pre-filters unprefixed claims (see
+	// admitStampedUnprefixedRuntimeCandidates); it is never authority.
 	return tmuxFmt(
 		"#{session_id}",
 		"#{session_name}",
@@ -58,14 +60,19 @@ func runtimeCandidateFormat() string {
 		"#{E:AGENTDECK_RUNTIME_STARTED_UNIX_NANO}",
 		"#{E:AGENTDECK_RUNTIME_BINDING_KIND}",
 		"#{pane_pid}",
+		"#{"+runtimeCleanupInstanceOption+"}",
 		"#{E:AGENTDECK_RUNTIME_BINDING_VALUE}",
 	)
 }
 
-// SnapshotRuntimeCandidates inventories every requested socket with one
-// formatted list-sessions subprocess per distinct socket. The result is
-// indexed by instance ID so startup reconciliation never rescans a socket for
-// every persisted instance.
+// SnapshotRuntimeCandidates inventories every requested socket once. Each
+// distinct socket costs one formatted list-sessions subprocess, plus one
+// bounded local-option batch when an unprefixed session's options name the
+// instance its environment claims (admitStampedUnprefixedRuntimeCandidates).
+// If that batch fails because a session closed after the listing, the socket
+// is listed once more and the vanished session is absent; any other failure
+// leaves the socket indeterminate. The result is indexed by instance ID so
+// startup reconciliation never rescans a socket for every persisted instance.
 func SnapshotRuntimeCandidates(socketNames []string) RuntimeCandidateSnapshot {
 	snapshot := make(RuntimeCandidateSnapshot, len(socketNames))
 	for _, socketName := range socketNames {
@@ -82,23 +89,49 @@ func SnapshotRuntimeCandidates(socketNames []string) RuntimeCandidateSnapshot {
 }
 
 func snapshotRuntimeCandidatesOnSocket(socketName string) (map[string][]RuntimeCandidate, error) {
+	byInstance, claims, err := listRuntimeCandidatesOnSocket(socketName)
+	if err != nil {
+		return nil, err
+	}
+	admitErr := admitStampedUnprefixedRuntimeCandidates(socketName, claims, byInstance)
+	if admitErr == nil {
+		return byInstance, nil
+	}
+	// tmux drops the rest of a command list after one command fails, and a
+	// server exits with its last session: a claim that closed after the
+	// listing can fail the batch for every other claim. List once more; when
+	// a claim has vanished, the batch is read again for what remains.
+	relisted, relistedClaims, err := listRuntimeCandidatesOnSocket(socketName)
+	if err != nil || !runtimeClaimVanished(claims, relistedClaims) {
+		return nil, admitErr
+	}
+	if err := admitStampedUnprefixedRuntimeCandidates(socketName, relistedClaims, relisted); err != nil {
+		return nil, err
+	}
+	return relisted, nil
+}
+
+// listRuntimeCandidatesOnSocket parses one formatted listing into the
+// prefixed candidates, indexed by instance, and the unprefixed claims whose
+// effective instance option names the instance their environment claims.
+func listRuntimeCandidatesOnSocket(socketName string) (map[string][]RuntimeCandidate, []RuntimeCandidate, error) {
 	out, err := runtimeCandidateSnapshotOutputFn(socketName, "list-sessions", "-F", runtimeCandidateFormat())
 	if err != nil {
 		if isEmptyTmuxServerResult(err) {
-			return map[string][]RuntimeCandidate{}, nil
+			return map[string][]RuntimeCandidate{}, nil, nil
 		}
-		return nil, fmt.Errorf("tmux: snapshot runtime candidates: %w", err)
+		return nil, nil, fmt.Errorf("tmux: snapshot runtime candidates: %w", err)
 	}
 
 	byInstance := make(map[string][]RuntimeCandidate)
-	var unprefixed []RuntimeCandidate
+	var claims []RuntimeCandidate
 	for _, line := range strings.Split(strings.TrimSuffix(string(out), "\n"), "\n") {
 		if line == "" {
 			continue
 		}
 		fields := strings.SplitN(line, tmuxFieldSep, runtimeCandidateFormatFields)
 		if len(fields) != runtimeCandidateFormatFields {
-			return nil, fmt.Errorf("tmux: malformed runtime candidate record on socket %q", socketName)
+			return nil, nil, fmt.Errorf("tmux: malformed runtime candidate record on socket %q", socketName)
 		}
 		sessionID, name := strings.TrimSpace(fields[0]), strings.TrimSpace(fields[1])
 		paneID, instanceID := strings.TrimSpace(fields[2]), strings.TrimSpace(fields[3])
@@ -106,19 +139,31 @@ func snapshotRuntimeCandidatesOnSocket(socketName string) (map[string][]RuntimeC
 			continue
 		}
 		if !validTmuxStableID(sessionID, '$') || !validTmuxStableID(paneID, '%') {
-			return nil, fmt.Errorf("tmux: invalid stable runtime candidate identity on socket %q", socketName)
+			return nil, nil, fmt.Errorf("tmux: invalid stable runtime candidate identity on socket %q", socketName)
 		}
 		candidate := runtimeCandidateFromFields(socketName, fields)
 		if !strings.HasPrefix(name, SessionPrefix) {
-			unprefixed = append(unprefixed, candidate)
+			if fields[10] == instanceID {
+				claims = append(claims, candidate)
+			}
 			continue
 		}
 		byInstance[instanceID] = append(byInstance[instanceID], candidate)
 	}
-	if err := admitStampedUnprefixedRuntimeCandidates(socketName, unprefixed, byInstance); err != nil {
-		return nil, err
+	return byInstance, claims, nil
+}
+
+func runtimeClaimVanished(listed, relisted []RuntimeCandidate) bool {
+	remaining := make(map[string]bool, len(relisted))
+	for _, claim := range relisted {
+		remaining[claim.SessionID] = true
 	}
-	return byInstance, nil
+	for _, claim := range listed {
+		if !remaining[claim.SessionID] {
+			return true
+		}
+	}
+	return false
 }
 
 // admitStampedUnprefixedRuntimeCandidates admits a session whose name lacks
@@ -129,8 +174,11 @@ func snapshotRuntimeCandidatesOnSocket(socketName string) (map[string][]RuntimeC
 // either: tmux falls back to the server's global environment, which a server
 // started from inside an Agent Deck pane inherits wholesale. The local stamp
 // is the authority the cleanup inventory and every conditional mutation
-// already require, and it costs one bounded batch only when such a session
-// exists.
+// already require. Its batch covers only the claims whose effective instance
+// option already names the claimed instance: a session whose own options
+// carry that stamp always expands it, so no other claim can be admitted,
+// however many user sessions an inherited global environment turns into
+// claims.
 func admitStampedUnprefixedRuntimeCandidates(socketName string, claims []RuntimeCandidate, byInstance map[string][]RuntimeCandidate) error {
 	if len(claims) == 0 {
 		return nil
@@ -168,7 +216,7 @@ func runtimeCandidateFromFields(socketName string, fields []string) RuntimeCandi
 		InstanceID:   strings.TrimSpace(fields[3]),
 		Status:       fields[6],
 		BindingKind:  fields[8],
-		BindingValue: fields[10],
+		BindingValue: fields[11],
 	}
 	if generation, err := strconv.ParseUint(strings.TrimSpace(fields[4]), 10, 64); err != nil {
 		candidate.ProofError = "missing or invalid AGENTDECK_RUNTIME_GENERATION"
