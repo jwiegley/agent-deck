@@ -2025,8 +2025,6 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			tmuxSession:           tmuxSess,
 			owningDB:              s.db,
 		}
-		// Restore configured detection without restarting the running harness.
-		inst.loadCustomPatternsFromConfig()
 
 		// Convert multi-repo worktree data
 		for _, wt := range instData.MultiRepoWorktrees {
@@ -2040,7 +2038,8 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 
 		// Set tmux option overrides so EnsureConfigured/ConfigureStatusBar
 		// respects user-defined keys (e.g. status = "2" for multi-line bar),
-		// along with the per-session settings and the group path.
+		// along with the per-session settings, the group path and the
+		// configured detection, restored without restarting the running harness.
 		if tmuxSess != nil {
 			inst.configureTmuxWrapperLocked(tmuxSess)
 		}
