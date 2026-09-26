@@ -4441,12 +4441,7 @@ func hydrateLegacyCodexIdentity(
 	// pane, so an identity read from an older runtime cannot bind its
 	// replacement.
 	observation := inst.CaptureRuntimeBindingObservation("codex")
-	candidate := liveCodexSessionID(inst)
-	processOwned := false
-	// Panes from earlier builds can carry a disk-scan guess (#2394).
-	if live := inst.LiveCodexThreadID(); live != "" {
-		candidate, processOwned = live, true
-	}
+	candidate, processOwned := legacyCodexPaneIdentityFn(inst)
 	if candidate == "" {
 		return errCodexIdentityUnavailable
 	}
@@ -4515,6 +4510,22 @@ func codexComposerFallbackAllowed(err error, flag, structuredWait bool) bool {
 		return false
 	}
 	return errors.Is(err, errCodexIdentityUnavailable) || errors.Is(err, errCodexGenerationUnavailable)
+}
+
+// legacyCodexPaneIdentityFn is hydration's pane query, between its binding
+// token capture and the publish; tests replace it to change the runtime
+// mid-observation.
+var legacyCodexPaneIdentityFn = legacyCodexPaneIdentity
+
+// legacyCodexPaneIdentity returns the one thread the pane's live Codex process
+// holds open (processOwned), or else the pane's Codex identity. The live thread
+// outranks the pane value because panes from earlier builds can carry a
+// disk-scan guess (#2394).
+func legacyCodexPaneIdentity(inst *session.Instance) (candidate string, processOwned bool) {
+	if live := inst.LiveCodexThreadID(); live != "" {
+		return live, true
+	}
+	return liveCodexSessionID(inst), false
 }
 
 // liveCodexSessionID reads only the authoritative Codex identity from a live
