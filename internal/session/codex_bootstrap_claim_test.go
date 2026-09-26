@@ -1,0 +1,101 @@
+package session
+
+import (
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
+)
+
+// holdCodexBootstrapForTest takes codexBootstrapMu as a peer mid-way through
+// its disk-scan selection would, and returns an idempotent release that also
+// runs at cleanup.
+func holdCodexBootstrapForTest(t *testing.T) func() {
+	t.Helper()
+	codexBootstrapMu.Lock()
+	var once sync.Once
+	release := func() { once.Do(codexBootstrapMu.Unlock) }
+	t.Cleanup(release)
+	return release
+}
+
+func codexSessionIDForTest(inst *Instance) string {
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.CodexSessionID
+}
+
+// codexBootstrapMu serializes only the disk fallback's selection with its
+// publication. An unbound instance whose own tmux environment names its
+// session publishes that authoritative binding while a peer holds the lock for
+// its disk scan. Taking the lock before the environment read serialized every
+// unbound instance's read and process probe behind one mutex, and the TUI's
+// ten-worker status sweep outlived the ownership TTL and re-read the fleet
+// (TestBackgroundStatusPassOwnershipLinear in internal/ui).
+func TestCodexBootstrapClaimSkipsAuthoritativeEnvironmentRead(t *testing.T) {
+	resetCodexOwnershipCache(t)
+	codexCountingTmux(t, 1)
+	// The process probe is not due, so the environment read, which names this
+	// session's own ID, is the only evidence.
+	inst := &Instance{ID: "codex-bootstrap-env", Tool: "codex", lastCodexProbeAt: time.Now(),
+		tmuxSession: &tmux.Session{Name: "agentdeck_scan_0"}}
+	release := holdCodexBootstrapForTest(t)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		inst.updateCodexSessionForPass(nil, false, &StatusUpdatePass{})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		release()
+		<-done
+		t.Fatal("the authoritative tmux environment read waited for a peer's bootstrap selection")
+	}
+	release()
+	if got := codexSessionIDForTest(inst); got != "id-agentdeck_scan_0" {
+		t.Fatalf("codex binding = %q, want the environment's id-agentdeck_scan_0", got)
+	}
+}
+
+// The disk fallback still selects under the claim: it waits for a peer's
+// selection and publication, then binds, and it releases the claim when done.
+func TestCodexBootstrapClaimSerializesDiskFallback(t *testing.T) {
+	resetCodexOwnershipCache(t)
+	codexCountingTmux(t, 1)
+	t.Setenv("CODEX_SCAN_EMPTY", "1") // no tmux environment evidence anywhere
+	t.Setenv("CODEX_HOME", t.TempDir())
+	sid := uniqueSID(t)
+	seedCodexRolloutWithMeta(t, os.Getenv("CODEX_HOME"), sid, "", "", false)
+	inst := &Instance{ID: "codex-bootstrap-disk", Tool: "codex", ProjectPath: "/tmp/project",
+		CodexStartedAt: time.Now().Add(-time.Minute).UnixMilli(), lastCodexProbeAt: time.Now(),
+		tmuxSession: &tmux.Session{Name: "agentdeck_scan_0"}}
+	release := holdCodexBootstrapForTest(t)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		inst.updateCodexSessionForPass(nil, false, &StatusUpdatePass{})
+	}()
+	select {
+	case <-done:
+		t.Fatal("the disk fallback selected while a peer held the bootstrap claim")
+	case <-time.After(300 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the disk fallback never finished after the peer released its claim")
+	}
+	if got := codexSessionIDForTest(inst); got != sid {
+		t.Fatalf("codex binding = %q, want the rollout %s", got, sid)
+	}
+	if !codexBootstrapMu.TryLock() {
+		t.Fatal("the disk fallback kept the bootstrap claim after publishing")
+	}
+	codexBootstrapMu.Unlock()
+}
