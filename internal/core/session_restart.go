@@ -93,7 +93,7 @@ func (deps Deps) sessionRestart(ctx context.Context, in SessionRestartIn) (Sessi
 		return SessionRestartOut{}, &Error{Code: CodeInvalid, Message: fmt.Sprintf("failed to restart session: %v", err), Cause: err}
 	}
 	if err := inst.VerifySpawned(SpawnVerifyWait); err != nil {
-		return SessionRestartOut{}, d.failSpawn("restart", inst, err)
+		return SessionRestartOut{}, d.failSpawn(ctx, "restart", inst, err)
 	}
 	// A warning is both part of the typed result and an envelope warning;
 	// the duplication is intentional (typed field for the CLI shape, generic

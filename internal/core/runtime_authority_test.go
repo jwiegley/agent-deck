@@ -231,6 +231,49 @@ func TestSessionStartSpawnDiedBeforeCommitErrorsDurableRuntime(t *testing.T) {
 	}
 }
 
+// A spawn failure whose error verdict loses its status CAS to a concurrent
+// writer reaches every client: the legacy CLI shape prints
+// SpawnFailure.StatusErr, and envelope and daemon clients read the warning.
+func TestSessionStartLostErrorVerdictIsAWarning(t *testing.T) {
+	requireTmux(t)
+	const profile = "_core_start_lost_error_verdict"
+	inst := session.NewInstance("dies", t.TempDir())
+	seedStore(t, profile, nil, inst)
+	var concurrent statedb.RuntimeState
+	setStartRuntimeHook(t, func(inst *session.Instance, message string) (statedb.RuntimeState, error) {
+		// No pane is spawned, so verification fails; meanwhile another
+		// writer moves the status revision the verdict would CAS on.
+		current := inst.RuntimeState()
+		storage, err := session.NewStorageWithProfile(profile)
+		if err != nil {
+			return statedb.RuntimeState{}, err
+		}
+		defer storage.Close()
+		applied, err := storage.GetDB().WriteStatusIfVersion(inst.ID, inst.PersistenceIncarnation(),
+			current.Generation, current.StatusRevision, string(session.StatusStopped))
+		if err != nil || !applied {
+			return statedb.RuntimeState{}, fmt.Errorf("concurrent status write: applied=%v err=%v", applied, err)
+		}
+		concurrent = current
+		concurrent.Status = string(session.StatusStopped)
+		concurrent.StatusRevision++
+		return current, nil
+	})
+
+	res := testRegistry(t, Deps{}).Run(context.Background(), IDSessionStart, SessionStartIn{Profile: profile, Session: "dies", NoWait: true})
+	wantCode(t, res.Err, CodeSpawnFailed, "")
+	sf, ok := AsError(res.Err).Data.(*SpawnFailure)
+	if !ok || sf.StatusErr == nil || sf.SaveErr != nil {
+		t.Fatalf("spawn failure = %+v, want a lost error verdict", AsError(res.Err).Data)
+	}
+	if want := []string{"failed to save session error status: " + sf.StatusErr.Error()}; !slices.Equal(res.Warnings, want) {
+		t.Fatalf("envelope warnings = %q, want %q", res.Warnings, want)
+	}
+	if got := durableRuntime(t, profile, inst.ID); got != concurrent {
+		t.Fatalf("durable runtime = %+v, want the concurrent verdict %+v kept", got, concurrent)
+	}
+}
+
 func TestSessionRestartPartialSuccessIsAWarning(t *testing.T) {
 	requireTmux(t)
 	const profile = "_core_restart_partial"
