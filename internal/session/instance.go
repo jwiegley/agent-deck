@@ -617,9 +617,10 @@ type Instance struct {
 	codexCompletedSessionID     string
 	codexInvalidatingGeneration string
 
-	// Per runtime binding kind, the last id recordRecallLinkLocked confirmed
-	// an authoritative session_links row for.
-	linkedSessionIDs recallLinkMarks
+	// Per runtime binding kind, the last binding version (id, generation and
+	// revision) recordRecallLinkLocked confirmed an authoritative
+	// session_links row for.
+	linkedBindings recallLinkMarks
 
 	// Durable last-activity record (issue #1846). Unlike hookLastUpdate this
 	// survives ClearHookStatus and, via tool_data.last_activity_at, TUI
@@ -12649,10 +12650,16 @@ func (i *Instance) confirmHookSessionLink(kind, sessionID, hookSource string) {
 // recordRecallLinkLocked writes the authoritative session_links row for
 // value while value is still this instance's durable binding of kind
 // (statedb.LinkRuntimeBinding checks both in one transaction). The
-// in-memory marker keeps it to one attempt per id per process once the
-// link exists, not one per hook event. The caller holds i.mu.
+// in-memory mark keeps it to one attempt per binding version per process
+// once the link exists, not one per hook event. It names the version, not
+// the id: a rebind, even back to an id linked earlier, is a new version,
+// and a peer may have linked another id in between. The caller holds i.mu.
 func (i *Instance) recordRecallLinkLocked(kind, value string) error {
-	if value == "" || i.linkedSessionIDs.has(kind, value) {
+	if value == "" {
+		return nil
+	}
+	version, versioned := i.recallLinkVersionLocked(kind, value)
+	if versioned && i.linkedBindings.has(kind, version) {
 		return nil
 	}
 	db := i.owningDB
@@ -12666,8 +12673,28 @@ func (i *Instance) recordRecallLinkLocked(kind, value string) error {
 	if err != nil || !linked {
 		return err
 	}
-	i.linkedSessionIDs.set(kind, value)
+	if versioned {
+		i.linkedBindings.set(kind, version)
+	}
 	return nil
+}
+
+// recallLinkVersionLocked returns the version of the in-memory binding of
+// kind while it holds value. Every publish and every adoption of a peer's
+// binding records one, so a hook-bound id always has a version; an id that
+// reached memory without either has none, and no mark can vouch for its
+// link. The caller holds i.mu.
+func (i *Instance) recallLinkVersionLocked(kind, value string) (recallLinkVersion, bool) {
+	binding, ok := i.RuntimeBindings[kind]
+	if !ok || binding.Value != value {
+		return recallLinkVersion{}, false
+	}
+	return recallLinkVersion{
+		incarnation: i.persistenceIncarnation,
+		generation:  binding.Generation,
+		revision:    binding.Revision,
+		value:       value,
+	}, true
 }
 
 // RecordRecallLink records the authoritative recall link for the instance's
@@ -12711,7 +12738,7 @@ func (i *Instance) retractClaudeCandidateLink(candidate string) {
 			slog.String("error", err.Error()))
 		return
 	}
-	i.linkedSessionIDs.clear("claude", candidate)
+	i.linkedBindings.clear("claude", candidate)
 }
 
 // sessionHasConversationData checks if a Claude session file contains actual
