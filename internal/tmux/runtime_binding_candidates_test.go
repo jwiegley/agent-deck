@@ -1054,8 +1054,9 @@ func TestRuntimeLifecycle_CandidateRespawnDeadlineStartsAfterClaim(t *testing.T)
 // TestRuntimeLifecycle_CandidateRespawnEscalationRetriesThroughPaneID: when
 // the post-respawn probe is indeterminate, the escalation re-probes before it
 // reaps, and the retry's tree is the set it spares. The retry must resolve the
-// respawned pane by its immutable ID, as the respawn itself did; by then the
-// mutable session name may resolve to a same-name replacement.
+// respawned pane by its immutable ID through the same probe the respawn itself
+// used; by then the mutable session name may resolve to a same-name
+// replacement.
 func TestRuntimeLifecycle_CandidateRespawnEscalationRetriesThroughPaneID(t *testing.T) {
 	binding := runtimeBindingCandidateForTest()
 	candidate := runtimeGenerationCandidateFromBinding(binding)
@@ -1089,7 +1090,7 @@ func TestRuntimeLifecycle_CandidateRespawnEscalationRetriesThroughPaneID(t *test
 	probesMu.Lock()
 	defer probesMu.Unlock()
 	if len(probes) != 4 {
-		t.Fatalf("pane-ID process-tree probes = %d, want the escalation's retry as the 4th; the retry bypassed the pane ID", len(probes))
+		t.Fatalf("pane-ID process-tree probes = %d, want the escalation's retry as the 4th; the retry bypassed the candidate's pane-ID probe", len(probes))
 	}
 	if want := (probeTarget{candidate.SocketName, candidate.PaneID}); probes[3] != want {
 		t.Fatalf("escalation retry probed %#v, want the respawned pane %#v", probes[3], want)

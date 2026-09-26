@@ -4188,27 +4188,25 @@ const respawnPanePIDRetryDelay = 500 * time.Millisecond
 // visible in `ps` over destroying live work on a guess, with no warning and no
 // recovery.
 func (s *Session) escalateAfterRespawn(oldIdentities []ProcessIdentity, newPIDs []int, probeErr error) {
-	s.escalateAfterRespawnTarget(oldIdentities, newPIDs, probeErr, "")
+	s.escalateAfterRespawnTarget(oldIdentities, newPIDs, probeErr, func() ([]int, error) {
+		_, pids, err := s.paneProcessTree()
+		return pids, err
+	})
 }
 
 // escalateAfterRespawnTarget is the immutable-pane variant used by
-// Session.RespawnPane and RespawnRuntimeGenerationCandidate. The empty-pane
-// fallback preserves the existing helper contract for callers that already
-// performed their own stable-ID proof.
-func (s *Session) escalateAfterRespawnTarget(oldIdentities []ProcessIdentity, newPIDs []int, probeErr error, paneID string) {
+// Session.RespawnPane and RespawnRuntimeGenerationCandidate. Each passes the
+// probe that produced newPIDs as reprobe, so the retry resolves the respawned
+// pane exactly as the first probe did: by the same immutable pane ID, through
+// the same probe function.
+func (s *Session) escalateAfterRespawnTarget(oldIdentities []ProcessIdentity, newPIDs []int, probeErr error, reprobe func() ([]int, error)) {
 	if len(oldIdentities) == 0 {
 		return
 	}
 
 	if probeErr != nil {
 		time.Sleep(respawnPanePIDRetryDelay)
-		var retryPIDs []int
-		var retryErr error
-		if paneID == "" {
-			_, retryPIDs, retryErr = s.paneProcessTree()
-		} else {
-			retryPIDs, retryErr = runtimeGenerationProcessTreeFn(s.SocketName, paneID)
-		}
+		retryPIDs, retryErr := reprobe()
 		if retryErr != nil {
 			respawnLog.Warn("respawn_escalation_skipped_unknown_pane_pid",
 				slog.String("session", s.Name),
@@ -4303,13 +4301,17 @@ func (s *Session) RespawnPane(command string) error {
 	// Capture the NEW process tree so we don't accidentally kill anything the
 	// respawn just created. Keep the probe error: "could not tell" must not be
 	// spent as an empty tree, which would silently disable that very guard
-	// (see escalateAfterRespawn).
-	_, newPIDs, newTreeErr := paneProcessTreeForPaneID(s.SocketName, target.PaneID)
+	// (see escalateAfterRespawn). The escalation retries with this same probe.
+	probeNewTree := func() ([]int, error) {
+		_, pids, err := paneProcessTreeForPaneID(s.SocketName, target.PaneID)
+		return pids, err
+	}
+	newPIDs, newTreeErr := probeNewTree()
 
 	// Verify old processes are dead; escalate to SIGKILL if needed
 	// Run in background so RespawnPane returns quickly
 	identitiesOwned = false
-	go s.escalateAfterRespawnTarget(oldIdentities, newPIDs, newTreeErr, target.PaneID)
+	go s.escalateAfterRespawnTarget(oldIdentities, newPIDs, newTreeErr, probeNewTree)
 
 	// A control-mode client is attached to the session rather than the pane
 	// process; reconnecting via a mutable name could attach to a replacement.
