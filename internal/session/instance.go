@@ -10036,8 +10036,12 @@ func (i *Instance) killInternalLocked(selection RuntimeSelection, sync, deleteRo
 		}
 		return nil
 	}
+	operation := destroyForStop
+	if deleteRow {
+		operation = destroyForDelete
+	}
 	candidate, err := i.captureDestructiveRuntimeCandidateLocked(
-		db, expected, selection.Incarnation, versioned)
+		db, operation, expected, selection.Incarnation, versioned)
 	if err != nil {
 		return err
 	}

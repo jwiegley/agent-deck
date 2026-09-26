@@ -3,7 +3,9 @@ package session
 import (
 	"errors"
 	"fmt"
+	"strings"
 
+	"al.essio.dev/pkg/shellescape"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
@@ -85,14 +87,23 @@ var terminateCapturedRuntimeFn = tmux.KillRuntimeGenerationCandidate
 // ErrRuntimeOwnershipUnproven reports a destructive action refused because the
 // tmux session its selected runtime names may still be live, yet no inventory
 // proves that session is this exact Agent Deck runtime: it lacks the ownership
-// stamp (an imported or pre-stamp session), or this process cannot see the
-// server it lives on. Recording it stopped would leave the process running
-// under a stopped row; killing it would act without authority.
+// stamp (a pre-stamp legacy session not yet adopted, a session whose stamp
+// names another instance, or an import whose stamp failed), or this process
+// cannot see the server it lives on. Recording it stopped would leave the
+// process running under a stopped row; killing it would act without
+// authority. The refusal names the operation and what the operator can do.
 var ErrRuntimeOwnershipUnproven = errors.New("live runtime ownership is unproven")
 
 var (
 	selectedRuntimeSessionExistsFn      = tmux.SelectedRuntimeSessionExists
 	destructionAbsenceIsForeignServerFn = runtimeAbsenceIsForeignServer
+)
+
+// Destructive operations, as a refusal names them.
+const (
+	destroyForStop    = "stop"
+	destroyForDelete  = "delete"
+	destroyForRestart = "restart"
 )
 
 // requireSelectedRuntimeGone is the last check before a destruction that found
@@ -102,24 +113,56 @@ var (
 // answering, from a process that can see its server. Like those inventories,
 // the probe reads a missing socket file as absence, so a stop after a reboot
 // completes; a live server whose socket file was unlinked or relocated is the
-// accepted cost (tmux.SelectedRuntimeSessionExists).
-func requireSelectedRuntimeGone(expected statedb.RuntimeState) error {
+// accepted cost (tmux.SelectedRuntimeSessionExists). A refusal names the
+// operation and the way out: the exact command that ends the session by hand,
+// and legacy adoption when the runtime is still eligible for it.
+func requireSelectedRuntimeGone(db *statedb.StateDB, operation string, expected statedb.RuntimeState) error {
 	if expected.TmuxSession == "" {
 		return nil
 	}
 	live, err := selectedRuntimeSessionExistsFn(expected.TmuxSocketName, expected.TmuxSession)
+	kill := tmuxKillSessionCommand(expected)
 	switch {
 	case err != nil:
-		return fmt.Errorf("cannot prove tmux session %q of %s stopped (%v); refusing to record it stopped: %w",
-			expected.TmuxSession, expected.InstanceID, err, ErrRuntimeOwnershipUnproven)
+		return fmt.Errorf("%s refused: cannot prove tmux session %q of %s stopped (%v); retry once its tmux server answers, or end the session yourself with `%s`: %w",
+			operation, expected.TmuxSession, expected.InstanceID, err, kill, ErrRuntimeOwnershipUnproven)
 	case live:
-		return fmt.Errorf("tmux session %q of %s is still live, but no Agent Deck ownership stamp proves it is runtime generation %d; refusing to record it stopped: %w",
-			expected.TmuxSession, expected.InstanceID, expected.Generation, ErrRuntimeOwnershipUnproven)
+		remedy := fmt.Sprintf("end it yourself with `%s`, then retry the %s", kill, operation)
+		if legacyRuntimeAdoptionOffered(db, expected) {
+			remedy = fmt.Sprintf("run `agent-deck session adopt-runtime %s --yes` to bring it under Agent Deck, or %s",
+				expected.InstanceID, remedy)
+		}
+		return fmt.Errorf("%s refused: tmux session %q of %s is still live, but no Agent Deck ownership stamp proves it is runtime generation %d (Agent Deck neither started nor imported it, or its stamp names another instance); %s: %w",
+			operation, expected.TmuxSession, expected.InstanceID, expected.Generation, remedy, ErrRuntimeOwnershipUnproven)
 	case destructionAbsenceIsForeignServerFn(expected):
-		return fmt.Errorf("tmux session %q of %s is on the native default server, which this process inside another tmux server cannot see; refusing to record it stopped: %w",
-			expected.TmuxSession, expected.InstanceID, ErrRuntimeOwnershipUnproven)
+		return fmt.Errorf("%s refused: tmux session %q of %s is on the native default tmux server, which this process cannot see from inside another tmux server; run the %s from outside tmux, or end the session yourself with `%s`: %w",
+			operation, expected.TmuxSession, expected.InstanceID, operation, kill, ErrRuntimeOwnershipUnproven)
 	}
 	return nil
+}
+
+// tmuxKillSessionCommand is the command that ends the selected session by
+// hand: its own socket ("" is tmux's native default socket, which tmux names
+// "default") and an exact "=" target that no similarly named session answers.
+func tmuxKillSessionCommand(state statedb.RuntimeState) string {
+	socket := state.TmuxSocketName
+	if socket == "" {
+		socket = "default"
+	}
+	return "tmux -L " + shellescape.Quote(socket) + " kill-session -t " + shellescape.Quote("="+state.TmuxSession)
+}
+
+// legacyRuntimeAdoptionOffered reports whether `session adopt-runtime` can
+// stamp this pre-stamp runtime: it still holds its one-time migration record,
+// and its tmux name is one legacy adoption accepts (SessionPrefix; see
+// tmux.AdoptLegacyRuntimeCandidate). Offering it anywhere else would send the
+// operator to a command that refuses.
+func legacyRuntimeAdoptionOffered(db *statedb.StateDB, expected statedb.RuntimeState) bool {
+	if db == nil || !strings.HasPrefix(expected.TmuxSession, tmux.SessionPrefix) {
+		return false
+	}
+	_, found, err := db.ReadLegacyRuntimeAdoption(expected.InstanceID)
+	return err == nil && found
 }
 
 // discoverCapturedRuntimeChildrenFn returns, but does not register, descendants
@@ -177,10 +220,11 @@ func (i *Instance) deleteCapturedAndRetireService(selection RuntimeSelection, de
 // identity of the durable winner. The caller already holds the instance lock.
 // A target no inventory holds is already stopped only once its selected tmux
 // session no longer answers (requireSelectedRuntimeGone); a live session the
-// inventories cannot prove is refused, never recorded stopped. A target that
-// appeared or changed is preserved for a later reconciliation pass.
+// inventories cannot prove is refused, never recorded stopped, and the
+// refusal names the operation. A target that appeared or changed is preserved
+// for a later reconciliation pass.
 func (i *Instance) captureDestructiveRuntimeCandidateLocked(
-	db *statedb.StateDB, expected statedb.RuntimeState, incarnation string, durable bool,
+	db *statedb.StateDB, operation string, expected statedb.RuntimeState, incarnation string, durable bool,
 ) (*tmux.RuntimeGenerationCandidate, error) {
 	live := false
 	if durable {
@@ -226,7 +270,7 @@ func (i *Instance) captureDestructiveRuntimeCandidateLocked(
 		return nil, fmt.Errorf("runtime candidate appeared after reconciliation: %w", statedb.ErrRuntimeGenerationConflict)
 	}
 	if selected == nil {
-		if err := requireSelectedRuntimeGone(expected); err != nil {
+		if err := requireSelectedRuntimeGone(db, operation, expected); err != nil {
 			return nil, err
 		}
 	}
@@ -250,7 +294,7 @@ func (i *Instance) terminateTransitionPredecessor(authority *runtimeTransitionAu
 			return err
 		}
 		candidate, err := i.captureDestructiveRuntimeCandidateLocked(
-			authority.db, selected, authority.incarnation, false)
+			authority.db, destroyForRestart, selected, authority.incarnation, false)
 		if err != nil || candidate == nil {
 			return err
 		}
@@ -264,7 +308,7 @@ func (i *Instance) terminateTransitionPredecessor(authority *runtimeTransitionAu
 		return err
 	}
 	candidate, err := i.captureDestructiveRuntimeCandidateLocked(
-		authority.db, selected, authority.incarnation, true)
+		authority.db, destroyForRestart, selected, authority.incarnation, true)
 	if err != nil {
 		return err
 	}
