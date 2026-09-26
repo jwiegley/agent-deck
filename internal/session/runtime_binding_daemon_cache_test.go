@@ -6,10 +6,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/health"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/testutil"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -190,30 +193,99 @@ func TestRuntimeLifecycle_DaemonPollStateDoesNotCarryFlipAcrossTUILifetime(t *te
 }
 
 // A successful profile listing retires every per-profile map of a deleted
-// profile. The carried flip priors are per-profile state like the poll-state
-// bridge; left behind they leak for the notify daemon's lifetime, and a
-// profile recreated under the same name would inherit the old verdicts.
-func TestRuntimeLifecycle_DaemonPruneDeletedProfileDropsLivePriors(t *testing.T) {
+// profile and keeps the active profile's. Left behind, an entry leaks for the
+// notify daemon's lifetime and a profile recreated under the same name
+// inherits it: flip priors, poll state, turn and journal baselines that
+// swallow its first events, desktop-notification edges, and a live journal
+// writer goroutine bound to the old journal. Every map field of the daemon
+// must be classified below, so a new one cannot be forgotten by the prune.
+func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *testing.T) {
+	profileKeyed := []string{
+		"storages", "lastStatus", "initialized", "livePrior", "lastDone", "lastTurn",
+		"lastDoneScan", "journalWriters", "lastJournaled", "pollState",
+	}
+	profilePipeKeyed := []string{"lastProbeStall", "lastDesktopNotify"}
+
 	d := NewTransitionDaemon()
-	d.livePrior["kept"] = map[string]liveStatusPrior{"worker": {status: StatusRunning, flipPending: true}}
-	d.livePrior["deleted"] = map[string]liveStatusPrior{"worker": {status: StatusRunning, flipPending: true}}
-	d.pollState["kept"] = map[string]instancePollingState{"worker": {}}
-	d.pollState["deleted"] = map[string]instancePollingState{"worker": {}}
+	appenders := map[string]*slowJournalAppender{}
+	for _, profile := range []string{"kept", "deleted"} {
+		d.storages[profile] = nil
+		d.lastStatus[profile] = map[string]string{"worker": "running"}
+		d.initialized[profile] = true
+		d.livePrior[profile] = map[string]liveStatusPrior{"worker": {status: StatusRunning, flipPending: true}}
+		d.lastDone[profile] = map[string]DoneSignal{"worker": {Status: "ok"}}
+		d.lastTurn[profile] = map[string]string{"worker": "waiting|turn"}
+		d.lastDoneScan[profile] = map[string]time.Time{"worker": time.Now()}
+		appenders[profile] = &slowJournalAppender{delay: 20 * time.Millisecond}
+		d.journalWriters[profile] = health.NewAsyncWriter(appenders[profile], 8)
+		d.lastJournaled[profile] = map[string]string{"worker": "running|"}
+		d.pollState[profile] = map[string]instancePollingState{"worker": {}}
+		d.lastProbeStall[profile+"|worker"] = time.Now()
+		d.lastDesktopNotify[profile+"|worker"] = "waiting"
+	}
+	t.Cleanup(func() { d.Flush() })
+	// Queue events behind a slow appender. Only a writer the prune stopped,
+	// and whose drain it waited for, has written all of them when it returns.
+	const queued = 5
+	for j := 0; j < queued; j++ {
+		d.journalWriters["deleted"].Append(health.Event{TS: time.Now(), SessionID: "worker", Kind: health.KindStatus})
+	}
 
 	d.pruneDeletedProfiles([]string{"kept"})
 
-	if priors, ok := d.livePrior["deleted"]; ok {
-		t.Fatalf("deleted profile kept its flip priors: %+v", priors)
+	daemon := reflect.ValueOf(d).Elem()
+	classified := map[string]string{}
+	for _, name := range profileKeyed {
+		classified[name] = ""
 	}
-	if _, ok := d.pollState["deleted"]; ok {
-		t.Fatal("deleted profile kept its poll state")
+	for _, name := range profilePipeKeyed {
+		classified[name] = "|worker"
+	}
+	for j := 0; j < daemon.NumField(); j++ {
+		field := daemon.Type().Field(j)
+		if field.Type.Kind() != reflect.Map {
+			continue
+		}
+		suffix, ok := classified[field.Name]
+		if !ok {
+			t.Errorf("TransitionDaemon.%s is not classified: key it by profile, retire it in pruneDeletedProfiles, and list it here", field.Name)
+			continue
+		}
+		entries := daemon.Field(j)
+		if entries.MapIndex(reflect.ValueOf("deleted" + suffix)).IsValid() {
+			t.Errorf("deleted profile kept its %s entry", field.Name)
+		}
+		if !entries.MapIndex(reflect.ValueOf("kept" + suffix)).IsValid() {
+			t.Errorf("active profile lost its %s entry", field.Name)
+		}
+	}
+	if got := appenders["deleted"].count(); got != queued {
+		t.Errorf("deleted profile's journal writer wrote %d of %d queued events before the prune returned; want it stopped and drained", got, queued)
 	}
 	if prior := d.livePrior["kept"]["worker"]; prior.status != StatusRunning || !prior.flipPending {
 		t.Fatalf("active profile lost its flip prior: %+v", prior)
 	}
-	if _, ok := d.pollState["kept"]["worker"]; !ok {
-		t.Fatal("active profile lost its poll state")
-	}
+}
+
+// slowJournalAppender counts journal events, taking delay over each one.
+type slowJournalAppender struct {
+	delay time.Duration
+	mu    sync.Mutex
+	n     int
+}
+
+func (a *slowJournalAppender) Append(health.Event) error {
+	time.Sleep(a.delay)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.n++
+	return nil
+}
+
+func (a *slowJournalAppender) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.n
 }
 
 func installRuntimeLifecycleNoopTmux(t *testing.T) {

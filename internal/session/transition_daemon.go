@@ -498,59 +498,64 @@ func profilesForTransitionDaemon() ([]string, error) {
 // only after ListProfiles completed successfully. A transient listing error
 // must not make the daemon forget live profiles; a successful list is the
 // authoritative snapshot and lets deleted profiles be retired immediately.
+//
+// Every per-profile field of TransitionDaemon is retired here. An entry left
+// behind outlives its profile for the daemon's lifetime, and a profile
+// recreated under the same name inherits it: a turn or journal baseline that
+// swallows its first events, a live journal writer bound to the old journal.
+// TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap fails
+// when a map field is added to the daemon without being classified there.
 func (d *TransitionDaemon) pruneDeletedProfiles(profiles []string) {
 	active := make(map[string]bool, len(profiles))
 	for _, profile := range profiles {
 		active[profile] = true
 	}
 
-	for profile, storage := range d.storages {
-		if active[profile] {
-			continue
-		}
+	retireProfiles(d.storages, active, func(storage *Storage) {
 		if storage != nil {
 			_ = storage.Close()
 		}
-		delete(d.storages, profile)
-	}
-	for profile := range d.lastStatus {
-		if !active[profile] {
-			delete(d.lastStatus, profile)
-		}
-	}
-	for profile := range d.initialized {
-		if !active[profile] {
-			delete(d.initialized, profile)
-		}
-	}
-	for profile := range d.lastDone {
-		if !active[profile] {
-			delete(d.lastDone, profile)
-		}
-	}
-	for profile := range d.lastDoneScan {
-		if !active[profile] {
-			delete(d.lastDoneScan, profile)
-		}
-	}
-	for profile := range d.pollState {
-		if !active[profile] {
-			delete(d.pollState, profile)
-		}
-	}
-	for profile := range d.livePrior {
-		if !active[profile] {
-			delete(d.livePrior, profile)
-		}
-	}
-	for key := range d.lastProbeStall {
-		profile, _, ok := strings.Cut(key, "|")
-		if ok && !active[profile] {
-			delete(d.lastProbeStall, key)
-		}
-	}
+	})
+	retireProfiles(d.lastStatus, active, nil)
+	retireProfiles(d.initialized, active, nil)
+	retireProfiles(d.livePrior, active, nil)
+	retireProfiles(d.lastDone, active, nil)
+	retireProfiles(d.lastTurn, active, nil)
+	retireProfiles(d.lastDoneScan, active, nil)
+	retireProfiles(d.lastJournaled, active, nil)
+	// Stop drains what is already queued and ends the writer goroutine,
+	// bounded as at shutdown. A nil writer (session_events off) is a no-op.
+	retireProfiles(d.journalWriters, active, func(writer *health.AsyncWriter) {
+		writer.Stop(journalFlushTimeout)
+	})
+	retireProfiles(d.pollState, active, nil)
+	retireProfileKeys(d.lastProbeStall, active)
+	retireProfileKeys(d.lastDesktopNotify, active)
 	if d.selfheal != nil {
 		d.selfheal.pruneProfiles(active)
+	}
+}
+
+// retireProfiles deletes the entries of m keyed by a profile missing from
+// active, handing each dropped value to release when release is non-nil.
+func retireProfiles[V any](m map[string]V, active map[string]bool, release func(V)) {
+	for profile, value := range m {
+		if active[profile] {
+			continue
+		}
+		if release != nil {
+			release(value)
+		}
+		delete(m, profile)
+	}
+}
+
+// retireProfileKeys is retireProfiles for maps keyed "profile|key".
+func retireProfileKeys[V any](m map[string]V, active map[string]bool) {
+	for key := range m {
+		if profile, _, ok := strings.Cut(key, "|"); ok && !active[profile] {
+			delete(m, key)
+		}
 	}
 }
 
