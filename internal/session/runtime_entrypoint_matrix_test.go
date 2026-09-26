@@ -223,7 +223,8 @@ func TestRuntimeLifecycle_PhysicalEntrypointRoutingContract(t *testing.T) {
 // the exact transition tuple and turns a partial success into a retryable
 // failure, an uncaptured kill can take out a replacement adopted mid-command,
 // and a write to a runtime-owned field (Status, LastStartedAt, the generation
-// or status revision) is dropped by the snapshot save.
+// or status revision), whether assigned, set through an in-memory setter or
+// keyed in an Instance literal, is dropped by the snapshot save.
 func TestRuntimeLifecycle_CoreRegistryBypassesNoRuntimeAuthority(t *testing.T) {
 	root := runtimeLifecycleSourceRoot(t)
 	dir := filepath.Join(root, "internal", "core")
@@ -235,7 +236,7 @@ func TestRuntimeLifecycle_CoreRegistryBypassesNoRuntimeAuthority(t *testing.T) {
 		"Start": true, "StartWithMessage": true, "Restart": true, "RestartWithEnv": true,
 		"Kill": true, "KillAndWait": true,
 	}
-	parsed := 0
+	parsed, startStatuses := 0, 0
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || filepath.Ext(name) != ".go" || strings.HasSuffix(name, "_test.go") {
@@ -259,11 +260,30 @@ func TestRuntimeLifecycle_CoreRegistryBypassesNoRuntimeAuthority(t *testing.T) {
 			if field, ok := runtimeOwnedWrite(node); ok {
 				t.Errorf("%s: writes runtime-owned field %s", where(node.Pos()), field)
 			}
+			// The Status exemption for StartStatus* values is sound only
+			// while they cannot be assigned to a session.Status.
+			if spec, ok := node.(*ast.TypeSpec); ok && spec.Name.Name == "StartStatus" && spec.Assign.IsValid() {
+				t.Errorf("%s: StartStatus must be a defined type, not an alias", where(spec.Pos()))
+			}
+			if spec, ok := node.(*ast.ValueSpec); ok {
+				for _, ident := range spec.Names {
+					if !strings.HasPrefix(ident.Name, "StartStatus") {
+						continue
+					}
+					startStatuses++
+					if typ, ok := spec.Type.(*ast.Ident); !ok || typ.Name != "StartStatus" {
+						t.Errorf("%s: %s must be declared as a StartStatus", where(ident.Pos()), ident.Name)
+					}
+				}
+			}
 			return true
 		})
 	}
 	if parsed == 0 {
 		t.Fatalf("no internal/core sources found under %s", dir)
+	}
+	if startStatuses == 0 {
+		t.Fatal("no StartStatus* declarations found in internal/core: update provablyNotSessionStatus")
 	}
 }
 
@@ -272,13 +292,26 @@ func TestRuntimeLifecycle_CoreRegistryBypassesNoRuntimeAuthority(t *testing.T) {
 // declares these names, so any write to such a selector is a bypass.
 var runtimeOwnedFields = map[string]bool{"LastStartedAt": true, "RuntimeGeneration": true, "StatusRevision": true}
 
+// runtimeOwnedSetters are the Instance methods that write a runtime-owned
+// field in memory only; the snapshot save drops that write too.
+var runtimeOwnedSetters = map[string]string{"SetStatusThreadSafe": "Status"}
+
 // runtimeOwnedWrite reports the runtime-owned field that node writes in
 // memory, whatever the written value. Status is also a field of core's own
 // output types, so a Status write passes only when its value provably is not
-// a session.Status: a StartStatus* constant (SessionStartOut's vocabulary) or
-// an address (GroupNode.Status is a *string; Instance.Status never is).
+// a session.Status: a StartStatus* constant (SessionStartOut's vocabulary,
+// declared as the StartStatus type, which the guard above keeps true) or an
+// address (GroupNode.Status is a *string; Instance.Status never is).
 func runtimeOwnedWrite(node ast.Node) (string, bool) {
 	switch n := node.(type) {
+	case *ast.CallExpr:
+		if sel, ok := n.Fun.(*ast.SelectorExpr); ok {
+			if field, ok := runtimeOwnedSetters[sel.Sel.Name]; ok {
+				return field, true
+			}
+		}
+	case *ast.CompositeLit:
+		return runtimeOwnedInstanceKey(n)
 	case *ast.IncDecStmt:
 		if sel, ok := n.X.(*ast.SelectorExpr); ok && (runtimeOwnedFields[sel.Sel.Name] || sel.Sel.Name == "Status") {
 			return sel.Sel.Name, true
@@ -310,6 +343,60 @@ func provablyNotSessionStatus(value ast.Expr) bool {
 	return false
 }
 
+// runtimeOwnedInstanceKey reports a runtime-owned key in a session.Instance
+// literal, or in an element literal whose Instance type a slice, array or map
+// literal elides. Any Status key counts: no StartStatus value or address is
+// assignable to an Instance's Status.
+func runtimeOwnedInstanceKey(lit *ast.CompositeLit) (string, bool) {
+	var literals []*ast.CompositeLit
+	if isSessionInstanceType(lit.Type) {
+		literals = append(literals, lit)
+	}
+	var elem ast.Expr
+	switch t := lit.Type.(type) {
+	case *ast.ArrayType:
+		elem = t.Elt
+	case *ast.MapType:
+		elem = t.Value
+	}
+	if elem != nil && isSessionInstanceType(elem) {
+		for _, e := range lit.Elts {
+			if kv, ok := e.(*ast.KeyValueExpr); ok {
+				e = kv.Value
+			}
+			if inner, ok := e.(*ast.CompositeLit); ok && inner.Type == nil {
+				literals = append(literals, inner)
+			}
+		}
+	}
+	for _, l := range literals {
+		for _, elt := range l.Elts {
+			kv, ok := elt.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			if key, ok := kv.Key.(*ast.Ident); ok && (runtimeOwnedFields[key.Name] || key.Name == "Status") {
+				return key.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
+// isSessionInstanceType reports whether expr names session.Instance or a
+// pointer to it.
+func isSessionInstanceType(expr ast.Expr) bool {
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "Instance" {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	return ok && pkg.Name == "session"
+}
+
 // The negative guard above is only as strong as runtimeOwnedWrite: pin every
 // write shape a snapshot save drops, and the core output writes it must pass.
 func TestRuntimeLifecycle_CoreRuntimeOwnedWriteClassifier(t *testing.T) {
@@ -324,9 +411,19 @@ func TestRuntimeLifecycle_CoreRuntimeOwnedWriteClassifier(t *testing.T) {
 		{"inst.LastStartedAt, err = parse(raw)", "LastStartedAt"},
 		{"inst.RuntimeGeneration = 0", "RuntimeGeneration"},
 		{"inst.StatusRevision++", "StatusRevision"},
+		{"inst.SetStatusThreadSafe(session.StatusError)", "Status"},
+		{"inst = &session.Instance{ID: id, Status: session.StatusRunning}", "Status"},
+		{"return session.Instance{LastStartedAt: now}", "LastStartedAt"},
+		{"use(session.Instance{RuntimeGeneration: 1})", "RuntimeGeneration"},
+		{"rows := []*session.Instance{{ID: id}, {StatusRevision: 2}}", "StatusRevision"},
+		{"byID := map[string]session.Instance{id: {Status: st}}", "Status"},
 		{"out.Status = StartStatusQueued", ""},
+		{"out := SessionStartOut{ID: id, Status: StartStatusStarted}", ""},
 		{"node.Status = &status", ""},
 		{"inst.Title = title", ""},
+		{"inst := &session.Instance{ID: id, Title: title}", ""},
+		{"rows := []*session.Instance{{ID: id}}", ""},
+		{"status := inst.GetStatusThreadSafe()", ""},
 	}
 	for _, c := range cases {
 		src := "package p\nfunc f() {\n" + c.stmt + "\n}\n"
@@ -334,7 +431,16 @@ func TestRuntimeLifecycle_CoreRuntimeOwnedWriteClassifier(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", c.stmt, err)
 		}
-		field, ok := runtimeOwnedWrite(file.Decls[0].(*ast.FuncDecl).Body.List[0])
+		// The guard inspects every node, so a write nested in the statement
+		// (a literal or a setter call) counts as the statement's.
+		var field string
+		var ok bool
+		ast.Inspect(file.Decls[0].(*ast.FuncDecl).Body.List[0], func(node ast.Node) bool {
+			if !ok && node != nil {
+				field, ok = runtimeOwnedWrite(node)
+			}
+			return !ok
+		})
 		if ok != (c.want != "") || field != c.want {
 			t.Errorf("runtimeOwnedWrite(%s) = %q, %v; want %q", c.stmt, field, ok, c.want)
 		}
