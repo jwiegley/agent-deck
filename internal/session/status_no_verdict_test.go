@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -144,5 +145,52 @@ func TestStatusProbe_ForeignServerGuardRunsUnlockedAndRevalidates(t *testing.T) 
 				t.Fatalf("durable status = %+v found=%v err=%v, want %q", durable, found, err, c.want)
 			}
 		})
+	}
+}
+
+// The notify daemon reloads every instance on each pass and carries the error
+// recheck throttle across. The throttle trusts only the generation it confirmed
+// absent, so the daemon carries that generation too: otherwise the throttle
+// lapses on every reload, and each ghost session past generation 0 is probed
+// on every pass.
+func TestStatusProbe_DaemonReloadCarriesRecheckThrottle(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	storage, seeded := loadStatusMetadataFixture(t, "claude", "agentdeck-status-throttle-carry", StatusError)
+	// Any session that was ever started is past generation 0.
+	observed := seeded.RuntimeState()
+	next := observed
+	next.Generation++
+	next.StatusRevision = 0
+	next.LastStartedAt = time.Now().UTC()
+	if err := storage.db.CommitRuntimeTransition(observed.Generation, seeded.PersistenceIncarnation(), next); err != nil {
+		t.Fatal(err)
+	}
+	reload := func() *Instance {
+		t.Helper()
+		loaded, _, err := storage.LoadWithGroups()
+		if err != nil || len(loaded) != 1 {
+			t.Fatalf("reload: %v (%d instances)", err, len(loaded))
+		}
+		return loaded[0]
+	}
+	// The guard runs only after a probe found the tmux session absent.
+	probes := 0
+	stageForeignServerGuard(t, func(*tmux.Session) bool {
+		probes++
+		return false
+	})
+
+	polled := reload()
+	if evidence, err := polled.updateStatusWithEvidence(nil, true); err != nil || evidence.noVerdict.Load() || probes != 1 {
+		t.Fatalf("first pass: err=%v no verdict=%v probes=%d; want the absence confirmed", err, evidence.noVerdict.Load(), probes)
+	}
+	carried := reload()
+	if !carried.restorePollingState(polled.pollingStateForIdentity(polled.pollingIdentity())) {
+		t.Fatal("the daemon's polling state was not restored onto the reloaded instance")
+	}
+	evidence, err := carried.updateStatusWithEvidence(nil, true)
+	if err != nil || !evidence.noVerdict.Load() || probes != 1 {
+		t.Fatalf("pass after reload: err=%v no verdict=%v probes=%d; want the carried throttle to skip the probe",
+			err, evidence.noVerdict.Load(), probes)
 	}
 }

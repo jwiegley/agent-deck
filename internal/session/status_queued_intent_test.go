@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // Queued is operator intent (v1.9.1 group concurrency): the session waits for
@@ -124,5 +125,67 @@ func TestStatusQueued_TUIPollKeepsQueuedSession(t *testing.T) {
 	}
 	if next := FindNextQueued([]*Instance{inst}, inst.GroupPath); next != inst {
 		t.Fatalf("FindNextQueued = %v, want the polled session still waiting for capacity", next)
+	}
+}
+
+// The 30-second recheck throttle trusts only the runtime whose absence it
+// confirmed. Another process that drains a command-less queued session
+// commits the next generation still queued, now with a live tmux session. A
+// poller that confirmed the old generation absent moments earlier must probe
+// the adopted one at once: until the throttle expired it showed the live
+// session queued, CountRunningInGroup undercounted its group, and
+// FindNextQueued could offer it to the drain again.
+func TestStatusQueued_AdoptedGenerationEscapesRecheckThrottle(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	t.Setenv("HOME", t.TempDir())
+	storage, inst := loadStatusMetadataFixture(t, "claude", "agentdeck-status-queued-waiting", StatusQueued)
+	stageForeignServerGuard(t, func(*tmux.Session) bool { return false })
+	// The first poll confirms the queued generation's tmux session absent; the
+	// second, at the same generation, is throttled.
+	for n, throttled := range []bool{false, true} {
+		evidence, err := inst.updateStatusWithEvidence(nil, true)
+		if err != nil {
+			t.Fatalf("poll %d: %v", n+1, err)
+		}
+		if got := inst.GetStatusThreadSafe(); got != StatusQueued || evidence.noVerdict.Load() != throttled {
+			t.Fatalf("poll %d: status = %q, no verdict = %v; want queued, %v", n+1, got, evidence.noVerdict.Load(), throttled)
+		}
+	}
+
+	const drained = "agentdeck-status-queued-drained"
+	startEarlyExitPane(t, drained, "drained by another process\n")
+	queued := inst.RuntimeState()
+	next := queued
+	next.Generation++
+	next.StatusRevision = 0
+	next.TmuxSession = drained
+	next.LastStartedAt = time.Now().UTC()
+	if err := storage.db.CommitRuntimeTransition(queued.Generation, inst.PersistenceIncarnation(), next); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, _, err := storage.LoadWithGroups()
+	if err != nil || len(reloaded) != 1 || !inst.MergeReloaded(reloaded[0]) {
+		t.Fatalf("reload merge: %v (%d instances)", err, len(reloaded))
+	}
+	if got := inst.RuntimeState(); got.Generation != next.Generation || got.TmuxSession != drained {
+		t.Fatalf("adopted runtime = %+v, want generation %d on %s", got, next.Generation, drained)
+	}
+	tmux.RefreshExistingSessions()
+	tmux.RefreshPaneInfoCache()
+
+	evidence, err := inst.updateStatusWithEvidence(nil, true)
+	if err != nil {
+		t.Fatalf("poll after adoption: %v", err)
+	}
+	if evidence.noVerdict.Load() || !evidence.paneSampled.Load() {
+		t.Fatalf("poll after adoption: no verdict = %v, pane sampled = %v; want the live pane probed",
+			evidence.noVerdict.Load(), evidence.paneSampled.Load())
+	}
+	if got := inst.GetStatusThreadSafe(); got == StatusQueued {
+		t.Fatal("the adopted live generation still reads queued")
+	}
+	durable, found, err := storage.db.ReadRuntimeState(inst.ID)
+	if err != nil || !found || durable != inst.RuntimeState() {
+		t.Fatalf("durable runtime = %+v found=%v err=%v, want the committed verdict %+v", durable, found, err, inst.RuntimeState())
 	}
 }
