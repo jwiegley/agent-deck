@@ -98,3 +98,34 @@ AGENTDECK_UPDATE_GOLDENS=1 go test ./cmd/agent-deck/ -run 'TestCLIGoldens$|TestS
 
 Then `git diff` the changed `.golden` files and get a reviewer's PASS before
 committing.
+
+## Fork deviations
+
+This fork keeps runtime state authoritative in `state.db` and differs from
+upstream v1.16.17 on purpose in the behaviours below. The goldens record the
+fork's behaviour; the goldens each deviation changes were regenerated with
+it, and nothing else was.
+
+1. **One-pass CLI reads commit what they observe.** `list --json`,
+   `session show`, `status` and `group list` durably commit the status their
+   probe observes through the single status authority
+   (`session.Instance.UpdateStatusObserved`) before printing it. Upstream's
+   CLI keeps these observations in memory and persists observed statuses
+   only from long-running pollers such as the transition daemon. The
+   fixture's sessions have no tmux sessions, so the first such read commits
+   `golden-sess-1` to `-3` (seeded idle, running, waiting) as `error`, and
+   `fleet status`, which reads stored statuses, then counts them as down.
+   So that no golden depends on which specs ran before it,
+   `TestCLIGoldens/safe` commits the observations once, through a
+   `list --json` warm-up that is not itself a golden
+   (`goldens_observations_test.go`), before any spec runs, and fails if a
+   spec commits another observation after it. A filtered run such as
+   `-run 'TestCLIGoldens/safe/fleet_status$'` prints the same bytes as the
+   full run.
+2. **Queued is operator intent.** A `queued` session is waiting for group
+   capacity and was never started, so the status probe keeps it queued when
+   its tmux session is absent, as it keeps `stopped`; only the queue drain's
+   start replaces it. Upstream classifies it as a dead pane (`error`,
+   substate `unknown-exit`). `golden-sess-6` is therefore `queued` in
+   `list --json`, is not counted as `error` by `status --json` or
+   `group list --json`, and is not running (skipped) in `fleet status`.
