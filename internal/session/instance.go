@@ -12605,6 +12605,8 @@ func (i *Instance) bindClaudeSessionFromHook(observation RuntimeBindingObservati
 // (--session-id) reach UpdateHookStatus already equal, and an id bound by a
 // non-hook path, or whose earlier link write failed, has no link until a
 // hook vouches for it. Failures are logged and retried on the next hook.
+// The caller holds i.mu; recordRecallLinkLocked releases it around the
+// write.
 func (i *Instance) confirmHookSessionLink(kind, sessionID, hookSource string) {
 	if err := i.recordRecallLinkLocked(kind, sessionID); err != nil {
 		sessionLog.Warn("session_link_confirm_failed",
@@ -12616,13 +12618,24 @@ func (i *Instance) confirmHookSessionLink(kind, sessionID, hookSource string) {
 	}
 }
 
+// linkRuntimeBindingFn is statedb's LinkRuntimeBinding. Test seam: it lets a
+// test observe the link write, including the instance locks held around it.
+var linkRuntimeBindingFn = (*statedb.StateDB).LinkRuntimeBinding
+
 // recordRecallLinkLocked writes the authoritative session_links row for
 // value while value is still this instance's durable binding of kind
 // (statedb.LinkRuntimeBinding checks both in one transaction). The
 // in-memory mark keeps it to one attempt per binding version per process
 // once the link exists, not one per hook event. It names the version, not
 // the id: a rebind, even back to an id linked earlier, is a new version,
-// and a peer may have linked another id in between. The caller holds i.mu.
+// and a peer may have linked another id in between.
+//
+// The caller holds i.mu, which is released around the database call and
+// retaken before returning, as publishObservedRuntimeBindingLocked does
+// around the CAS: writing a missing link takes SQLite's writer reservation,
+// and status readers must not queue on i.mu behind a peer's write. The mark
+// set afterwards names the version read before the call, so a binding that
+// moved on meanwhile simply misses it.
 func (i *Instance) recordRecallLinkLocked(kind, value string) error {
 	if value == "" {
 		return nil
@@ -12638,7 +12651,10 @@ func (i *Instance) recordRecallLinkLocked(kind, value string) error {
 	if db == nil {
 		return nil
 	}
-	linked, err := db.LinkRuntimeBinding(i.ID, i.persistenceIncarnation, kind, value)
+	instanceID, incarnation := i.ID, i.persistenceIncarnation
+	i.mu.Unlock()
+	linked, err := linkRuntimeBindingFn(db, instanceID, incarnation, kind, value)
+	i.mu.Lock()
 	if err != nil || !linked {
 		return err
 	}
