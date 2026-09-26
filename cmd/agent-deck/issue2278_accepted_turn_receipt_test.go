@@ -240,6 +240,7 @@ func appendCodexTurnStart(path, turnID string) error {
 }
 
 func TestCodexAcceptanceGuardHydratesLegacyIdentity(t *testing.T) {
+	isolateCodexIdentityStore(t)
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
 	project := filepath.Join(home, "project")
@@ -300,6 +301,19 @@ func TestCodexAcceptanceGuardHydratesLegacyIdentity(t *testing.T) {
 	if persisted := persistedCodexIdentity(t, storage, inst.ID); persisted != sessionID {
 		t.Fatalf("persisted identity = %q, want %q", persisted, sessionID)
 	}
+}
+
+// isolateCodexIdentityStore gives the test its own agent-deck home. A runtime
+// binding's value is unique within a profile store, so a repeated run
+// (-count>1) must not meet the identities an earlier run bound there.
+func isolateCodexIdentityStore(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	for _, key := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(key, "")
+	}
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
 }
 
 func persistedCodexIdentity(t *testing.T, storage *session.Storage, instanceID string) string {
@@ -398,6 +412,7 @@ func TestLegacyCodexIdentityHydrationRefusesUntrustedCandidates(t *testing.T) {
 		{name: "stale peer binding owns live identity", startPane: true, paneID: candidate, rolloutIDs: []string{candidate}, peer: true, want: "already owned"},
 	}
 
+	isolateCodexIdentityStore(t)
 	for n, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			home := filepath.Join(t.TempDir(), "codex")
@@ -448,6 +463,7 @@ func TestLegacyCodexIdentityHydrationRefusesUntrustedCandidates(t *testing.T) {
 }
 
 func TestLegacyCodexIdentityHydrationRequiresCurrentGeneration(t *testing.T) {
+	isolateCodexIdentityStore(t)
 	home := filepath.Join(t.TempDir(), "codex")
 	t.Setenv("CODEX_HOME", home)
 	project := filepath.Join(t.TempDir(), "project")
