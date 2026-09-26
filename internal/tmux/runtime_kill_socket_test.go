@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -232,6 +233,71 @@ func TestRuntimeLifecycle_GenericMutationRejectsSameNameReplacement(t *testing.T
 				t.Fatalf("retained handle closes = %d, want 1", closed)
 			}
 		})
+	}
+}
+
+// TestRuntimeLifecycle_RespawnPaneEscalationRetriesThroughItsOwnProbe: when
+// the post-respawn probe is indeterminate, the escalation re-probes before it
+// reaps, and the retry must resolve the pane exactly as that first probe did.
+// RespawnPane probes the pane ID directly, so its retry must neither fall back
+// to the mutable session name nor read runtimeGenerationProcessTreeFn, the
+// candidate respawn's seam, which stub tests replace (some with a stub that
+// fails the test on any other pane).
+func TestRuntimeLifecycle_RespawnPaneEscalationRetriesThroughItsOwnProbe(t *testing.T) {
+	binDir := t.TempDir()
+	argsLog := filepath.Join(binDir, "args.log")
+	t.Setenv("AGENT_DECK_TMUX_ARGS_LOG", argsLog)
+	// Every probe fails: the escalation retries once, then skips its reap.
+	writeFakeTmux(t, binDir, "printf '%s\\n' \"$*\" >> \"$AGENT_DECK_TMUX_ARGS_LOG\"\nexit 1\n")
+	oldCapture := captureStableSessionProcessTreeFn
+	oldMutation := stableSessionConditionalMutationFn
+	oldTree := runtimeGenerationProcessTreeFn
+	t.Cleanup(func() {
+		captureStableSessionProcessTreeFn = oldCapture
+		stableSessionConditionalMutationFn = oldMutation
+		runtimeGenerationProcessTreeFn = oldTree
+	})
+	// The skipped reap closes the retained handle as its last step, which is
+	// how the test knows the untracked escalation goroutine is done.
+	escalated := make(chan struct{})
+	identity := ProcessIdentity{
+		PID: 4242, StartToken: "birth-a",
+		handle: &processIdentityHandle{closeFn: func() error {
+			close(escalated)
+			return nil
+		}},
+	}
+	captureStableSessionProcessTreeFn = func(s *Session) (stableSessionTarget, []ProcessIdentity, error) {
+		return stableSessionTargetForTest(s.Name, s.SocketName), []ProcessIdentity{identity}, nil
+	}
+	stableSessionConditionalMutationFn = func(context.Context, string, ...string) ([]byte, error) {
+		return nil, nil // the conditional respawn applied
+	}
+	var seamProbes atomic.Int32
+	runtimeGenerationProcessTreeFn = func(string, string) ([]int, error) {
+		seamProbes.Add(1)
+		return nil, errors.New("RespawnPane read the candidate process-tree seam")
+	}
+
+	s := &Session{Name: "respawned", SocketName: "runtime-socket"}
+	if err := s.RespawnPane(""); err != nil {
+		t.Fatalf("RespawnPane: %v", err)
+	}
+	select {
+	case <-escalated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the respawn's escalation never finished")
+	}
+	if n := seamProbes.Load(); n != 0 {
+		t.Fatalf("escalation retry read the candidate process-tree seam %d time(s); want RespawnPane's own pane-ID probe", n)
+	}
+	raw, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := "-u -L runtime-socket display-message -t %9 -p #{pane_pid}"
+	if lines := strings.Split(strings.TrimSpace(string(raw)), "\n"); !reflect.DeepEqual(lines, []string{probe, probe}) {
+		t.Fatalf("tmux commands = %q, want the post-respawn probe and its retry, both %q", lines, probe)
 	}
 }
 

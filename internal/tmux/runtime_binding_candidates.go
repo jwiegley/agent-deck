@@ -82,7 +82,7 @@ var (
 		return cmd.Output()
 	}
 	// runtimeGenerationProcessTreeFn resolves the process tree rooted at an
-	// immutable pane ID, including the post-respawn escalation's retry.
+	// immutable pane ID, including a candidate respawn's escalation retry.
 	runtimeGenerationProcessTreeFn = func(socketName, paneID string) ([]int, error) {
 		_, pids, err := paneProcessTreeForPaneID(socketName, paneID)
 		return pids, err
@@ -667,9 +667,12 @@ func RespawnRuntimeGenerationCandidate(session *Session, candidate RuntimeGenera
 	}
 
 	session.invalidateCache()
-	oldIdentities, err := captureStableProcessTree(func() ([]int, error) {
+	// Every probe of the pane, the escalation's retry included, resolves it by
+	// its immutable ID through the same seam.
+	probeTree := func() ([]int, error) {
 		return runtimeGenerationProcessTreeFn(candidate.SocketName, candidate.PaneID)
-	}, candidate.PanePID, ErrRuntimeGenerationCandidateChanged)
+	}
+	oldIdentities, err := captureStableProcessTree(probeTree, candidate.PanePID, ErrRuntimeGenerationCandidateChanged)
 	if err != nil {
 		return fmt.Errorf("tmux: capture stable process tree before respawn: %w", err)
 	}
@@ -710,13 +713,13 @@ func RespawnRuntimeGenerationCandidate(session *Session, candidate RuntimeGenera
 		respawnLog.Info("cleared_scrollback", slog.String("session", candidate.SessionName))
 	}
 
-	newPIDs, newTreeErr := runtimeGenerationProcessTreeFn(candidate.SocketName, candidate.PaneID)
+	newPIDs, newTreeErr := probeTree()
 	identitiesOwned = false
-	// As in Session.RespawnPane, a failed probe is retried through the
-	// immutable pane ID. The retry's tree is the set the escalation spares,
-	// and by then the mutable name may resolve to a same-name replacement.
+	// As in Session.RespawnPane, a failed probe is retried with the same
+	// pane-ID probe. The retry's tree is the set the escalation spares, and by
+	// then the mutable name may resolve to a same-name replacement.
 	runtimeGenerationEscalationGoFn(func() {
-		session.escalateAfterRespawnTarget(oldIdentities, newPIDs, newTreeErr, candidate.PaneID)
+		session.escalateAfterRespawnTarget(oldIdentities, newPIDs, newTreeErr, probeTree)
 	})
 	// A control-mode client is attached to the session, not to the pane process,
 	// so respawn-pane does not require reconnecting it. More importantly, a
