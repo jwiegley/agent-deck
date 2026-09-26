@@ -3663,7 +3663,7 @@ func handleStatus(profile string, args []string) {
 		printStatusGroup("RUNNING", "●", session.StatusRunning)
 		printStatusGroup("IDLE", "○", session.StatusIdle)
 		printStatusGroup("STOPPED", "■", session.StatusStopped)
-		printStatusGroup("QUEUED", "○", session.StatusQueued)
+		printStatusGroup("QUEUED", StatusSymbol(session.StatusQueued), session.StatusQueued)
 		printStatusGroup("ERROR", "✕", session.StatusError)
 
 		fmt.Printf("Total: %d sessions in profile '%s'\n", counts.total, storage.Profile())

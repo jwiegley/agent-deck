@@ -53,6 +53,31 @@ func TestStatusCountsEverySessionOnce(t *testing.T) {
 	}
 }
 
+// TestQueuedGlyphAgreesBetweenStatusAndShow: `session show` draws a queued
+// session with the same glyph as its row in the `status -v` QUEUED section,
+// not StatusSymbol's "?" for an unknown status.
+func TestQueuedGlyphAgreesBetweenStatusAndShow(t *testing.T) {
+	bin := goldensBinary(t)
+	home, env := goldensSandbox(t)
+
+	stdout, stderr, exit := runGoldensStreamsIn(t, bin, env, home, []string{"-p", goldensProfile, "status", "-v"})
+	if exit != 0 {
+		t.Fatalf("status -v: exit %d\n%s\n%s", exit, stdout, stderr)
+	}
+	row := regexp.MustCompile(`(?m)^QUEUED \(1\):\n  (\S+) codex queued`).FindStringSubmatch(stdout)
+	if row == nil {
+		t.Fatalf("status -v has no QUEUED row for codex queued:\n%s", stdout)
+	}
+
+	stdout, stderr, exit = runGoldensStreamsIn(t, bin, env, home, []string{"-p", goldensProfile, "session", "show", "golden-sess-6"})
+	if exit != 0 {
+		t.Fatalf("session show: exit %d\n%s\n%s", exit, stdout, stderr)
+	}
+	if want := "Status:  " + row[1] + " queued\n"; !strings.Contains(stdout, want) {
+		t.Errorf("session show golden-sess-6 lacks %q (status -v draws queued as %q):\n%s", want, row[1], stdout)
+	}
+}
+
 // TestGroupListCountsEverySessionOnce: every group's `group list --json`
 // status buckets add up to its session_count, through the registry path and
 // the legacy handler (whose builder the remote agent's change probe shares).
