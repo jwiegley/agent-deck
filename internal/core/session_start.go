@@ -90,7 +90,7 @@ func (deps Deps) sessionStart(ctx context.Context, in SessionStartIn) (SessionSt
 	}
 	// #2099: nil from Start only means tmux accepted the spawn.
 	if err := inst.VerifySpawned(SpawnVerifyWait); err != nil {
-		return SessionStartOut{}, d.failSpawn("start", inst, err)
+		return SessionStartOut{}, d.failSpawn(ctx, "start", inst, err)
 	}
 	if !in.NoWait {
 		inst.PostStartSync(PostStartSyncWait)
