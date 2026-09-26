@@ -306,9 +306,7 @@ func TestStatusProbe_EarlyExitsTakeNoPaneSample(t *testing.T) {
 			want:    StatusRunning},
 		{name: "foreign server absence", tool: "claude", status: StatusRunning,
 			arrange: func(t *testing.T, _ *Instance) {
-				old := statusAbsenceIsForeignServerFn
-				statusAbsenceIsForeignServerFn = func(*tmux.Session) bool { return true }
-				t.Cleanup(func() { statusAbsenceIsForeignServerFn = old })
+				stageForeignServerGuard(t, func(*tmux.Session) bool { return true })
 			},
 			want: StatusRunning, noVerdict: true},
 		{name: "live pane sample (control)", tool: "claude", status: StatusIdle, frame: "control\n",
