@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
@@ -54,6 +55,27 @@ func statusCommitContextError(ctx context.Context) error {
 		return err
 	}
 	return context.Canceled
+}
+
+type statusProbeEvidenceKey struct{}
+
+// statusProbeEvidence reports how one probe settled its candidate. paneSampled
+// is set only when the candidate came from a live tmux pane sample, not from a
+// fast path, a skip, a debounce hold, or an absent session; only such a sample
+// may refresh tool identity and session metadata after the commit.
+type statusProbeEvidence struct {
+	paneSampled atomic.Bool
+}
+
+func withStatusProbeEvidence(ctx context.Context) (context.Context, *statusProbeEvidence) {
+	evidence := &statusProbeEvidence{}
+	return context.WithValue(ctx, statusProbeEvidenceKey{}, evidence), evidence
+}
+
+func recordStatusPaneSample(ctx context.Context) {
+	if evidence, ok := ctx.Value(statusProbeEvidenceKey{}).(*statusProbeEvidence); ok {
+		evidence.paneSampled.Store(true)
+	}
 }
 
 // Test seams surround candidate calculation and the DB-before-memory boundary.
