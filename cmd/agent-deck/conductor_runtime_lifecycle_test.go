@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,6 +133,60 @@ func failGroupWrites(t *testing.T, home string) {
 	}
 }
 
+// resurrectInstanceRows re-inserts every deleted session row from its OLD
+// values. SQLite's changes() count omits rows a trigger touches, so the
+// conditional delete still sees one affected row and commits, and only the
+// removal verify finds the row back in place.
+func resurrectInstanceRows(t *testing.T, home string) {
+	t.Helper()
+	db, err := statedb.Open(teardownTestStateDBPath(home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.DB().Query(`SELECT name FROM pragma_table_info('instances')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var columns, values []string
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			t.Fatal(err)
+		}
+		columns = append(columns, `"`+column+`"`)
+		values = append(values, `OLD."`+column+`"`)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if len(columns) == 0 {
+		t.Fatal("instances has no columns")
+	}
+	statement := `CREATE TRIGGER teardown_test_resurrect_instance AFTER DELETE ON instances BEGIN
+		INSERT INTO instances (` + strings.Join(columns, ", ") + `) VALUES (` + strings.Join(values, ", ") + `); END`
+	if _, err := db.DB().Exec(statement); err != nil {
+		t.Fatalf("%s: %v", statement, err)
+	}
+}
+
+// resurrectInstanceRowsAndFailGroupWrites makes both the removal verify and
+// the group save fail, so the order in which teardown handles them shows.
+func resurrectInstanceRowsAndFailGroupWrites(t *testing.T, home string) {
+	t.Helper()
+	resurrectInstanceRows(t, home)
+	failGroupWrites(t, home)
+}
+
+// failProfileLoad stores a group row whose expanded flag is not an integer.
+// The profile still opens and migrates, but the registry snapshot scan
+// rejects the row, so loading the profile fails.
+func failProfileLoad(t *testing.T, home string) {
+	t.Helper()
+	execTeardownTestStateDB(t, home, `INSERT INTO groups (path, name, expanded)
+		VALUES ('teardown-test-unloadable', 'unloadable', 'not an integer')`)
+}
+
 // corruptProfileStore replaces the profile's state.db with bytes SQLite
 // rejects, so the profile cannot be opened at all.
 func corruptProfileStore(t *testing.T, home string) {
@@ -155,18 +210,26 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 		name   string
 		remove bool
 		inject func(*testing.T, string)
-		reason string
+		// reason opens the skip reason, and detail must appear later in it.
+		reason, detail string
 		// heartbeat is the heartbeat_enabled flag the skipped conductor keeps.
 		heartbeat bool
 	}{
 		// A refused runtime action leaves the heartbeat and directory alone.
-		{"runtime-action", false, registerLiveLegacyWriter, "runtime action aborted for conductor-abort-ops: " + statedb.ErrIncompatibleWriterSchema.Error(), true},
-		{"runtime-action-remove", true, registerLiveLegacyWriter, "runtime action aborted for conductor-abort-ops: " + statedb.ErrIncompatibleWriterSchema.Error(), true},
-		// An unopenable store leaves the runtime unobserved and unstopped.
-		{"store-open", true, corruptProfileStore, "failed to open profile default: ", true},
+		{"runtime-action", false, registerLiveLegacyWriter, "runtime action aborted for conductor-abort-ops: " + statedb.ErrIncompatibleWriterSchema.Error(), "", true},
+		{"runtime-action-remove", true, registerLiveLegacyWriter, "runtime action aborted for conductor-abort-ops: " + statedb.ErrIncompatibleWriterSchema.Error(), "", true},
+		// A store that cannot be opened or loaded leaves the runtime
+		// unobserved and unstopped.
+		{"store-open", true, corruptProfileStore, "failed to open profile default: ", "", true},
+		{"store-load", true, failProfileLoad, "failed to load profile default: ", `"expanded"`, true},
 		// The runtime row is already deleted, so its heartbeat goes with it;
 		// only the directory stays for the rerun.
-		{"group-save", true, failGroupWrites, "failed to save groups in default: ", false},
+		{"group-save", true, failGroupWrites, "failed to save groups in default: ", "injected group write failure", false},
+		// A row that survives its conditional delete keeps the heartbeat on,
+		// even when the group save failed too: the verify is decided first.
+		{"verify", true, resurrectInstanceRows, "failed to verify conditional removal ", ": exists=true err=<nil>", true},
+		{"verify+group-save", true, resurrectInstanceRowsAndFailGroupWrites, "failed to verify conditional removal ",
+			": exists=true err=<nil>", true},
 	} {
 		for _, jsonOutput := range []bool{true, false} {
 			mode := "human"
@@ -206,16 +269,20 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 						t.Fatalf("teardown must report failure and an empty teardown list: %s", out)
 					}
 					if len(result.Aborted) != 1 || result.Aborted[0].Name != name || result.Aborted[0].Profile != "default" ||
-						!strings.Contains(result.Aborted[0].Reason, tc.reason) {
-						t.Fatalf("aborted = %+v, want %s with reason %q", result.Aborted, name, tc.reason)
+						!strings.HasPrefix(result.Aborted[0].Reason, tc.reason) || !strings.Contains(result.Aborted[0].Reason, tc.detail) {
+						t.Fatalf("aborted = %s, want %s with reason %q ... %q", out, name, tc.reason, tc.detail)
 					}
 				} else {
 					if strings.Contains(out, "Teardown complete.") {
 						t.Fatalf("human teardown must not claim completion: stdout=%q", out)
 					}
 					summary := "Teardown incomplete: 1 of 1 conductor(s) not torn down:\n  " + name + " (profile: default): " + tc.reason
-					if !strings.Contains(stderr, summary) {
+					_, reason, found := strings.Cut(stderr, summary)
+					if !found {
 						t.Fatalf("stderr must name the skipped conductor and why, want %q in %q", summary, stderr)
+					}
+					if line, _, _ := strings.Cut(reason, "\n"); !strings.Contains(line, tc.detail) {
+						t.Fatalf("skip reason %q must contain %q", line, tc.detail)
 					}
 				}
 				meta, err := session.LoadConductorMeta(name)
@@ -227,6 +294,81 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// A conductor directory that cannot be removed leaves the teardown incomplete
+// and fails the command too, although upstream only warns. It is not a
+// TestRuntimeLifecycle_ case: that gate counts the root skip as a failure.
+func TestConductorTeardownReportsDirectoryRemovalFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: a read-only directory would not block the removal")
+	}
+	for _, jsonOutput := range []bool{true, false} {
+		mode := "human"
+		if jsonOutput {
+			mode = "json"
+		}
+		t.Run(mode, func(t *testing.T) {
+			const name = "dir-ops"
+			home := teardownTestConductor(t, name)
+			dir, err := session.ConductorNameDir(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// RemoveAll needs write permission on a directory to unlink its
+			// entries, so a file under a read-only subdirectory pins both.
+			blocked := filepath.Join(dir, "blocked")
+			if err := os.MkdirAll(blocked, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(blocked, "pinned"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(blocked, 0o500); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
+
+			args := []string{"conductor", "teardown", name, "--remove"}
+			if jsonOutput {
+				args = append(args, "--json")
+			}
+			out, stderr, code := runAgentDeck(t, home, args...)
+			if code != 1 {
+				t.Fatalf("teardown that keeps a directory must exit 1: exit=%d stdout=%q stderr=%q", code, out, stderr)
+			}
+			reason := "failed to remove dir for " + name + ": "
+			if jsonOutput {
+				var result struct {
+					Success  *bool    `json:"success"`
+					Teardown []string `json:"teardown"`
+					Aborted  []struct {
+						Name   string `json:"name"`
+						Reason string `json:"reason"`
+					} `json:"aborted"`
+				}
+				if err := json.Unmarshal([]byte(out), &result); err != nil {
+					t.Fatalf("decode teardown: %v: %q", err, out)
+				}
+				if result.Success == nil || *result.Success || result.Teardown == nil || len(result.Teardown) != 0 ||
+					len(result.Aborted) != 1 || result.Aborted[0].Name != name || !strings.HasPrefix(result.Aborted[0].Reason, reason) {
+					t.Fatalf("teardown must report %s skipped with reason %q: %s", name, reason, out)
+				}
+			} else {
+				summary := "Teardown incomplete: 1 of 1 conductor(s) not torn down:\n  " + name + " (profile: default): " + reason
+				if strings.Contains(out, "Teardown complete.") || !strings.Contains(stderr, summary) {
+					t.Fatalf("human teardown must report the skip, want %q: stdout=%q stderr=%q", summary, out, stderr)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(blocked, "pinned")); err != nil {
+				t.Fatalf("the blocked entry must survive the failed removal: %v", err)
+			}
+			listed, stderr, code := runAgentDeck(t, home, "-p", "default", "list", "--json")
+			if code != 0 || strings.Contains(listed, session.ConductorSessionTitle(name)) {
+				t.Fatalf("the session row must be removed before the directory: exit=%d stdout=%q stderr=%q", code, listed, stderr)
+			}
+		})
 	}
 }
 
