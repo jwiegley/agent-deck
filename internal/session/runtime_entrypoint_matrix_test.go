@@ -222,7 +222,8 @@ func TestRuntimeLifecycle_PhysicalEntrypointRoutingContract(t *testing.T) {
 // the runtime only through the seams above: an error-only lifecycle call drops
 // the exact transition tuple and turns a partial success into a retryable
 // failure, an uncaptured kill can take out a replacement adopted mid-command,
-// and a Status assignment is dropped by the snapshot save.
+// and a write to a runtime-owned field (Status, LastStartedAt, the generation
+// or status revision) is dropped by the snapshot save.
 func TestRuntimeLifecycle_CoreRegistryBypassesNoRuntimeAuthority(t *testing.T) {
 	root := runtimeLifecycleSourceRoot(t)
 	dir := filepath.Join(root, "internal", "core")
@@ -250,21 +251,13 @@ func TestRuntimeLifecycle_CoreRegistryBypassesNoRuntimeAuthority(t *testing.T) {
 			return fmt.Sprintf("internal/core/%s:%d", name, fset.Position(pos).Line)
 		}
 		ast.Inspect(file, func(node ast.Node) bool {
-			switch n := node.(type) {
-			case *ast.CallExpr:
-				if sel, ok := n.Fun.(*ast.SelectorExpr); ok && forbiddenCalls[sel.Sel.Name] {
-					t.Errorf("%s: calls error-only lifecycle method %s", where(n.Pos()), sel.Sel.Name)
+			if call, ok := node.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && forbiddenCalls[sel.Sel.Name] {
+					t.Errorf("%s: calls error-only lifecycle method %s", where(call.Pos()), sel.Sel.Name)
 				}
-			case *ast.AssignStmt:
-				for idx, lhs := range n.Lhs {
-					sel, ok := lhs.(*ast.SelectorExpr)
-					if !ok || idx >= len(n.Rhs) {
-						continue
-					}
-					if runtimeOwnedAssignment(sel.Sel.Name, n.Rhs[idx]) {
-						t.Errorf("%s: assigns runtime-owned field %s", where(n.Pos()), sel.Sel.Name)
-					}
-				}
+			}
+			if field, ok := runtimeOwnedWrite(node); ok {
+				t.Errorf("%s: writes runtime-owned field %s", where(node.Pos()), field)
 			}
 			return true
 		})
@@ -274,30 +267,78 @@ func TestRuntimeLifecycle_CoreRegistryBypassesNoRuntimeAuthority(t *testing.T) {
 	}
 }
 
-// runtimeOwnedAssignment matches `x.Status = session.Status*` and
-// `x.LastStartedAt = time.Now()`, the in-memory writes a snapshot save drops.
-func runtimeOwnedAssignment(field string, rhs ast.Expr) bool {
-	switch field {
-	case "Status":
-		sel, ok := rhs.(*ast.SelectorExpr)
-		if !ok {
-			return false
+// runtimeOwnedFields are the Instance fields only runtime authority writes; a
+// snapshot save drops an in-memory write to any of them. No internal/core type
+// declares these names, so any write to such a selector is a bypass.
+var runtimeOwnedFields = map[string]bool{"LastStartedAt": true, "RuntimeGeneration": true, "StatusRevision": true}
+
+// runtimeOwnedWrite reports the runtime-owned field that node writes in
+// memory, whatever the written value. Status is also a field of core's own
+// output types, so a Status write passes only when its value provably is not
+// a session.Status: a StartStatus* constant (SessionStartOut's vocabulary) or
+// an address (GroupNode.Status is a *string; Instance.Status never is).
+func runtimeOwnedWrite(node ast.Node) (string, bool) {
+	switch n := node.(type) {
+	case *ast.IncDecStmt:
+		if sel, ok := n.X.(*ast.SelectorExpr); ok && (runtimeOwnedFields[sel.Sel.Name] || sel.Sel.Name == "Status") {
+			return sel.Sel.Name, true
 		}
-		pkg, ok := sel.X.(*ast.Ident)
-		return ok && pkg.Name == "session" && strings.HasPrefix(sel.Sel.Name, "Status")
-	case "LastStartedAt":
-		call, ok := rhs.(*ast.CallExpr)
-		if !ok {
-			return false
+	case *ast.AssignStmt:
+		for idx, lhs := range n.Lhs {
+			sel, ok := lhs.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			if runtimeOwnedFields[sel.Sel.Name] {
+				return sel.Sel.Name, true
+			}
+			if sel.Sel.Name == "Status" && (len(n.Rhs) != len(n.Lhs) || !provablyNotSessionStatus(n.Rhs[idx])) {
+				return sel.Sel.Name, true
+			}
 		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return false
-		}
-		pkg, ok := sel.X.(*ast.Ident)
-		return ok && pkg.Name == "time" && sel.Sel.Name == "Now"
+	}
+	return "", false
+}
+
+func provablyNotSessionStatus(value ast.Expr) bool {
+	switch v := value.(type) {
+	case *ast.Ident:
+		return strings.HasPrefix(v.Name, "StartStatus")
+	case *ast.UnaryExpr:
+		return v.Op == token.AND
 	}
 	return false
+}
+
+// The negative guard above is only as strong as runtimeOwnedWrite: pin every
+// write shape a snapshot save drops, and the core output writes it must pass.
+func TestRuntimeLifecycle_CoreRuntimeOwnedWriteClassifier(t *testing.T) {
+	cases := []struct{ stmt, want string }{
+		{"inst.Status = session.StatusError", "Status"},
+		{"inst.Status = st", "Status"},
+		{"inst.Status = session.Status(value)", "Status"},
+		{"inst.Status, ok = next()", "Status"},
+		{"inst.LastStartedAt = time.Now()", "LastStartedAt"},
+		{"inst.LastStartedAt = now", "LastStartedAt"},
+		{"inst.LastStartedAt = time.Now().UTC()", "LastStartedAt"},
+		{"inst.LastStartedAt, err = parse(raw)", "LastStartedAt"},
+		{"inst.RuntimeGeneration = 0", "RuntimeGeneration"},
+		{"inst.StatusRevision++", "StatusRevision"},
+		{"out.Status = StartStatusQueued", ""},
+		{"node.Status = &status", ""},
+		{"inst.Title = title", ""},
+	}
+	for _, c := range cases {
+		src := "package p\nfunc f() {\n" + c.stmt + "\n}\n"
+		file, err := parser.ParseFile(token.NewFileSet(), "case.go", src, 0)
+		if err != nil {
+			t.Fatalf("%s: %v", c.stmt, err)
+		}
+		field, ok := runtimeOwnedWrite(file.Decls[0].(*ast.FuncDecl).Body.List[0])
+		if ok != (c.want != "") || field != c.want {
+			t.Errorf("runtimeOwnedWrite(%s) = %q, %v; want %q", c.stmt, field, ok, c.want)
+		}
+	}
 }
 
 // F6: the outcome of a start's initial message is rendered in one place,
