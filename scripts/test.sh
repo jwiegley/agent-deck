@@ -9,6 +9,12 @@ trap 'rm -rf -- "$sandbox"' EXIT
 sandbox=$(cd "$sandbox" && pwd -P)
 mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/tmux"
 
+# tmux falls back to the account's login shell when SHELL is unset, and a
+# login shell reading the empty sandbox HOME may prompt (zsh-newuser-install
+# consumes the first keystroke of a typed command). Pin the shell the tests
+# are written against.
+bash_path=$(command -v bash)
+
 # Leave XDG unset so tests that replace HOME also isolate their XDG paths.
 test_env=(
     "PATH=$PATH"
@@ -22,6 +28,7 @@ test_env=(
     "GOCACHE=$gocache"
     "GOMODCACHE=$gomodcache"
     "LANG=en_US.UTF-8"
+    "SHELL=$bash_path"
 )
 for name in GOTOOLCHAIN GOFLAGS CGO_ENABLED CC CXX SDKROOT DEVELOPER_DIR MACOSX_DEPLOYMENT_TARGET CI GITHUB_ACTIONS; do
     if [[ ${!name+x} ]]; then
