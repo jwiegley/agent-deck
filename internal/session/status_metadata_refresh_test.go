@@ -292,7 +292,7 @@ func TestStatusProbe_EarlyExitsTakeNoPaneSample(t *testing.T) {
 				inst.CreatedAt = time.Now()
 				inst.mu.Unlock()
 			},
-			want: StatusStarting},
+			want: StatusStarting, noVerdict: true},
 		{name: "tmux grace window keeps running", tool: "claude", status: StatusRunning,
 			arrange: func(_ *testing.T, inst *Instance) {
 				inst.mu.Lock()

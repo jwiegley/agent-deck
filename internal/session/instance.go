@@ -6636,6 +6636,25 @@ func (i *Instance) updateStatusWithEvidence(pass *StatusUpdatePass, syncMetadata
 	return evidence, err
 }
 
+// graceWindowStatus settles a probe inside the tmux grace window, while the
+// spawn has no session to look at yet. Running, idle and queued are kept; any
+// other status reads starting. The window observes nothing, so a status that
+// stays what it was, starting included, forms no verdict: finalizing it would
+// mark the status sampled live and release an auth hold on no evidence. Only a
+// status the window changes to starting is a verdict.
+func graceWindowStatus(ctx context.Context, current Status) Status {
+	candidate := current
+	switch current {
+	case StatusRunning, StatusIdle, StatusQueued:
+	default:
+		candidate = StatusStarting
+	}
+	if candidate == current {
+		recordStatusNoVerdict(ctx)
+	}
+	return candidate
+}
+
 func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.RuntimeState) (Status, error) {
 	if statusProbeCandidateOverride != nil {
 		return statusProbeCandidateOverride(ctx, i, observed)
@@ -6660,13 +6679,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 	if time.Since(graceTime) < 1500*time.Millisecond {
 		// Only skip if tmux session doesn't exist yet
 		if i.tmuxSession == nil {
-			if candidate != StatusRunning && candidate != StatusIdle && candidate != StatusQueued {
-				candidate = StatusStarting
-			} else {
-				// Kept, not observed: the spawn has no session to look at yet.
-				recordStatusNoVerdict(ctx)
-			}
-			return candidate, ctx.Err()
+			return graceWindowStatus(ctx, candidate), ctx.Err()
 		}
 		var err error
 		if exists, err = i.probeTmuxExists(ctx, observed); err != nil {
@@ -6674,13 +6687,8 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 		}
 		checkedExists = true
 		if !exists {
-			if candidate != StatusRunning && candidate != StatusIdle && candidate != StatusQueued {
-				candidate = StatusStarting
-			} else {
-				// An absence inside the window proves nothing about these.
-				recordStatusNoVerdict(ctx)
-			}
-			return candidate, ctx.Err()
+			// An absence inside the window proves nothing yet.
+			return graceWindowStatus(ctx, candidate), ctx.Err()
 		}
 		// Session exists - allow normal status detection below
 	}
