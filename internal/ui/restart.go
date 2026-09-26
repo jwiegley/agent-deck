@@ -32,7 +32,10 @@ import (
 var errRestartBlocked = errors.New("restart blocked")
 
 // sessionActionInFlight reports whether a create/resume/fork/setup/remote
-// restart is still running, or a tmux attach is being set up.
+// restart is still running, a tmux attach is being set up, or a confirmed
+// worktree finish is still running. The finish counts once Esc has dismissed
+// its progress into the background, where hasModalVisible no longer sees it:
+// the re-exec would stop it partway through its merge or deletes.
 func (h *Home) sessionActionInFlight() bool {
 	return len(h.launchingSessions) > 0 ||
 		len(h.resumingSessions) > 0 ||
@@ -40,7 +43,8 @@ func (h *Home) sessionActionInFlight() bool {
 		len(h.creatingSessions) > 0 ||
 		len(h.setupRunningSessions) > 0 ||
 		len(h.remoteRestarting) > 0 ||
-		h.isAttaching.Load()
+		h.isAttaching.Load() ||
+		h.worktreeFinishDialog.IsExecuting()
 }
 
 // Seams for the pre-arm check of the restart target; tests swap them so no
