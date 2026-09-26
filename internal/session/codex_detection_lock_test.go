@@ -11,6 +11,7 @@ import (
 
 	"al.essio.dev/pkg/shellescape"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 const codexDetectionLockThread = "019c9ffa-c9d6-7be1-9e1c-527080e68952"
@@ -64,31 +65,52 @@ exit 1
 	return codexDetectionLockThread
 }
 
-// A start or restart launches detectCodexSessionAsync before the runtime
-// commit that adopts its runtime: restartWithTransition runs
-// commitPhysicalRuntime deferred, after the goroutine is started. A TUI
-// storage reload can also merge into the same Instance while the detection
-// retries. Both write under i.mu, so every Instance field one detection
-// attempt reads must be read under i.mu as well. Each case runs one writer
-// beside one attempt with nothing else ordering the two, so the race detector
-// reports an unlocked read whichever runs first. The attempt reads the tmux
-// wrapper and socket (process probe, peer exclusions, ownership claim), the
-// sandbox and its container, the Codex home, project path and start time
-// (disk fallback) and the tool and bound thread (subagent gate).
-func TestRuntimeLifecycle_CodexDetectionReadsInstanceUnderLock(t *testing.T) {
-	commit := func(tmuxName string) func(*Instance) {
-		return func(inst *Instance) {
-			next := inst.RuntimeState()
-			next.Generation++
-			next.StatusRevision = 0
-			next.Status = string(StatusWaiting)
-			next.LastStartedAt = time.Now().UTC()
-			if tmuxName != "" {
-				next.TmuxSession = tmuxName
-			}
-			inst.adoptRuntimeState(next)
-		}
+// newCodexDetectionLockInstance is a Codex instance at runtime generation 1
+// whose tmux session and sandbox container the staged probe answers for.
+func newCodexDetectionLockInstance(projectPath string, sandboxed bool, socket string) *Instance {
+	inst := &Instance{
+		ID: "codex-detection-lock", Title: "codex detection lock", ProjectPath: projectPath,
+		GroupPath: "work", Tool: "codex", Command: "codex", Status: StatusStarting,
 	}
+	if sandboxed {
+		inst.Sandbox = &SandboxConfig{Enabled: true}
+		inst.SandboxContainer = "agentdeck-codex-lock"
+	}
+	inst.adoptRuntimeState(statedb.RuntimeState{
+		InstanceID: inst.ID, Generation: 1, TmuxSession: "agentdeck_codex_lock",
+		TmuxSocketName: socket, Status: string(StatusStarting),
+	})
+	return inst
+}
+
+// adoptNextCodexLockRuntime adopts the next runtime generation under i.mu, as
+// a runtime commit or a reload of a newer one does, in a new tmux session when
+// tmuxName is set.
+func adoptNextCodexLockRuntime(inst *Instance, tmuxName string) {
+	next := inst.RuntimeState()
+	next.Generation++
+	next.StatusRevision = 0
+	next.Status = string(StatusWaiting)
+	next.LastStartedAt = time.Now().UTC()
+	if tmuxName != "" {
+		next.TmuxSession = tmuxName
+	}
+	inst.adoptRuntimeState(next)
+}
+
+// A detection attempt holds the spawn lock, which orders it after every start,
+// restart and stop, but a TUI storage reload merges into the same Instance
+// without that lock: it rewrites metadata and adopts a newer runtime, and with
+// it a new tmux wrapper, under i.mu alone. So every Instance field one
+// detection attempt reads must be read under i.mu. Each case runs one writer
+// beside one attempt with nothing else ordering the two, so the race detector
+// reports an unlocked read whichever runs first. The commit cases adopt a
+// newer runtime as the reload does (adoptRuntimeStateLocked). The attempt
+// reads the tmux wrapper and socket (process probe, peer exclusions,
+// ownership claim), the sandbox and its container, the Codex home, project
+// path and start time (disk fallback) and the tool and bound thread (subagent
+// gate).
+func TestRuntimeLifecycle_CodexDetectionReadsInstanceUnderLock(t *testing.T) {
 	for n, c := range []struct {
 		name      string
 		sandboxed bool
@@ -96,35 +118,22 @@ func TestRuntimeLifecycle_CodexDetectionReadsInstanceUnderLock(t *testing.T) {
 		write func(inst, reloaded *Instance)
 	}{
 		{name: "restart commit adopts the runtime",
-			write: func(inst, _ *Instance) { commit("")(inst) }},
+			write: func(inst, _ *Instance) { adoptNextCodexLockRuntime(inst, "") }},
 		{name: "restart commit replaces the wrapper",
-			write: func(inst, _ *Instance) { commit("agentdeck_codex_lock_next")(inst) }},
+			write: func(inst, _ *Instance) { adoptNextCodexLockRuntime(inst, "agentdeck_codex_lock_next") }},
 		{name: "metadata reload",
 			write: func(inst, reloaded *Instance) { inst.MergeReloaded(reloaded) }},
 		{name: "sandboxed restart commit replaces the wrapper", sandboxed: true,
-			write: func(inst, _ *Instance) { commit("agentdeck_codex_lock_next")(inst) }},
+			write: func(inst, _ *Instance) { adoptNextCodexLockRuntime(inst, "agentdeck_codex_lock_next") }},
 		{name: "sandboxed metadata reload", sandboxed: true,
 			write: func(inst, reloaded *Instance) { inst.MergeReloaded(reloaded) }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			projectPath := t.TempDir()
 			want := stageCodexDetectionProbe(t, projectPath)
-			build := func() *Instance {
-				inst := &Instance{
-					ID: "codex-detection-lock", Title: "codex detection lock", ProjectPath: projectPath,
-					GroupPath: "work", Tool: "codex", Command: "codex", Status: StatusStarting,
-				}
-				if c.sandboxed {
-					inst.Sandbox = &SandboxConfig{Enabled: true}
-					inst.SandboxContainer = "agentdeck-codex-lock"
-				}
-				inst.adoptRuntimeState(statedb.RuntimeState{
-					InstanceID: inst.ID, Generation: 1, TmuxSession: "agentdeck_codex_lock",
-					TmuxSocketName: fmt.Sprintf("codex-lock-%d", n), Status: string(StatusStarting),
-				})
-				return inst
-			}
-			inst, reloaded := build(), build()
+			socket := fmt.Sprintf("codex-lock-%d", n)
+			inst := newCodexDetectionLockInstance(projectPath, c.sandboxed, socket)
+			reloaded := newCodexDetectionLockInstance(projectPath, c.sandboxed, socket)
 
 			var got string
 			var wg sync.WaitGroup
@@ -143,5 +152,149 @@ func TestRuntimeLifecycle_CodexDetectionReadsInstanceUnderLock(t *testing.T) {
 				t.Fatalf("detection attempt found %q, want the staged thread %q", got, want)
 			}
 		})
+	}
+}
+
+// installCodexDetectionSpawnLock stands held in for inst's spawn lock. Every
+// acquisition for inst reports its number on entered, then runs before (when
+// set) with that number, then takes held. Other instances keep the real lock.
+func installCodexDetectionSpawnLock(t *testing.T, inst *Instance, held *sync.Mutex, before func(int)) <-chan int {
+	t.Helper()
+	entered := make(chan int, 8)
+	calls := 0
+	oldAcquire := instanceSpawnLockAcquireFn
+	instanceSpawnLockAcquireFn = func(id string) (func(), error) {
+		if id != inst.ID {
+			return oldAcquire(id)
+		}
+		calls++
+		entered <- calls
+		if before != nil {
+			before(calls)
+		}
+		held.Lock()
+		var once sync.Once
+		return func() { once.Do(held.Unlock) }, nil
+	}
+	t.Cleanup(func() { instanceSpawnLockAcquireFn = oldAcquire })
+	return entered
+}
+
+// awaitCodexDetection returns once the detection goroutine has asked for the
+// spawn lock for attempt want, and fails the test if detection ends first: an
+// attempt that probes without the lock does not ask for it before it has read
+// the Instance.
+func awaitCodexDetection(t *testing.T, entered <-chan int, detected <-chan struct{}, want int) {
+	t.Helper()
+	select {
+	case n := <-entered:
+		if n != want {
+			t.Fatalf("detection asked for the spawn lock %d times, want %d", n, want)
+		}
+	case <-detected:
+		t.Fatalf("detection ended without asking for the spawn lock for attempt %d", want)
+	case <-time.After(30 * time.Second):
+		t.Fatalf("detection never asked for the spawn lock for attempt %d", want)
+	}
+}
+
+// A start or restart launches detectCodexSessionAsync, which keeps retrying
+// after the transition returns, and a stop or a fallback restart can begin in
+// the meantime. Such a transition holds the spawn lock while it writes fields
+// an attempt reads, without i.mu: restartWithTransition's fallback recreate
+// replaces the tmux wrapper (recreateTmuxSession), and the relaunch stamps
+// CodexStartedAt and the sandbox container. An attempt therefore takes the
+// spawn lock before it reads the Instance. Here those writes run beside the
+// detection goroutine while the lock is held, and nothing but that lock orders
+// the two, so the race detector reports an attempt that probes first. Once the
+// transition releases the lock, the attempt finds the staged thread.
+func TestRuntimeLifecycle_CodexDetectionWaitsForTheTransitionHoldingTheSpawnLock(t *testing.T) {
+	for n, sandboxed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sandboxed=%v", sandboxed), func(t *testing.T) {
+			projectPath := t.TempDir()
+			want := stageCodexDetectionProbe(t, projectPath)
+			socket := fmt.Sprintf("codex-wait-%d", n)
+			inst := newCodexDetectionLockInstance(projectPath, sandboxed, socket)
+			oldDelays := codexDetectionDelays
+			codexDetectionDelays = []time.Duration{0}
+			t.Cleanup(func() { codexDetectionDelays = oldDelays })
+			var held sync.Mutex
+			entered := installCodexDetectionSpawnLock(t, inst, &held, nil)
+
+			held.Lock() // the transition's spawn lock
+			replacement := tmux.NewSession(inst.Title, projectPath)
+			replacement.SocketName, replacement.InstanceID = socket, inst.ID
+			// An hour back, so the staged rollout still post-dates the start.
+			startedAt := time.Now().Add(-time.Hour).UnixMilli()
+			written, detected := make(chan struct{}), make(chan struct{})
+			go func() {
+				inst.tmuxSession = replacement
+				inst.CodexStartedAt = startedAt
+				inst.SandboxContainer = "agentdeck-codex-lock-next"
+				close(written)
+				// Stay alive while detection runs: the race detector can lose
+				// an access made by a goroutine that has exited once a new
+				// goroutine reuses its slot.
+				<-detected
+			}()
+			go func() {
+				defer close(detected)
+				inst.detectCodexSessionAsync()
+			}()
+			<-written
+			awaitCodexDetection(t, entered, detected, 1)
+			held.Unlock()
+			<-detected
+
+			if got, _ := inst.currentRuntimeBinding("codex"); got != want {
+				t.Fatalf("detection bound %q after the transition, want the staged thread %q", got, want)
+			}
+		})
+	}
+}
+
+// Detection serves the runtime its launching transition committed. After a
+// later transition has replaced that runtime, the next attempt stops without
+// probing: the replacement's own start or restart detects for it. The thread
+// staged for the replacement stays unbound.
+func TestRuntimeLifecycle_CodexDetectionStopsOnceItsRuntimeIsReplaced(t *testing.T) {
+	projectPath := t.TempDir()
+	stageCodexDetectionProbe(t, projectPath)
+	inst := newCodexDetectionLockInstance(projectPath, false, "codex-replaced")
+	rollout := filepath.Join(os.Getenv("CODEX_HOME"), "sessions", "2026", "09", "25",
+		"rollout-2026-09-25T00-00-00-"+codexDetectionLockThread+".jsonl")
+	hidden := rollout + ".hidden"
+	if err := os.Rename(rollout, hidden); err != nil {
+		t.Fatal(err)
+	}
+	oldDelays := codexDetectionDelays
+	codexDetectionDelays = []time.Duration{0, 0}
+	t.Cleanup(func() { codexDetectionDelays = oldDelays })
+	var held sync.Mutex
+	replaced := make(chan struct{})
+	entered := installCodexDetectionSpawnLock(t, inst, &held, func(n int) {
+		if n == 2 {
+			<-replaced
+		}
+	})
+
+	detected := make(chan struct{})
+	go func() {
+		defer close(detected)
+		inst.detectCodexSessionAsync()
+	}()
+	awaitCodexDetection(t, entered, detected, 1)
+	// The first attempt found nothing. The second waits while a restart
+	// commits the replacement, whose thread is then on disk.
+	awaitCodexDetection(t, entered, detected, 2)
+	adoptNextCodexLockRuntime(inst, "agentdeck_codex_replaced_next")
+	if err := os.Rename(hidden, rollout); err != nil {
+		t.Fatal(err)
+	}
+	close(replaced)
+	<-detected
+
+	if got, _ := inst.currentRuntimeBinding("codex"); got != "" {
+		t.Fatalf("detection of the replaced runtime bound %q to its replacement, want nothing bound", got)
 	}
 }
