@@ -99,7 +99,10 @@ var (
 // no provable candidate completes as stopped. The runtime inventories admit
 // only stamped sessions, so an empty inventory proves only that no stamped
 // runtime remains. The selected tmux identity itself must also have stopped
-// answering, from a process that can see its server.
+// answering, from a process that can see its server. Like those inventories,
+// the probe reads a missing socket file as absence, so a stop after a reboot
+// completes; a live server whose socket file was unlinked or relocated is the
+// accepted cost (tmux.SelectedRuntimeSessionExists).
 func requireSelectedRuntimeGone(expected statedb.RuntimeState) error {
 	if expected.TmuxSession == "" {
 		return nil

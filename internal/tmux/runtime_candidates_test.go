@@ -284,51 +284,69 @@ func TestRuntimeLifecycle_KillRuntimeGenerationCandidateKillsStampedUnprefixedSe
 	}
 }
 
-// SelectedRuntimeSessionExists asks for exactly the selected name on its own
-// socket and reads only tmux's canonical absence answers as absence.
+// ProbeExactSession and SelectedRuntimeSessionExists ask for exactly the named
+// session on its own socket through probeSessionExistence, and read only
+// tmux's canonical absence answers as absence. The one difference is a missing
+// socket file: indeterminate to the exact probe, and absence to the
+// destruction probe, which shares the empty inventories' trade-off.
 func TestRuntimeLifecycle_SelectedRuntimeSessionExistsClassifiesExactProbe(t *testing.T) {
 	tests := []struct {
-		name        string
-		stderr      string
-		exit        int
-		wantPresent bool
-		wantErr     bool
+		name         string
+		stderr       string
+		exit         int
+		wantPresent  bool
+		wantErr      bool
+		wantExactErr bool
 	}{
 		{name: "answers", wantPresent: true},
 		{name: "missing session", stderr: "can't find session: ad-golden-sess-shell", exit: 1},
 		{name: "no server", stderr: "no server running on /tmp/tmux-501/isolated", exit: 1},
-		{name: "no socket file", stderr: "error connecting to /tmp/tmux-501/isolated (No such file or directory)", exit: 1},
-		{name: "another session missing", stderr: "can't find session: ad-golden", exit: 1, wantErr: true},
-		{name: "permission", stderr: "error connecting to /tmp/tmux-501/isolated (Permission denied)", exit: 1, wantErr: true},
-		{name: "protocol", stderr: "protocol version mismatch", exit: 1, wantErr: true},
+		{name: "no sessions", stderr: "no sessions", exit: 1},
+		{name: "no socket file", stderr: "error connecting to /tmp/tmux-501/isolated (No such file or directory)", exit: 1, wantExactErr: true},
+		{name: "another session missing", stderr: "can't find session: ad-golden", exit: 1, wantErr: true, wantExactErr: true},
+		{name: "permission", stderr: "error connecting to /tmp/tmux-501/isolated (Permission denied)", exit: 1, wantErr: true, wantExactErr: true},
+		{name: "protocol", stderr: "protocol version mismatch", exit: 1, wantErr: true, wantExactErr: true},
+	}
+	probes := []struct {
+		name  string
+		probe func(string, string) (bool, error)
+	}{
+		{name: "selected", probe: SelectedRuntimeSessionExists},
+		{name: "exact", probe: ProbeExactSession},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			binDir := t.TempDir()
-			argsFile := filepath.Join(binDir, "args")
-			script := "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > " + argsFile + "\n"
-			if tt.stderr != "" {
-				script += fmt.Sprintf("printf '%%s\\n' %q >&2\n", tt.stderr)
-			}
-			script += fmt.Sprintf("exit %d\n", tt.exit)
-			if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte(script), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			t.Setenv("PATH", binDir)
+		for _, probe := range probes {
+			t.Run(tt.name+"/"+probe.name, func(t *testing.T) {
+				binDir := t.TempDir()
+				argsFile := filepath.Join(binDir, "args")
+				script := "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > " + argsFile + "\n"
+				if tt.stderr != "" {
+					script += fmt.Sprintf("printf '%%s\\n' %q >&2\n", tt.stderr)
+				}
+				script += fmt.Sprintf("exit %d\n", tt.exit)
+				if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("PATH", binDir)
 
-			present, err := SelectedRuntimeSessionExists("isolated", "ad-golden-sess-shell")
-			if present != tt.wantPresent || (err != nil) != tt.wantErr {
-				t.Fatalf("probe = (%v, %v), want present=%v error=%v", present, err, tt.wantPresent, tt.wantErr)
-			}
-			raw, readErr := os.ReadFile(argsFile)
-			if readErr != nil {
-				t.Fatal(readErr)
-			}
-			args := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
-			want := []string{"-L", "isolated", "has-session", "-t", "=ad-golden-sess-shell"}
-			if len(args) < len(want) || !reflect.DeepEqual(args[len(args)-len(want):], want) {
-				t.Fatalf("tmux args = %q, want to end with %q", args, want)
-			}
-		})
+				wantErr := tt.wantErr
+				if probe.name == "exact" {
+					wantErr = tt.wantExactErr
+				}
+				present, err := probe.probe("isolated", "ad-golden-sess-shell")
+				if present != tt.wantPresent || (err != nil) != wantErr {
+					t.Fatalf("probe = (%v, %v), want present=%v error=%v", present, err, tt.wantPresent, wantErr)
+				}
+				raw, readErr := os.ReadFile(argsFile)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				args := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+				want := []string{"-L", "isolated", "has-session", "-t", "=ad-golden-sess-shell"}
+				if len(args) < len(want) || !reflect.DeepEqual(args[len(args)-len(want):], want) {
+					t.Fatalf("tmux args = %q, want to end with %q", args, want)
+				}
+			})
+		}
 	}
 }
