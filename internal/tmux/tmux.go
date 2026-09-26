@@ -459,11 +459,13 @@ var (
 //
 // An error means the probe was indeterminate (timed out). Callers MUST treat
 // that as "assume alive" — never as "no sessions" — or a briefly-wedged server
-// will look like a pile of dead sessions. A successful probe returning an empty
-// set is authoritative for the socket path this process computes (server
-// present with no sessions, no server running, or no socket file). A caller
-// that may compute a different path than the server's own must not read a
-// missing socket as empty (see listDefaultServerSessions).
+// will look like a pile of dead sessions. An empty set means tmux reported no
+// sessions or no server running, or found no socket file at the path this
+// process computes. That last answer is a deliberate trade-off, not proof of
+// absence (see isMissingTmuxSocketResult): a live server whose socket file was
+// unlinked, or that runs under another TMUX_TMPDIR, reads as empty too. A
+// caller that must not mistake an unreachable server for an empty one lists
+// with isNoTmuxServerResult instead (listDefaultServerSessions).
 func ListSessionNamesOnSocket(socketName string) (map[string]struct{}, error) {
 	return listSessionsOnSocket(socketName)
 }
@@ -506,8 +508,9 @@ func listSessionNamesOnSocket(socketName string, empty func(error) bool) (map[st
 }
 
 // isEmptyTmuxServerResult distinguishes tmux's expected empty-server exits
-// from launch, permission, and other probe failures: the server reported no
-// sessions, or no server exists at the socket path this process computed.
+// from launch, permission, and other probe failures: tmux reported no sessions
+// or no server running, or found no socket file at the path this process
+// computed (a trade-off; see isMissingTmuxSocketResult).
 func isEmptyTmuxServerResult(err error) bool {
 	return isNoTmuxServerResult(err) || isMissingTmuxSocketResult(err)
 }
@@ -525,10 +528,24 @@ func isNoTmuxServerResult(err error) bool {
 		strings.Contains(stderr, "no sessions")
 }
 
-// isMissingTmuxSocketResult reports that the socket file this process computed
-// does not exist. That proves the server absent only where the computed path
-// is the server's own; it is no evidence for a process that may compute a
-// different path (foreign_server.go).
+// isMissingTmuxSocketResult reports tmux's "error connecting to <path> (No such
+// file or directory)": there is no socket file at the path this process
+// computed. That does not prove that no server exists. tmux answers the same
+// way when a live server's socket file was unlinked (macOS's periodic /tmp
+// cleanup, systemd-tmpfiles) or when the server runs under another
+// TMUX_TMPDIR. A server that exited is different: it leaves its socket file
+// behind, connecting is refused, and tmux reports "no server running".
+//
+// isEmptyTmuxServerResult still counts a missing socket as an empty server,
+// knowingly. Runtime inventories always list the native default socket beside
+// the configured one, and where no server has run on a socket since boot there
+// is no socket file at all; failing those inventories closed would block every
+// lifecycle decision. The cost is that a live server behind an unlinked or
+// relocated socket reads as empty, so its sessions look gone to those
+// inventories' consumers (reserved-destruction completion, the `session
+// cleanup` purge). The foreign-server guard, which computes the default socket
+// while $TMUX names another server, does not accept that cost
+// (listDefaultServerSessions).
 func isMissingTmuxSocketResult(err error) bool {
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {

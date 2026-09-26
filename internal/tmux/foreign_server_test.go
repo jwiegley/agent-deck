@@ -3,6 +3,7 @@ package tmux
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,15 +57,16 @@ func startServerOnSocket(t *testing.T, socket, session string) {
 	})
 }
 
-// The fork's socket inventories read a missing socket file as a server with no
-// sessions (isEmptyTmuxServerResult), which holds where this process computes
-// the server's own path. The guard cannot: it computes the DEFAULT socket from
-// its own TMUX_TMPDIR while $TMUX names another server, so a missing default
-// socket is no evidence that the default server is gone. It may be healthy at
-// a path this process does not compute (a TMUX_TMPDIR mismatch) or behind an
-// unlinked socket file. Reading that as "gone everywhere" published error for
-// healthy sessions from a nested TUI. Only a default server that answers
-// without the session permits a verdict.
+// The socket inventories read a missing socket file as a server with no
+// sessions (isEmptyTmuxServerResult), a trade-off isMissingTmuxSocketResult
+// records: tmux reports a missing socket the same way whether no server exists
+// or a live one sits behind an unlinked socket file or another TMUX_TMPDIR.
+// The guard does not accept that trade-off. It computes the DEFAULT socket
+// from its own TMUX_TMPDIR while $TMUX names another server, and reading a
+// missing default socket as "gone everywhere" published error for healthy
+// sessions from a nested TUI. Only a default server that answers permits a
+// verdict: one without the session, or one that exited and left its socket
+// file behind ("no server running").
 func TestAbsenceIsForeignServer_UnlistableDefaultServerFormsNoVerdict(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 	const name = "agentdeck_foreign_probe"
@@ -87,6 +89,22 @@ func TestAbsenceIsForeignServer_UnlistableDefaultServerFormsNoVerdict(t *testing
 		}, true},
 		{"default server answers without the session", func(t *testing.T, socket string) {
 			startServerOnSocket(t, socket, "agentdeck_other")
+		}, false},
+		{"default server exited, stale socket file remains", func(t *testing.T, socket string) {
+			// The file an exited server leaves behind, with nothing listening:
+			// tmux is refused and reports "no server running", so the default
+			// server has no sessions and the session is gone everywhere.
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatalf("bind stale socket: %v", err)
+			}
+			listener.(*net.UnixListener).SetUnlinkOnClose(false)
+			if err := listener.Close(); err != nil {
+				t.Fatalf("close stale socket: %v", err)
+			}
+			if _, err := os.Stat(socket); err != nil {
+				t.Fatalf("stale socket file missing: %v", err)
+			}
 		}, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
