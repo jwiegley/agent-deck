@@ -572,7 +572,8 @@ func TestLegacyCodexIdentityHydrationRefusesStaleObservation(t *testing.T) {
 
 // The published binding is durable and adopted before hydration adds its
 // recall link, so a failed link reports the error without rolling the
-// in-memory identity back behind storage's.
+// in-memory identity back behind storage's. The identity stays bound, so the
+// next hydration takes the bound path, which must repair the missing link.
 func TestLegacyCodexIdentityHydrationKeepsPublishedIdentityWhenRecallLinkFails(t *testing.T) {
 	isolateCodexIdentityStore(t)
 	home := filepath.Join(t.TempDir(), "codex")
@@ -612,6 +613,20 @@ func TestLegacyCodexIdentityHydrationKeepsPublishedIdentityWhenRecallLinkFails(t
 	}
 	if binding, found, err := db.ReadRuntimeBinding(inst.ID, "codex"); err != nil || !found || binding.Value != identity {
 		t.Fatalf("durable binding = %+v found=%v err=%v, want %q", binding, found, err, identity)
+	}
+	if links, err := db.ListSessionLinks(inst.ID); err != nil || len(links) != 0 {
+		t.Fatalf("links after the failed write = %+v err=%v, want none", links, err)
+	}
+
+	if _, err := db.DB().Exec(`DROP TRIGGER hydration_test_fail_recall_link`); err != nil {
+		t.Fatal(err)
+	}
+	if err := hydrateLegacyCodexIdentity(inst, []*session.Instance{inst}, storage); err != nil {
+		t.Fatalf("hydration of the bound identity: %v", err)
+	}
+	links, err := db.ListSessionLinks(inst.ID)
+	if err != nil || len(links) != 1 || links[0].Harness != "codex" || links[0].NativeID != identity || !links[0].Authoritative {
+		t.Fatalf("links after the repair = %+v err=%v, want one authoritative codex/%s", links, err, identity)
 	}
 }
 

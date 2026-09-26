@@ -4421,13 +4421,23 @@ func (g *codexAcceptanceGuard) ResolveAccepted() error {
 // process holds open is the authority (a fresh composer owns its thread before
 // any rollout exists); without it, the pane environment is used. Disk scans and
 // terminal text are deliberately not identity sources here.
+// An identity that is already bound only has a missing recall link repaired.
 func hydrateLegacyCodexIdentity(
 	inst *session.Instance,
 	peers []*session.Instance,
 	storage *session.Storage,
 ) error {
-	if inst == nil || !session.IsCodexCompatible(inst.Tool) ||
-		!inst.CodexRolloutIsResolvableLocally() || strings.TrimSpace(inst.CodexSessionID) != "" {
+	if inst == nil || !session.IsCodexCompatible(inst.Tool) || !inst.CodexRolloutIsResolvableLocally() {
+		return nil
+	}
+	if strings.TrimSpace(inst.CodexSessionID) != "" {
+		// A bound identity may still lack its recall link: an earlier
+		// hydration keeps the published identity when only the link write
+		// fails, and a pane without Codex hooks has no other link writer.
+		// The repair writes only a missing link. The identity is already
+		// durable, so a failure here is logged by the session layer and
+		// must not refuse the send.
+		_ = inst.RecordRecallLink("codex")
 		return nil
 	}
 
@@ -4487,9 +4497,10 @@ func hydrateLegacyCodexIdentity(
 	if err := inst.PublishRuntimeBindingObservation(observation, candidate, time.Now()); err != nil {
 		return fmt.Errorf("persist live Codex session identity: %w", err)
 	}
-	// The binding is durable and adopted in memory now; this adds its recall
-	// link, so a failure here must not roll the adopted identity back.
-	if err := storage.GetDB().WriteCodexSessionBinding(inst.ID, inst.CodexSessionID, inst.CodexDetectedAt); err != nil {
+	// The binding and its tool_data projection are durable and adopted in
+	// memory now; this adds its recall link, so a failure here must not roll
+	// the adopted identity back. The next hydration retries the link.
+	if err := inst.RecordRecallLink("codex"); err != nil {
 		return fmt.Errorf("persist live Codex session identity: %w", err)
 	}
 	return nil

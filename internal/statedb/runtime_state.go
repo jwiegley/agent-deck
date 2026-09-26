@@ -1740,6 +1740,68 @@ func (s *StateDB) commitRuntimeBinding(instanceID, expectedIncarnation string, g
 	return committed, err
 }
 
+// LinkRuntimeBinding records the authoritative recall link (session_links)
+// for value while value is still the instance's durable binding of kind
+// under expectedIncarnation, and reports whether that link now exists.
+// Upstream wrote a harness binding and its link in one transaction; here the
+// binding changes only through the runtime binding CAS, so the link follows
+// a successful publish instead. Checking the binding and upserting the link
+// under one BEGIN IMMEDIATE keeps a link from ever naming an identity a
+// peer has already replaced: a late writer finds the newer binding and
+// writes nothing. A link that is already authoritative is left untouched, so
+// re-confirming a linked identity costs one read.
+func (s *StateDB) LinkRuntimeBinding(instanceID, expectedIncarnation, kind, value string) (bool, error) {
+	if _, ok := bindingJSONKeys[kind]; !ok {
+		return false, fmt.Errorf("unsupported runtime binding kind %q", kind)
+	}
+	if instanceID == "" || value == "" {
+		return false, nil
+	}
+	var linked int
+	err := s.db.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM session_links l
+		JOIN instance_runtime_binding b
+		  ON b.instance_id = l.session_id AND b.binding_kind = l.harness AND b.binding_value = l.native_id
+		WHERE l.session_id = ? AND l.harness = ? AND l.native_id = ? AND l.authoritative = 1)`,
+		instanceID, kind, value).Scan(&linked)
+	if err != nil {
+		return false, err
+	}
+	if linked != 0 {
+		return true, nil
+	}
+	written := false
+	err = withBusyRetry(func() error {
+		written = false
+		return s.withImmediateTransaction(func(tx *immediateTransaction) error {
+			if err := requireRuntimeIncarnation(tx, instanceID, expectedIncarnation); err != nil {
+				if errors.Is(err, ErrInstanceParentConflict) {
+					return nil
+				}
+				return err
+			}
+			var current string
+			err := tx.QueryRow(`SELECT binding_value FROM instance_runtime_binding
+				WHERE instance_id = ? AND binding_kind = ?`, instanceID, kind).Scan(&current)
+			if err == sql.ErrNoRows || (err == nil && current != value) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := upsertSessionLink(tx, instanceID, kind, value, "", true, time.Now()); err != nil {
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			written = true
+			return nil
+		})
+	})
+	return written, err
+}
+
 func overlayBindings(toolData json.RawMessage, bindings map[string]RuntimeBinding) json.RawMessage {
 	var values map[string]json.RawMessage
 	if json.Unmarshal(toolData, &values) != nil {
