@@ -65,8 +65,15 @@ type statusProbeEvidenceKey struct{}
 // is set only when the candidate came from a live tmux pane sample, not from a
 // fast path, a skip, a debounce hold, or an absent session; only such a sample
 // may refresh tool identity and session metadata after the commit.
+//
+// noVerdict is set when the probe took no observation at all: a session this
+// process cannot see from inside another tmux server, or a skip that trusts
+// the verdict an earlier sample settled. Such a pass is a no-op, as upstream's
+// early return is: nothing is committed or finalized, and no metadata refresh
+// follows.
 type statusProbeEvidence struct {
 	paneSampled atomic.Bool
+	noVerdict   atomic.Bool
 }
 
 func withStatusProbeEvidence(ctx context.Context) (context.Context, *statusProbeEvidence) {
@@ -74,9 +81,25 @@ func withStatusProbeEvidence(ctx context.Context) (context.Context, *statusProbe
 	return context.WithValue(ctx, statusProbeEvidenceKey{}, evidence), evidence
 }
 
+// statusProbeEvidenceFor returns the pass evidence ctx carries, installing one
+// for callers that bring none (the notify daemon), so every probe can report
+// that it formed no verdict.
+func statusProbeEvidenceFor(ctx context.Context) (context.Context, *statusProbeEvidence) {
+	if evidence, ok := ctx.Value(statusProbeEvidenceKey{}).(*statusProbeEvidence); ok {
+		return ctx, evidence
+	}
+	return withStatusProbeEvidence(ctx)
+}
+
 func recordStatusPaneSample(ctx context.Context) {
 	if evidence, ok := ctx.Value(statusProbeEvidenceKey{}).(*statusProbeEvidence); ok {
 		evidence.paneSampled.Store(true)
+	}
+}
+
+func recordStatusNoVerdict(ctx context.Context) {
+	if evidence, ok := ctx.Value(statusProbeEvidenceKey{}).(*statusProbeEvidence); ok {
+		evidence.noVerdict.Store(true)
 	}
 }
 
@@ -285,10 +308,13 @@ func PersistSpawnFailureStatus(storage *Storage, inst *Instance) error {
 // exact runtime tuple before probing; the candidate remains private until its
 // durable CAS succeeds. Losers adopt the durable winner unless a physical
 // transition is still in flight, in which case reconciliation waits for a later poll.
+// A probe that forms no verdict (statusProbeEvidence.noVerdict) returns the
+// observed tuple untouched.
 func (i *Instance) UpdateStatusObserved(ctx context.Context, observed statedb.RuntimeState, incarnation string) (statedb.RuntimeState, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, evidence := statusProbeEvidenceFor(ctx)
 	release, err := i.acquireStatusProbe(ctx)
 	if err != nil {
 		return i.runtimeStateSnapshot(), err
@@ -330,6 +356,11 @@ func (i *Instance) UpdateStatusObserved(ctx context.Context, observed statedb.Ru
 		conflictErr := statusRuntimeConflict(observed, current)
 		winner, reloadErr := i.reloadStatusWinner(db, incarnation)
 		return winner, errors.Join(probeErr, conflictErr, reloadErr)
+	}
+	if evidence.noVerdict.Load() {
+		// Nothing was observed, so nothing is confirmed: finalizing would mark
+		// the status sampled live and release an auth hold on no evidence.
+		return observed, probeErr
 	}
 
 	next := observed

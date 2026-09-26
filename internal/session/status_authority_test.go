@@ -81,6 +81,51 @@ func TestRuntimeLifecycle_StatusAuthority_UnchangedCandidateDoesNotBumpRevision(
 	}
 }
 
+// A probe that forms no verdict leaves the authority a no-op even for a caller
+// that brings no pass evidence of its own (the notify daemon): an unchanged
+// verdict marks the status sampled live and releases a healthy session's auth
+// hold, but a pass that observed nothing does neither.
+func TestRuntimeLifecycle_StatusAuthority_NoVerdictFinalizesNothing(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		noVerdict bool
+	}{
+		{"unchanged verdict", false},
+		{"no verdict", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			db, inst := runtimeLifecycleReviverFixture(t, StatusRunning, time.Unix(7120, 0).UTC())
+			t.Cleanup(func() { clearAuthHoldRecord(inst.ID) })
+			if err := writeAuthHoldRecord(AuthHoldRecord{InstanceID: inst.ID, Reason: AuthHoldReasonDeath}); err != nil {
+				t.Fatal(err)
+			}
+			observed := inst.runtimeStateSnapshot()
+			setStatusProbeOverride(t, func(ctx context.Context, _ *Instance, observed statedb.RuntimeState) (Status, error) {
+				if c.noVerdict {
+					recordStatusNoVerdict(ctx)
+				}
+				return Status(observed.Status), nil
+			})
+
+			got, err := inst.UpdateStatusObserved(context.Background(), observed, inst.PersistenceIncarnation())
+			if err != nil || got != observed {
+				t.Fatalf("UpdateStatusObserved = %+v, %v; want the observed tuple %+v", got, err, observed)
+			}
+			durable, found, err := db.ReadRuntimeState(inst.ID)
+			if err != nil || !found || durable != observed {
+				t.Fatalf("durable runtime = %+v found=%v err=%v, want %+v", durable, found, err, observed)
+			}
+			inst.mu.RLock()
+			sampledLive := inst.statusSampledLive
+			inst.mu.RUnlock()
+			held := inst.AuthHold() != nil
+			if sampledLive != !c.noVerdict || held != c.noVerdict {
+				t.Fatalf("sampled live = %v, auth hold kept = %v; want %v and %v", sampledLive, held, !c.noVerdict, c.noVerdict)
+			}
+		})
+	}
+}
+
 func TestRuntimeLifecycle_StatusAuthority_RejectsByteIdenticalIncarnationABA(t *testing.T) {
 	started := time.Unix(7150, 123).UTC()
 	db, stale := runtimeLifecycleReviverFixture(t, StatusWaiting, started)

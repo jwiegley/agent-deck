@@ -6547,6 +6547,13 @@ func (i *Instance) probeTmuxExists(ctx context.Context, observed statedb.Runtime
 }
 
 func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error {
+	_, err := i.updateStatusWithEvidence(pass, syncMetadata)
+	return err
+}
+
+// updateStatusWithEvidence is updateStatus, also reporting how its probe
+// settled the candidate.
+func (i *Instance) updateStatusWithEvidence(pass *StatusUpdatePass, syncMetadata bool) (*statusProbeEvidence, error) {
 	// #1846: flush any unpersisted last-activity evidence once the lock is
 	// released (declared before Lock so it runs after the Unlock defer).
 	// Cheap no-op unless the cold-load fold below (or an earlier
@@ -6556,10 +6563,11 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 	bindingObserved := i.captureActiveRuntimeBindingObservation()
 	ctx, evidence := withStatusProbeEvidence(context.Background())
 	committed, err := i.UpdateStatusObserved(ctx, selection.State, selection.Incarnation)
-	if err == nil && syncMetadata {
+	// A pass without a verdict is a no-op, as upstream's early return is.
+	if err == nil && syncMetadata && !evidence.noVerdict.Load() {
 		i.refreshStatusMetadataIfCurrent(committed, bindingObserved, evidence.paneSampled.Load(), pass)
 	}
-	return err
+	return evidence, err
 }
 
 func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.RuntimeState) (Status, error) {
@@ -6626,6 +6634,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 	// This reduces subprocess spawns from 74/sec to ~5/sec for 28 ghost sessions
 	if (candidate == StatusError || candidate == StatusStopped || candidate == StatusQueued) && !i.lastErrorCheck.IsZero() &&
 		time.Since(i.lastErrorCheck) < errorRecheckInterval {
+		recordStatusNoVerdict(ctx)
 		return candidate, ctx.Err() // Skip - still in error/stopped/queued, checked recently
 	}
 
@@ -6646,6 +6655,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 			// probe followed $TMUX there; the session is alive on the default
 			// server. No verdict: keep the last-known status rather than publish
 			// error for a session this process cannot see (rc 2026-09-23).
+			recordStatusNoVerdict(ctx)
 			return candidate, ctx.Err()
 		}
 		// Queued is operator intent, like stopped: the session waits for group
@@ -6689,6 +6699,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 		currentTS := i.tmuxSession.GetCachedWindowActivity()
 		if currentTS == i.lastKnownActivity && !i.lastIdleCheck.IsZero() &&
 			time.Since(i.lastIdleCheck) < 10*time.Second {
+			recordStatusNoVerdict(ctx)
 			return candidate, ctx.Err() // No activity detected, skip full check
 		}
 		// Activity detected OR recheck interval passed: do full check
