@@ -6519,13 +6519,17 @@ func (i *Instance) UpdateStatus() error {
 
 // probeTmuxExists is called with i.mu held and returns with it held. tmux can
 // wait for a busy server, so status readers must not wait behind this probe.
-func (i *Instance) probeTmuxExists() (exists, current bool) {
+// A runtime replacement or cancellation while the query is in flight discards
+// the result, as in probeTerminatedPaneStatus.
+func (i *Instance) probeTmuxExists(ctx context.Context, observed statedb.RuntimeState) (bool, error) {
 	s := i.tmuxSession
-	status := i.Status
 	i.mu.Unlock()
-	exists = s.Exists()
+	exists := s.Exists()
 	i.mu.Lock()
-	return exists, i.tmuxSession == s && (status == StatusStopped || i.Status != StatusStopped)
+	if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error {
@@ -6568,15 +6572,14 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 	if time.Since(graceTime) < 1500*time.Millisecond {
 		// Only skip if tmux session doesn't exist yet
 		if i.tmuxSession == nil {
-			if i.Status != StatusRunning && i.Status != StatusIdle {
-				i.Status = StatusStarting
+			if candidate != StatusRunning && candidate != StatusIdle {
+				candidate = StatusStarting
 			}
-			return nil
+			return candidate, ctx.Err()
 		}
-		var current bool
-		exists, current = i.probeTmuxExists()
-		if !current {
-			return nil
+		var err error
+		if exists, err = i.probeTmuxExists(ctx, observed); err != nil {
+			return candidate, err
 		}
 		checkedExists = true
 		if !exists {
@@ -6614,10 +6617,9 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 
 	// Check if tmux session exists
 	if !checkedExists {
-		var current bool
-		exists, current = i.probeTmuxExists()
-		if !current {
-			return nil
+		var err error
+		if exists, err = i.probeTmuxExists(ctx, observed); err != nil {
+			return candidate, err
 		}
 	}
 	if !exists {
@@ -6626,7 +6628,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 			// probe followed $TMUX there; the session is alive on the default
 			// server. No verdict: keep the last-known status rather than publish
 			// error for a session this process cannot see (rc 2026-09-23).
-			return nil
+			return candidate, ctx.Err()
 		}
 		if i.addedThisProcess && i.lastStartTime.IsZero() &&
 			(candidate == StatusIdle || candidate == StatusStarting) {
