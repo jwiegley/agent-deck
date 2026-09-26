@@ -19,9 +19,12 @@ const codexDetectionLockThread = "019c9ffa-c9d6-7be1-9e1c-527080e68952"
 // stageCodexDetectionProbe lets one Codex detection attempt run to completion
 // without tmux, Docker or Codex, and returns the thread it must find. A fake
 // tmux reports every session live, with a `sleep` child as the only pane and
-// no peer bindings. A fake docker lists the rollout the container's Codex
-// holds open. CODEX_HOME holds that rollout, scoped to projectPath, for the
-// disk fallback to select.
+// no peer bindings. Fake ps, pgrep and lsof describe that pane as a lone,
+// non-Codex process, so the process probe settles on "absent" without the
+// host's tools (the Nix runtime-lifecycle gate has none on PATH, and a probe
+// that cannot run fails closed). A fake docker lists the rollout the
+// container's Codex holds open. CODEX_HOME holds that rollout, scoped to
+// projectPath, for the disk fallback to select.
 func stageCodexDetectionProbe(t *testing.T, projectPath string) string {
 	t.Helper()
 	pane := exec.Command("sleep", "60")
@@ -55,8 +58,20 @@ case " $* " in
 esac
 exit 1
 `, pane.Process.Pid)
+	fakePs := fmt.Sprintf(`#!/bin/sh
+case " $* " in
+*" -eo pid=,ppid=,comm= "*) echo "%[1]d 1 sleep"; exit 0 ;;
+*" -eo pid=,ppid= "*) echo "%[1]d 1"; exit 0 ;;
+*" -o args= "*) echo "sleep 60"; exit 0 ;;
+esac
+exit 1
+`, pane.Process.Pid)
+	fakePgrep := "#!/bin/sh\nexit 1\n" // no children
+	fakeLsof := "#!/bin/sh\nexit 0\n"  // holds no rollout open
 	fakeDocker := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' %s\n", shellescape.Quote(rollout))
-	for name, script := range map[string]string{"tmux": fakeTmux, "docker": fakeDocker} {
+	for name, script := range map[string]string{
+		"tmux": fakeTmux, "docker": fakeDocker, "ps": fakePs, "pgrep": fakePgrep, "lsof": fakeLsof,
+	} {
 		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755); err != nil {
 			t.Fatal(err)
 		}
