@@ -111,6 +111,8 @@ func installRuntimeDeletionCandidateSeams(t *testing.T, state statedb.RuntimeSta
 	oldRevalidate := runtimeCandidateRevalidateFn
 	oldSweep := runtimeDuplicateSweepFn
 	oldDiscover := discoverCapturedRuntimeChildrenFn
+	oldSelectedExists := selectedRuntimeSessionExistsFn
+	oldForeign := destructionAbsenceIsForeignServerFn
 	runtimeCandidateInventoryFn = func(socketName, instanceID string) ([]tmux.RuntimeCandidate, error) {
 		if socketName != state.TmuxSocketName || instanceID != state.InstanceID {
 			return nil, nil
@@ -130,12 +132,18 @@ func installRuntimeDeletionCandidateSeams(t *testing.T, state statedb.RuntimeSta
 	discoverCapturedRuntimeChildrenFn = func(*Instance, tmux.RuntimeGenerationCandidate) ([]tmux.ProcessIdentity, error) {
 		return nil, nil
 	}
+	// The stubbed inventories are the whole physical world: a session they do
+	// not return no longer answers.
+	selectedRuntimeSessionExistsFn = func(string, string) (bool, error) { return false, nil }
+	destructionAbsenceIsForeignServerFn = func(statedb.RuntimeState) bool { return false }
 	t.Cleanup(func() {
 		runtimeCandidateInventoryFn = oldInventory
 		runtimeGenerationCandidateInventoryFn = oldGenerationInventory
 		runtimeCandidateRevalidateFn = oldRevalidate
 		runtimeDuplicateSweepFn = oldSweep
 		discoverCapturedRuntimeChildrenFn = oldDiscover
+		selectedRuntimeSessionExistsFn = oldSelectedExists
+		destructionAbsenceIsForeignServerFn = oldForeign
 	})
 }
 

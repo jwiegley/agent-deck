@@ -67,6 +67,8 @@ func installRuntimeLifecycleTestSeams(t *testing.T) {
 	oldCommit := runtimeTransitionCommitFn
 	oldSweep := runtimeDuplicateSweepFn
 	oldGenerationKill := killRuntimeGenerationCandidateFn
+	oldSelectedExists := selectedRuntimeSessionExistsFn
+	oldForeign := destructionAbsenceIsForeignServerFn
 	oldNow := nowFn
 
 	lock := make(chan struct{}, 1)
@@ -89,6 +91,8 @@ func installRuntimeLifecycleTestSeams(t *testing.T) {
 	}
 	runtimeDuplicateSweepFn = func(*Instance, ...string) {}
 	killRuntimeGenerationCandidateFn = func(tmux.RuntimeGenerationCandidate, bool) error { return nil }
+	selectedRuntimeSessionExistsFn = func(string, string) (bool, error) { return false, nil }
+	destructionAbsenceIsForeignServerFn = func(statedb.RuntimeState) bool { return false }
 	nowFn = func() time.Time { return time.Unix(100, 123).UTC() }
 
 	t.Cleanup(func() {
@@ -105,6 +109,8 @@ func installRuntimeLifecycleTestSeams(t *testing.T) {
 		runtimeTransitionCommitFn = oldCommit
 		runtimeDuplicateSweepFn = oldSweep
 		killRuntimeGenerationCandidateFn = oldGenerationKill
+		selectedRuntimeSessionExistsFn = oldSelectedExists
+		destructionAbsenceIsForeignServerFn = oldForeign
 		nowFn = oldNow
 	})
 }
