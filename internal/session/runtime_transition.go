@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -172,6 +173,8 @@ func (i *Instance) mergeReloaded(loaded *Instance, mergeMetadata, mergeRuntime b
 			i.hookLastUpdate = time.Time{}
 			i.hookFingerprint = HookStatusFingerprint{}
 			i.validatedHookBindings = nil
+		} else if i.tmuxSession != nil {
+			i.refreshKeptTmuxWrapperLocked(i.tmuxSession)
 		}
 		if !mergeRuntime {
 			i.SandboxContainer = currentSandboxContainer
@@ -718,6 +721,29 @@ func (i *Instance) configureTmuxWrapperLocked(sess *tmux.Session) {
 	sess.SetGroupPath(i.GroupPath)
 	sess.OptionOverrides = i.buildTmuxOptionOverrides()
 	i.loadCustomPatternsFromConfig(sess)
+}
+
+// refreshKeptTmuxWrapperLocked brings the wrapper a metadata reload keeps (same
+// tmux session, same tool) up to date with the merged fields it was configured
+// from: the display name, the group path, and the option overrides, whose
+// remain-on-exit follows the sandbox and one-shot settings. Upstream replaced
+// the Instance on every reload; a kept wrapper otherwise carries the metadata
+// it was built with, and after a move, rename or sandbox change committed by
+// another process the next attach's EnsureConfigured writes the old
+// @agentdeck_group_path and display name back over tmux. The wrapper is live,
+// and the tmux layer reads DisplayName and OptionOverrides without its lock
+// (SyncTmuxDisplayName writes DisplayName the same way), so each is written
+// only when it changed.
+func (i *Instance) refreshKeptTmuxWrapperLocked(sess *tmux.Session) {
+	if sess.DisplayName != i.Title {
+		sess.DisplayName = i.Title
+	}
+	if sess.GetGroupPath() != i.GroupPath {
+		sess.SetGroupPath(i.GroupPath)
+	}
+	if overrides := i.buildTmuxOptionOverrides(); !maps.Equal(overrides, sess.OptionOverrides) {
+		sess.OptionOverrides = overrides
+	}
 }
 
 // applyTmuxSessionSettings copies the configured per-session tmux and terminal
