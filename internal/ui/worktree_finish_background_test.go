@@ -91,6 +91,81 @@ func TestQuitAsksBeforeAbandoningABackgroundWorktreeFinish(t *testing.T) {
 	require.True(t, ok, "confirming must schedule the ordinary quit")
 }
 
+// The restart_deck key (ctrl+t) and auto_restart (on by default) end in the
+// same quit as q, followed by a re-exec, so they would stop a background
+// finish partway just the same. Neither can ask first, since auto_restart has
+// no one to ask, so both wait the way restart already waits on a create,
+// resume, fork or setup: ctrl+t is refused with the in-flight footer, and the
+// auto path stays quiet until the finish reports.
+func TestRestartWaitsForABackgroundWorktreeFinish(t *testing.T) {
+	const reason = "a session action is still running, try again in a moment"
+	for _, tc := range []struct {
+		name    string
+		restart func(h *Home) tea.Cmd
+		// waited checks how the refused restart told the user it is waiting.
+		waited func(t *testing.T, h *Home)
+	}{
+		{
+			name: "ctrl+t",
+			restart: func(h *Home) tea.Cmd {
+				_, cmd := h.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+				return cmd
+			},
+			waited: func(t *testing.T, h *Home) {
+				require.ErrorIs(t, h.err, errRestartBlocked)
+				require.Contains(t, h.err.Error(), reason)
+			},
+		},
+		{
+			name:    "auto_restart",
+			restart: (*Home).maybeAutoRestart,
+			waited: func(t *testing.T, h *Home) {
+				require.Equal(t, reason, h.restartWaitReason)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, running, _, pressFinish := newWorktreeFinishFixture(t)
+			armRestartIntoNewerBuild(t, h)
+			dismissFinishIntoBackground(t, h, running, pressFinish)
+
+			require.Nil(t, tc.restart(h), "%s must not start the quit sequence while a finish runs", tc.name)
+			require.False(t, h.restartRequested, "%s must not arm a restart while a finish runs", tc.name)
+			require.False(t, h.isQuitting, "%s must not quit while a finish runs", tc.name)
+			_, armed := h.RestartTarget()
+			require.False(t, armed, "main() must not re-exec over a running finish")
+			tc.waited(t, h)
+			require.True(t, h.worktreeFinishDialog.IsExecuting())
+
+			// Once the finish reports, nothing else holds the restart back.
+			h.Update(worktreeFinishResultMsg{sessionID: running.ID, sessionTitle: running.Title})
+			require.False(t, h.worktreeFinishDialog.IsExecuting())
+			require.NotNil(t, tc.restart(h), "%s proceeds once the finish has reported", tc.name)
+			require.True(t, h.restartRequested)
+			require.True(t, h.isQuitting)
+		})
+	}
+}
+
+// armRestartIntoNewerBuild puts a newer build "on disk" and stubs the restart
+// target's pre-arm checks as newAutoRestartTestHome does, with auto_restart at
+// its default (on), so only h's own state decides whether ctrl+t or
+// auto_restart may re-exec.
+func armRestartIntoNewerBuild(t *testing.T, h *Home) {
+	t.Helper()
+	stubUpdateSettings(t, session.UpdateSettings{})
+	stubRestartTarget(t, nil, nil)
+	stubStatBinary(t, fpAt(1, 1), nil)
+	prevOrphan := orphanCheck
+	orphanCheck = func(string) string { return "" }
+	t.Cleanup(func() { orphanCheck = prevOrphan })
+	h.binaryWatch = newBinaryWatch("/bin/agent-deck", "1.16.0", fpAt(1, 1))
+	h.binaryWatch.observe(fpAt(2, 2))
+	h.binaryWatch.recordProbe(fpAt(2, 2), "1.16.1", nil)
+	require.Equal(t, "1.16.1", h.installedUpdateVersion())
+	require.True(t, h.autoRestartEnabled())
+}
+
 // newWorktreeFinishFixture returns a loaded Home listing two stopped worktree
 // sessions, "running" and "next", and a func that presses W on one of them.
 func newWorktreeFinishFixture(t *testing.T) (h *Home, running, next *session.Instance, pressFinish func(*session.Instance) tea.Cmd) {
