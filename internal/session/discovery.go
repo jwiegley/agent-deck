@@ -53,14 +53,6 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 			groupPath = "recovered"
 		}
 
-		// DiscoverAllTmuxSessions lists DefaultSocketName() but leaves each
-		// wrapper's SocketName unset. Name the server the session was found on,
-		// or every later probe, the stored runtime and the ownership stamp
-		// below would address the native default server instead.
-		if sess.SocketName == "" {
-			sess.SocketName = tmux.DefaultSocketName()
-		}
-
 		// Create instance for discovered session
 		projectPath := sess.WorkDir
 		if projectPath == "" {
