@@ -230,7 +230,7 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 		// even when the group save failed too: the verify is decided first.
 		{"verify", true, resurrectInstanceRows, "failed to verify conditional removal ", ": exists=true err=<nil>", true},
 		{"verify+group-save", true, resurrectInstanceRowsAndFailGroupWrites, "failed to verify conditional removal ",
-			": exists=true err=<nil>", true},
+			": exists=true err=<nil>; group save also failed: failed to save groups: ", true},
 	} {
 		for _, jsonOutput := range []bool{true, false} {
 			mode := "human"

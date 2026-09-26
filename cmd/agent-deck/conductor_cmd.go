@@ -958,7 +958,11 @@ conductorLoop:
 				exists, existsErr := storage.InstanceExists(id)
 				if existsErr != nil || exists {
 					_ = storage.Close()
-					abort(meta, fmt.Sprintf("failed to verify conditional removal %s: exists=%v err=%v", id, exists, existsErr))
+					reason := fmt.Sprintf("failed to verify conditional removal %s: exists=%v err=%v", id, exists, existsErr)
+					if saveErr != nil {
+						reason += fmt.Sprintf("; group save also failed: %v", saveErr)
+					}
+					abort(meta, reason)
 					continue conductorLoop
 				}
 			}
