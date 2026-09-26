@@ -587,6 +587,12 @@ type Instance struct {
 	// row. Routine writes compare it in SQLite so a stale object cannot update a
 	// byte-identical delete/recreate winner.
 	persistenceIncarnation string
+	// importOwnershipPending marks an instance DiscoverExistingTmuxSessions
+	// built around a live tmux session. InsertSessionAndVerify consumes it
+	// once the instance's row commits and only then applies the import's
+	// ownership grant (runtime_import.go), so no stamp ever names an instance
+	// that was never persisted. Not persisted; guarded by mu.
+	importOwnershipPending bool
 
 	paneDeadExitStatusForTest func() (int, bool) // nil uses tmuxSession.PaneDeadExitStatus
 

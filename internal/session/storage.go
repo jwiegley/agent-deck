@@ -874,12 +874,14 @@ func (s *Storage) RollbackSessionSeed(seed statedb.InstanceSeedToken) error {
 // InsertSessionAndVerify creates one parent/runtime seed through the same
 // atomic insert-only boundary used by restores. A same-ID winner is never
 // updated, and a delete that linearizes after this insert is never retried or
-// resurrected. Group persistence remains a separate metadata operation.
+// resurrected. Group persistence remains a separate metadata operation. An
+// imported instance's ownership grant runs only after its row commits.
 func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *GroupTree) error {
 	if _, err := s.InsertSessionIfAbsent(newInstance); err != nil {
 		return err
 	}
 	consumeGenericSessionIDCleared(newInstance)
+	s.grantPendingImportOwnership(newInstance)
 
 	if groupTree != nil {
 		if err := s.SaveGroupsOnly(groupTree); err != nil {
