@@ -7959,12 +7959,15 @@ func GetActiveSession() (string, error) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // DiscoverAllTmuxSessions returns all tmux sessions (including non-Agent Deck ones)
+// on DefaultSocketName(). Each wrapper names that socket, so everything done
+// through it reaches the server the session was listed on.
 func DiscoverAllTmuxSessions() ([]*Session, error) {
+	socketName := DefaultSocketName()
 	// Bounded — see tmuxPollTimeout. pane_current_path goes LAST: it is the
 	// one field that can legitimately contain a colon (a path component),
 	// and SplitN below relies on that so the path is never truncated at an
 	// embedded colon.
-	output, err := runBoundedOutput(DefaultSocketName(), "list-sessions", "-F",
+	output, err := runBoundedOutput(socketName, "list-sessions", "-F",
 		"#{session_name}:#{session_created}:#{pane_current_command}:#{pane_current_path}")
 	if err != nil {
 		// No sessions exist
@@ -8007,6 +8010,7 @@ func DiscoverAllTmuxSessions() ([]*Session, error) {
 			WorkDir:     workDir,
 			Created:     created,
 			Command:     command,
+			SocketName:  socketName,
 		}
 
 		// If it's an agent-deck session, clean up the display name
