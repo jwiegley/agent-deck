@@ -27,7 +27,9 @@ import (
 // onto pinned upstream revisions from before the cleanup fixes and greps their
 // runs for this test's case names and failure messages. Keep both files
 // compilable against those revisions, and update the workflow's grep strings
-// when a message it names changes.
+// when a message it names changes. That is why this test reads the finish
+// dialog's unexported isExecuting field on purpose: the IsExecuting accessor
+// does not exist at those revisions, so switching to it breaks the overlay.
 func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
