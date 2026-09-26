@@ -800,6 +800,14 @@ func (identity instancePollingIdentity) equal(other instancePollingIdentity) boo
 		identity.copilotSessionID == other.copilotSessionID
 }
 
+// instancePollingState carries caches and throttles across the notify
+// daemon's per-pass reload. The running-flip debounce state
+// (statusSampledLive, tmuxFlipFromRunningPending) is deliberately absent: the
+// daemon's livePrior is its only carrier, because it is dropped while a TUI
+// owns status and reseeded only while the durable status still equals the
+// carried verdict. Carrying it here as well would restore a pending flip
+// frozen across a whole TUI lifetime, or a verdict another writer has
+// superseded.
 type instancePollingState struct {
 	identity instancePollingIdentity
 
@@ -813,13 +821,11 @@ type instancePollingState struct {
 	lastJSONLPath      string
 	cachedPrompt       string
 
-	lastErrorCheck             time.Time
-	lastIdleCheck              time.Time
-	lastKnownActivity          int64
-	tmuxFlipFromRunningPending bool
-	statusSampledLive          bool
-	lastSessionMetaSync        time.Time
-	validatedHookBindings      map[string]validatedHookRuntimeBinding
+	lastErrorCheck        time.Time
+	lastIdleCheck         time.Time
+	lastKnownActivity     int64
+	lastSessionMetaSync   time.Time
+	validatedHookBindings map[string]validatedHookRuntimeBinding
 
 	hermesGatewayCheckedAt time.Time
 	hermesGatewayOK        bool
@@ -894,24 +900,22 @@ func (i *Instance) pollingStateForIdentity(identity instancePollingIdentity) ins
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return instancePollingState{
-		identity:                   identity,
-		tmuxSession:                i.tmuxSession,
-		lastOpenCodeScanAt:         i.lastOpenCodeScanAt,
-		lastCodexScanAt:            i.lastCodexScanAt,
-		lastCodexProbeAt:           i.lastCodexProbeAt,
-		lastPromptModTime:          i.lastPromptModTime,
-		lastJSONLSize:              i.lastJSONLSize,
-		lastJSONLPath:              i.lastJSONLPath,
-		cachedPrompt:               i.cachedPrompt,
-		lastErrorCheck:             i.lastErrorCheck,
-		lastIdleCheck:              i.lastIdleCheck,
-		lastKnownActivity:          i.lastKnownActivity,
-		tmuxFlipFromRunningPending: i.tmuxFlipFromRunningPending,
-		statusSampledLive:          i.statusSampledLive,
-		lastSessionMetaSync:        i.lastSessionMetaSync,
-		validatedHookBindings:      maps.Clone(i.validatedHookBindings),
-		hermesGatewayCheckedAt:     i.hermesGatewayCheckedAt,
-		hermesGatewayOK:            i.hermesGatewayOK,
+		identity:               identity,
+		tmuxSession:            i.tmuxSession,
+		lastOpenCodeScanAt:     i.lastOpenCodeScanAt,
+		lastCodexScanAt:        i.lastCodexScanAt,
+		lastCodexProbeAt:       i.lastCodexProbeAt,
+		lastPromptModTime:      i.lastPromptModTime,
+		lastJSONLSize:          i.lastJSONLSize,
+		lastJSONLPath:          i.lastJSONLPath,
+		cachedPrompt:           i.cachedPrompt,
+		lastErrorCheck:         i.lastErrorCheck,
+		lastIdleCheck:          i.lastIdleCheck,
+		lastKnownActivity:      i.lastKnownActivity,
+		lastSessionMetaSync:    i.lastSessionMetaSync,
+		validatedHookBindings:  maps.Clone(i.validatedHookBindings),
+		hermesGatewayCheckedAt: i.hermesGatewayCheckedAt,
+		hermesGatewayOK:        i.hermesGatewayOK,
 	}
 }
 
@@ -950,8 +954,6 @@ func (i *Instance) restorePollingState(state instancePollingState) bool {
 	i.lastErrorCheck = state.lastErrorCheck
 	i.lastIdleCheck = state.lastIdleCheck
 	i.lastKnownActivity = state.lastKnownActivity
-	i.tmuxFlipFromRunningPending = state.tmuxFlipFromRunningPending
-	i.statusSampledLive = state.statusSampledLive
 	i.lastSessionMetaSync = state.lastSessionMetaSync
 	i.validatedHookBindings = maps.Clone(state.validatedHookBindings)
 	i.hermesGatewayCheckedAt = state.hermesGatewayCheckedAt
