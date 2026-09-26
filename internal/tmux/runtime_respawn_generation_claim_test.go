@@ -17,8 +17,10 @@ import (
 // calls RespawnRuntimeGenerationCandidate on the Instance's own Session, not
 // Session.RespawnPane. The upstream #1892/#2361 generation tests exercise only
 // RespawnPane, so these drive the candidate respawn against the same races on
-// a real pane. The lock-scope unit tests live beside the other candidate unit
-// tests in runtime_binding_candidates_test.go.
+// a real pane. Needing a live tmux server, they stay out of the SQLite-only
+// TestRuntimeLifecycle_ gate, whose tmux is a stub that always reports no
+// server. The lock-scope unit tests that gate does run live beside the other
+// candidate unit tests in runtime_binding_candidates_test.go.
 
 const runtimeRespawnClaimGeneration = 4
 
@@ -182,13 +184,13 @@ func expireStartupClockForTest(s *Session) {
 	s.mu.Unlock()
 }
 
-// TestRuntimeLifecycle_CandidateRespawnReleasesClaimedStartupTimeout restarts
-// a session whose startup timeout was already claimed, in the same process
-// (the TUI restart). The claim belonged to the pane generation the respawn
-// ended; left set, GetStatus skips the #2361 alive probe and reports the
-// healthy replacement as "error" on every poll, and MarkInteractiveAt drops
-// the replacement's hook evidence.
-func TestRuntimeLifecycle_CandidateRespawnReleasesClaimedStartupTimeout(t *testing.T) {
+// TestCandidateRespawn_ReleasesClaimedStartupTimeout restarts a session whose
+// startup timeout was already claimed, in the same process (the TUI restart).
+// The claim belonged to the pane generation the respawn ended; left set,
+// GetStatus skips the #2361 alive probe and reports the healthy replacement as
+// "error" on every poll, and MarkInteractiveAt drops the replacement's hook
+// evidence.
+func TestCandidateRespawn_ReleasesClaimedStartupTimeout(t *testing.T) {
 	s := startRuntimeGenerationSession(t, "candidate-claim-release")
 	expireStartupClockForTest(s)
 	if status, err := s.GetStatus(); err != nil || status != "error" {
@@ -222,11 +224,11 @@ func TestRuntimeLifecycle_CandidateRespawnReleasesClaimedStartupTimeout(t *testi
 	}
 }
 
-// TestRuntimeLifecycle_CandidateRespawnCannotLeaveTimeoutClaimCurrent replaces
-// the pane between a poll's timeout claim and its generation validation, the
+// TestCandidateRespawn_CannotLeaveTimeoutClaimCurrent replaces the pane
+// between a poll's timeout claim and its generation validation, the
 // afterStartupTimeoutClaim window. The poll must describe the replacement, not
 // return the ended generation's timeout for it.
-func TestRuntimeLifecycle_CandidateRespawnCannotLeaveTimeoutClaimCurrent(t *testing.T) {
+func TestCandidateRespawn_CannotLeaveTimeoutClaimCurrent(t *testing.T) {
 	s := startRuntimeGenerationSession(t, "candidate-claim-race")
 	expireStartupClockForTest(s)
 
@@ -253,12 +255,12 @@ func TestRuntimeLifecycle_CandidateRespawnCannotLeaveTimeoutClaimCurrent(t *test
 	}
 }
 
-// TestRuntimeLifecycle_CandidateRespawnCannotCrossTimeoutGenerationClaim holds
-// session.mu as expireStartupHandover does while it claims a generation and
-// respawns the timeout hold. Replacing the pane inside that window would let
-// the claim land on (and the hold respawn over) the freshly restarted agent;
-// the candidate respawn must wait for the claim instead.
-func TestRuntimeLifecycle_CandidateRespawnCannotCrossTimeoutGenerationClaim(t *testing.T) {
+// TestCandidateRespawn_CannotCrossTimeoutGenerationClaim holds session.mu as
+// expireStartupHandover does while it claims a generation and respawns the
+// timeout hold. Replacing the pane inside that window would let the claim
+// land on (and the hold respawn over) the freshly restarted agent; the
+// candidate respawn must wait for the claim instead.
+func TestCandidateRespawn_CannotCrossTimeoutGenerationClaim(t *testing.T) {
 	// Installed before the fixture so its seam is restored only after the
 	// fixture's cleanup has waited out the respawn's escalation.
 	captured := signalCandidateCaptureForTest(t)
