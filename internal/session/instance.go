@@ -4398,6 +4398,28 @@ func (i *Instance) updateCodexSessionForPass(excludeIDs map[string]bool, forcePr
 	return candidate.missingDependency
 }
 
+// adoptCodexSessionForRestart is a restart's Codex detection, run under the
+// restart's transition authority. Like the status pass it takes the bootstrap
+// claim lazily, on the way into the disk fallback, so it cannot select the
+// rollout a peer bootstrapping in the same project is selecting from the same
+// ownership snapshot. It publishes its selection to peers before releasing
+// the claim: recordCodexOwnership for this process and the tmux environment
+// for others, as the status pass's publication does. The durable binding
+// follows with the restart's generation; holding the claim across the spawn
+// would stall every peer's fallback behind it.
+func (i *Instance) adoptCodexSessionForRestart() codexSessionCandidate {
+	var bootstrap codexBootstrapClaim
+	defer bootstrap.release()
+	candidate := i.queryCodexSessionCandidateForPass(nil, true, i.CodexSessionID, &StatusUpdatePass{}, &bootstrap)
+	if candidate.id != "" {
+		i.CodexSessionID = candidate.id
+		i.CodexDetectedAt = time.Now()
+		i.recordCodexOwnership(candidate.id)
+		i.syncPublishedCodexCandidate(candidate, "")
+	}
+	return candidate
+}
+
 // codexBootstrapClaim holds codexBootstrapMu from the moment the disk fallback
 // starts selecting until its caller has published the result, so peers sharing
 // a project cannot claim one rollout from the same ownership snapshot. It is
@@ -4418,10 +4440,6 @@ func (c *codexBootstrapClaim) release() {
 		c.held = false
 		codexBootstrapMu.Unlock()
 	}
-}
-
-func (i *Instance) queryCodexSessionCandidate(excludeIDs map[string]bool, forceProbe bool, currentID string) codexSessionCandidate {
-	return i.queryCodexSessionCandidateForPass(excludeIDs, forceProbe, currentID, nil, nil)
 }
 
 // queryCodexSessionCandidateForPass reads the tmux environment and the process
@@ -10582,12 +10600,7 @@ func (i *Instance) restartWithTransition(transition *runtimeTransitionAuthority,
 		i.mu.Lock()
 		i.pendingCodexRestartWarning = ""
 		i.mu.Unlock()
-		candidate := i.queryCodexSessionCandidate(nil, true, i.CodexSessionID)
-		if candidate.id != "" {
-			i.CodexSessionID = candidate.id
-			i.CodexDetectedAt = time.Now()
-			i.syncPublishedCodexCandidate(candidate, "")
-		}
+		candidate := i.adoptCodexSessionForRestart()
 		if missingDep := candidate.missingDependency; missingDep != "" {
 			i.mu.Lock()
 			i.pendingCodexRestartWarning = codexProbeMissingWarning(missingDep)
