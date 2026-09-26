@@ -121,7 +121,12 @@ it, and nothing else was.
    (`goldens_observations_test.go`), before any spec runs, and fails if a
    spec commits another observation after it. A filtered run such as
    `-run 'TestCLIGoldens/safe/fleet_status$'` prints the same bytes as the
-   full run.
+   full run. The storage-bytes dumps show the same commits: the
+   `session show --json` polls in `waitForStatus` commit the started shell
+   fixture as `idle` (`storage_01`; upstream's row keeps the `stopped` its
+   start left), and `group list` commits `golden-sess-1` to `-3` as `error`
+   (`storage_05`). Plain `list` prints no status and probes none, so
+   `storage_04` is unchanged.
 2. **Queued is operator intent.** A `queued` session is waiting for group
    capacity and was never started, so the status probe keeps it queued when
    its tmux session is absent, as it keeps `stopped`; only the queue drain's
