@@ -9792,6 +9792,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.worktreeFinishDialog.SetError(msg.err.Error())
 			} else {
 				h.setError(msg.err)
+				h.worktreeFinishDialog.Hide() // Ends a finish dismissed into the background.
 			}
 			return h, nil
 		}
@@ -12327,6 +12328,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				inst := item.Session
 				if !inst.IsWorktree() {
 					h.setError(fmt.Errorf("session '%s' is not a worktree", inst.Title))
+					return h, nil
+				}
+				// The dialog owns one finish at a time: reopening it over a
+				// finish dismissed into the background would let that result
+				// land on, or hide, another finish's dialog.
+				if h.worktreeFinishDialog.IsExecuting() {
+					h.setError(fmt.Errorf("still finishing worktree '%s'", h.worktreeFinishDialog.sessionTitle))
 					return h, nil
 				}
 				// Determine default target branch
@@ -26209,6 +26217,12 @@ func (h *Home) handleWorktreeFinishDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd
 
 	switch action {
 	case "close":
+		return h, nil
+
+	case "background":
+		// The finish keeps running; worktreeFinishResultMsg reports its outcome
+		// through the status line now that the dialog is hidden.
+		h.setError(fmt.Errorf("finishing worktree '%s' in the background", h.worktreeFinishDialog.sessionTitle))
 		return h, nil
 
 	case "confirm":

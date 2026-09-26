@@ -149,20 +149,28 @@ func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 			h.Update(tea.WindowSizeMsg{Width: 110, Height: 35})
 			require.Equal(t, 110, h.width)
 			if tc.finish {
-				// Finish stays modal until its command reports, cleanup included,
-				// just as it is during the merge and worktree steps before it.
+				// Finish shows its progress until the command reports, cleanup
+				// included. Esc dismisses that progress without cancelling it.
 				require.Contains(t, stripAnsi(h.View()), "Finishing Worktree...")
-			} else {
-				h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
-				require.True(t, h.search.IsVisible(), "search input must work while cleanup is blocked")
-				frame := stripAnsi(h.View())
-				if os.Getenv("UPDATE_GOLDEN") == "1" {
-					require.NoError(t, os.WriteFile("testdata/hook_cleanup_search.txt", []byte(frame), 0644))
+				h.Update(tea.KeyMsg{Type: tea.KeyEsc})
+				require.False(t, h.worktreeFinishDialog.IsVisible(), "Esc must dismiss the finish while cleanup is blocked")
+				require.True(t, h.worktreeFinishDialog.isExecuting, "dismissing the finish must not forget it is running")
+				require.ErrorContains(t, h.err, "finishing worktree 'gone' in the background")
+				select {
+				case <-result:
+					t.Fatal("dismissing the finish ended its command")
+				default:
 				}
-				golden, err := os.ReadFile("testdata/hook_cleanup_search.txt")
-				require.NoError(t, err)
-				require.Equal(t, string(golden), frame, "search frame while deletion cleanup is blocked")
 			}
+			h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+			require.True(t, h.search.IsVisible(), "search input must work while cleanup is blocked")
+			frame := stripAnsi(h.View())
+			if os.Getenv("UPDATE_GOLDEN") == "1" {
+				require.NoError(t, os.WriteFile("testdata/hook_cleanup_search.txt", []byte(frame), 0644))
+			}
+			golden, err := os.ReadFile("testdata/hook_cleanup_search.txt")
+			require.NoError(t, err)
+			require.Equal(t, string(golden), frame, "search frame while deletion cleanup is blocked")
 			require.FileExists(t, artifact)
 			if tc.undo {
 				// The deletion has not been reported yet, so there is nothing a
@@ -195,6 +203,9 @@ func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 			// lifecycle lock, where it can hit a same-ID replacement.
 			require.Nil(t, update(deleted), outsideAuthority)
 			require.Nil(t, h.getInstanceByID(inst.ID), "reported deletion must leave the session list")
+			if tc.finish {
+				require.False(t, h.worktreeFinishDialog.isExecuting, "reported finish must release the dialog for the next finish")
+			}
 			if tc.undo {
 				// A deliberately invalid account makes Restart return before any
 				// process launch. Its error still reveals when Restart was attempted.
