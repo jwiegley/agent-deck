@@ -3466,23 +3466,12 @@ func (s *Session) PaneDeadExitStatus() (int, bool) {
 	return parsePaneDeadStatus(string(out))
 }
 
-// primaryPaneLine returns the first line of a list-panes result. list-panes
-// expands a window target to every pane in that window, in pane-index order,
-// so the first line describes the lowest-index pane: the primary pane, as the
-// list-panes -a cache also defines it (parseListPanesOutput). That is the
-// pane the session was created with unless the user split before it (-b) or
-// swapped panes.
-func primaryPaneLine(raw string) string {
-	line, _, _ := strings.Cut(strings.TrimSpace(raw), "\n")
-	return strings.TrimSpace(line)
-}
-
 // parsePaneDeadStatus interprets the "#{pane_dead}|#{pane_dead_status}" line
 // tmux emits for the primary pane, the first line of a window's list-panes
-// result. It returns (code, true) only for a dead pane whose
-// exit status is a parseable integer — i.e. one preserved by remain-on-exit.
-// A live pane ("0|..."), or a dead pane with an empty status field (no
-// remain-on-exit), yields (0, false). Pure so the parsing is unit-testable.
+// result. It returns (code, true) only for a dead pane whose exit status is a
+// parseable integer — i.e. one preserved by remain-on-exit. A live pane
+// ("0|..."), or a dead pane with an empty status field (no remain-on-exit),
+// yields (0, false). Pure so the parsing is unit-testable.
 func parsePaneDeadStatus(raw string) (int, bool) {
 	dead, status, ok := strings.Cut(primaryPaneLine(raw), "|")
 	if !ok || dead != "1" {
