@@ -864,20 +864,21 @@ func executeRuntimeCandidateConditionalKill(
 	if len(out) != 0 {
 		return mismatchErr
 	}
-	forgetKilledSession(candidate.SocketName, candidate.SessionName)
+	ForgetSessionPresence(candidate.SocketName, candidate.SessionName)
 	return nil
 }
 
-// forgetKilledSession drops a session the conditional kill just destroyed from
-// this process's positive presence evidence. Session.Exists trusts a positive
-// hit in the shared session cache (default socket) and a live control pipe,
-// and Start registers each new session in that cache, but neither learns of a
-// kill until the next refresh, up to sessionCacheTTL later. Session.Kill
-// disconnects the pipe for the same reason. Without this, a runtime stopped
-// through its candidate still reads live to Exists after the stop reported
-// success, and a restart that follows picks a respawn path for a pane that is
-// gone.
-func forgetKilledSession(socketName, sessionName string) {
+// ForgetSessionPresence drops a session that is known to be gone from this
+// process's positive presence evidence: one the conditional kill just
+// destroyed, or one a destruction just proved absent. Session.Exists trusts a
+// positive hit in the shared session cache (default socket) and a live
+// control pipe, and Start registers each new session in that cache, but
+// neither learns that a session ended until the next refresh, up to
+// sessionCacheTTL later. Session.Kill disconnects the pipe for the same
+// reason. Without this, a runtime whose stop reported success still reads
+// live to Exists, and a restart that follows picks a respawn path for a pane
+// that is gone.
+func ForgetSessionPresence(socketName, sessionName string) {
 	if pm := GetPipeManager(); pm != nil {
 		pm.Disconnect(sessionName)
 	}

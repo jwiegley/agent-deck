@@ -114,9 +114,10 @@ const (
 // answering, from a process that can see its server. Like those inventories,
 // the probe reads a missing socket file as absence, so a stop after a reboot
 // completes; a live server whose socket file was unlinked or relocated is the
-// accepted cost (tmux.SelectedRuntimeSessionExists). A refusal names the
-// operation and the way out: the exact command that ends the session by hand,
-// and legacy adoption when the runtime is still eligible for it.
+// accepted cost (tmux.SelectedRuntimeSessionExists). Proved absence also
+// drops the session's cached presence. A refusal names the operation and the
+// way out: the exact command that ends the session by hand, and legacy
+// adoption when the runtime is still eligible for it.
 func requireSelectedRuntimeGone(db *statedb.StateDB, operation string, expected statedb.RuntimeState) error {
 	if expected.TmuxSession == "" {
 		return nil
@@ -139,6 +140,12 @@ func requireSelectedRuntimeGone(db *statedb.StateDB, operation string, expected 
 		return fmt.Errorf("%s refused: tmux session %q of %s is on the native default tmux server, which this process cannot see from inside another tmux server; run the %s from outside tmux, or end the session yourself with `%s`: %w",
 			operation, expected.TmuxSession, expected.InstanceID, operation, kill, ErrRuntimeOwnershipUnproven)
 	}
+	// The selected session is proved gone, and the destruction completes
+	// without a kill. Forget this process's positive presence evidence for
+	// it, as a successful conditional kill does: Start registered it in the
+	// shared cache, so Exists would otherwise read it live for up to that
+	// cache's TTL after the stop reported success.
+	tmux.ForgetSessionPresence(expected.TmuxSocketName, expected.TmuxSession)
 	return nil
 }
 
