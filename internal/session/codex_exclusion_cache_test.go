@@ -280,7 +280,7 @@ func TestCodexExclusionAuthoritativeBindingAfterSnapshot(t *testing.T) {
 			if source == "hook" {
 				observation := a.CaptureRuntimeBindingObservation("codex")
 				a.mu.Lock()
-				a.bindCodexSessionFromHook(observation, sid, "agent-turn-complete", HookStatusFingerprint{})
+				a.bindCodexSessionFromHook(observation, sid, "hook_payload", "agent-turn-complete", HookStatusFingerprint{})
 				a.mu.Unlock()
 			} else if got := a.resolveCodexDetectionCandidate(sid, nil); got != sid {
 				t.Fatalf("probe candidate=%q", got)

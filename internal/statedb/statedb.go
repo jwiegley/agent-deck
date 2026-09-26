@@ -2090,10 +2090,11 @@ func (s *StateDB) PersistInstanceStatusesTx(updates []InstanceStatusUpdate) erro
 // update — matching the WriteStatus rationale above.
 //
 // Recall phase 1: the same call also records the mapping in session_links
-// (authoritative), because this is one of the two places that already know
-// it. The other is the hook confirmation of an id agent-deck minted itself
-// (Instance.confirmClaudeSessionLink, via UpsertSessionLink); the adoption
-// arbitration retracts a rejected candidate via RetractSessionLink.
+// (authoritative), in the same transaction as the binding. The hook paths
+// publish bindings through the runtime binding CAS instead and record the
+// link after it (Instance.confirmHookSessionLink, via LinkRuntimeBinding);
+// the adoption arbitration retracts a rejected candidate via
+// RetractSessionLink.
 func (s *StateDB) WriteClaudeSessionBinding(id, sessionID string, detectedAt time.Time) error {
 	return s.writeHarnessSessionBinding(id, sessionID, "claude", detectedAt)
 }

@@ -611,12 +611,15 @@ type Instance struct {
 	hookEvent                   string    // Hook event name that caused the last status (e.g. "PermissionRequest")
 	hookSessionID               string    // Session ID from hook payload
 	hookLastUpdate              time.Time // When hook status was last received
-	linkedClaudeSessionID       string    // Last Claude id confirmClaudeSessionLink wrote a session_links row for
 	codexStartedGeneration      string
 	codexCompletedGeneration    string
 	codexStartedSessionID       string
 	codexCompletedSessionID     string
 	codexInvalidatingGeneration string
+
+	// Per runtime binding kind, the last id recordRecallLinkLocked confirmed
+	// an authoritative session_links row for.
+	linkedSessionIDs recallLinkMarks
 
 	// Durable last-activity record (issue #1846). Unlike hookLastUpdate this
 	// survives ClearHookStatus and, via tool_data.last_activity_at, TUI
@@ -7472,7 +7475,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 			// treated as a no-op.
 			if i.publishObservedRuntimeBindingLocked(observation, sessionID, status.Fingerprint) {
 				i.markClaudeSessionIDVerified()
-				i.confirmClaudeSessionLink(sessionID, hookSource)
+				i.confirmHookSessionLink("claude", sessionID, hookSource)
 			}
 			return
 		}
@@ -7563,7 +7566,12 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 		i.bindClaudeSessionFromHook(observation, sessionID, hookSource, status.Event, "rebind", status.Fingerprint)
 	case IsCodexCompatible(i.Tool):
 		if sessionID == i.CodexSessionID {
-			i.publishObservedRuntimeBindingLocked(observation, sessionID, status.Fingerprint)
+			// Like Claude's equality branch: a live hook vouching for the
+			// bound id also records its recall link, which an id bound by
+			// any other path (or a link write that failed) still lacks.
+			if i.publishObservedRuntimeBindingLocked(observation, sessionID, status.Fingerprint) {
+				i.confirmHookSessionLink("codex", sessionID, hookSource)
+			}
 			return
 		}
 		// Quality gate (incident 2026-07-15): codex subagent threads fire
@@ -7600,28 +7608,29 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 			})
 			return
 		}
-		i.bindCodexSessionFromHook(observation, sessionID, status.Event, status.Fingerprint)
+		i.bindCodexSessionFromHook(observation, sessionID, hookSource, status.Event, status.Fingerprint)
 	case i.Tool == "gemini":
 		if sessionID == i.GeminiSessionID {
-			i.publishObservedRuntimeBindingLocked(observation, sessionID, status.Fingerprint)
+			if i.publishObservedRuntimeBindingLocked(observation, sessionID, status.Fingerprint) {
+				i.confirmHookSessionLink("gemini", sessionID, hookSource)
+			}
 			return
 		}
 		// Quality gate: only accept when candidate session appears valid on disk,
 		// OR when current session is empty (first detection/bootstrap).
 		if i.GeminiSessionID == "" || geminiSessionHasConversationData(sessionID, i.ProjectPath) {
-			i.bindGeminiSessionFromHook(observation, sessionID, status.Event, status.Fingerprint)
+			i.bindGeminiSessionFromHook(observation, sessionID, hookSource, status.Event, status.Fingerprint)
 		}
 	}
 }
 
-// bindCodexSessionFromHook is the Codex counterpart of
-// bindClaudeSessionFromHook (see that function's doc comment for the
-// PERSIST-12 rationale). It performs the same bookkeeping that the
-// inlined pre-#1139 code did — debug log, in-memory mutation, tmux env
-// propagation — and then persists the new binding to SQLite so
-// DB-direct consumers and peer agent-deck processes observe the new
-// codex_session_id immediately, instead of reloading the stale row and
-// clobbering the in-memory mutation on the next save cycle.
+// publishObservedRuntimeBindingLocked publishes a hook-observed tool session
+// id through the runtime binding CAS, which commits the durable binding and
+// its tool_data projection together and only then adopts the id in memory,
+// so DB-direct consumers and peer processes see it at once (PERSIST-12,
+// #1138/#1139). It reports whether the id is now this instance's binding.
+// The recall link is not part of that write: callers record it with
+// confirmHookSessionLink after a successful publish.
 func (i *Instance) publishObservedRuntimeBindingLocked(observation RuntimeBindingObservation, sessionID string, fingerprint HookStatusFingerprint) bool {
 	// UpdateHookStatus owns i.mu across its quality gates. Publication uses the
 	// global lock order (spawn lock, then i.mu), so leave the instance critical
@@ -7638,7 +7647,15 @@ func (i *Instance) publishObservedRuntimeBindingLocked(observation RuntimeBindin
 	return true
 }
 
-func (i *Instance) bindCodexSessionFromHook(observation RuntimeBindingObservation, sessionID, hookEvent string, fingerprint HookStatusFingerprint) {
+// bindCodexSessionFromHook is the Codex counterpart of
+// bindClaudeSessionFromHook. It publishes the new binding durably first
+// (publishObservedRuntimeBindingLocked), because none of the UpdateHookStatus
+// callers (TUI tick, web refresh, CLI status refresh) save after a
+// hook-triggered rebind (#1139); only a published id gets the bookkeeping
+// that follows: debug log, ownership record, tmux env propagation and the
+// authoritative recall link that upstream's WriteCodexSessionBinding wrote
+// with the binding.
+func (i *Instance) bindCodexSessionFromHook(observation RuntimeBindingObservation, sessionID, hookSource, hookEvent string, fingerprint HookStatusFingerprint) {
 	oldID := i.CodexSessionID
 	if !i.publishObservedRuntimeBindingLocked(observation, sessionID, fingerprint) {
 		return
@@ -7654,25 +7671,16 @@ func (i *Instance) bindCodexSessionFromHook(observation RuntimeBindingObservatio
 	if i.tmuxSession != nil && i.tmuxSession.Exists() {
 		_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID)
 	}
-
-	// Persist the rebind to SQLite. See bindClaudeSessionFromHook for the
-	// full rationale: none of the three UpdateHookStatus callers (TUI
-	// tick, web refresh, CLI status refresh) save after a hook-triggered
-	// rebind, so tool_data.codex_session_id stays pinned at the stale
-	// UUID indefinitely for DB-direct consumers, and peer processes
-	// holding stale snapshots keep clobbering the in-memory mutation —
-	// producing a runaway loop of fresh "rebind" decisions on every
-	// poll. WriteCodexSessionBinding rewrites only the typed schema
-	// fields via json_set, leaving every other tool_data key untouched.
+	i.confirmHookSessionLink("codex", sessionID, hookSource)
 }
 
 // bindGeminiSessionFromHook is the Gemini counterpart of
-// bindClaudeSessionFromHook. See that function's doc comment for the
-// PERSIST-12 rationale. The quality gate (GeminiSessionID == "" ||
-// geminiSessionHasConversationData(...)) is enforced by the caller in
-// UpdateHookStatus before this function is invoked, mirroring the
-// invariant the inlined pre-#1139 code preserved.
-func (i *Instance) bindGeminiSessionFromHook(observation RuntimeBindingObservation, sessionID, hookEvent string, fingerprint HookStatusFingerprint) {
+// bindCodexSessionFromHook: publish first, then the bookkeeping and the
+// recall link upstream's WriteGeminiSessionBinding wrote. The quality gate
+// (GeminiSessionID == "" || geminiSessionHasConversationData(...)) is
+// enforced by the caller in UpdateHookStatus before this function is
+// invoked, mirroring the invariant the inlined pre-#1139 code preserved.
+func (i *Instance) bindGeminiSessionFromHook(observation RuntimeBindingObservation, sessionID, hookSource, hookEvent string, fingerprint HookStatusFingerprint) {
 	oldID := i.GeminiSessionID
 	if !i.publishObservedRuntimeBindingLocked(observation, sessionID, fingerprint) {
 		return
@@ -7687,15 +7695,7 @@ func (i *Instance) bindGeminiSessionFromHook(observation RuntimeBindingObservati
 	if i.tmuxSession != nil && i.tmuxSession.Exists() {
 		_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", sessionID)
 	}
-
-	// Persist the rebind to SQLite. See bindClaudeSessionFromHook for
-	// the full rationale on why the in-memory mutation alone is not
-	// enough: the bug pattern (#1138 for Claude, #1139 for
-	// Codex/Gemini) is that UpdateHookStatus callers don't call Save
-	// afterwards, so peer agent-deck processes keep reloading the stale
-	// row and clobbering this instance's in-memory state. The targeted
-	// json_set UPDATE atomically rewrites only $.gemini_session_id and
-	// $.gemini_detected_at, preserving the rest of tool_data.
+	i.confirmHookSessionLink("gemini", sessionID, hookSource)
 }
 
 // GetHookStatus returns the current hook-based status and its freshness.
@@ -12585,66 +12585,86 @@ func (i *Instance) bindClaudeSessionFromHook(observation RuntimeBindingObservati
 		_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", sessionID)
 	}
 
-	// Persist the rebind to SQLite. The PERSIST-12 contract above assumed
-	// an "external save cycle" would pick this up, but none of the three
+	// The publish above already persisted the rebind: none of the three
 	// UpdateHookStatus callers (TUI tick, web refresh, CLI status refresh)
-	// actually save after rebind — leaving tool_data.claude_session_id
-	// stuck at the pre-/clear UUID indefinitely for DB-direct consumers,
-	// and producing a runaway loop of fresh "rebind" lifecycle entries
-	// because peer processes keep reloading the stale row and clobbering
-	// the in-memory mutation.
-	//
-	// What this UPDATE guarantees: the write is atomic at SQLite's row
-	// lock against WriteStatus (different columns) and SaveInstance
-	// (same row, serialized). What it does NOT prevent: a concurrent
-	// SaveInstance from a peer process holding a stale Instance snapshot
-	// can still clobber the value we just wrote, because
-	// claude_session_id is a typed schema field — MergeToolDataExtras
-	// only protects keys outside that typed set, so the peer's stale
-	// typed value wins. The runaway-rebind loop terminates anyway
-	// because the writer that decided to rebind also persists
-	// synchronously here, not because clobbering is impossible — a
-	// later peer reload that observes the new ID will short-circuit at
-	// the `sessionID == i.ClaudeSessionID` check in UpdateHookStatus.
-	i.confirmClaudeSessionLink(sessionID, hookSource)
+	// save after a rebind, and without a synchronous write the pre-/clear
+	// UUID stayed in tool_data.claude_session_id for DB-direct consumers
+	// while peers reloading the stale row kept producing fresh "rebind"
+	// lifecycle entries. What remains is the recall link.
+	i.confirmHookSessionLink("claude", sessionID, hookSource)
 }
 
-// confirmClaudeSessionLink records the authoritative recall session_links
-// row for an id a live hook just confirmed as this instance's own. It is the
-// second Claude link writer next to bindClaudeSessionFromHook: ids agent-deck
-// mints at launch (--session-id) are assigned directly and reach
-// UpdateHookStatus already equal, so without this the common local Claude
-// session would never get a link. Idempotent upsert; the in-memory marker
-// keeps it to one write per id per process, not one per hook event.
-func (i *Instance) confirmClaudeSessionLink(sessionID, hookSource string) {
-	if sessionID == "" || i.linkedClaudeSessionID == sessionID {
-		return
+// confirmHookSessionLink records the authoritative recall session_links row
+// for a harness id a live hook just bound (the bind/rebind paths) or
+// confirmed as this instance's already-bound id (the equality branches).
+// The binding itself changes only through the runtime binding CAS, so the
+// link follows a successful publish rather than sharing its transaction as
+// upstream's Write{Claude,Codex,Gemini}SessionBinding did. The equality
+// branches matter as much as the binds: ids agent-deck mints at launch
+// (--session-id) reach UpdateHookStatus already equal, and an id bound by a
+// non-hook path, or whose earlier link write failed, has no link until a
+// hook vouches for it. Failures are logged and retried on the next hook.
+func (i *Instance) confirmHookSessionLink(kind, sessionID, hookSource string) {
+	if err := i.recordRecallLinkLocked(kind, sessionID); err != nil {
+		sessionLog.Warn("session_link_confirm_failed",
+			slog.String("instance_id", i.ID),
+			slog.String("kind", kind),
+			slog.String("session_id", sessionID),
+			slog.String("source", hookSource),
+			slog.String("error", err.Error()))
+	}
+}
+
+// recordRecallLinkLocked writes the authoritative session_links row for
+// value while value is still this instance's durable binding of kind
+// (statedb.LinkRuntimeBinding checks both in one transaction). The
+// in-memory marker keeps it to one attempt per id per process once the
+// link exists, not one per hook event. The caller holds i.mu.
+func (i *Instance) recordRecallLinkLocked(kind, value string) error {
+	if value == "" || i.linkedSessionIDs.has(kind, value) {
+		return nil
 	}
 	db := i.owningDB
 	if db == nil {
 		db = statedb.GetGlobal()
 	}
 	if db == nil {
-		return
+		return nil
 	}
-	if err := db.UpsertSessionLink(i.ID, "claude", sessionID, "", true); err != nil {
-		sessionLog.Warn("claude_session_link_confirm_failed",
+	linked, err := db.LinkRuntimeBinding(i.ID, i.persistenceIncarnation, kind, value)
+	if err != nil || !linked {
+		return err
+	}
+	i.linkedSessionIDs.set(kind, value)
+	return nil
+}
+
+// RecordRecallLink records the authoritative recall link for the instance's
+// current binding of kind when it lacks one. A published binding whose link
+// write failed stays bound, and nothing about the binding itself will retry
+// the link; an observer that owns the identity (legacy Codex hydration)
+// calls this to repair it. A linked identity costs one read.
+func (i *Instance) RecordRecallLink(kind string) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	value := i.runtimeBindingValueLocked(kind)
+	if err := i.recordRecallLinkLocked(kind, value); err != nil {
+		sessionLog.Warn("session_link_record_failed",
 			slog.String("instance_id", i.ID),
-			slog.String("session_id", sessionID),
-			slog.String("source", hookSource),
+			slog.String("kind", kind),
+			slog.String("session_id", value),
 			slog.String("error", err.Error()))
-		return
+		return err
 	}
-	i.linkedClaudeSessionID = sessionID
+	return nil
 }
 
 // retractClaudeCandidateLink drops the recall session_links row of a
 // candidate id the adoption arbitration rejected. A candidate that was bound
 // earlier and lost a re-adoption (or turned out to be a zombie) must not
 // linger as a link, or the recall index would bind its transcript to this
-// instance. Rows are written by bindClaudeSessionFromHook's
-// WriteClaudeSessionBinding and by confirmClaudeSessionLink; this is the
-// matching retraction.
+// instance. Rows are written by confirmHookSessionLink when a hook binds or
+// confirms an id; this is the matching retraction.
 func (i *Instance) retractClaudeCandidateLink(candidate string) {
 	db := i.owningDB
 	if db == nil {
@@ -12660,9 +12680,7 @@ func (i *Instance) retractClaudeCandidateLink(candidate string) {
 			slog.String("error", err.Error()))
 		return
 	}
-	if i.linkedClaudeSessionID == candidate {
-		i.linkedClaudeSessionID = ""
-	}
+	i.linkedSessionIDs.clear("claude", candidate)
 }
 
 // sessionHasConversationData checks if a Claude session file contains actual
