@@ -30,8 +30,16 @@ func TestRuntimeLifecycle_RecallLinkFollowsOnlyTheCurrentBinding(t *testing.T) {
 		}
 		return out
 	}
+	// reserved counts the writer reservations (BEGIN IMMEDIATE) the last
+	// link call took. A call that can only find its id superseded must not
+	// take one: callers run it on every hook tick, and a lagging instance
+	// would otherwise queue for the writer slot to write nothing.
+	reserved := 0
+	db.testAfterImmediateBegin = func() { reserved++ }
+	t.Cleanup(func() { db.testAfterImmediateBegin = nil })
 	link := func(value, withIncarnation string) bool {
 		t.Helper()
+		reserved = 0
 		linked, err := db.LinkRuntimeBinding("one", withIncarnation, "codex", value)
 		if err != nil {
 			t.Fatalf("LinkRuntimeBinding(%s): %v", value, err)
@@ -42,6 +50,9 @@ func TestRuntimeLifecycle_RecallLinkFollowsOnlyTheCurrentBinding(t *testing.T) {
 	if link("first", incarnation) || len(links()) != 0 {
 		t.Fatalf("an unbound id was linked: %v", links())
 	}
+	if reserved != 0 {
+		t.Fatalf("linking an unbound id took %d writer reservations, want 0", reserved)
+	}
 	if _, err := db.CommitRuntimeBinding("one", incarnation, 0, "codex", 0, "first"); err != nil {
 		t.Fatal(err)
 	}
@@ -50,6 +61,9 @@ func TestRuntimeLifecycle_RecallLinkFollowsOnlyTheCurrentBinding(t *testing.T) {
 	}
 	if !link("first", incarnation) {
 		t.Fatal("the current binding was not linked")
+	}
+	if reserved != 1 {
+		t.Fatalf("linking the current binding took %d writer reservations, want 1", reserved)
 	}
 	if got := links(); len(got) != 1 || !got["first"] {
 		t.Fatalf("links = %v, want first authoritative", got)
@@ -64,6 +78,9 @@ func TestRuntimeLifecycle_RecallLinkFollowsOnlyTheCurrentBinding(t *testing.T) {
 	}
 	if link("first", incarnation) {
 		t.Fatal("a superseded id was linked")
+	}
+	if reserved != 0 {
+		t.Fatalf("linking a superseded id took %d writer reservations, want 0", reserved)
 	}
 	if got := links(); len(got) != 2 || got["first"] || !got["second"] {
 		t.Fatalf("links = %v, want second authoritative and first demoted", got)
@@ -83,5 +100,8 @@ func TestRuntimeLifecycle_RecallLinkFollowsOnlyTheCurrentBinding(t *testing.T) {
 	}
 	if !link("second", incarnation) {
 		t.Fatal("an existing authoritative link was not reported")
+	}
+	if reserved != 0 {
+		t.Fatalf("re-confirming a linked identity took %d writer reservations, want 0", reserved)
 	}
 }

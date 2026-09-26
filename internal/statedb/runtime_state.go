@@ -1748,8 +1748,11 @@ func (s *StateDB) commitRuntimeBinding(instanceID, expectedIncarnation string, g
 // a successful publish instead. Checking the binding and upserting the link
 // under one BEGIN IMMEDIATE keeps a link from ever naming an identity a
 // peer has already replaced: a late writer finds the newer binding and
-// writes nothing. A link that is already authoritative is left untouched, so
-// re-confirming a linked identity costs one read.
+// writes nothing. A link that is already authoritative is left untouched,
+// and an id the durable binding no longer holds is refused before the
+// transaction, so either costs one read and no writer reservation: callers
+// confirm on every hook tick, and an instance whose in-memory binding lags a
+// peer's rebind would otherwise queue for the writer slot to write nothing.
 func (s *StateDB) LinkRuntimeBinding(instanceID, expectedIncarnation, kind, value string) (bool, error) {
 	if _, ok := bindingJSONKeys[kind]; !ok {
 		return false, fmt.Errorf("unsupported runtime binding kind %q", kind)
@@ -1757,13 +1760,18 @@ func (s *StateDB) LinkRuntimeBinding(instanceID, expectedIncarnation, kind, valu
 	if instanceID == "" || value == "" {
 		return false, nil
 	}
+	var bound string
 	var linked int
-	err := s.db.QueryRow(`SELECT EXISTS(
+	err := s.db.QueryRow(`SELECT b.binding_value, EXISTS(
 		SELECT 1 FROM session_links l
-		JOIN instance_runtime_binding b
-		  ON b.instance_id = l.session_id AND b.binding_kind = l.harness AND b.binding_value = l.native_id
-		WHERE l.session_id = ? AND l.harness = ? AND l.native_id = ? AND l.authoritative = 1)`,
-		instanceID, kind, value).Scan(&linked)
+		WHERE l.session_id = b.instance_id AND l.harness = b.binding_kind
+		  AND l.native_id = b.binding_value AND l.authoritative = 1)
+		FROM instance_runtime_binding b
+		WHERE b.instance_id = ? AND b.binding_kind = ?`,
+		instanceID, kind).Scan(&bound, &linked)
+	if err == sql.ErrNoRows || (err == nil && bound != value) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
