@@ -5065,10 +5065,12 @@ func (i *Instance) hasEffectiveWrapper() bool {
 }
 
 // loadCustomPatternsFromConfig loads detection patterns from built-in defaults + config.toml
-// overrides, and sets them on the tmux session for status detection and tool auto-detection.
+// overrides, and sets them on sess for status detection and tool auto-detection.
 // Works for ALL tools: built-in (claude, gemini, opencode, codex) and custom.
-func (i *Instance) loadCustomPatternsFromConfig() {
-	if i.tmuxSession == nil {
+// sess is i's wrapper, or one configureTmuxWrapperLocked prepares for it; only
+// i.Tool is read.
+func (i *Instance) loadCustomPatternsFromConfig(sess *tmux.Session) {
+	if sess == nil {
 		return
 	}
 
@@ -5080,13 +5082,13 @@ func (i *Instance) loadCustomPatternsFromConfig() {
 			sessionLog.Warn("pattern_compile_error", slog.String("tool", i.Tool), slog.String("error", err.Error()))
 		}
 		if resolved != nil {
-			i.tmuxSession.SetPatterns(resolved)
+			sess.SetPatterns(resolved)
 		}
 	}
 
 	// Keep detect patterns for DetectTool() (separate from busy/prompt detection)
 	if toolDef := GetToolDef(i.Tool); toolDef != nil {
-		i.tmuxSession.SetDetectPatterns(i.Tool, toolDef.DetectPatterns)
+		sess.SetDetectPatterns(i.Tool, toolDef.DetectPatterns)
 	}
 }
 
@@ -5563,7 +5565,7 @@ func (i *Instance) start(result *statedb.RuntimeState) error {
 	}
 
 	// Load custom patterns for status detection
-	i.loadCustomPatternsFromConfig()
+	i.loadCustomPatternsFromConfig(i.tmuxSession)
 
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
@@ -5959,7 +5961,7 @@ func (i *Instance) startWithMessage(message string, result *statedb.RuntimeState
 	}
 
 	// Load custom patterns for status detection.
-	i.loadCustomPatternsFromConfig()
+	i.loadCustomPatternsFromConfig(i.tmuxSession)
 
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
@@ -10769,7 +10771,7 @@ func (i *Instance) restartWithTransition(transition *runtimeTransitionAuthority,
 
 			sessionLog.Info("restart_generic_respawn_succeeded", slog.String("tool", i.Tool))
 
-			i.loadCustomPatternsFromConfig() // Reload custom patterns
+			i.loadCustomPatternsFromConfig(i.tmuxSession) // Reload custom patterns
 			i.Status = StatusWaiting
 			return nil
 		}
@@ -10908,7 +10910,7 @@ fallbackRecreate:
 	}
 
 	// Load custom patterns for status detection (for custom tools).
-	i.loadCustomPatternsFromConfig()
+	i.loadCustomPatternsFromConfig(i.tmuxSession)
 
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.

@@ -703,17 +703,21 @@ func (i *Instance) adoptRuntimeStateLocked(state statedb.RuntimeState) {
 // configureTmuxWrapperLocked gives a wrapper around a live tmux session the
 // per-instance configuration a wrapper otherwise receives from Start: the
 // configured per-session settings, the group path published as
-// @agentdeck_group_path, and the [tmux].options overrides. Storage load,
-// runtime adoption (including a reload that corrects the tool) and discovery
-// all adopt a running session without Start. A wrapper missing the overrides
-// or the group path makes the next attach's EnsureConfigured push agent-deck's
-// status-bar and title defaults over the user's options and clear the group.
-// The caller holds i.mu or owns i exclusively; buildTmuxOptionOverrides takes
-// no Instance lock.
+// @agentdeck_group_path, the [tmux].options overrides, and the detection
+// patterns for i.Tool. Storage load, runtime adoption (including a reload that
+// corrects the tool) and discovery all adopt a running session without Start.
+// A wrapper missing the overrides or the group path makes the next attach's
+// EnsureConfigured push agent-deck's status-bar and title defaults over the
+// user's options and clear the group. One missing the patterns detects status
+// with the command-inferred defaults, ignoring a [tools.<name>] definition and
+// the user's pattern overrides, and publishes those verdicts to every process.
+// The caller holds i.mu or owns i exclusively; buildTmuxOptionOverrides and
+// loadCustomPatternsFromConfig take no Instance lock.
 func (i *Instance) configureTmuxWrapperLocked(sess *tmux.Session) {
 	applyTmuxSessionSettings(sess)
 	sess.SetGroupPath(i.GroupPath)
 	sess.OptionOverrides = i.buildTmuxOptionOverrides()
+	i.loadCustomPatternsFromConfig(sess)
 }
 
 // applyTmuxSessionSettings copies the configured per-session tmux and terminal

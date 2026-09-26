@@ -233,12 +233,16 @@ esac
 // Every construction of an Instance's tmux wrapper carries the configured
 // per-session options and the Instance's group path, and a wrapper around a
 // live session that no Start or Restart configures afterwards also carries the
-// [tmux].options overrides. Runtime adoption (a reload that corrects the tool,
-// or a durable winner under another tmux name) built its wrapper bare: the
-// adopted session ignored inject_status_line, mouse, clear_on_restart, the
-// Indic zero-width-mark opt-in (#2334) and the terminal-chrome setting, and the
-// next attach pushed agent-deck's status-bar defaults over the user's options
-// and cleared @agentdeck_group_path. Discovery is covered with a real server by
+// [tmux].options overrides and its tool's detection patterns. Runtime adoption
+// (a reload that corrects the tool, or a durable winner under another tmux
+// name) built its wrapper bare: the adopted session ignored
+// inject_status_line, mouse, clear_on_restart, the Indic zero-width-mark
+// opt-in (#2334) and the terminal-chrome setting, the next attach pushed
+// agent-deck's status-bar defaults over the user's options and cleared
+// @agentdeck_group_path, and status detection fell back to command-inferred
+// patterns that ignore a [tools.<name>] definition. The adopting sites run a
+// custom tool so that only a configured definition can supply its patterns.
+// Discovery is covered with a real server by
 // TestDiscoverExistingTmuxSessionsConfiguresImportedWrappers.
 func TestRuntimeLifecycle_EveryTmuxWrapperConstructionAppliesSettings(t *testing.T) {
 	home := configureNonDefaultTmuxWrapperSettings(t)
@@ -264,8 +268,8 @@ func TestRuntimeLifecycle_EveryTmuxWrapperConstructionAppliesSettings(t *testing
 		}},
 		"storage load": {adopts: true, build: func(t *testing.T) (*Instance, *tmux.Session) {
 			instances, _, err := (&Storage{}).convertToInstances(&StorageData{Instances: []*InstanceData{{
-				ID: "settings", Title: "settings", Tool: "claude", ProjectPath: home, GroupPath: "work/settings",
-				TmuxSession: "agentdeck_settings",
+				ID: "settings", Title: "settings", Tool: wrapperSettingsCustomTool, Command: wrapperSettingsCustomTool,
+				ProjectPath: home, GroupPath: "work/settings", TmuxSession: "agentdeck_settings",
 			}}})
 			if err != nil {
 				t.Fatal(err)
@@ -273,7 +277,8 @@ func TestRuntimeLifecycle_EveryTmuxWrapperConstructionAppliesSettings(t *testing
 			return instances[0], instances[0].tmuxSession
 		}},
 		"runtime adoption": {adopts: true, build: func(*testing.T) (*Instance, *tmux.Session) {
-			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/settings", Tool: "claude", Command: "claude"}
+			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/settings",
+				Tool: wrapperSettingsCustomTool, Command: wrapperSettingsCustomTool}
 			inst.adoptRuntimeState(statedb.RuntimeState{
 				InstanceID: "settings", Generation: 2, TmuxSession: "agentdeck_settings_g2", TmuxSocketName: "isolated",
 				Status: string(StatusRunning),
@@ -283,7 +288,8 @@ func TestRuntimeLifecycle_EveryTmuxWrapperConstructionAppliesSettings(t *testing
 		"tool-correcting reload": {adopts: true, build: func(t *testing.T) (*Instance, *tmux.Session) {
 			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/old", Tool: "shell", Command: "bash",
 				TmuxSocketName: "isolated", tmuxSession: &tmux.Session{Name: "agentdeck_settings", SocketName: "isolated"}}
-			loaded := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/settings", Tool: "claude", Command: "claude",
+			loaded := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/settings",
+				Tool: wrapperSettingsCustomTool, Command: wrapperSettingsCustomTool,
 				TmuxSocketName: "isolated", tmuxSession: &tmux.Session{Name: "agentdeck_settings", SocketName: "isolated"}}
 			if !inst.MergeReloaded(loaded) {
 				t.Fatal("the reloaded row was not merged")
@@ -299,10 +305,19 @@ func TestRuntimeLifecycle_EveryTmuxWrapperConstructionAppliesSettings(t *testing
 	}
 }
 
+// wrapperSettingsCustomTool is the [tools.<name>] entry
+// configureNonDefaultTmuxWrapperSettings defines, with its own busy, prompt
+// and detection patterns and no built-in defaults to fall back on.
+const (
+	wrapperSettingsCustomTool    = "wrapped-agent"
+	wrapperSettingsBusyPattern   = "wrapped-agent is thinking"
+	wrapperSettingsDetectPattern = "Wrapped Agent v"
+)
+
 // configureNonDefaultTmuxWrapperSettings writes a user config whose per-session
 // tmux settings all differ from both a new wrapper's defaults and a bare
-// wrapper's zero values, plus one [tmux].options override, and returns the
-// isolated HOME.
+// wrapper's zero values, plus one [tmux].options override and the
+// wrapperSettingsCustomTool definition, and returns the isolated HOME.
 func configureNonDefaultTmuxWrapperSettings(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
@@ -317,6 +332,12 @@ func configureNonDefaultTmuxWrapperSettings(t *testing.T) string {
 			Options: map[string]string{"status": "2"},
 		},
 		Terminal: TerminalSettings{ITermBadge: &badge},
+		Tools: map[string]ToolDef{wrapperSettingsCustomTool: {
+			Command:        wrapperSettingsCustomTool,
+			BusyPatterns:   []string{wrapperSettingsBusyPattern},
+			PromptPatterns: []string{"wrapped> "},
+			DetectPatterns: []string{wrapperSettingsDetectPattern},
+		}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +347,8 @@ func configureNonDefaultTmuxWrapperSettings(t *testing.T) string {
 // assertTmuxWrapperConfigured checks sess against the settings
 // configureNonDefaultTmuxWrapperSettings wrote. Every wrapper carries the
 // per-session settings and inst's group path; an adopting wrapper also carries
-// the option overrides that Start would otherwise install.
+// the option overrides and the detection patterns that Start would otherwise
+// install, which for wrapperSettingsCustomTool come from its definition alone.
 func assertTmuxWrapperConfigured(t *testing.T, inst *Instance, sess *tmux.Session, adopts bool) {
 	t.Helper()
 	if inst == nil || sess == nil {
@@ -350,10 +372,29 @@ func assertTmuxWrapperConfigured(t *testing.T, inst *Instance, sess *tmux.Sessio
 	if got := sess.GetGroupPath(); got != inst.GroupPath {
 		t.Errorf("wrapper group path = %q, want the instance's %q", got, inst.GroupPath)
 	}
-	if adopts {
-		if got := sess.OptionOverrides["status"]; got != "2" {
-			t.Errorf("option overrides = %v, want the configured status=2", sess.OptionOverrides)
+	if !adopts {
+		return
+	}
+	if got := sess.OptionOverrides["status"]; got != "2" {
+		t.Errorf("option overrides = %v, want the configured status=2", sess.OptionOverrides)
+	}
+	patterns := fields.FieldByName("resolvedPatterns")
+	if patterns.IsNil() {
+		t.Errorf("resolved patterns = nil, want %s's detection patterns", inst.Tool)
+	}
+	if inst.Tool != wrapperSettingsCustomTool {
+		return
+	}
+	if !patterns.IsNil() {
+		if busy := patterns.Elem().FieldByName("BusyStrings"); busy.Len() != 1 || busy.Index(0).String() != wrapperSettingsBusyPattern {
+			t.Errorf("resolved busy strings = %v, want the definition's [%q]", busy, wrapperSettingsBusyPattern)
 		}
+	}
+	if got := fields.FieldByName("customToolName").String(); got != inst.Tool {
+		t.Errorf("custom tool name = %q, want %q", got, inst.Tool)
+	}
+	if detect := fields.FieldByName("customDetectPatterns"); detect.Len() != 1 || detect.Index(0).String() != wrapperSettingsDetectPattern {
+		t.Errorf("detect patterns = %v, want the definition's [%q]", detect, wrapperSettingsDetectPattern)
 	}
 }
 
