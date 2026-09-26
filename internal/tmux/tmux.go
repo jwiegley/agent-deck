@@ -4114,23 +4114,6 @@ func parsePanePID(out []byte, err error) (int, error) {
 	return pid, nil
 }
 
-// isOurProcess checks if a PID still belongs to a process we spawned
-// (claude, node, zsh, bash, sh) rather than an unrelated process that
-// reused the PID. This prevents accidentally killing random processes.
-func isOurProcess(pid int) bool {
-	out, err := commandOutput(exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm="))
-	if err != nil {
-		return false // Process doesn't exist
-	}
-	name := strings.ToLower(strings.TrimSpace(string(out)))
-	for _, known := range []string{"claude", "node", "zsh", "bash", "sh", "cat", "npm"} {
-		if strings.Contains(name, known) {
-			return true
-		}
-	}
-	return false
-}
-
 // ensureProcessesDead reaps identities captured before a tmux mutation. On
 // Linux it escalates from SIGTERM to SIGKILL through the same retained pidfd
 // used for the final pre-mutation liveness proof.

@@ -188,6 +188,8 @@ func spawnSendWorker(profile, sessionID string) error {
 	if err != nil {
 		return err
 	}
+	// #nosec G702 -- exe is this binary (os.Executable) and every argument,
+	// including the resolved session id, is passed as argv, never to a shell.
 	cmd := exec.Command(exe, profileArgs(profile, "session", "send-worker", "--target", sessionID)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
