@@ -418,6 +418,11 @@ func (i *Instance) ReconcileRestartResult(restartErr error) error {
 	if !errors.As(restartErr, &partial) {
 		return restartErr
 	}
+	if spawnedRuntimeGone(partial.Err) {
+		// A spawn proved gone published nothing and left nothing live: there
+		// is no winner to prove, and trying would only append that failure.
+		return restartErr
+	}
 	if !partial.NeedsReconciliation {
 		result, err := i.ReconcileRuntime()
 		if err == nil && result.Live {
