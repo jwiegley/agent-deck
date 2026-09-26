@@ -2761,15 +2761,20 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	// `resume <stale-uuid>` on every restart and Codex exits immediately,
 	// flipping the session back to error in an infinite loop. Drop the
 	// stale ID, clear the .sid sidecar so the next hook tick rebinds
-	// cleanly, and spawn fresh.
+	// cleanly, and spawn fresh. The start or restart building this command
+	// holds the spawn lock, not i.mu, and every status pass observes the
+	// binding under i.mu alone (captureActiveRuntimeBindingObservation), so
+	// the drop is written under i.mu.
 	if i.CodexSessionID != "" && !codexRolloutExistsInHome(i.CodexSessionID, codexHome) {
 		sessionLog.Warn("codex_resume_stale_sid_dropped",
 			slog.String("instance_id", i.ID),
 			slog.String("title", i.Title),
 			slog.String("sid", i.CodexSessionID),
 			slog.String("codex_home", codexHome))
+		i.mu.Lock()
 		i.CodexSessionID = ""
 		i.CodexDetectedAt = time.Time{}
+		i.mu.Unlock()
 		ClearHookSessionAnchor(i.ID)
 	}
 
@@ -4482,14 +4487,18 @@ func (i *Instance) updateCodexSessionForPass(excludeIDs map[string]bool, forcePr
 // the claim: recordCodexOwnership for this process and the tmux environment
 // for others, as the status pass's publication does. The durable binding
 // follows with the restart's generation; holding the claim across the spawn
-// would stall every peer's fallback behind it.
+// would stall every peer's fallback behind it. The selection is written under
+// i.mu: the restart holds the spawn lock, not i.mu, and every status pass
+// observes the binding under i.mu alone (captureActiveRuntimeBindingObservation).
 func (i *Instance) adoptCodexSessionForRestart() codexSessionCandidate {
 	var bootstrap codexBootstrapClaim
 	defer bootstrap.release()
 	candidate := i.queryCodexSessionCandidateForPass(nil, true, i.CodexSessionID, &StatusUpdatePass{}, &bootstrap)
 	if candidate.id != "" {
+		i.mu.Lock()
 		i.CodexSessionID = candidate.id
 		i.CodexDetectedAt = time.Now()
+		i.mu.Unlock()
 		i.recordCodexOwnership(candidate.id)
 		i.syncPublishedCodexCandidate(candidate, "")
 	}
@@ -8398,7 +8407,13 @@ func (i *Instance) SyncSessionIDsToTmux() {
 	}
 }
 
+// clearSessionBindingForFreshStart drops the conversation bindings a fresh
+// restart must not resume. It writes under i.mu, as restoreFresh puts them
+// back: the restart holds the spawn lock, not i.mu, and every status pass
+// observes the active binding under i.mu alone
+// (captureActiveRuntimeBindingObservation).
 func (i *Instance) clearSessionBindingForFreshStart() {
+	i.mu.Lock()
 	if IsClaudeCompatible(i.Tool) {
 		i.ClaudeSessionID = ""
 		i.ClaudeDetectedAt = time.Time{}
@@ -8421,9 +8436,7 @@ func (i *Instance) clearSessionBindingForFreshStart() {
 		i.CodexDetectedAt = time.Time{}
 		i.CodexStartedAt = 0
 		i.lastCodexScanAt = time.Time{}
-		i.mu.Lock()
 		i.pendingCodexRestartWarning = ""
-		i.mu.Unlock()
 	}
 
 	if i.Tool == "copilot" {
@@ -8454,29 +8467,35 @@ func (i *Instance) clearSessionBindingForFreshStart() {
 	// fresh start does not re-attach resume after reboot. Flag the clear so
 	// a subsequent SaveWithGroups writes explicit empty (sticky-safe) even
 	// when statedb.GetGlobal() is nil (CLI paths).
-	if i.GenericSessionID != "" || !i.GenericDetectedAt.IsZero() || i.genericSessionIDCleared ||
-		i.GenericSessionTool != "" || i.GenericSessionCommand != "" || i.GenericSessionLocation != "" {
-		cleared := i.GenericSessionID
+	clearGeneric := i.GenericSessionID != "" || !i.GenericDetectedAt.IsZero() || i.genericSessionIDCleared ||
+		i.GenericSessionTool != "" || i.GenericSessionCommand != "" || i.GenericSessionLocation != ""
+	cleared := i.GenericSessionID
+	if clearGeneric {
 		i.GenericSessionID = ""
 		i.GenericDetectedAt = time.Time{}
 		i.GenericSessionTool = ""
 		i.GenericSessionCommand = ""
 		i.GenericSessionLocation = ""
 		i.genericSessionIDCleared = true
-		if db := statedb.GetGlobal(); db != nil {
-			// The flag above means a later save re-applies this clear, so the
-			// outcome is eventually right either way — but a write that keeps
-			// failing on a data path would otherwise never be visible, and
-			// this one deletes a binding the operator asked to be rid of.
-			err := db.WriteGenericSessionBinding(i.ID, "", "", "", "", time.Time{})
-			i.setGenericSessionPersistError(err)
-			if err != nil {
-				sessionLog.Warn("generic_session_clear_persist_failed",
-					slog.String("instance_id", logging.SanitizeValue(i.ID)),
-					slog.String("tool", logging.SanitizeValue(i.Tool)),
-					slog.String("session_id_fingerprint", fingerprintSessionID(cleared)),
-					slog.String("error", logging.SanitizeValue(err.Error())))
-			}
+	}
+	i.mu.Unlock()
+
+	if !clearGeneric {
+		return
+	}
+	if db := statedb.GetGlobal(); db != nil {
+		// The flag above means a later save re-applies this clear, so the
+		// outcome is eventually right either way — but a write that keeps
+		// failing on a data path would otherwise never be visible, and
+		// this one deletes a binding the operator asked to be rid of.
+		err := db.WriteGenericSessionBinding(i.ID, "", "", "", "", time.Time{})
+		i.setGenericSessionPersistError(err)
+		if err != nil {
+			sessionLog.Warn("generic_session_clear_persist_failed",
+				slog.String("instance_id", logging.SanitizeValue(i.ID)),
+				slog.String("tool", logging.SanitizeValue(i.Tool)),
+				slog.String("session_id_fingerprint", fingerprintSessionID(cleared)),
+				slog.String("error", logging.SanitizeValue(err.Error())))
 		}
 	}
 }
@@ -10685,11 +10704,14 @@ func (i *Instance) restartWithTransition(transition *runtimeTransitionAuthority,
 
 	// If Codex session AND tmux session exists, use respawn-pane
 	if IsCodexCompatible(i.Tool) && i.tmuxSession != nil && i.tmuxSession.Exists() {
-		// Try to get session ID from tmux environment if not already set
+		// Try to get session ID from tmux environment if not already set.
+		// Written under i.mu, as adoptCodexSessionForRestart does.
 		if i.CodexSessionID == "" {
 			if envID, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && envID != "" {
+				i.mu.Lock()
 				i.CodexSessionID = envID
 				i.CodexDetectedAt = time.Now()
+				i.mu.Unlock()
 				sessionLog.Info("restart_codex_recovered_id", slog.String("session_id", envID))
 			}
 		}
