@@ -22,6 +22,12 @@ import (
 // before cleanup starts, the handler that applies the report must neither
 // block nor schedule work of its own, and undo becomes available only once
 // the reported deletion (cleanup included) has been applied.
+//
+// hooks-fd-macos.yml copies this file and runtime_authority_fixture_test.go
+// onto pinned upstream revisions from before the cleanup fixes and greps their
+// runs for this test's case names and failure messages. Keep both files
+// compilable against those revisions, and update the workflow's grep strings
+// when a message it names changes.
 func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
