@@ -15,6 +15,10 @@ var (
 	ErrRuntimeBindingObservationStale = errors.New("session: runtime binding observation is stale")
 	ErrRuntimeBindingOwnership        = errors.New("session: runtime binding is owned by another instance")
 
+	// errRuntimeBindingSpawnLockBusy reports a publication that found the
+	// instance spawn lock held and did not wait for it.
+	errRuntimeBindingSpawnLockBusy = errors.New("session: instance spawn lock is held; binding not published")
+
 	// Test seam: a successful durable change has committed, but the matching
 	// in-memory projection has not been published yet.
 	runtimeBindingBeforeMemoryPublishFn = func(*Instance, statedb.RuntimeBinding) {}
@@ -102,6 +106,14 @@ func (i *Instance) captureActiveRuntimeBindingObservation() RuntimeBindingObserv
 // instance spawn lock. The token is never recaptured after waiting: an
 // observation made by an older physical runtime cannot bind its replacement.
 func (i *Instance) PublishRuntimeBindingObservation(observation RuntimeBindingObservation, value string, detectedAt time.Time) error {
+	return i.publishRuntimeBindingObservation(observation, value, detectedAt, true)
+}
+
+// publishRuntimeBindingObservation is PublishRuntimeBindingObservation that,
+// unless wait is set, makes a single attempt at the instance spawn lock and
+// returns errRuntimeBindingSpawnLockBusy while a start, restart or another
+// publisher holds it, rather than wait out the lock's budget.
+func (i *Instance) publishRuntimeBindingObservation(observation RuntimeBindingObservation, value string, detectedAt time.Time, wait bool) error {
 	if observation.instanceID != i.ID {
 		return i.runtimeBindingPublishError(observation.kind, observation.generation, observation.revision,
 			ErrRuntimeBindingObservationStale)
@@ -111,7 +123,16 @@ func (i *Instance) PublishRuntimeBindingObservation(observation RuntimeBindingOb
 			fmt.Errorf("unsupported runtime binding kind %q", observation.kind))
 	}
 
-	release, err := acquireInstanceSpawnLock(observation.instanceID)
+	var release func()
+	var err error
+	if wait {
+		release, err = acquireInstanceSpawnLock(observation.instanceID)
+	} else {
+		var acquired bool
+		if release, acquired, err = tryAcquireInstanceSpawnLock(observation.instanceID); err == nil && !acquired {
+			err = errRuntimeBindingSpawnLockBusy
+		}
+	}
 	if err != nil {
 		return i.runtimeBindingPublishError(observation.kind, observation.generation, observation.revision, err)
 	}
@@ -279,7 +300,9 @@ func restampRuntimeBindingCleanup(target runtimeBindingCleanupTarget) error {
 // fingerprint or binding token deliberately misses this cache and takes the
 // durable publisher above. Timestamp is intentionally excluded: hook payloads
 // have whole-second granularity and distinct events can share one value.
-func (i *Instance) publishHookRuntimeBindingObservation(observation RuntimeBindingObservation, value string, fingerprint HookStatusFingerprint) error {
+// wait selects how the durable publisher takes the instance spawn lock (see
+// publishRuntimeBindingObservation).
+func (i *Instance) publishHookRuntimeBindingObservation(observation RuntimeBindingObservation, value string, fingerprint HookStatusFingerprint, wait bool) error {
 	i.mu.Lock()
 	// Cached hook IDs can predate their rollout metadata or the watcher's
 	// ownership check. Recheck before even the unchanged-fingerprint fast path:
@@ -313,7 +336,7 @@ func (i *Instance) publishHookRuntimeBindingObservation(observation RuntimeBindi
 		return nil
 	}
 
-	if err := i.PublishRuntimeBindingObservation(observation, value, time.Now()); err != nil {
+	if err := i.publishRuntimeBindingObservation(observation, value, time.Now(), wait); err != nil {
 		return err
 	}
 

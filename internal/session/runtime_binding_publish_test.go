@@ -332,7 +332,7 @@ func TestRuntimeLifecycle_BindingObservationRejectsByteIdenticalIncarnationABA(t
 		}
 		fingerprint := hookStatusSourceFingerprint([]byte("same cached hook"))
 		if err := stale.publishHookRuntimeBindingObservation(
-			stale.CaptureRuntimeBindingObservation("copilot"), "same-binding", fingerprint,
+			stale.CaptureRuntimeBindingObservation("copilot"), "same-binding", fingerprint, true,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -364,7 +364,7 @@ func TestRuntimeLifecycle_BindingObservationRejectsByteIdenticalIncarnationABA(t
 			t.Fatalf("stale A same-value error = %v, want parent conflict", err)
 		}
 		if err := stale.publishHookRuntimeBindingObservation(
-			observation, bindingA.Value, fingerprint,
+			observation, bindingA.Value, fingerprint, true,
 		); !errors.Is(err, statedb.ErrInstanceParentConflict) {
 			t.Fatalf("stale A cache-hit error = %v, want parent conflict", err)
 		}
@@ -409,7 +409,7 @@ func TestRuntimeLifecycle_UnchangedCachedHookPublishesOnceAllKinds(t *testing.T)
 
 			fingerprint := hookStatusSourceFingerprint([]byte("cached hook " + tc.kind))
 			if err := inst.publishHookRuntimeBindingObservation(
-				inst.CaptureRuntimeBindingObservation(tc.kind), tc.value, fingerprint); err != nil {
+				inst.CaptureRuntimeBindingObservation(tc.kind), tc.value, fingerprint, true); err != nil {
 				t.Fatal(err)
 			}
 			// The transition daemon reloads Instance values on every pass. Carry
@@ -430,7 +430,7 @@ func TestRuntimeLifecycle_UnchangedCachedHookPublishesOnceAllKinds(t *testing.T)
 					t.Fatal("validated hook cache was not restored")
 				}
 				if err := reloaded.publishHookRuntimeBindingObservation(
-					reloaded.CaptureRuntimeBindingObservation(tc.kind), tc.value, fingerprint); err != nil {
+					reloaded.CaptureRuntimeBindingObservation(tc.kind), tc.value, fingerprint, true); err != nil {
 					t.Fatalf("repeat %d: %v", n, err)
 				}
 				inst = reloaded
@@ -456,7 +456,7 @@ func TestRuntimeLifecycle_DistinctSameSecondHookStillDetectsStaleBinding(t *test
 			firstFingerprint := hookStatusSourceFingerprint([]byte(`{"event":"first","ts":1200}`))
 			secondFingerprint := hookStatusSourceFingerprint([]byte(`{"event":"second","ts":1200}`))
 			if err := inst.publishHookRuntimeBindingObservation(
-				inst.CaptureRuntimeBindingObservation(kind), "first", firstFingerprint); err != nil {
+				inst.CaptureRuntimeBindingObservation(kind), "first", firstFingerprint, true); err != nil {
 				t.Fatal(err)
 			}
 			stale := inst.CaptureRuntimeBindingObservation(kind)
@@ -464,7 +464,7 @@ func TestRuntimeLifecycle_DistinctSameSecondHookStillDetectsStaleBinding(t *test
 				t.Fatal(err)
 			}
 
-			err := inst.publishHookRuntimeBindingObservation(stale, "first", secondFingerprint)
+			err := inst.publishHookRuntimeBindingObservation(stale, "first", secondFingerprint, true)
 			if !errors.Is(err, statedb.ErrBindingRevisionConflict) {
 				t.Fatalf("changed hook error = %v, want stale revision", err)
 			}
