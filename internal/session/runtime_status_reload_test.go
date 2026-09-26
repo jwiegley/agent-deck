@@ -398,6 +398,65 @@ func assertTmuxWrapperConfigured(t *testing.T, inst *Instance, sess *tmux.Sessio
 	}
 }
 
+// A reload that keeps the wrapper (same tmux session, same tool) still brings
+// it up to date with the metadata another process committed. After a
+// cross-process `session move`, rename or sandbox change the kept wrapper
+// carried the old group path, display name and remain-on-exit, and the next
+// attach's EnsureConfigured wrote them back over the tmux options the
+// committing process had published. A deferred reload merges the same
+// metadata once the transition that deferred it has finished.
+func TestRuntimeLifecycle_ReloadRefreshesKeptWrapperMetadata(t *testing.T) {
+	configureNonDefaultTmuxWrapperSettings(t)
+	for _, deferred := range []bool{false, true} {
+		name := "reload"
+		if deferred {
+			name = "deferred"
+		}
+		t.Run(name, func(t *testing.T) {
+			canonical := &Instance{ID: "kept", Title: "before", GroupPath: "work/old", Tool: "claude", Command: "claude",
+				Status: StatusRunning, RuntimeGeneration: 2, StatusRevision: 1, TmuxSocketName: "isolated"}
+			canonical.adoptRuntimeState(statedb.RuntimeState{
+				InstanceID: "kept", Generation: 2, StatusRevision: 1, TmuxSession: "agentdeck_kept", TmuxSocketName: "isolated",
+				Status: string(StatusRunning),
+			})
+			kept := canonical.GetTmuxSession()
+			merge := func(title, group string, sandbox *SandboxConfig) {
+				t.Helper()
+				loaded := &Instance{ID: "kept", Title: title, GroupPath: group, Tool: "claude", Command: "claude", Sandbox: sandbox}
+				loaded.adoptRuntimeState(canonical.RuntimeState())
+				merged := canonical.MergeReloaded
+				if deferred {
+					merged = canonical.MergeDeferredReload
+				}
+				if !merged(loaded) {
+					t.Fatal("the reloaded row was not merged")
+				}
+				if canonical.GetTmuxSession() != kept {
+					t.Fatal("a metadata-only reload replaced the wrapper")
+				}
+				if got := kept.GetGroupPath(); got != group {
+					t.Errorf("kept wrapper group path = %q, want the moved group %q", got, group)
+				}
+				if kept.DisplayName != title {
+					t.Errorf("kept wrapper display name = %q, want the new title %q", kept.DisplayName, title)
+				}
+				if got := kept.OptionOverrides["status"]; got != "2" {
+					t.Errorf("kept wrapper option overrides = %v, want the configured status=2 kept", kept.OptionOverrides)
+				}
+			}
+
+			merge("after", "work/new", &SandboxConfig{Enabled: true})
+			if got := kept.OptionOverrides["remain-on-exit"]; got != "on" {
+				t.Errorf("sandboxed wrapper remain-on-exit = %q, want on", got)
+			}
+			merge("after", "work/new", nil)
+			if got, ok := kept.OptionOverrides["remain-on-exit"]; ok {
+				t.Errorf("unsandboxed wrapper remain-on-exit = %q, want it dropped", got)
+			}
+		})
+	}
+}
+
 // A long-lived process keeps its canonical Instance across storage reloads
 // and merges each reloaded row into it. The merge also installs the reloaded
 // row as the next save's baseline, so a favourite it did not copy reads as
