@@ -769,7 +769,8 @@ func applyConductorRuntimeAction(target conductorRuntimeTarget, selection sessio
 // Separately, some skipped conductors still have the heartbeat on: a skip
 // before the runtime action is confirmed leaves it as it was, while a later
 // skip has already turned it off. Heartbeat is its state after the skip,
-// under the `conductor status` key.
+// under the `conductor status` key; the human summary marks it "(heartbeat
+// still on)".
 type conductorTeardownAbort struct {
 	Name      string `json:"name"`
 	Profile   string `json:"profile"`
@@ -1033,7 +1034,11 @@ conductorLoop:
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintf(os.Stderr, "Teardown incomplete: %d of %d conductor(s) not torn down:\n", len(aborted), len(targets))
 		for _, skipped := range aborted {
-			fmt.Fprintf(os.Stderr, "  %s (profile: %s): %s\n", skipped.Name, skipped.Profile, skipped.Reason)
+			heartbeat := ""
+			if skipped.Heartbeat {
+				heartbeat = " (heartbeat still on)"
+			}
+			fmt.Fprintf(os.Stderr, "  %s (profile: %s): %s%s\n", skipped.Name, skipped.Profile, skipped.Reason, heartbeat)
 		}
 		os.Exit(1)
 	}
