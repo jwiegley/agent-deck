@@ -242,7 +242,9 @@ esac
 // @agentdeck_group_path, and status detection fell back to command-inferred
 // patterns that ignore a [tools.<name>] definition. The adopting sites run a
 // custom tool so that only a configured definition can supply its patterns.
-// Discovery is covered with a real server by
+// A reload that corrects the tool into a sandbox recomputes remain-on-exit,
+// which dead-pane detection needs, from the merged row. Discovery is covered
+// with a real server by
 // TestDiscoverExistingTmuxSessionsConfiguresImportedWrappers.
 func TestRuntimeLifecycle_EveryTmuxWrapperConstructionAppliesSettings(t *testing.T) {
 	home := configureNonDefaultTmuxWrapperSettings(t)
@@ -251,6 +253,24 @@ func TestRuntimeLifecycle_EveryTmuxWrapperConstructionAppliesSettings(t *testing
 		// adopts marks a wrapper around a live session that no Start or
 		// Restart configures afterwards.
 		adopts bool
+		// remainOnExit marks an adopting wrapper whose Instance is sandboxed,
+		// which Start would give remain-on-exit.
+		remainOnExit bool
+	}
+	// toolCorrectingReload merges a row that corrects a shell's tool to the
+	// custom tool, with sandbox, into a live Instance.
+	toolCorrectingReload := func(sandbox *SandboxConfig) func(*testing.T) (*Instance, *tmux.Session) {
+		return func(t *testing.T) (*Instance, *tmux.Session) {
+			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/old", Tool: "shell", Command: "bash",
+				TmuxSocketName: "isolated", tmuxSession: &tmux.Session{Name: "agentdeck_settings", SocketName: "isolated"}}
+			loaded := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/settings",
+				Tool: wrapperSettingsCustomTool, Command: wrapperSettingsCustomTool, Sandbox: sandbox,
+				TmuxSocketName: "isolated", tmuxSession: &tmux.Session{Name: "agentdeck_settings", SocketName: "isolated"}}
+			if !inst.MergeReloaded(loaded) {
+				t.Fatal("the reloaded row was not merged")
+			}
+			return inst, inst.GetTmuxSession()
+		}
 	}
 	sites := map[string]site{
 		"NewInstance": {build: func(*testing.T) (*Instance, *tmux.Session) {
@@ -285,22 +305,20 @@ func TestRuntimeLifecycle_EveryTmuxWrapperConstructionAppliesSettings(t *testing
 			})
 			return inst, inst.tmuxSession
 		}},
-		"tool-correcting reload": {adopts: true, build: func(t *testing.T) (*Instance, *tmux.Session) {
-			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/old", Tool: "shell", Command: "bash",
-				TmuxSocketName: "isolated", tmuxSession: &tmux.Session{Name: "agentdeck_settings", SocketName: "isolated"}}
-			loaded := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/settings",
-				Tool: wrapperSettingsCustomTool, Command: wrapperSettingsCustomTool,
-				TmuxSocketName: "isolated", tmuxSession: &tmux.Session{Name: "agentdeck_settings", SocketName: "isolated"}}
-			if !inst.MergeReloaded(loaded) {
-				t.Fatal("the reloaded row was not merged")
-			}
-			return inst, inst.GetTmuxSession()
-		}},
+		"tool-correcting reload": {adopts: true, build: toolCorrectingReload(nil)},
+		"tool-correcting reload into a sandbox": {adopts: true, remainOnExit: true,
+			build: toolCorrectingReload(&SandboxConfig{Enabled: true})},
 	}
 	for name, site := range sites {
 		t.Run(name, func(t *testing.T) {
 			inst, sess := site.build(t)
 			assertTmuxWrapperConfigured(t, inst, sess, site.adopts)
+			if !site.adopts {
+				return
+			}
+			if got, ok := sess.OptionOverrides["remain-on-exit"]; ok != site.remainOnExit || ok && got != "on" {
+				t.Errorf("remain-on-exit = %q (set %v), want it on exactly for a sandboxed Instance (%v)", got, ok, site.remainOnExit)
+			}
 		})
 	}
 }
