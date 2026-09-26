@@ -134,7 +134,7 @@ func TestRuntimeLifecycle_ReloadToolMetadataDiscardsOldDetection(t *testing.T) {
 			} else {
 				canonical.MergeReloaded(loaded)
 			}
-			canonical.refreshStatusMetadataIfCurrent(state, RuntimeBindingObservation{}, nil)
+			canonical.refreshStatusMetadataIfCurrent(state, RuntimeBindingObservation{}, true, nil)
 			if canonical.Tool != "codex" || canonical.tmuxSession.Command != "codex" {
 				t.Fatalf("status poll restored old metadata: tool=%q command=%q", canonical.Tool, canonical.tmuxSession.Command)
 			}
@@ -188,7 +188,7 @@ esac
 	oldWrapper := canonical.tmuxSession
 	done := make(chan struct{})
 	go func() {
-		canonical.refreshStatusMetadataIfCurrent(state, RuntimeBindingObservation{}, nil)
+		canonical.refreshStatusMetadataIfCurrent(state, RuntimeBindingObservation{}, true, nil)
 		close(done)
 	}()
 	t.Cleanup(func() {

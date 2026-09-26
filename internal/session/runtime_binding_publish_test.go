@@ -743,7 +743,7 @@ func TestRuntimeLifecycle_StatusRefreshPublishesBindingWithoutInstanceMutex(t *t
 	t.Cleanup(func() { instanceSpawnLockAcquireFn = oldAcquire })
 
 	observation := inst.captureActiveRuntimeBindingObservation()
-	inst.refreshStatusMetadataIfCurrent(inst.runtimeStateSnapshot(), observation, nil)
+	inst.refreshStatusMetadataIfCurrent(inst.runtimeStateSnapshot(), observation, false, nil)
 	if inst.ClaudeSessionID != "status-hook-session" {
 		t.Fatalf("status hook binding = %q", inst.ClaudeSessionID)
 	}

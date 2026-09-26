@@ -6547,10 +6547,10 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 	defer i.persistLastActivity(false)
 	selection := i.CaptureRuntimeSelection()
 	bindingObserved := i.captureActiveRuntimeBindingObservation()
-	committed, err := i.UpdateStatusObserved(
-		context.Background(), selection.State, selection.Incarnation)
+	ctx, evidence := withStatusProbeEvidence(context.Background())
+	committed, err := i.UpdateStatusObserved(ctx, selection.State, selection.Incarnation)
 	if err == nil && syncMetadata {
-		i.refreshStatusMetadataIfCurrent(committed, bindingObserved, pass)
+		i.refreshStatusMetadataIfCurrent(committed, bindingObserved, evidence.paneSampled.Load(), pass)
 	}
 	return err
 }
@@ -7015,14 +7015,19 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 		}
 	}
 
+	// Only this settled live pane sample licenses the post-commit tool refresh.
+	recordStatusPaneSample(ctx)
 	return candidate, ctx.Err()
 }
 
 // refreshStatusMetadataIfCurrent preserves the status poller's historical
 // metadata refresh, but only after the observed status has won authority.
 // The bounded daemon calls UpdateStatusObserved directly and therefore cannot
-// publish tool IDs after its context has timed out.
-func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState, hookObservation RuntimeBindingObservation, pass *StatusUpdatePass) {
+// publish tool IDs after its context has timed out. Tool detection and session
+// discovery also require a live pane sample (paneSampled): for an absent
+// session DetectTool's pane capture fails and reports "shell", which would
+// rename a stored claude, codex or gemini session.
+func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState, hookObservation RuntimeBindingObservation, paneSampled bool, pass *StatusUpdatePass) {
 	i.mu.Lock()
 	if !sameStatusRuntime(committed, i.runtimeStateLocked()) {
 		i.mu.Unlock()
@@ -7044,7 +7049,7 @@ func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState
 		}
 	}
 
-	if tmuxSession == nil {
+	if tmuxSession == nil || !paneSampled {
 		return
 	}
 	detectedTool := tmuxSession.DetectTool()
