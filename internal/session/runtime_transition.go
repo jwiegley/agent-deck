@@ -266,8 +266,8 @@ func (i *Instance) mergeReloadedMetadataLocked(loaded *Instance) {
 	// The reloaded row is the new save baseline, so the favourite follows it.
 	// A stale Favorite here reads as this process's own edit in the three-way
 	// tool_data merge and reverts a `session set favorite false` from another
-	// process; a stale favoriteCleared would write an explicit false over a
-	// row re-favourited since. A loaded instance never carries a pending clear.
+	// process. A loaded instance never carries a pending clear, so take its
+	// (false) favoriteCleared along with Favorite.
 	i.Favorite = loaded.Favorite
 	i.favoriteCleared = loaded.favoriteCleared
 	i.ExtraArgs = append([]string(nil), loaded.ExtraArgs...)
