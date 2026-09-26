@@ -214,7 +214,7 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 		reason  string
 		details []string
 		// heartbeat is the heartbeat_enabled flag the skipped conductor keeps,
-		// which its aborted entry must report.
+		// which its aborted entry and human summary line must report.
 		heartbeat bool
 	}{
 		// A refused runtime action leaves the heartbeat and directory alone.
@@ -299,6 +299,9 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 							t.Fatalf("skip reason %q must contain %q", line, detail)
 						}
 					}
+					if marked := strings.HasSuffix(line, " (heartbeat still on)"); marked != tc.heartbeat {
+						t.Fatalf("summary line %q marks the heartbeat still on = %v, want %v", line, marked, tc.heartbeat)
+					}
 				}
 				meta, err := session.LoadConductorMeta(name)
 				if err != nil {
@@ -380,6 +383,9 @@ func TestConductorTeardownReportsDirectoryRemovalFailure(t *testing.T) {
 				summary := "Teardown incomplete: 1 of 1 conductor(s) not torn down:\n  " + name + " (profile: default): " + reason
 				if strings.Contains(out, "Teardown complete.") || !strings.Contains(stderr, summary) {
 					t.Fatalf("human teardown must report the skip, want %q: stdout=%q stderr=%q", summary, out, stderr)
+				}
+				if strings.Contains(stderr, "(heartbeat still on)") {
+					t.Fatalf("human teardown must not mark a removed heartbeat still on: %q", stderr)
 				}
 			}
 			if _, err := os.Stat(filepath.Join(blocked, "pinned")); err != nil {
