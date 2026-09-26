@@ -356,6 +356,16 @@ func (i *Instance) publishRuntimeBinding(kind, value string, detectedAt time.Tim
 	return i.PublishRuntimeBindingObservation(i.CaptureRuntimeBindingObservation(kind), value, detectedAt)
 }
 
+// NormalizeCodexSessionID validates a Codex identity exactly as
+// SetField(FieldCodexSessionID) does, without publishing it. An observer that
+// must vet a candidate before binding it validates here and publishes through
+// PublishRuntimeBindingObservation only once the candidate is accepted:
+// SetField's binding is durable before it returns, so a later refusal could
+// not take it back.
+func NormalizeCodexSessionID(value string) (string, error) {
+	return normalizeToolSessionID(FieldCodexSessionID, value)
+}
+
 // rejectRuntimeBindingConflictLocked runs while PublishRuntimeBindingObservation
 // holds the instance lifecycle lock.
 func (i *Instance) rejectRuntimeBindingConflictLocked(observation RuntimeBindingObservation, cause error) error {

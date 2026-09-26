@@ -4394,6 +4394,10 @@ func hydrateLegacyCodexIdentity(
 		inst.CodexDetectedAt = previousDetectedAt
 	}
 
+	// A runtime observer captures its binding token before it queries the
+	// pane, so an identity read from an older runtime cannot bind its
+	// replacement.
+	observation := inst.CaptureRuntimeBindingObservation("codex")
 	candidate := liveCodexSessionID(inst)
 	processOwned := false
 	if candidate == "" {
@@ -4403,10 +4407,14 @@ func hydrateLegacyCodexIdentity(
 	if candidate == "" {
 		return errCodexIdentityUnavailable
 	}
-	if _, _, err := session.SetField(inst, session.FieldCodexSessionID, candidate, nil); err != nil {
-		restore()
+	// Vet the candidate on the in-memory projection only. SetField would
+	// publish the binding durably before returning, where a refusal below
+	// could not take it back; it is published once every check has passed.
+	candidate, err := session.NormalizeCodexSessionID(candidate)
+	if err != nil {
 		return fmt.Errorf("invalid live Codex session identity: %w", err)
 	}
+	inst.CodexSessionID = candidate
 
 	for _, peer := range peers {
 		if peer == nil || peer.ID == inst.ID || !session.IsCodexCompatible(peer.Tool) ||
@@ -4432,8 +4440,13 @@ func hydrateLegacyCodexIdentity(
 		restore()
 		return fmt.Errorf("cannot persist live Codex session identity")
 	}
+	restore()
+	if err := inst.PublishRuntimeBindingObservation(observation, candidate, time.Now()); err != nil {
+		return fmt.Errorf("persist live Codex session identity: %w", err)
+	}
+	// The binding is durable and adopted in memory now; this adds its recall
+	// link, so a failure here must not roll the adopted identity back.
 	if err := storage.GetDB().WriteCodexSessionBinding(inst.ID, inst.CodexSessionID, inst.CodexDetectedAt); err != nil {
-		restore()
 		return fmt.Errorf("persist live Codex session identity: %w", err)
 	}
 	return nil
