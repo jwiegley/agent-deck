@@ -4478,6 +4478,11 @@ func hydrateLegacyCodexIdentity(
 		restore()
 		return fmt.Errorf("cannot persist live Codex session identity")
 	}
+	// Clear the vetted projection first: with no codex binding at this
+	// generation the publisher compares against CodexSessionID, and an
+	// unchanged value would take its repeated-observation path, which finds
+	// no durable binding and refuses it as a binding-revision conflict
+	// instead of writing one.
 	restore()
 	if err := inst.PublishRuntimeBindingObservation(observation, candidate, time.Now()); err != nil {
 		return fmt.Errorf("persist live Codex session identity: %w", err)

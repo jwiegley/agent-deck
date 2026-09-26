@@ -35,8 +35,10 @@ type startSuccess struct {
 	// messageUndelivered: the pane is live but the initial message never
 	// reached it (session.InitialMessageUndelivered).
 	messageUndelivered bool
-	// messageDeferred: the message is sent after the start returns (launch
-	// --no-wait), so it is still pending when the start reports.
+	// messageDeferred: launch --no-wait, which reports the message pending
+	// because it returns without waiting for the agent. launch sets it for
+	// every --no-wait, even when the prompt rode the spawn command and is
+	// already delivered, which keeps upstream's message_pending = *noWait.
 	messageDeferred bool
 }
 
