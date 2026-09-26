@@ -5616,10 +5616,14 @@ func (i *Instance) start(result *statedb.RuntimeState) error {
 		i.Status = StatusStarting
 	}
 	candidate, plan, committed, err := i.commitPhysicalRuntime(transition)
+	if spawnedRuntimeGone(err) {
+		captureRuntimeResult(result, transition.expected)
+		return nil
+	}
 	captureRuntimeResult(result, candidate)
 	if err != nil {
 		return &RestartPartialSuccessError{
-			InstanceID: i.ID, Runtime: candidate, BindingPlan: plan,
+			InstanceID: i.ID, Operation: "start", Runtime: candidate, BindingPlan: plan,
 			NeedsReconciliation: !committed, Err: err,
 		}
 	}
@@ -5977,10 +5981,22 @@ func (i *Instance) startWithMessage(message string, result *statedb.RuntimeState
 	// New sessions start as STARTING
 	i.Status = StatusStarting
 	candidate, plan, committed, err := i.commitPhysicalRuntime(transition)
+	if spawnedRuntimeGone(err) {
+		captureRuntimeResult(result, transition.expected)
+		if message != "" && !promptEmbeddedInCommand {
+			// The message had no live pane to go to; the call must not
+			// report it sent.
+			return &RestartPartialSuccessError{
+				InstanceID: i.ID, Operation: "start", Runtime: transition.expected,
+				MessageUndelivered: true, Err: err,
+			}
+		}
+		return nil
+	}
 	captureRuntimeResult(result, candidate)
 	if err != nil {
 		return &RestartPartialSuccessError{
-			InstanceID: i.ID, Runtime: candidate, BindingPlan: plan,
+			InstanceID: i.ID, Operation: "start", Runtime: candidate, BindingPlan: plan,
 			NeedsReconciliation: !committed,
 			MessageUndelivered:  message != "" && !promptEmbeddedInCommand,
 			Err:                 err,
@@ -6003,7 +6019,7 @@ func (i *Instance) startWithMessage(message string, result *statedb.RuntimeState
 	if message != "" && !promptEmbeddedInCommand {
 		if err := i.sendMessageWhenReady(message); err != nil {
 			return &RestartPartialSuccessError{
-				InstanceID: i.ID, Runtime: candidate, MessageUndelivered: true, Err: err,
+				InstanceID: i.ID, Operation: "start", Runtime: candidate, MessageUndelivered: true, Err: err,
 			}
 		}
 	}
@@ -10207,10 +10223,14 @@ func (i *Instance) restartWithTransition(transition *runtimeTransitionAuthority,
 		// different durable winner into this Instance.
 		i.commitOwnershipAfterRestart(ownershipCommand)
 		candidate, plan, committed, persistErr := i.commitPhysicalRuntime(transition)
+		if spawnedRuntimeGone(persistErr) {
+			captureRuntimeResult(result, transition.expected)
+			return
+		}
 		captureRuntimeResult(result, candidate)
 		if persistErr != nil {
 			err = &RestartPartialSuccessError{
-				InstanceID: i.ID, Runtime: candidate, BindingPlan: plan,
+				InstanceID: i.ID, Operation: "restart", Runtime: candidate, BindingPlan: plan,
 				NeedsReconciliation: !committed, Err: persistErr,
 			}
 			return
