@@ -50,6 +50,12 @@ var defaultServerSessions struct {
 	at    time.Time
 }
 
+// listDefaultServerSessionsFn is the listing defaultServerHasSession caches.
+// It is read and replaced only under defaultServerSessions' lock, so a test
+// outside this package can stage the default server's answer without a tmux
+// server (StageDefaultServerSessionsForTest).
+var listDefaultServerSessionsFn = listDefaultServerSessions
+
 // listDefaultServerSessions lists the default server for the guard below.
 // Unlike ListSessionNamesOnSocket it reports a missing default socket as an
 // error, not as a server with no sessions: this process computes that socket
@@ -68,7 +74,7 @@ func defaultServerHasSession(name string) bool {
 	defaultServerSessions.Lock()
 	defer defaultServerSessions.Unlock()
 	if defaultServerSessions.at.IsZero() || time.Since(defaultServerSessions.at) > defaultServerSessionsTTL {
-		defaultServerSessions.names, defaultServerSessions.err = listDefaultServerSessions()
+		defaultServerSessions.names, defaultServerSessions.err = listDefaultServerSessionsFn()
 		defaultServerSessions.at = time.Now()
 	}
 	if defaultServerSessions.err != nil {

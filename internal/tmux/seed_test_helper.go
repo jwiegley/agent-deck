@@ -90,6 +90,33 @@ func ResetDefaultServerSessionsForTest(t testing.TB) {
 	t.Cleanup(reset)
 }
 
+// StageDefaultServerSessionsForTest makes the foreign-server guard see a
+// default server that lists exactly names or, with a non-nil err, one this
+// process cannot list. It drops the cached listing now and restores the real
+// listing at cleanup. Packages outside internal/tmux use it to drive the
+// guard's verdict without a tmux server; the real listing's classification is
+// covered by TestAbsenceIsForeignServer_UnlistableDefaultServerFormsNoVerdict.
+func StageDefaultServerSessionsForTest(t testing.TB, err error, names ...string) {
+	t.Helper()
+	install := func(list func() (map[string]struct{}, error)) {
+		defaultServerSessions.Lock()
+		listDefaultServerSessionsFn = list
+		defaultServerSessions.names, defaultServerSessions.err, defaultServerSessions.at = nil, nil, time.Time{}
+		defaultServerSessions.Unlock()
+	}
+	install(func() (map[string]struct{}, error) {
+		if err != nil {
+			return nil, err
+		}
+		listed := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			listed[name] = struct{}{}
+		}
+		return listed, nil
+	})
+	t.Cleanup(func() { install(listDefaultServerSessions) })
+}
+
 // ExpirePaneInfoCacheForTest leaves the cache contents intact but rewinds the
 // timestamp past the freshness threshold so GetCachedPaneInfo treats it as
 // stale. Used to model the case where backgroundStatusUpdate hasn't run for a
