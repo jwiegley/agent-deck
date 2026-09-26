@@ -460,7 +460,7 @@ func (i *Instance) applyRuntimeBindingLocked(binding statedb.RuntimeBinding) err
 		i.CopilotSessionID, i.CopilotDetectedAt = binding.Value, binding.DetectedAt
 	case "codex":
 		i.CodexSessionID, i.CodexDetectedAt = binding.Value, binding.DetectedAt
-		i.recordCodexOwnership(binding.Value)
+		i.recordCodexOwnershipLocked(binding.Value)
 	case "gemini":
 		i.GeminiSessionID, i.GeminiDetectedAt = binding.Value, binding.DetectedAt
 	case "opencode":

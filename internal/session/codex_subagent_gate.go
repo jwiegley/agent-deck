@@ -265,17 +265,27 @@ func codexHookEventEndsTurn(event string) bool {
 	return false
 }
 
+// filterCodexProcessProbeCandidate is the process probe's subagent gate. The
+// caller must not hold i.mu: the probe runs beside the reloads and binding
+// publications that write the fields it reads, so it reads them under i.mu
+// (see queryCodexSessionFromProcessFiles).
 func (i *Instance) filterCodexProcessProbeCandidate(candidateID string) string {
-	if candidateID == "" || !i.shouldRejectCodexSubagentRebind(candidateID) {
+	if candidateID == "" {
+		return candidateID
+	}
+	i.mu.RLock()
+	codexHome, tool, currentID := i.getCodexHomeDir(), i.Tool, i.CodexSessionID
+	i.mu.RUnlock()
+	if !CodexSubagentThread(candidateID, codexHome) {
 		return candidateID
 	}
 	_ = WriteSessionIDLifecycleEvent(SessionIDLifecycleEvent{
-		InstanceID: i.ID, Tool: i.Tool, Action: "reject",
-		Source: "process_probe", OldID: i.CodexSessionID, Candidate: candidateID,
+		InstanceID: i.ID, Tool: tool, Action: "reject",
+		Source: "process_probe", OldID: currentID, Candidate: candidateID,
 		Reason: "candidate_is_subagent_thread",
 	})
 	sessionLog.Debug("codex_session_probe_rejected_subagent",
-		slog.String("old_id", i.CodexSessionID),
+		slog.String("old_id", currentID),
 		slog.String("candidate", candidateID))
 	return ""
 }
