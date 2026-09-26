@@ -3442,7 +3442,9 @@ type statusCounts struct {
 // countByStatus counts sessions by their status
 func countByStatus(instances []*session.Instance) statusCounts {
 	// Warm tmux pane-title cache + load hook statuses so `status`/`status --json`
-	// reports the same counts the TUI and /api/menu do (issue #610).
+	// reports the same counts the TUI and /api/menu do (issue #610). Queued
+	// differs on purpose: the TUI folds it into idle, while these counts give
+	// it its own bucket.
 	session.RefreshInstancesForCLIStatus(instances)
 	// Superseded/archived source rows (from cross-harness "Restart with new
 	// session ID") stay in storage with their old tmux session still
