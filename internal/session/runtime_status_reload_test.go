@@ -228,3 +228,72 @@ esac
 		t.Fatalf("in-flight old detector restored tool %q after reload", canonical.Tool)
 	}
 }
+
+// A long-lived process keeps its canonical Instance across storage reloads
+// and merges each reloaded row into it. The merge also installs the reloaded
+// row as the next save's baseline, so a favourite it did not copy reads as
+// this process's own edit and the next routine save reverts a `session set
+// favorite false` another process made.
+func TestRuntimeLifecycle_ReloadMergeKeepsFavoriteUnsetFromOtherProcess(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	openStorage := func() *Storage {
+		db, err := statedb.Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Migrate(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		return &Storage{db: db, dbPath: dbPath, profile: "_test"}
+	}
+	tui, cli := openStorage(), openStorage()
+	seed := &Instance{
+		ID: "favorite-reload", Title: "favorite", ProjectPath: t.TempDir(), GroupPath: "test",
+		Command: "claude", Tool: "claude", Status: StatusIdle, CreatedAt: time.Now(), Favorite: true,
+	}
+	if err := tui.InsertSessionAndVerify(seed, nil); err != nil {
+		t.Fatal(err)
+	}
+	instances, _, err := tui.LoadWithGroups()
+	if err != nil || len(instances) != 1 || !instances[0].Favorite {
+		t.Fatalf("load favourite: instances=%d err=%v", len(instances), err)
+	}
+	canonical := instances[0]
+
+	// `agent-deck session set favorite-reload favorite false` in another process.
+	cliInstances, cliGroups, err := cli.LoadWithGroups()
+	if err != nil || len(cliInstances) != 1 {
+		t.Fatalf("cli load: instances=%d err=%v", len(cliInstances), err)
+	}
+	if _, _, err := SetField(cliInstances[0], FieldFavorite, "false", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.SaveWithGroups(cliInstances, NewGroupTreeWithGroups(cliInstances, cliGroups)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The storage watcher's reload merges into the canonical object, then any
+	// routine save (rename, reorder, another session's delete) writes it back.
+	reloaded, _, err := tui.LoadWithGroups()
+	if err != nil || len(reloaded) != 1 {
+		t.Fatalf("reload: instances=%d err=%v", len(reloaded), err)
+	}
+	if !canonical.MergeReloaded(reloaded[0]) {
+		t.Fatal("reload was not merged into the canonical instance")
+	}
+	if err := tui.SaveWithGroups([]*Instance{canonical}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	row, err := tui.db.LoadInstanceByID(canonical.ID)
+	if err != nil || row == nil {
+		t.Fatalf("read row: row=%v err=%v", row, err)
+	}
+	if ReadFavoriteFromToolData(row.ToolData) {
+		t.Fatalf("routine save reverted the other process's favourite unset: tool_data=%s", row.ToolData)
+	}
+	if canonical.Favorite {
+		t.Fatal("canonical instance kept the stale favourite after the reload")
+	}
+}
