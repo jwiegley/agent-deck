@@ -1914,3 +1914,104 @@ func TestRuntimeLifecycle_KillRuntimeGenerationCandidateAllowsProvedLegacyGenera
 		}
 	}
 }
+
+// seedSessionPresenceCachesForTest makes this process believe name is live on
+// socket, the way a recent RefreshSessionCache plus Start's
+// registerSessionInCache (shared cache, default socket) or a warm per-socket
+// refresh would, and restores every cache and the default socket afterwards.
+func seedSessionPresenceCachesForTest(t *testing.T, socket, name string) {
+	t.Helper()
+	oldDefault := DefaultSocketName()
+	sessionCacheMu.Lock()
+	oldData, oldTime := sessionCacheData, sessionCacheTime
+	sessionCacheData = map[string]int64{name: time.Now().Unix(), "neighbour": time.Now().Unix()}
+	sessionCacheTime = time.Now()
+	sessionCacheMu.Unlock()
+	socketSessionCacheMu.Lock()
+	oldSocketCache := socketSessionCache
+	socketSessionCache = map[string]*socketSessionsEntry{socket: {
+		names:       map[string]struct{}{name: {}, "neighbour": {}},
+		refreshedAt: time.Now(), warm: true,
+	}}
+	socketSessionCacheMu.Unlock()
+	SetDefaultSocketName(socket)
+	t.Cleanup(func() {
+		SetDefaultSocketName(oldDefault)
+		sessionCacheMu.Lock()
+		sessionCacheData, sessionCacheTime = oldData, oldTime
+		sessionCacheMu.Unlock()
+		socketSessionCacheMu.Lock()
+		socketSessionCache = oldSocketCache
+		socketSessionCacheMu.Unlock()
+	})
+}
+
+func cachedSessionPresenceForTest(socket, name string) (shared, perSocket bool) {
+	shared, _ = sessionExistsFromCache(name)
+	socketSessionCacheMu.Lock()
+	defer socketSessionCacheMu.Unlock()
+	if entry := socketSessionCache[socket]; entry != nil {
+		_, perSocket = entry.names[name]
+	}
+	return shared, perSocket
+}
+
+// A runtime killed through its candidate must stop reading live to
+// Session.Exists at once. Start registers each new session in the shared
+// presence cache, and Exists trusts a positive hit there for sessionCacheTTL:
+// before the kill forgot the session, a stop that had just succeeded still
+// reported the session live (TestStatusCycle_ShellSessionWithCommand in
+// internal/session, whenever an earlier test had refreshed the cache less
+// than two seconds before). A refused kill forgets nothing.
+func TestRuntimeLifecycle_KillRuntimeGenerationCandidateForgetsKilledSessionPresence(t *testing.T) {
+	stubProcessStartIdentityForTest(t)
+	oldKill := runtimeBindingConditionalKillFn
+	oldTree := runtimeGenerationProcessTreeFn
+	oldEnsure := runtimeGenerationEnsurePIDsDeadFn
+	t.Cleanup(func() {
+		runtimeBindingConditionalKillFn = oldKill
+		runtimeGenerationProcessTreeFn = oldTree
+		runtimeGenerationEnsurePIDsDeadFn = oldEnsure
+	})
+	binding := runtimeBindingCandidateForTest()
+	stubCompleteRuntimeCleanupLocalOptions(t, binding)
+	candidate := runtimeGenerationCandidateFromBinding(binding)
+	runtimeGenerationProcessTreeFn = func(string, string) ([]int, error) { return []int{candidate.PanePID}, nil }
+	runtimeGenerationEnsurePIDsDeadFn = func(identities []ProcessIdentity, _ time.Duration) error {
+		CloseProcessIdentities(identities)
+		return nil
+	}
+
+	for _, tc := range []struct {
+		name     string
+		response []byte
+		wantErr  bool
+	}{
+		{name: "refused kill", response: []byte("agent-deck-runtime-generation-candidate-changed\n"), wantErr: true},
+		{name: "successful kill"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seedSessionPresenceCachesForTest(t, candidate.SocketName, candidate.SessionName)
+			runtimeBindingConditionalKillFn = func(context.Context, string, ...string) ([]byte, error) {
+				return tc.response, nil
+			}
+			err := KillRuntimeGenerationCandidate(candidate, true)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("kill error = %v, want error %v", err, tc.wantErr)
+			}
+			shared, perSocket := cachedSessionPresenceForTest(candidate.SocketName, candidate.SessionName)
+			if tc.wantErr {
+				if !shared || !perSocket {
+					t.Fatalf("refused kill forgot the live session: shared=%v per-socket=%v", shared, perSocket)
+				}
+				return
+			}
+			if shared || perSocket {
+				t.Fatalf("killed session still cached live: shared=%v per-socket=%v", shared, perSocket)
+			}
+			if neighbour, neighbourPerSocket := cachedSessionPresenceForTest(candidate.SocketName, "neighbour"); !neighbour || !neighbourPerSocket {
+				t.Fatalf("kill forgot an unrelated session: shared=%v per-socket=%v", neighbour, neighbourPerSocket)
+			}
+		})
+	}
+}

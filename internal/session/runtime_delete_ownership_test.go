@@ -306,3 +306,48 @@ func TestUnprefixedRuntime_UnownedLiveSessionRefusesStop(t *testing.T) {
 		t.Fatalf("stored runtime after refused stop = %#v found=%v err=%v, want %#v", after, found, err, before)
 	}
 }
+
+// A stop that reported success leaves nothing that reads live. Start registers
+// the new session in the process's shared presence cache, and a status pass
+// that refreshed that cache just before the stop left it warm; Exists trusted
+// that positive hit for its TTL, so a stopped runtime still read live (the
+// flake in TestStatusCycle_ShellSessionWithCommand during full runs).
+func TestStoppedRuntime_StopsReadingLive(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	socketName := fmt.Sprintf("adtest-stop-presence-%d", time.Now().UnixNano())
+	t.Cleanup(func() { _ = exec.Command("tmux", "-L", socketName, "kill-server").Run() })
+	oldDefault := tmux.DefaultSocketName()
+	tmux.SetDefaultSocketName(socketName)
+	t.Cleanup(func() { tmux.SetDefaultSocketName(oldDefault) })
+
+	storage, err := NewStorageWithProfile("_test_stop_presence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	inst := NewInstance("stop presence", t.TempDir())
+	inst.Command = "sleep 60"
+	inst.tmuxSession.SocketName = socketName
+	inst.TmuxSocketName = socketName
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := inst.Start(); err != nil {
+		t.Fatal(err)
+	}
+	sessionName := inst.GetTmuxSession().Name
+	tmux.RefreshSessionCache()
+	if !inst.Exists() {
+		t.Fatalf("started runtime %q does not read live", sessionName)
+	}
+
+	if err := inst.KillCaptured(inst.CaptureRuntimeSelection()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if tmuxSessionAnswers(socketName, sessionName) {
+		t.Fatalf("stop left %q running", sessionName)
+	}
+	if inst.Exists() {
+		t.Fatalf("stopped runtime %q still reads live", sessionName)
+	}
+}
