@@ -37,7 +37,9 @@ func TestStartRetainsRemainOnExitSessionUnderBaseIndexOne(t *testing.T) {
 	s.RunCommandAsInitialProcess = true
 	s.OptionOverrides = map[string]string{"remain-on-exit": "on"}
 	require.NoError(t, s.Start("printf 'one-shot answer\\n'; exit 7"))
-	t.Cleanup(func() { _ = s.Kill() })
+	// KillAndWait reaps synchronously. Kill's background reaper could outlive
+	// the test, reading the process-identity seams later tests replace.
+	t.Cleanup(func() { _ = s.KillAndWait() })
 
 	if index := ctl("display-message", "-p", "-t", "="+s.primaryWindowTarget(), "#{window_index}.#{pane_index}"); index != "1.1" {
 		t.Fatalf("primary pane index = %q, want 1.1 (server did not apply base-index 1)", index)
@@ -75,7 +77,7 @@ func TestPaneDeadProbesReadOnlyThePrimaryPane(t *testing.T) {
 	s.RunCommandAsInitialProcess = true
 	s.OptionOverrides = map[string]string{"remain-on-exit": "on"}
 	require.NoError(t, s.Start("exec sleep 300"))
-	t.Cleanup(func() { _ = s.Kill() })
+	t.Cleanup(func() { _ = s.KillAndWait() })
 
 	// A split that exits at once: retained dead beside the live agent.
 	ctl("split-window", "-d", "-t", "="+s.primaryWindowTarget(), "sh", "-c", "exit 3")

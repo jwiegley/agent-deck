@@ -48,13 +48,17 @@ func trackRuntimeGenerationEscalationsForTest(t *testing.T) (wait func()) {
 func startRuntimeGenerationSession(t *testing.T, name string) *Session {
 	t.Helper()
 	skipIfNoTmuxBinary(t)
+	// Neither the respawn's escalation nor the kill may still be reaping when
+	// this test returns: either would be reading the process-identity seams
+	// that stub-based tests replace. Cleanup runs KillAndWait, which reaps
+	// synchronously, then waits for every escalation this test's respawns
+	// started.
+	trackRuntimeGenerationEscalationsForTest(t)
 	s := NewSession(name, t.TempDir())
 	s.InstanceID = "instance-" + name
 	if err := s.Start("sleep 300"); err != nil {
 		t.Fatalf("start inert pane: %v", err)
 	}
-	// KillAndWait reaps synchronously: Kill's background reaper would still
-	// be reading the process-identity seams that stub-based tests replace.
 	t.Cleanup(func() { _ = s.KillAndWait() })
 	if err := StampRuntimeCleanupIdentity(s, s.InstanceID, runtimeRespawnClaimGeneration, "", ""); err != nil {
 		t.Fatalf("stamp runtime cleanup identity: %v", err)
