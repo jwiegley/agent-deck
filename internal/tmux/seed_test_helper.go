@@ -135,3 +135,54 @@ func ExpirePaneInfoCacheForTest(t testing.TB) {
 		paneCacheMu.Unlock()
 	})
 }
+
+// SeedSessionPresenceForTest makes this process believe each of names is live
+// on socketName, the way a recent RefreshSessionCache plus Start's
+// registerSessionInCache (the shared cache, which describes the default
+// socket) or a warm per-socket refresh would. socketName becomes the default
+// socket so Session.Exists consults the shared cache for it. Every cache and
+// the default socket are restored at cleanup. Packages outside internal/tmux
+// use it, with SessionPresenceCachedForTest, to pin that a session known to be
+// gone stops reading live (ForgetSessionPresence) without a tmux server.
+func SeedSessionPresenceForTest(t testing.TB, socketName string, names ...string) {
+	t.Helper()
+	oldDefault := DefaultSocketName()
+	shared := make(map[string]int64, len(names))
+	perSocket := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		shared[name] = time.Now().Unix()
+		perSocket[name] = struct{}{}
+	}
+	sessionCacheMu.Lock()
+	oldData, oldTime := sessionCacheData, sessionCacheTime
+	sessionCacheData, sessionCacheTime = shared, time.Now()
+	sessionCacheMu.Unlock()
+	socketSessionCacheMu.Lock()
+	oldSocketCache := socketSessionCache
+	socketSessionCache = map[string]*socketSessionsEntry{socketName: {
+		names: perSocket, refreshedAt: time.Now(), warm: true,
+	}}
+	socketSessionCacheMu.Unlock()
+	SetDefaultSocketName(socketName)
+	t.Cleanup(func() {
+		SetDefaultSocketName(oldDefault)
+		sessionCacheMu.Lock()
+		sessionCacheData, sessionCacheTime = oldData, oldTime
+		sessionCacheMu.Unlock()
+		socketSessionCacheMu.Lock()
+		socketSessionCache = oldSocketCache
+		socketSessionCacheMu.Unlock()
+	})
+}
+
+// SessionPresenceCachedForTest reports whether the shared presence cache and
+// socketName's per-socket cache still hold name as live.
+func SessionPresenceCachedForTest(socketName, name string) (shared, perSocket bool) {
+	shared, _ = sessionExistsFromCache(name)
+	socketSessionCacheMu.Lock()
+	defer socketSessionCacheMu.Unlock()
+	if entry := socketSessionCache[socketName]; entry != nil {
+		_, perSocket = entry.names[name]
+	}
+	return shared, perSocket
+}

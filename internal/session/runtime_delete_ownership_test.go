@@ -154,6 +154,65 @@ func TestRuntimeLifecycle_DestructionOfVanishedSessionCompletesStopped(t *testin
 	}
 }
 
+// A destruction that completes because its selected session proved absent
+// leaves nothing that reads the session live. Start registers each session
+// in the process's shared presence cache, and only a conditional kill forgot
+// it: a stop of a pane that had exited on its own reported success while
+// Exists still trusted that entry for its TTL, so a restart that followed
+// could pick the respawn path for a pane that was gone. A refused destruction
+// forgets nothing, and no other session is forgotten.
+func TestRuntimeLifecycle_DestructionOfVanishedSessionForgetsItsPresence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		live bool
+	}{
+		{name: "proved absent"},
+		{name: "still live", live: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inst, _, state := newRuntimeDeleteTestInstance(t)
+			stubRuntimeDeletionPhysicalWork(t, state, func(tmux.RuntimeGenerationCandidate, bool) error {
+				t.Error("a destruction with no candidate terminated one")
+				return nil
+			})
+			runtimeCandidateInventoryFn = func(string, string) ([]tmux.RuntimeCandidate, error) { return nil, nil }
+			runtimeGenerationCandidateInventoryFn = func(string, string) ([]tmux.RuntimeGenerationCandidate, error) {
+				return nil, nil
+			}
+			selectedRuntimeSessionExistsFn = func(string, string) (bool, error) { return tc.live, nil }
+			tmux.SeedSessionPresenceForTest(t, state.TmuxSocketName, state.TmuxSession, "neighbour")
+			wrapper := inst.GetTmuxSession()
+			if !wrapper.Exists() {
+				t.Fatalf("seeded session %q does not read live", state.TmuxSession)
+			}
+
+			err := inst.KillCaptured(inst.CaptureRuntimeSelection())
+			shared, perSocket := tmux.SessionPresenceCachedForTest(state.TmuxSocketName, state.TmuxSession)
+			if tc.live {
+				if !errors.Is(err, ErrRuntimeOwnershipUnproven) {
+					t.Fatalf("stop of a live unproven session = %v, want ErrRuntimeOwnershipUnproven", err)
+				}
+				if !shared || !perSocket {
+					t.Fatalf("refused stop forgot the live session: shared=%v per-socket=%v", shared, perSocket)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("stop of a vanished session: %v", err)
+			}
+			if shared || perSocket {
+				t.Fatalf("stopped session still cached live: shared=%v per-socket=%v", shared, perSocket)
+			}
+			if wrapper.Exists() {
+				t.Fatalf("stopped runtime %q still reads live", state.TmuxSession)
+			}
+			if neighbour, neighbourPerSocket := tmux.SessionPresenceCachedForTest(state.TmuxSocketName, "neighbour"); !neighbour || !neighbourPerSocket {
+				t.Fatalf("stop forgot an unrelated session: shared=%v per-socket=%v", neighbour, neighbourPerSocket)
+			}
+		})
+	}
+}
+
 // startUnownedTmuxSession starts a plain tmux session on a private socket, as
 // a user (or `agent-deck` import) would find it: no Agent Deck stamp at all.
 func startUnownedTmuxSession(t *testing.T, socketName, sessionName string) {
