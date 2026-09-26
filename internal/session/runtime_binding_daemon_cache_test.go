@@ -1,6 +1,8 @@
 package session
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/testutil"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
@@ -96,6 +99,93 @@ func TestRuntimeLifecycle_TUIAliveDaemonCarriesValidatedHookBinding(t *testing.T
 	d.syncProfile(profile)
 	if lockAcquisitions != 1 {
 		t.Fatalf("unchanged second pass acquired binding lock %d times, want 1 total", lockAcquisitions)
+	}
+}
+
+// The poll-state bridge carries the daemon's caches and throttles across its
+// per-pass reload, never the running-flip debounce: livePrior alone carries
+// that, and it is dropped while a TUI owns status. A flip held on the last
+// no-TUI pass before a TUI started is hours stale when the TUI exits. Restored
+// anyway, it skips the one-sample hold a cold instance gives a transient
+// capture failure, so the first pass after the TUI exits committed
+// running -> error for a pane that was never read as dead.
+func TestRuntimeLifecycle_DaemonPollStateDoesNotCarryFlipAcrossTUILifetime(t *testing.T) {
+	inboxTestHome(t)
+	profile := "_test_runtime_poll_state_flip"
+	storage, err := NewStorageWithProfile(profile)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	defer storage.Close()
+	inst := &Instance{
+		ID: "runtime-poll-state-flip", Title: "worker", ProjectPath: t.TempDir(), GroupPath: DefaultGroupPath,
+		Tool: "codex", Status: StatusRunning, CreatedAt: time.Now(),
+	}
+	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	db := storage.GetDB()
+	if db == nil {
+		t.Fatal("no state db")
+	}
+
+	// The candidate probe stands in for probeStatusCandidate's tmux path with
+	// the instance's carried debounce state: a readable sample goes through
+	// the live-prior debounce, and a capture failure through the hold on the
+	// persisted status that the capture-error branch applies.
+	sample, captureFails := StatusRunning, false
+	orig := statusProbeCandidateOverride
+	t.Cleanup(func() { statusProbeCandidateOverride = orig })
+	statusProbeCandidateOverride = func(_ context.Context, inst *Instance, observed statedb.RuntimeState) (Status, error) {
+		inst.mu.Lock()
+		defer inst.mu.Unlock()
+		prev := Status(observed.Status)
+		livePrev := prev
+		if !inst.statusSampledLive {
+			livePrev = ""
+		}
+		inst.statusSampledLive = true
+		if captureFails {
+			apply, next, held := debounceFlipFromRunning(prev, StatusError, "", inst.hookStatus, inst.tmuxFlipFromRunningPending)
+			inst.tmuxFlipFromRunningPending = next
+			if held {
+				return apply, nil
+			}
+			return StatusError, errors.New("capture-pane failed")
+		}
+		apply, next, _ := debounceFlipFromRunning(livePrev, sample, string(sample), inst.hookStatus, inst.tmuxFlipFromRunningPending)
+		inst.tmuxFlipFromRunningPending = next
+		return apply, nil
+	}
+
+	d := NewTransitionDaemon()
+	d.turnLiveCheck = func(*Instance) bool { return false }
+	d.syncProfile(profile) // no TUI: running observed live
+	sample = StatusWaiting
+	d.syncProfile(profile) // no TUI: the first waiting sample is held
+	if got, prior := d.lastStatus[profile][inst.ID], d.livePrior[profile][inst.ID]; got != "running" || !prior.flipPending {
+		t.Fatalf("precondition: status=%q prior=%+v, want a held running verdict with its flip pending", got, prior)
+	}
+
+	if err := db.RegisterInstance(false); err != nil {
+		t.Fatalf("RegisterInstance: %v", err)
+	}
+	if err := db.Heartbeat(); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	d.syncProfile(profile) // a TUI owns status
+	if err := db.UnregisterInstance(); err != nil {
+		t.Fatalf("UnregisterInstance: %v", err)
+	}
+
+	captureFails = true
+	d.syncProfile(profile) // the TUI exited; this pass's capture fails once
+	if got := d.lastStatus[profile][inst.ID]; got != "running" {
+		t.Fatalf("status after the TUI exited = %q, want running: a stale pending flip skipped the capture-failure hold", got)
+	}
+	durable, found, err := db.ReadRuntimeState(inst.ID)
+	if err != nil || !found || durable.Status != string(StatusRunning) {
+		t.Fatalf("durable status = %+v (found=%v err=%v), want running", durable, found, err)
 	}
 }
 
