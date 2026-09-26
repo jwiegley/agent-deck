@@ -189,6 +189,33 @@ func TestRuntimeLifecycle_DaemonPollStateDoesNotCarryFlipAcrossTUILifetime(t *te
 	}
 }
 
+// A successful profile listing retires every per-profile map of a deleted
+// profile. The carried flip priors are per-profile state like the poll-state
+// bridge; left behind they leak for the notify daemon's lifetime, and a
+// profile recreated under the same name would inherit the old verdicts.
+func TestRuntimeLifecycle_DaemonPruneDeletedProfileDropsLivePriors(t *testing.T) {
+	d := NewTransitionDaemon()
+	d.livePrior["kept"] = map[string]liveStatusPrior{"worker": {status: StatusRunning, flipPending: true}}
+	d.livePrior["deleted"] = map[string]liveStatusPrior{"worker": {status: StatusRunning, flipPending: true}}
+	d.pollState["kept"] = map[string]instancePollingState{"worker": {}}
+	d.pollState["deleted"] = map[string]instancePollingState{"worker": {}}
+
+	d.pruneDeletedProfiles([]string{"kept"})
+
+	if priors, ok := d.livePrior["deleted"]; ok {
+		t.Fatalf("deleted profile kept its flip priors: %+v", priors)
+	}
+	if _, ok := d.pollState["deleted"]; ok {
+		t.Fatal("deleted profile kept its poll state")
+	}
+	if prior := d.livePrior["kept"]["worker"]; prior.status != StatusRunning || !prior.flipPending {
+		t.Fatalf("active profile lost its flip prior: %+v", prior)
+	}
+	if _, ok := d.pollState["kept"]["worker"]; !ok {
+		t.Fatal("active profile lost its poll state")
+	}
+}
+
 func installRuntimeLifecycleNoopTmux(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()

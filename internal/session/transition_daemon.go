@@ -538,6 +538,11 @@ func (d *TransitionDaemon) pruneDeletedProfiles(profiles []string) {
 			delete(d.pollState, profile)
 		}
 	}
+	for profile := range d.livePrior {
+		if !active[profile] {
+			delete(d.livePrior, profile)
+		}
+	}
 	for key := range d.lastProbeStall {
 		profile, _, ok := strings.Cut(key, "|")
 		if ok && !active[profile] {
