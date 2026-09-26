@@ -9825,6 +9825,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case worktreeFinishResultMsg:
+		// Every result ends the finish, so a quit confirmation opened over it
+		// must stop saying it is still running.
+		h.confirmDialog.NoteWorktreeFinishEnded(msg.sessionID, msg.err)
 		if msg.err != nil {
 			// Show error in dialog (user can go back or cancel)
 			if h.worktreeFinishDialog.IsVisible() {
@@ -13928,7 +13931,7 @@ func (h *Home) tryQuit() (tea.Model, tea.Cmd) {
 	// it partway. Ask rather than refuse: a hung finish must not make the TUI
 	// impossible to quit.
 	if h.worktreeFinishDialog.IsExecuting() {
-		h.confirmDialog.ShowQuitWithWorktreeFinish(h.worktreeFinishDialog.sessionTitle)
+		h.confirmDialog.ShowQuitWithWorktreeFinish(h.worktreeFinishDialog.GetSessionID(), h.worktreeFinishDialog.sessionTitle)
 		return h, nil
 	}
 	return h.tryQuitWithPool()
