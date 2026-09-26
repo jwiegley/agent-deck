@@ -6654,6 +6654,9 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 		if i.tmuxSession == nil {
 			if candidate != StatusRunning && candidate != StatusIdle && candidate != StatusQueued {
 				candidate = StatusStarting
+			} else {
+				// Kept, not observed: the spawn has no session to look at yet.
+				recordStatusNoVerdict(ctx)
 			}
 			return candidate, ctx.Err()
 		}
@@ -6665,6 +6668,9 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 		if !exists {
 			if candidate != StatusRunning && candidate != StatusIdle && candidate != StatusQueued {
 				candidate = StatusStarting
+			} else {
+				// An absence inside the window proves nothing about these.
+				recordStatusNoVerdict(ctx)
 			}
 			return candidate, ctx.Err()
 		}
@@ -6683,6 +6689,10 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 			// but the substate now says auth-401, and the automatic boot paths
 			// hold off (see auth_hold.go).
 			i.refreshAuthHoldOnDeathLocked()
+		} else {
+			// Stopped and queued are operator intent, and without a tmux session
+			// there is nothing to observe: keep them, forming no verdict.
+			recordStatusNoVerdict(ctx)
 		}
 		return candidate, ctx.Err()
 	}

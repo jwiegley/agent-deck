@@ -126,6 +126,73 @@ func TestRuntimeLifecycle_StatusAuthority_NoVerdictFinalizesNothing(t *testing.T
 	}
 }
 
+// A probe exit that keeps the last-known status without looking forms no
+// verdict: inside the tmux grace window a running, idle or queued status is
+// kept while the spawn has no session yet, and with no tmux session at all a
+// stopped or queued session keeps its operator intent. Finalizing such a keep
+// marked the status sampled live and, for a healthy status, released the
+// cross-process auth hold on no evidence. The exits that rewrite the status,
+// starting inside the window and a death's classification, remain verdicts.
+func TestRuntimeLifecycle_StatusProbe_UnobservedKeepsFormNoVerdict(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		status    Status
+		inGrace   bool
+		want      Status
+		noVerdict bool
+	}{
+		{"grace window keeps running", StatusRunning, true, StatusRunning, true},
+		{"grace window keeps queued", StatusQueued, true, StatusQueued, true},
+		{"no tmux session keeps stopped", StatusStopped, false, StatusStopped, true},
+		{"no tmux session keeps queued", StatusQueued, false, StatusQueued, true},
+		{"grace window reads starting (verdict)", StatusError, true, StatusStarting, false},
+		{"no tmux session classifies the death (verdict)", StatusRunning, false, StatusError, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			db, inst := runtimeLifecycleReviverFixture(t, c.status, time.Unix(7300, 0).UTC())
+			t.Cleanup(func() { clearAuthHoldRecord(inst.ID) })
+			if err := writeAuthHoldRecord(AuthHoldRecord{InstanceID: inst.ID, Reason: AuthHoldReasonDeath}); err != nil {
+				t.Fatal(err)
+			}
+			if c.inGrace {
+				inst.mu.Lock()
+				inst.CreatedAt = time.Now()
+				inst.mu.Unlock()
+			}
+			before := inst.RuntimeState()
+
+			evidence, err := inst.updateStatusWithEvidence(nil, true)
+			if err != nil {
+				t.Fatalf("status pass: %v", err)
+			}
+			if got := inst.GetStatusThreadSafe(); got != c.want {
+				t.Fatalf("status = %q, want %q", got, c.want)
+			}
+			durable, found, err := db.ReadRuntimeState(inst.ID)
+			if err != nil || !found || durable != inst.RuntimeState() {
+				t.Fatalf("durable runtime = %+v found=%v err=%v, want memory's %+v", durable, found, err, inst.RuntimeState())
+			}
+			inst.mu.RLock()
+			sampledLive := inst.statusSampledLive
+			inst.mu.RUnlock()
+			if sampledLive == c.noVerdict {
+				t.Fatalf("sampled live = %v, want %v", sampledLive, !c.noVerdict)
+			}
+			if c.noVerdict {
+				if got := inst.RuntimeState(); got != before {
+					t.Fatalf("runtime = %+v, want the kept tuple %+v", got, before)
+				}
+				if inst.AuthHold() == nil {
+					t.Fatal("a pass without a verdict released the auth-hold sidecar")
+				}
+			}
+			if got := evidence.noVerdict.Load(); got != c.noVerdict {
+				t.Fatalf("no verdict = %v, want %v", got, c.noVerdict)
+			}
+		})
+	}
+}
+
 func TestRuntimeLifecycle_StatusAuthority_RejectsByteIdenticalIncarnationABA(t *testing.T) {
 	started := time.Unix(7150, 123).UTC()
 	db, stale := runtimeLifecycleReviverFixture(t, StatusWaiting, started)

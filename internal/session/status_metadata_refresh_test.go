@@ -293,6 +293,13 @@ func TestStatusProbe_EarlyExitsTakeNoPaneSample(t *testing.T) {
 				inst.mu.Unlock()
 			},
 			want: StatusStarting},
+		{name: "tmux grace window keeps running", tool: "claude", status: StatusRunning,
+			arrange: func(_ *testing.T, inst *Instance) {
+				inst.mu.Lock()
+				inst.CreatedAt = time.Now()
+				inst.mu.Unlock()
+			},
+			want: StatusRunning, noVerdict: true},
 		{name: "debounce hold", tool: "claude", status: StatusRunning, frame: codexIdleFrame,
 			// This process settled running itself, so one idle frame is held.
 			arrange: func(_ *testing.T, inst *Instance) { inst.SeedLiveStatusPrior(StatusRunning, false) },
