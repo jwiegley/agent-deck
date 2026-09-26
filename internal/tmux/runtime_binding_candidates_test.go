@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -947,6 +948,51 @@ func TestRuntimeLifecycle_CandidateRespawnDeadlineStartsAfterClaim(t *testing.T)
 	}
 	if remaining < tmuxMutationTimeout/2 {
 		t.Fatalf("conditional respawn deadline remaining = %v of %v; the claim wait spent it", remaining, tmuxMutationTimeout)
+	}
+}
+
+// TestRuntimeLifecycle_CandidateRespawnEscalationRetriesThroughPaneID: when
+// the post-respawn probe is indeterminate, the escalation re-probes before it
+// reaps, and the retry's tree is the set it spares. The retry must resolve the
+// respawned pane by its immutable ID, as the respawn itself did; by then the
+// mutable session name may resolve to a same-name replacement.
+func TestRuntimeLifecycle_CandidateRespawnEscalationRetriesThroughPaneID(t *testing.T) {
+	binding := runtimeBindingCandidateForTest()
+	candidate := runtimeGenerationCandidateFromBinding(binding)
+	stubRuntimeBindingCandidateProcessTreeForTest(t, binding)
+	stubCompleteRuntimeCleanupLocalOptions(t, binding)
+	oldMutation := runtimeBindingConditionalKillFn
+	t.Cleanup(func() { runtimeBindingConditionalKillFn = oldMutation })
+	runtimeBindingConditionalKillFn = func(context.Context, string, ...string) ([]byte, error) {
+		return nil, nil
+	}
+	type probeTarget struct{ socketName, paneID string }
+	var probesMu sync.Mutex
+	var probes []probeTarget
+	runtimeGenerationProcessTreeFn = func(socketName, paneID string) ([]int, error) {
+		probesMu.Lock()
+		probes = append(probes, probeTarget{socketName, paneID})
+		probe := len(probes)
+		probesMu.Unlock()
+		if probe == 3 { // capture, pre-mutation revalidation, then post-respawn
+			return nil, errors.New("signal: killed")
+		}
+		return []int{candidate.PanePID}, nil
+	}
+	waitForEscalations := trackRuntimeGenerationEscalationsForTest(t)
+	session := &Session{Name: candidate.SessionName, SocketName: candidate.SocketName, InstanceID: candidate.InstanceID}
+
+	if err := RespawnRuntimeGenerationCandidate(session, candidate, ""); err != nil {
+		t.Fatalf("candidate respawn: %v", err)
+	}
+	waitForEscalations()
+	probesMu.Lock()
+	defer probesMu.Unlock()
+	if len(probes) != 4 {
+		t.Fatalf("pane-ID process-tree probes = %d, want the escalation's retry as the 4th; the retry bypassed the pane ID", len(probes))
+	}
+	if want := (probeTarget{candidate.SocketName, candidate.PaneID}); probes[3] != want {
+		t.Fatalf("escalation retry probed %#v, want the respawned pane %#v", probes[3], want)
 	}
 }
 

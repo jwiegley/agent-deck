@@ -81,12 +81,19 @@ var (
 		cmd.WaitDelay = 100 * time.Millisecond
 		return cmd.Output()
 	}
+	// runtimeGenerationProcessTreeFn resolves the process tree rooted at an
+	// immutable pane ID, including the post-respawn escalation's retry.
 	runtimeGenerationProcessTreeFn = func(socketName, paneID string) ([]int, error) {
 		_, pids, err := paneProcessTreeForPaneID(socketName, paneID)
 		return pids, err
 	}
 	runtimeGenerationEnsurePIDsDeadFn = EnsureProcessIdentitiesDead
-	runtimeCleanupStampFn             = func(session *Session, args ...string) error {
+	// runtimeGenerationEscalationGoFn runs a candidate respawn's post-respawn
+	// escalation off the caller's path. The escalation outlives the respawn
+	// by its retry delay and reap grace while it reads the process-tree and
+	// process-identity seams, so tests wrap this to wait for it.
+	runtimeGenerationEscalationGoFn = func(escalate func()) { go escalate() }
+	runtimeCleanupStampFn           = func(session *Session, args ...string) error {
 		return session.runBoundedMutation(args...)
 	}
 )
@@ -702,9 +709,12 @@ func RespawnRuntimeGenerationCandidate(session *Session, candidate RuntimeGenera
 
 	newPIDs, newTreeErr := runtimeGenerationProcessTreeFn(candidate.SocketName, candidate.PaneID)
 	identitiesOwned = false
-	go func() {
-		session.escalateAfterRespawn(oldIdentities, newPIDs, newTreeErr)
-	}()
+	// As in Session.RespawnPane, a failed probe is retried through the
+	// immutable pane ID. The retry's tree is the set the escalation spares,
+	// and by then the mutable name may resolve to a same-name replacement.
+	runtimeGenerationEscalationGoFn(func() {
+		session.escalateAfterRespawnTarget(oldIdentities, newPIDs, newTreeErr, candidate.PaneID)
+	})
 	// A control-mode client is attached to the session, not to the pane process,
 	// so respawn-pane does not require reconnecting it. More importantly, a
 	// reconnect by mutable session name after the conditional could disconnect

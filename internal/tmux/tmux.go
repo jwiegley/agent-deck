@@ -4178,9 +4178,10 @@ func (s *Session) escalateAfterRespawn(oldIdentities []ProcessIdentity, newPIDs 
 	s.escalateAfterRespawnTarget(oldIdentities, newPIDs, probeErr, "")
 }
 
-// escalateAfterRespawnTarget is the immutable-pane variant used by the generic
-// Session respawn path. The empty-pane fallback preserves the existing helper
-// contract for callers that already performed their own stable-ID proof.
+// escalateAfterRespawnTarget is the immutable-pane variant used by
+// Session.RespawnPane and RespawnRuntimeGenerationCandidate. The empty-pane
+// fallback preserves the existing helper contract for callers that already
+// performed their own stable-ID proof.
 func (s *Session) escalateAfterRespawnTarget(oldIdentities []ProcessIdentity, newPIDs []int, probeErr error, paneID string) {
 	if len(oldIdentities) == 0 {
 		return
@@ -4193,7 +4194,7 @@ func (s *Session) escalateAfterRespawnTarget(oldIdentities []ProcessIdentity, ne
 		if paneID == "" {
 			_, retryPIDs, retryErr = s.paneProcessTree()
 		} else {
-			_, retryPIDs, retryErr = paneProcessTreeForPaneID(s.SocketName, paneID)
+			retryPIDs, retryErr = runtimeGenerationProcessTreeFn(s.SocketName, paneID)
 		}
 		if retryErr != nil {
 			respawnLog.Warn("respawn_escalation_skipped_unknown_pane_pid",
