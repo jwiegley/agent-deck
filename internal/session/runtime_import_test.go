@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,12 +28,34 @@ func importTmuxSessionForTest(t *testing.T, storage *Storage, socketName, sessio
 	return imported
 }
 
+// stampOrphanForTest stamps a live session the way Agent Deck left it for
+// "lost-instance", an instance no profile holds any more, started in profile
+// (none when empty).
+func stampOrphanForTest(t *testing.T, socketName, sessionName, profile string) {
+	t.Helper()
+	orphan := tmux.ReconnectSessionLazy(sessionName, "lost", t.TempDir(), "", string(StatusIdle))
+	orphan.SocketName = socketName
+	lost := statedb.RuntimeState{
+		InstanceID: "lost-instance", Generation: 3, Status: string(StatusIdle),
+		TmuxSession: sessionName, TmuxSocketName: socketName, LastStartedAt: time.Now(),
+	}
+	if err := stampRuntimeCandidate(orphan, lost, "", ""); err != nil {
+		t.Fatalf("stamp orphan for its lost instance: %v", err)
+	}
+	if profile == "" {
+		return
+	}
+	if err := orphan.SetEnvironment("AGENTDECK_PROFILE", profile); err != nil {
+		t.Fatalf("mark orphan's profile: %v", err)
+	}
+}
+
 // Importing a session is the user's grant of ownership. A live session Agent
-// Deck never started, and a recovered orphan still stamped for the instance it
-// lost, both used to be lifecycle-dead once imported: no inventory could prove
-// them, so stop and delete refused with ErrRuntimeOwnershipUnproven. The
-// import now stamps the session for its new instance, so stop and delete
-// really end it and record the result.
+// Deck never started, and a recovered orphan still stamped for the instance
+// this profile lost, both used to be lifecycle-dead once imported: no
+// inventory could prove them, so stop and delete refused with
+// ErrRuntimeOwnershipUnproven. The import now stamps the session for its new
+// instance, so stop and delete really end it and record the result.
 func TestImportedRuntime_StopAndDeleteEndTheImportedSession(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 	sessions := []struct {
@@ -47,15 +70,7 @@ func TestImportedRuntime_StopAndDeleteEndTheImportedSession(t *testing.T) {
 		{name: "recovered orphan stamped for a lost instance", session: tmux.SessionPrefix + "lost_1234abcd",
 			prepare: func(t *testing.T, socketName, sessionName string) {
 				startUnownedTmuxSession(t, socketName, sessionName)
-				orphan := tmux.ReconnectSessionLazy(sessionName, "lost", t.TempDir(), "", string(StatusIdle))
-				orphan.SocketName = socketName
-				lost := statedb.RuntimeState{
-					InstanceID: "lost-instance", Generation: 3, Status: string(StatusIdle),
-					TmuxSession: sessionName, TmuxSocketName: socketName, LastStartedAt: time.Now(),
-				}
-				if err := stampRuntimeCandidate(orphan, lost, "", ""); err != nil {
-					t.Fatalf("stamp orphan for its lost instance: %v", err)
-				}
+				stampOrphanForTest(t, socketName, sessionName, sessionProfileEnvValue())
 			}},
 	}
 	operations := []struct {
@@ -226,5 +241,167 @@ func TestImportedRuntime_StampWaitsForTheCommittedInsert(t *testing.T) {
 	if out, err := exec.Command("tmux", "-L", socketName, "show-environment", "-t", "=user-work", "AGENTDECK_RUNTIME_STARTED_UNIX_NANO").Output(); err != nil ||
 		string(out) != "AGENTDECK_RUNTIME_STARTED_UNIX_NANO=0\n" {
 		t.Fatalf("imported start stamp = %q err=%v, want 0 for an unknown start", out, err)
+	}
+}
+
+// tmuxSessionOwnership is the ownership evidence one live session carries in
+// its own options and environment.
+type tmuxSessionOwnership struct {
+	cleanupInstance, cleanupGeneration string
+	envInstance, envGeneration         string
+	profile                            string
+}
+
+func readTmuxSessionOwnershipForTest(t *testing.T, socketName, sessionName string) tmuxSessionOwnership {
+	t.Helper()
+	var owner tmuxSessionOwnership
+	stamped, err := tmux.ListRuntimeCleanupCandidates(socketName, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range stamped {
+		if candidate.SessionName == sessionName {
+			owner.cleanupInstance = candidate.InstanceID
+			owner.cleanupGeneration = fmt.Sprint(candidate.Generation)
+		}
+	}
+	out, err := exec.Command("tmux", "-L", socketName, "show-environment", "-t", "="+sessionName).Output()
+	if err != nil {
+		t.Fatalf("read %q's environment: %v", sessionName, err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, _ := strings.Cut(line, "=")
+		switch key {
+		case "AGENTDECK_INSTANCE_ID":
+			owner.envInstance = value
+		case "AGENTDECK_RUNTIME_GENERATION":
+			owner.envGeneration = value
+		case "AGENTDECK_PROFILE":
+			owner.profile = value
+		}
+	}
+	return owner
+}
+
+// Profiles share one tmux server, so every live runtime of another profile is
+// untracked in this one and shows up in its import. The import used to
+// restamp each of them for its new instance: the profile that owned the
+// session lost its candidates, and its stop, restart and delete all refused.
+// An import now takes over only what it truly holds the grant for: a session
+// that names no instance, or one whose instance this profile lost. Any other
+// session is imported without its stamp changing, the importing instance's
+// stop refuses with the manual remedy, and the owner's stop still ends it.
+func TestImportedRuntime_ImportTakesOverOnlyWhatItsProfileHoldsTheGrantFor(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	const (
+		sessionName     = "shared-work"
+		importerProfile = "_test_import_importer"
+		otherProfile    = "_test_import_other"
+	)
+	cases := []struct {
+		name string
+		// claim leaves the live session as its claimant did, and returns
+		// the claimant when it is an instance that still exists.
+		claim     func(t *testing.T, socketName string, importIn func(profile string) *Instance) *Instance
+		wantTaken bool
+	}{
+		{name: "a session no instance claims", wantTaken: true,
+			claim: func(*testing.T, string, func(string) *Instance) *Instance { return nil }},
+		{name: "a lost instance of this profile", wantTaken: true,
+			claim: func(t *testing.T, socketName string, _ func(string) *Instance) *Instance {
+				stampOrphanForTest(t, socketName, sessionName, importerProfile)
+				return nil
+			}},
+		{name: "a live instance of another profile",
+			claim: func(_ *testing.T, _ string, importIn func(string) *Instance) *Instance {
+				return importIn(otherProfile)
+			}},
+		{name: "an instance of this profile that still exists",
+			claim: func(_ *testing.T, _ string, importIn func(string) *Instance) *Instance {
+				return importIn(importerProfile)
+			}},
+		{name: "a lost instance of no recorded profile",
+			claim: func(t *testing.T, socketName string, _ func(string) *Instance) *Instance {
+				stampOrphanForTest(t, socketName, sessionName, "")
+				return nil
+			}},
+		{name: "a pre-stamp runtime of another profile",
+			claim: func(t *testing.T, socketName string, _ func(string) *Instance) *Instance {
+				for key, value := range map[string]string{"AGENTDECK_INSTANCE_ID": "legacy-instance", "AGENTDECK_PROFILE": otherProfile} {
+					if out, err := exec.Command("tmux", "-L", socketName, "set-environment", "-t", "="+sessionName, key, value).CombinedOutput(); err != nil {
+						t.Fatalf("set %s: %v: %s", key, err, out)
+					}
+				}
+				return nil
+			}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			socketName := fmt.Sprintf("adtest-import-claim-%d", time.Now().UnixNano())
+			startUnownedTmuxSession(t, socketName, sessionName)
+			storages := map[string]*Storage{}
+			storageOf := map[string]*Storage{}
+			importIn := func(profile string) *Instance {
+				t.Helper()
+				t.Setenv("AGENTDECK_PROFILE", profile)
+				storage := storages[profile]
+				if storage == nil {
+					var err error
+					if storage, err = NewStorageWithProfile(profile); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = storage.Close() })
+					storages[profile] = storage
+				}
+				inst := importTmuxSessionForTest(t, storage, socketName, sessionName)
+				storageOf[inst.ID] = storage
+				return inst
+			}
+			claimant := tc.claim(t, socketName, importIn)
+			before := readTmuxSessionOwnershipForTest(t, socketName, sessionName)
+
+			importer := importIn(importerProfile)
+			after := readTmuxSessionOwnershipForTest(t, socketName, sessionName)
+			if tc.wantTaken {
+				want := tmuxSessionOwnership{
+					cleanupInstance: importer.ID, cleanupGeneration: "0",
+					envInstance: importer.ID, envGeneration: "0", profile: importerProfile,
+				}
+				if after != want {
+					t.Fatalf("ownership after the import = %+v, want the importing instance's %+v", after, want)
+				}
+				if err := importer.KillCaptured(importer.CaptureRuntimeSelection()); err != nil {
+					t.Fatalf("stop of the taken-over session: %v", err)
+				}
+				if tmuxSessionAnswers(socketName, sessionName) {
+					t.Fatal("stop left the taken-over session running")
+				}
+				return
+			}
+
+			if after != before {
+				t.Fatalf("the import restamped a session it holds no grant for: before %+v, after %+v", before, after)
+			}
+			err := importer.KillCaptured(importer.CaptureRuntimeSelection())
+			if !errors.Is(err, ErrRuntimeOwnershipUnproven) || !strings.HasPrefix(err.Error(), "stop refused: ") {
+				t.Fatalf("importing instance's stop = %v, want a refusal with the manual remedy", err)
+			}
+			if !tmuxSessionAnswers(socketName, sessionName) {
+				t.Fatal("the importing instance's refused stop killed the session")
+			}
+			if claimant == nil {
+				return
+			}
+			if err := claimant.KillCaptured(claimant.CaptureRuntimeSelection()); err != nil {
+				t.Fatalf("the owner's stop after the import: %v", err)
+			}
+			if tmuxSessionAnswers(socketName, sessionName) {
+				t.Fatal("the owner's stop left its session running")
+			}
+			stored, found, err := storageOf[claimant.ID].GetDB().ReadRuntimeState(claimant.ID)
+			if err != nil || !found || stored.Status != string(StatusStopped) {
+				t.Fatalf("owner's stored runtime after its stop = %#v found=%v err=%v, want stopped", stored, found, err)
+			}
+		})
 	}
 }

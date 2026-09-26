@@ -88,7 +88,8 @@ var terminateCapturedRuntimeFn = tmux.KillRuntimeGenerationCandidate
 // tmux session its selected runtime names may still be live, yet no inventory
 // proves that session is this exact Agent Deck runtime: it lacks the ownership
 // stamp (a pre-stamp legacy session not yet adopted, a session whose stamp
-// names another instance, or an import whose stamp failed), or this process
+// names another instance, an import that left the session with the instance
+// that owns it, or an import whose stamp failed), or this process
 // cannot see the server it lives on. Recording it stopped would leave the
 // process running under a stopped row; killing it would act without
 // authority. The refusal names the operation and what the operator can do.
@@ -132,7 +133,7 @@ func requireSelectedRuntimeGone(db *statedb.StateDB, operation string, expected 
 			remedy = fmt.Sprintf("run `agent-deck session adopt-runtime %s --yes` to bring it under Agent Deck, or %s",
 				expected.InstanceID, remedy)
 		}
-		return fmt.Errorf("%s refused: tmux session %q of %s is still live, but no Agent Deck ownership stamp proves it is runtime generation %d (Agent Deck neither started nor imported it, or its stamp names another instance); %s: %w",
+		return fmt.Errorf("%s refused: tmux session %q of %s is still live, but no Agent Deck ownership stamp proves it is runtime generation %d (Agent Deck neither started it nor took it over on import, or its stamp names another instance); %s: %w",
 			operation, expected.TmuxSession, expected.InstanceID, expected.Generation, remedy, ErrRuntimeOwnershipUnproven)
 	case destructionAbsenceIsForeignServerFn(expected):
 		return fmt.Errorf("%s refused: tmux session %q of %s is on the native default tmux server, which this process cannot see from inside another tmux server; run the %s from outside tmux, or end the session yourself with `%s`: %w",
