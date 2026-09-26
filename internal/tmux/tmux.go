@@ -4201,11 +4201,14 @@ func (s *Session) escalateAfterRespawn(oldIdentities []ProcessIdentity, newPIDs 
 	})
 }
 
-// escalateAfterRespawnTarget is the immutable-pane variant used by
-// Session.RespawnPane and RespawnRuntimeGenerationCandidate. Each passes the
-// probe that produced newPIDs as reprobe, so the retry resolves the respawned
-// pane exactly as the first probe did: by the same immutable pane ID, through
-// the same probe function.
+// escalateAfterRespawnTarget is the escalation core every respawn path runs
+// (escalateAfterRespawn documents its policy). It is probe-agnostic: it never
+// resolves the pane itself, and a failed first probe is retried through the
+// caller-supplied reprobe. Each caller passes the probe that produced newPIDs,
+// so the retry resolves the respawned pane exactly as the first probe did.
+// Session.RespawnPane and RespawnRuntimeGenerationCandidate pass their probe
+// of the immutable pane ID they respawned; escalateAfterRespawn passes
+// upstream's by-name probe (s.paneProcessTree).
 func (s *Session) escalateAfterRespawnTarget(oldIdentities []ProcessIdentity, newPIDs []int, probeErr error, reprobe func() ([]int, error)) {
 	if len(oldIdentities) == 0 {
 		return
