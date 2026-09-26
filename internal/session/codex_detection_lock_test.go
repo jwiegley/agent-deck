@@ -362,3 +362,58 @@ func TestRuntimeLifecycle_RestartWritesTheObservedBindingUnderLock(t *testing.T)
 		})
 	}
 }
+
+// The status pass's Codex refresh holds the spawn lock but not i.mu, while a
+// TUI storage reload rebinds the thread under i.mu without the spawn lock. The
+// probe cadence asks whether a thread is bound, so it reads the binding under
+// i.mu. Here the reload runs once the pass has taken its first snapshot and is
+// waiting on tmux: a fake tmux leaves a marker, which the test polls for
+// without synchronizing with the pass. Nothing else orders the reload's write
+// and the cadence's read, so the race detector reports an unlocked read
+// whichever runs first. A recent probe keeps the pass from probing, so the
+// cadence check is its last read of the Instance.
+func TestRuntimeLifecycle_CodexStatusPassReadsTheBindingUnderLock(t *testing.T) {
+	projectPath := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "show-environment")
+	bin := t.TempDir()
+	fakeTmux := fmt.Sprintf("#!/bin/sh\ncase \" $* \" in\n*\" show-environment \"*) : > %s ;;\nesac\nexit 1\n",
+		shellescape.Quote(marker))
+	if err := os.WriteFile(filepath.Join(bin, "tmux"), []byte(fakeTmux), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	inst := newCodexDetectionLockInstance(projectPath, false, "codex-status-pass")
+	reloaded := newCodexDetectionLockInstance(projectPath, false, "codex-status-pass")
+	inst.CodexSessionID = codexDetectionLockThread
+	inst.lastCodexProbeAt = time.Now()
+
+	passed, merged := make(chan struct{}), make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		inst.queryCodexSessionCandidateForPass(nil, false, codexDetectionLockThread, nil, nil)
+		close(passed)
+		<-merged // stay alive (see runUnorderedAndAlive)
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the status pass never asked tmux for CODEX_SESSION_ID")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	go func() {
+		defer wg.Done()
+		inst.MergeReloaded(reloaded)
+		close(merged)
+		<-passed
+	}()
+	wg.Wait()
+	if got, _ := inst.currentRuntimeBinding("codex"); got != "" {
+		t.Fatalf("codex binding after the reload = %q, want the reloaded row's empty binding", got)
+	}
+}
