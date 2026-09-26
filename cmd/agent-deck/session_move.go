@@ -202,15 +202,18 @@ func handleSessionMove(profile string, args []string) {
 	}
 
 	result := map[string]interface{}{
-		"success":   true,
-		"id":        inst.ID,
-		"title":     inst.Title,
-		"old_path":  oldPath,
-		"new_path":  newPath,
-		"old_group": oldGroup,
-		"new_group": inst.GroupPath,
-		"restarted": restarted,
-		"copied":    *copyHistory,
+		"success":                  true,
+		"id":                       inst.ID,
+		"title":                    inst.Title,
+		"old_path":                 oldPath,
+		"new_path":                 newPath,
+		"old_group":                oldGroup,
+		"new_group":                inst.GroupPath,
+		"restarted":                restarted,
+		"copied":                   *copyHistory,
+		"history_files_moved":      historyFilesMoved,
+		"source_claude_config_dir": srcConfigDir,
+		"target_claude_config_dir": dstConfigDir,
 	}
 	if persistenceWarning != "" {
 		result["warning"] = persistenceWarning
