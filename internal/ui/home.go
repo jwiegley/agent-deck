@@ -13481,6 +13481,25 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case ConfirmQuitWithWorktreeFinish:
+		switch msg.String() {
+		case "y", "Y":
+			h.confirmDialog.Hide()
+			return h.tryQuitWithPool()
+		case "enter":
+			// Activate focused button: 0=quit anyway, 1=cancel
+			quit := h.confirmDialog.GetFocusedButton() == 0
+			h.confirmDialog.Hide()
+			if quit {
+				return h.tryQuitWithPool()
+			}
+			return h, nil
+		case "n", "N", "esc":
+			h.confirmDialog.Hide()
+			return h, nil
+		}
+		return h, nil
+
 	case ConfirmCreateDirectory:
 		switch msg.String() {
 		case "y", "Y":
@@ -13902,8 +13921,22 @@ func (h *Home) declineInstallHermesHooks() tea.Cmd {
 	return nil
 }
 
-// tryQuit checks if MCP pool is running and shows confirmation dialog, or quits directly
+// tryQuit asks before abandoning a background worktree finish, then checks if
+// MCP pool is running and shows confirmation dialog, or quits directly
 func (h *Home) tryQuit() (tea.Model, tea.Cmd) {
+	// A worktree finish dismissed into the background (Esc) is still merging,
+	// deleting its session, or removing its worktree, and quitting would stop
+	// it partway. Ask rather than refuse: a hung finish must not make the TUI
+	// impossible to quit.
+	if h.worktreeFinishDialog.IsExecuting() {
+		h.confirmDialog.ShowQuitWithWorktreeFinish(h.worktreeFinishDialog.sessionTitle)
+		return h, nil
+	}
+	return h.tryQuitWithPool()
+}
+
+// tryQuitWithPool quits, first offering to keep a running MCP pool alive.
+func (h *Home) tryQuitWithPool() (tea.Model, tea.Cmd) {
 	// Check if pool is enabled and has running MCPs
 	userConfig, _ := session.LoadUserConfig()
 	if userConfig != nil && userConfig.MCPPool.Enabled {
