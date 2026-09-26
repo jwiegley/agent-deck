@@ -20,6 +20,11 @@ import (
 //
 // This exercises the same sequence as the `u` case in updateInner, minus the
 // tmux session it needs to reach that code.
+//
+// Under runtime authority the status flip is not an in-memory assignment that
+// the save persists: the handler's UpdateStatus recomputes waiting from the
+// cleared flag and commits it through the status CAS. The fixture publishes
+// that probe result the same way, then checks the save itself committed.
 func TestMarkUnread_SaveIsNotAbortedByItsOwnWrite(t *testing.T) {
 	h, storage := newHeadlessHomeForTest(t, "_test_mark_unread_save")
 
@@ -56,9 +61,23 @@ func TestMarkUnread_SaveIsNotAbortedByItsOwnWrite(t *testing.T) {
 	if !h.adoptOwnWrite(stamps, "mark_unread") {
 		t.Fatal("adoptOwnWrite refused our own write: nothing else touched this database")
 	}
-	inst.Status = session.StatusWaiting
+	publishStatusThroughAuthority(t, storage, inst, session.StatusWaiting)
 	h.saveInstances()
 	// --- end ---
+
+	// Status is runtime-owned, so the save above no longer carries it and the
+	// stored status alone cannot tell a committed save from an aborted one. A
+	// committed save stamps last_modified past the acknowledged write and
+	// advances this TUI's freshness marker to it; an abort leaves the marker
+	// behind and schedules the reload that restores a stale snapshot.
+	current, err := storage.GetFileMtime()
+	if err != nil {
+		t.Fatalf("GetFileMtime after save: %v", err)
+	}
+	if !current.After(time.Unix(0, stamps.After)) || !h.lastLoadMtime.Equal(current) {
+		t.Errorf("save aborted on this TUI's own acknowledged write: last_modified=%d marker=%d "+
+			"acknowledged-write=%d", current.UnixNano(), h.lastLoadMtime.UnixNano(), stamps.After)
+	}
 
 	rows, err := storage.GetDB().LoadInstances()
 	if err != nil {
