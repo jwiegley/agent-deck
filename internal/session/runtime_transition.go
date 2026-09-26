@@ -413,6 +413,7 @@ func (i *Instance) ReconcileRestartResult(restartErr error) error {
 			InstanceID: partial.InstanceID, Runtime: partial.Runtime,
 			BindingPlan:         append([]statedb.RuntimeBindingTransition(nil), partial.BindingPlan...),
 			NeedsReconciliation: false,
+			MessageUndelivered:  partial.MessageUndelivered,
 			Err:                 errors.Join(partial.Err, fmt.Errorf("post-commit reconciliation failed: %w", err)),
 		}
 	}
@@ -421,6 +422,7 @@ func (i *Instance) ReconcileRestartResult(restartErr error) error {
 			InstanceID: partial.InstanceID, Runtime: partial.Runtime,
 			BindingPlan:         append([]statedb.RuntimeBindingTransition(nil), partial.BindingPlan...),
 			NeedsReconciliation: true,
+			MessageUndelivered:  partial.MessageUndelivered,
 			Err:                 fmt.Errorf("%v; durability reconciliation failed: %w", partial.Err, err),
 		}
 	}

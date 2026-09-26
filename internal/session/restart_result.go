@@ -21,12 +21,19 @@ type RestartPartialSuccessError struct {
 	// Post-start actions such as initial message delivery may also return this
 	// error type, but must not rewrite an already durable generation.
 	NeedsReconciliation bool
-	Err                 error
+	// MessageUndelivered is true when StartWithMessage spawned the pane but
+	// never delivered the initial message to it. Callers must not report the
+	// message as sent.
+	MessageUndelivered bool
+	Err                error
 }
 
 func (e *RestartPartialSuccessError) Error() string {
 	if e.NeedsReconciliation {
 		return fmt.Sprintf("restart completed for %s but runtime generation persistence failed: %v", e.InstanceID, e.Err)
+	}
+	if e.MessageUndelivered {
+		return fmt.Sprintf("session %s started but its initial message was not delivered: %v", e.InstanceID, e.Err)
 	}
 	return fmt.Sprintf("restart completed for %s but post-commit cleanup was interrupted: %v", e.InstanceID, e.Err)
 }
@@ -44,6 +51,26 @@ func IsRestartPartialSuccess(err error) bool {
 	}
 	var completed interface{ RestartCompleted() bool }
 	return errors.As(err, &completed) && completed.RestartCompleted()
+}
+
+// InitialMessageUndelivered reports whether a StartWithMessage result left the
+// pane live without delivering its initial message. Evaluate it on the raw
+// lifecycle error: ConsumePhysicalRuntimeResult turns that error into a warning.
+func InitialMessageUndelivered(err error) bool {
+	var partial *RestartPartialSuccessError
+	return errors.As(err, &partial) && partial.MessageUndelivered
+}
+
+// MergeRestartWarnings joins two optional operator warnings (a Codex resume
+// warning and a runtime durability warning) into the one line restart reports.
+func MergeRestartWarnings(first, second string) string {
+	if first == "" {
+		return second
+	}
+	if second == "" {
+		return first
+	}
+	return first + "; " + second
 }
 
 // RestartRuntimeCandidate extracts the physical runtime that completed even

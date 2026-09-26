@@ -5987,7 +5987,9 @@ func (i *Instance) startWithMessage(message string, result *statedb.RuntimeState
 	if err != nil {
 		return &RestartPartialSuccessError{
 			InstanceID: i.ID, Runtime: candidate, BindingPlan: plan,
-			NeedsReconciliation: !committed, Err: err,
+			NeedsReconciliation: !committed,
+			MessageUndelivered:  message != "" && !promptEmbeddedInCommand,
+			Err:                 err,
 		}
 	}
 	runtimeDuplicateSweepFn(i, transition.expected.TmuxSocketName)
@@ -6006,7 +6008,9 @@ func (i *Instance) startWithMessage(message string, result *statedb.RuntimeState
 	// prompt as a launch argument, in which case there is nothing to type.
 	if message != "" && !promptEmbeddedInCommand {
 		if err := i.sendMessageWhenReady(message); err != nil {
-			return &RestartPartialSuccessError{InstanceID: i.ID, Runtime: candidate, Err: err}
+			return &RestartPartialSuccessError{
+				InstanceID: i.ID, Runtime: candidate, MessageUndelivered: true, Err: err,
+			}
 		}
 	}
 

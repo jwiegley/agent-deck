@@ -180,6 +180,62 @@ func (i *Instance) acquireStatusProbe(ctx context.Context) (func(), error) {
 	}
 }
 
+// PersistSelectedStatus durably marks exactly the runtime generation and status
+// revision inst holds now with an operator-decided status (queued, or error
+// after a failed spawn or queue drain). Status is runtime-owned, so snapshot
+// saves drop it; this CAS is the only way such a verdict reaches the store. A
+// concurrent replacement or status observation wins: the write is refused with
+// statedb.ErrStatusRevisionConflict and inst is left untouched.
+func PersistSelectedStatus(storage *Storage, inst *Instance, status Status) error {
+	if storage == nil || storage.GetDB() == nil {
+		return errors.New("session: persist status: storage unavailable")
+	}
+	selection := inst.CaptureRuntimeSelection()
+	applied, err := storage.GetDB().WriteStatusIfVersion(
+		inst.ID, selection.Incarnation, selection.State.Generation,
+		selection.State.StatusRevision, string(status),
+	)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return statedb.ErrStatusRevisionConflict
+	}
+	next := selection.State
+	next.Status = string(status)
+	next.StatusRevision++
+	inst.ApplyRuntimeState(next)
+	return nil
+}
+
+// PersistSpawnFailureStatus durably marks a start or restart whose spawn
+// verification failed as errored. A pane that died before its generation was
+// committed leaves inst holding that uncommitted successor of the durable
+// generation: the partial success adopted it and reconciliation could not
+// prove it live. The verdict then belongs to the durable predecessor the
+// failed transition started from, so inst re-derives the canonical runtime
+// first; a live runtime found there is a replacement and never inherits the
+// error. A committed generation goes straight to PersistSelectedStatus.
+func PersistSpawnFailureStatus(storage *Storage, inst *Instance) error {
+	if storage == nil || storage.GetDB() == nil {
+		return errors.New("session: persist status: storage unavailable")
+	}
+	durable, found, err := storage.GetDB().ReadRuntimeState(inst.ID)
+	if err != nil {
+		return err
+	}
+	if found && durable.Generation+1 == inst.CaptureRuntimeSelection().State.Generation {
+		reconciled, err := inst.ReconcileRuntime()
+		if err != nil {
+			return err
+		}
+		if reconciled.Live {
+			return statedb.ErrRuntimeGenerationConflict
+		}
+	}
+	return PersistSelectedStatus(storage, inst, StatusError)
+}
+
 // UpdateStatusObserved is the single status authority. The caller captures the
 // exact runtime tuple before probing; the candidate remains private until its
 // durable CAS succeeds. Losers adopt the durable winner unless a physical
