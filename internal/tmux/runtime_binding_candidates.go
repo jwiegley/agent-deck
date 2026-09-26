@@ -98,7 +98,7 @@ var (
 	}
 )
 
-const runtimeCleanupCandidateFormatFields = 4
+const runtimeCleanupCandidateFormatFields = 5
 
 var runtimeCleanupOptionNames = [...]string{
 	runtimeCleanupInstanceOption,
@@ -114,12 +114,19 @@ type runtimeCleanupLocalOption struct {
 	present bool
 }
 
+// runtimeCleanupCandidateFormat lists stable identity plus the effective
+// instance option. That expansion falls back to an inherited global value, so
+// it is never authority, only a pre-filter: a session whose own options carry
+// the stamp always expands it non-empty, and a session that expands nothing
+// cannot be stamped and is left out of the local-option batch. It is last, as
+// the only free-text field, so SplitN preserves an embedded separator.
 func runtimeCleanupCandidateFormat() string {
 	return tmuxFmt(
 		"#{session_id}",
 		"#{session_name}",
 		"#{pane_id}",
 		"#{pane_pid}",
+		"#{"+runtimeCleanupInstanceOption+"}",
 	)
 }
 
@@ -375,54 +382,27 @@ func ListRuntimeBindingCandidates(socketName, envKey, envValue string) ([]Runtim
 // one socket: every session carrying the complete session-local cleanup
 // stamp, whatever its name (Agent Deck starts a persisted runtime under the
 // tmux name its instance carries, which need not have SessionPrefix). It uses
-// one stable-identity call and one bounded local-option batch, and preserves
-// socketName verbatim: "" is the native tmux default socket, even when Agent
-// Deck has a different configured DefaultSocketName.
+// one stable-identity call and one local-option batch, bounded to the
+// sessions whose effective instance option is set (a necessary condition for
+// the stamp; the local read stays the authority). A session that closes
+// between the two calls can fail the batch, so a failed batch re-lists once:
+// sessions no longer listed are absent, and only a batch that still fails is
+// an error. socketName is preserved verbatim: "" is the native tmux default
+// socket, even when Agent Deck has a different configured DefaultSocketName.
 func ListRuntimeCleanupCandidates(socketName, envKey string) ([]RuntimeBindingCandidate, error) {
 	if envKey != "" && !validTmuxEnvironmentKey(envKey) {
 		return nil, fmt.Errorf("tmux: invalid binding inventory environment key")
 	}
-	out, err := runtimeBindingCandidateOutputFn(socketName, "list-sessions", "-F", runtimeCleanupCandidateFormat())
-	if err != nil {
-		if isEmptyTmuxServerResult(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("tmux: list binding candidates: %w", err)
+	identities, err := listRuntimeCleanupIdentities(socketName)
+	if err != nil || len(identities) == 0 {
+		return nil, err
 	}
-
-	var identities []RuntimeBindingCandidate
-	if strings.TrimSpace(string(out)) == "" {
-		return nil, nil
-	}
-	for _, line := range strings.Split(strings.TrimSuffix(string(out), "\n"), "\n") {
-		fields := strings.SplitN(line, tmuxFieldSep, runtimeCleanupCandidateFormatFields)
-		if len(fields) != runtimeCleanupCandidateFormatFields {
-			return nil, fmt.Errorf("tmux: malformed runtime cleanup candidate record on socket %q", socketName)
-		}
-		sessionID, name := strings.TrimSpace(fields[0]), strings.TrimSpace(fields[1])
-		if name == "" {
-			continue
-		}
-		if !validTmuxStableID(sessionID, '$') {
-			return nil, fmt.Errorf("tmux: invalid binding candidate session id %q", sessionID)
-		}
-		paneID := strings.TrimSpace(fields[2])
-		if !validTmuxStableID(paneID, '%') {
-			return nil, fmt.Errorf("tmux: malformed binding candidate pane %q", paneID)
-		}
-		panePID, parseErr := strconv.Atoi(strings.TrimSpace(fields[3]))
-		if parseErr != nil || panePID <= 0 {
-			return nil, fmt.Errorf("tmux: invalid binding candidate pane pid %q", fields[3])
-		}
-		identities = append(identities, RuntimeBindingCandidate{
-			SessionName: name, SessionID: sessionID, SocketName: socketName,
-			PaneID: paneID, PanePID: panePID,
-		})
-	}
-
 	localOptions, err := runtimeCleanupLocalOptionsFn(socketName, identities)
 	if err != nil {
-		return nil, err
+		identities, localOptions, err = relistRuntimeCleanupIdentities(socketName, identities, err)
+		if err != nil {
+			return nil, err
+		}
 	}
 	candidates := make([]RuntimeBindingCandidate, 0, len(identities))
 	for _, candidate := range identities {
@@ -448,6 +428,84 @@ func ListRuntimeCleanupCandidates(socketName, envKey string) ([]RuntimeBindingCa
 		candidates = append(candidates, candidate)
 	}
 	return candidates, nil
+}
+
+// listRuntimeCleanupIdentities is the stable-identity half of the cleanup
+// inventory: every session on the socket whose effective instance option is
+// set, with its immutable session and pane IDs and pane pid.
+func listRuntimeCleanupIdentities(socketName string) ([]RuntimeBindingCandidate, error) {
+	out, err := runtimeBindingCandidateOutputFn(socketName, "list-sessions", "-F", runtimeCleanupCandidateFormat())
+	if err != nil {
+		if isEmptyTmuxServerResult(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("tmux: list binding candidates: %w", err)
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		return nil, nil
+	}
+	var identities []RuntimeBindingCandidate
+	for _, line := range strings.Split(strings.TrimSuffix(string(out), "\n"), "\n") {
+		fields := strings.SplitN(line, tmuxFieldSep, runtimeCleanupCandidateFormatFields)
+		if len(fields) != runtimeCleanupCandidateFormatFields {
+			return nil, fmt.Errorf("tmux: malformed runtime cleanup candidate record on socket %q", socketName)
+		}
+		sessionID, name := strings.TrimSpace(fields[0]), strings.TrimSpace(fields[1])
+		if name == "" || fields[4] == "" {
+			continue
+		}
+		if !validTmuxStableID(sessionID, '$') {
+			return nil, fmt.Errorf("tmux: invalid binding candidate session id %q", sessionID)
+		}
+		paneID := strings.TrimSpace(fields[2])
+		if !validTmuxStableID(paneID, '%') {
+			return nil, fmt.Errorf("tmux: malformed binding candidate pane %q", paneID)
+		}
+		panePID, parseErr := strconv.Atoi(strings.TrimSpace(fields[3]))
+		if parseErr != nil || panePID <= 0 {
+			return nil, fmt.Errorf("tmux: invalid binding candidate pane pid %q", fields[3])
+		}
+		identities = append(identities, RuntimeBindingCandidate{
+			SessionName: name, SessionID: sessionID, SocketName: socketName,
+			PaneID: paneID, PanePID: panePID,
+		})
+	}
+	return identities, nil
+}
+
+// relistRuntimeCleanupIdentities answers a failed local-option batch. tmux
+// drops the rest of a command list after one command fails, and a server
+// exits with its last session, so a session that closed after the listing can
+// fail the batch for every other session. The socket is listed once more;
+// when a listed session has vanished, the batch is read again for the
+// sessions that remain. When none has, the failure has another cause and
+// readErr is returned.
+func relistRuntimeCleanupIdentities(
+	socketName string, listed []RuntimeBindingCandidate, readErr error,
+) ([]RuntimeBindingCandidate, map[string]map[string]runtimeCleanupLocalOption, error) {
+	relisted, err := listRuntimeCleanupIdentities(socketName)
+	if err != nil {
+		return nil, nil, errors.Join(readErr, err)
+	}
+	remaining := make(map[string]bool, len(relisted))
+	for _, identity := range relisted {
+		remaining[identity.SessionID] = true
+	}
+	vanished := false
+	for _, identity := range listed {
+		vanished = vanished || !remaining[identity.SessionID]
+	}
+	if !vanished {
+		return nil, nil, readErr
+	}
+	if len(relisted) == 0 {
+		return nil, nil, nil
+	}
+	localOptions, err := runtimeCleanupLocalOptionsFn(socketName, relisted)
+	if err != nil {
+		return nil, nil, err
+	}
+	return relisted, localOptions, nil
 }
 
 // readRuntimeCleanupLocalOptions reads only options set on each session. tmux
