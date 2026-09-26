@@ -3452,10 +3452,6 @@ func (i *Instance) DetectCodexSession() {
 	i.detectCodexSessionAsync()
 }
 
-// detectCodexSessionAsync detects the Codex session ID after startup
-// Codex stores sessions in ~/.codex/sessions/YYYY/MM/DD/*.jsonl
-// Session ID is a UUID that can be extracted from the filename
-// Since Codex has no "session list" command, we scan the filesystem
 func (i *Instance) resolveCodexDetectionCandidate(sessionID string, probeErr error) string {
 	sessionID = i.filterCodexProcessProbeCandidate(sessionID)
 	if sessionID == "" && probeErr == nil {
@@ -3475,54 +3471,95 @@ func (i *Instance) resolveCodexDetectionCandidate(sessionID string, probeErr err
 	return sessionID
 }
 
+// codexDetectionDelays is how long detectCodexSessionAsync waits before each
+// attempt: a brief wait for Codex to initialize, then short retry delays.
+var codexDetectionDelays = []time.Duration{time.Second, time.Second, 2 * time.Second}
+
+// detectCodexSessionAsync detects the Codex session ID after startup. Codex
+// stores sessions in ~/.codex/sessions/YYYY/MM/DD/*.jsonl, and the session ID
+// is the UUID in the file name. Codex has no "session list" command, so the
+// live-process probe and the filesystem scan find it.
+//
+// A start or restart launches it, and it outlives that transition. Each
+// attempt therefore holds the instance spawn lock, as the status pass's Codex
+// refresh does (updateCodexSessionForPass). A start, restart or stop holds
+// that lock while it writes fields an attempt reads, without i.mu: the tmux
+// wrapper (a fallback recreate replaces it, then configures and starts it),
+// the sandbox container and CodexStartedAt among them. The first attempt runs
+// once the launching transition has committed its runtime and released the
+// lock, and it fixes the runtime generation detection serves. Once another
+// transition has replaced that runtime, detection stops; the replacement's own
+// start or restart detects for it.
 func (i *Instance) detectCodexSessionAsync() {
-	// Brief wait for Codex to initialize
-	time.Sleep(1 * time.Second)
-
-	// Try up to 3 times with short delays
-	delays := []time.Duration{0, 1 * time.Second, 2 * time.Second}
-
-	for attempt, delay := range delays {
-		if delay > 0 {
-			time.Sleep(delay)
-		}
-
-		observation := i.CaptureRuntimeBindingObservation("codex")
-		sessionID, _, probeErr := i.queryCodexSessionFromProcessFiles()
-		sessionID = i.resolveCodexDetectionCandidate(sessionID, probeErr)
-		if sessionID != "" {
-			if err := i.PublishRuntimeBindingObservation(observation, sessionID, time.Now()); err != nil {
-				sessionLog.Debug("codex_binding_rejected",
-					slog.String("session_id", sessionID), slog.String("error", err.Error()))
-				return
-			}
-
-			// Store in tmux environment for restart
-			i.mu.RLock()
-			tmuxSession := i.tmuxSession
-			i.mu.RUnlock()
-			if tmuxSession != nil {
-				if err := tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID); err != nil {
-					sessionLog.Warn("codex_set_env_failed", slog.String("error", err.Error()))
-				}
-			}
-
-			sessionLog.Debug(
-				"codex_session_detected",
-				slog.String("session_id", sessionID),
-				slog.Int("attempt", attempt+1),
-			)
+	var served codexDetectionRuntime
+	for attempt, delay := range codexDetectionDelays {
+		time.Sleep(delay)
+		if i.detectCodexSessionAttempt(attempt, &served) {
 			return
 		}
+	}
+	sessionLog.Warn("codex_detection_failed", slog.Int("attempts", len(codexDetectionDelays)))
+}
 
+// codexDetectionRuntime is the runtime generation detectCodexSessionAsync
+// serves, fixed by its first attempt that holds the spawn lock.
+type codexDetectionRuntime struct {
+	generation uint64
+	fixed      bool
+}
+
+// detectCodexSessionAttempt is one detection attempt, made under the instance
+// spawn lock. It reports whether detection is over: the thread it found was
+// published or refused, or the runtime it serves was replaced.
+func (i *Instance) detectCodexSessionAttempt(attempt int, served *codexDetectionRuntime) bool {
+	release, err := acquireInstanceSpawnLock(i.ID)
+	if err != nil {
+		sessionLog.Debug("codex_detection_lock_failed",
+			slog.Int("attempt", attempt+1), slog.String("error", err.Error()))
+		return false
+	}
+	defer release()
+
+	observation := i.CaptureRuntimeBindingObservation("codex")
+	if !served.fixed {
+		served.generation, served.fixed = observation.generation, true
+	} else if observation.generation != served.generation {
+		sessionLog.Debug("codex_detection_superseded", slog.Int("attempt", attempt+1),
+			slog.Uint64("generation", served.generation), slog.Uint64("current_generation", observation.generation))
+		return true
+	}
+	sessionID, _, probeErr := i.queryCodexSessionFromProcessFiles()
+	sessionID = i.resolveCodexDetectionCandidate(sessionID, probeErr)
+	if sessionID == "" {
 		if probeErr != nil {
 			sessionLog.Debug("codex_session_probe_undetermined", slog.Int("attempt", attempt+1), slog.Any("error", probeErr))
 		} else {
-			sessionLog.Debug("codex_session_not_found", slog.Int("attempt", attempt+1), slog.Int("total", len(delays)))
+			sessionLog.Debug("codex_session_not_found", slog.Int("attempt", attempt+1), slog.Int("total", len(codexDetectionDelays)))
+		}
+		return false
+	}
+	if err := i.publishRuntimeBindingObservationLocked(observation, sessionID, time.Now()); err != nil {
+		sessionLog.Debug("codex_binding_rejected",
+			slog.String("session_id", sessionID), slog.String("error", err.Error()))
+		return true
+	}
+
+	// Store in tmux environment for restart
+	i.mu.RLock()
+	tmuxSession := i.tmuxSession
+	i.mu.RUnlock()
+	if tmuxSession != nil {
+		if err := tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID); err != nil {
+			sessionLog.Warn("codex_set_env_failed", slog.String("error", err.Error()))
 		}
 	}
 
-	sessionLog.Warn("codex_detection_failed", slog.Int("attempts", len(delays)))
+	sessionLog.Debug(
+		"codex_session_detected",
+		slog.String("session_id", sessionID),
+		slog.Int("attempt", attempt+1),
+	)
+	return true
 }
 
 func getCodexHomeDir() string {
@@ -3876,9 +3913,10 @@ func (i *Instance) PaneProcessTreePIDs() ([]int, error) {
 // error strings are prefixed "codex process probe" for historical reasons
 // (its first caller); it is not codex-specific — see PaneProcessTreePIDs.
 //
-// The caller must not hold i.mu. The wrapper and socket are read under it:
-// detectCodexSessionAsync probes while the runtime commit that follows a
-// start or restart adopts them under i.mu.
+// The caller must not hold i.mu. The wrapper and socket are read under it: a
+// runtime commit adopts them under i.mu, and a storage reload replaces them
+// under i.mu without the spawn lock that Codex detection and the status pass
+// hold.
 func (i *Instance) collectTmuxPaneProcessTreePIDs() ([]int, error) {
 	i.mu.RLock()
 	tmuxSession, socketName := i.tmuxSession, i.TmuxSocketName
@@ -4335,8 +4373,8 @@ func (i *Instance) queryCodexSessionFromHostLsof(pids []int) (string, string, er
 // second return value names a missing dependency, when applicable.
 //
 // The caller must not hold i.mu: every step reads the Instance under it,
-// because detectCodexSessionAsync probes beside the runtime commit and the
-// metadata reloads that write those fields under i.mu.
+// because a storage reload writes those fields under i.mu without the spawn
+// lock its callers (a detection attempt, the status pass) hold.
 func (i *Instance) queryCodexSessionFromProcessFiles() (string, string, error) {
 	i.mu.RLock()
 	sandboxed := i.IsSandboxed()

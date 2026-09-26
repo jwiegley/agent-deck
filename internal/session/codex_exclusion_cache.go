@@ -134,8 +134,8 @@ func (p *StatusUpdatePass) codexOwnership(socket string) codexOwnershipSnapshot 
 
 // codexExclusions lists the Codex session IDs other tmux sessions on this
 // instance's socket own. The caller must not hold i.mu: the wrapper is read
-// under it, because Codex detection runs beside the runtime commit that
-// replaces the wrapper under i.mu.
+// under it, because a storage reload replaces the wrapper under i.mu without
+// the spawn lock Codex detection holds.
 func (i *Instance) codexExclusions(p *StatusUpdatePass) map[string]bool {
 	socket := tmux.DefaultSocketName()
 	ownName := ""
