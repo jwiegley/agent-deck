@@ -417,7 +417,7 @@ func (i *Instance) ReconcileRestartResult(restartErr error) error {
 			err = fmt.Errorf("no live durable runtime winner was proved")
 		}
 		return &RestartPartialSuccessError{
-			InstanceID: partial.InstanceID, Runtime: partial.Runtime,
+			InstanceID: partial.InstanceID, Operation: partial.Operation, Runtime: partial.Runtime,
 			BindingPlan:         append([]statedb.RuntimeBindingTransition(nil), partial.BindingPlan...),
 			NeedsReconciliation: false,
 			MessageUndelivered:  partial.MessageUndelivered,
@@ -426,7 +426,7 @@ func (i *Instance) ReconcileRestartResult(restartErr error) error {
 	}
 	if err := i.reconcileRuntimeCandidate(partial.Runtime, partial.BindingPlan); err != nil {
 		return &RestartPartialSuccessError{
-			InstanceID: partial.InstanceID, Runtime: partial.Runtime,
+			InstanceID: partial.InstanceID, Operation: partial.Operation, Runtime: partial.Runtime,
 			BindingPlan:         append([]statedb.RuntimeBindingTransition(nil), partial.BindingPlan...),
 			NeedsReconciliation: true,
 			MessageUndelivered:  partial.MessageUndelivered,
@@ -1031,7 +1031,8 @@ func (i *Instance) respawnRuntimePane(authority *runtimeTransitionAuthority, com
 
 // commitPhysicalRuntime is the only publication point after a successful
 // physical start/restart. committed distinguishes a pre-CAS candidate from a
-// post-CAS cleanup interruption; either error is a completed physical spawn.
+// post-CAS cleanup interruption; either error is a completed physical spawn,
+// except errSpawnedRuntimeGone: that spawn died before anything was published.
 func (i *Instance) commitPhysicalRuntime(authority *runtimeTransitionAuthority) (next statedb.RuntimeState, plan []statedb.RuntimeBindingTransition, committed bool, err error) {
 	if authority == nil {
 		return next, nil, false, fmt.Errorf("runtime transition authority unavailable")
@@ -1048,7 +1049,7 @@ func (i *Instance) commitPhysicalRuntime(authority *runtimeTransitionAuthority) 
 		return next, nil, false, fmt.Errorf("physical runtime for %s has no tmux identity", i.ID)
 	}
 	if !runtimeCandidateExistsFn(i.tmuxSession) {
-		return next, nil, false, fmt.Errorf("physical runtime %s was not verified live", next.TmuxSession)
+		return next, nil, false, fmt.Errorf("physical runtime %s was not verified live: %w", next.TmuxSession, errSpawnedRuntimeGone)
 	}
 	plan = authority.bindingPlanForCommit(i)
 	bindingKind := activeRuntimeBindingKind(i)

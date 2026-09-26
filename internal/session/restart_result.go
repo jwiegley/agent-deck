@@ -13,7 +13,10 @@ import (
 // surface this as a durability warning.
 type RestartPartialSuccessError struct {
 	InstanceID string
-	Runtime    statedb.RuntimeState
+	// Operation is the physical call that completed: "start" or "restart".
+	// Results built without it read as a restart.
+	Operation string
+	Runtime   statedb.RuntimeState
 	// BindingPlan is the exact CAS intent captured before the physical spawn.
 	// Durability reconciliation reuses it verbatim and never spawns again.
 	BindingPlan []statedb.RuntimeBindingTransition
@@ -29,13 +32,33 @@ type RestartPartialSuccessError struct {
 }
 
 func (e *RestartPartialSuccessError) Error() string {
+	operation := e.Operation
+	if operation == "" {
+		operation = "restart"
+	}
 	if e.NeedsReconciliation {
-		return fmt.Sprintf("restart completed for %s but runtime generation persistence failed: %v", e.InstanceID, e.Err)
+		return fmt.Sprintf("%s completed for %s but runtime generation persistence failed: %v", operation, e.InstanceID, e.Err)
 	}
 	if e.MessageUndelivered {
 		return fmt.Sprintf("session %s started but its initial message was not delivered: %v", e.InstanceID, e.Err)
 	}
-	return fmt.Sprintf("restart completed for %s but post-commit cleanup was interrupted: %v", e.InstanceID, e.Err)
+	return fmt.Sprintf("%s completed for %s but post-commit cleanup was interrupted: %v", operation, e.InstanceID, e.Err)
+}
+
+// errSpawnedRuntimeGone marks commitPhysicalRuntime finding the runtime tmux
+// just accepted already gone, before its generation could be published.
+var errSpawnedRuntimeGone = errors.New("the spawned runtime exited before its generation was published")
+
+// spawnedRuntimeGone reports a start or restart whose spawn tmux accepted but
+// whose runtime died before publication. Nothing was published and nothing
+// is live, so it is neither a failure to retry nor a partial success to
+// reconcile. The call completes as upstream's does once tmux accepted the
+// spawn, and reports the canonical runtime its transition kept. The death
+// belongs to spawn verification: the fast-death watcher records it,
+// VerifySpawned reports it, and PersistSpawnFailureStatus marks that
+// canonical runtime errored.
+func spawnedRuntimeGone(err error) bool {
+	return errors.Is(err, errSpawnedRuntimeGone)
 }
 
 func (e *RestartPartialSuccessError) Unwrap() error { return e.Err }
