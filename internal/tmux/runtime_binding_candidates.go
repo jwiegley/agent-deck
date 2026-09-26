@@ -372,9 +372,12 @@ func ListRuntimeBindingCandidates(socketName, envKey, envValue string) ([]Runtim
 }
 
 // ListRuntimeCleanupCandidates inventories every Agent Deck session on exactly
-// one socket. It uses one stable-identity call and one bounded local-option
-// batch, and preserves socketName verbatim: "" is the native tmux default
-// socket, even when Agent Deck has a different configured DefaultSocketName.
+// one socket: every session carrying the complete session-local cleanup
+// stamp, whatever its name (Agent Deck starts a persisted runtime under the
+// tmux name its instance carries, which need not have SessionPrefix). It uses
+// one stable-identity call and one bounded local-option batch, and preserves
+// socketName verbatim: "" is the native tmux default socket, even when Agent
+// Deck has a different configured DefaultSocketName.
 func ListRuntimeCleanupCandidates(socketName, envKey string) ([]RuntimeBindingCandidate, error) {
 	if envKey != "" && !validTmuxEnvironmentKey(envKey) {
 		return nil, fmt.Errorf("tmux: invalid binding inventory environment key")
@@ -397,7 +400,7 @@ func ListRuntimeCleanupCandidates(socketName, envKey string) ([]RuntimeBindingCa
 			return nil, fmt.Errorf("tmux: malformed runtime cleanup candidate record on socket %q", socketName)
 		}
 		sessionID, name := strings.TrimSpace(fields[0]), strings.TrimSpace(fields[1])
-		if name == "" || !strings.HasPrefix(name, SessionPrefix) {
+		if name == "" {
 			continue
 		}
 		if !validTmuxStableID(sessionID, '$') {
@@ -852,7 +855,9 @@ func runtimeGenerationCandidateCondition(candidate RuntimeGenerationCandidate) (
 }
 
 func runtimeGenerationCandidateChecks(candidate RuntimeGenerationCandidate) ([][2]string, error) {
-	if candidate.SessionName == "" || !strings.HasPrefix(candidate.SessionName, SessionPrefix) {
+	// The name is matched exactly below; ownership is the local stamp, not a
+	// name convention.
+	if candidate.SessionName == "" {
 		return nil, fmt.Errorf("tmux: invalid runtime cleanup target %q", candidate.SessionName)
 	}
 	if !validTmuxStableID(candidate.SessionID, '$') || !validTmuxStableID(candidate.PaneID, '%') || candidate.PanePID <= 0 {
