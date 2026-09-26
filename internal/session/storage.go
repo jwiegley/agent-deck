@@ -1912,11 +1912,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			}
 			// Pass instance ID for activity hooks (enables real-time status updates)
 			tmuxSess.InstanceID = instData.ID
-			tmuxSess.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
-			tmuxSess.SetMouse(GetTmuxSettings().GetMouse())
-			tmuxSess.SetIndicZeroWidthMarks(GetTmuxSettings().IndicZeroWidthMarks)
-			tmuxSess.SetClearOnRestart(GetTmuxSettings().ClearOnRestart)
-			tmuxSess.SetTerminalChromeEnabled(GetTerminalSettings().GetITermBadge())
+			applyTmuxSessionSettings(tmuxSess)
 			// Note: EnableMouseMode and ConfigureStatusBar are deferred to EnsureConfigured()
 			// Called automatically when user attaches to session
 		}
