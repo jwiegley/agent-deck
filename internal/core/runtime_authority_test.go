@@ -274,6 +274,45 @@ func TestSessionStartLostErrorVerdictIsAWarning(t *testing.T) {
 	}
 }
 
+// The session state saved after a spawn failure is the same kind of loss as
+// the error verdict: envelope and daemon clients must learn it as a warning.
+func TestSessionStartLostStateSaveIsAWarning(t *testing.T) {
+	requireTmux(t)
+	const profile = "_core_start_lost_state_save"
+	inst := session.NewInstance("dies", t.TempDir())
+	seedStore(t, profile, nil, inst)
+	// Every snapshot save upserts the profile's groups; the status CAS
+	// writes none, so only the state save fails.
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []string{"INSERT", "UPDATE"} {
+		if _, err := storage.GetDB().DB().Exec(`CREATE TRIGGER core_test_fail_group_` + strings.ToLower(op) +
+			` BEFORE ` + op + ` ON groups BEGIN SELECT RAISE(ABORT, 'injected group write failure'); END`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	storage.Close()
+	setStartRuntimeHook(t, func(inst *session.Instance, message string) (statedb.RuntimeState, error) {
+		// No pane is spawned, so verification fails.
+		return inst.RuntimeState(), nil
+	})
+
+	res := testRegistry(t, Deps{}).Run(context.Background(), IDSessionStart, SessionStartIn{Profile: profile, Session: "dies", NoWait: true})
+	wantCode(t, res.Err, CodeSpawnFailed, "")
+	sf, ok := AsError(res.Err).Data.(*SpawnFailure)
+	if !ok || sf.SaveErr == nil || sf.StatusErr != nil || !strings.Contains(sf.SaveErr.Error(), "injected group write failure") {
+		t.Fatalf("spawn failure = %+v, want only a lost state save", AsError(res.Err).Data)
+	}
+	if want := []string{"failed to save session state: " + sf.SaveErr.Error()}; !slices.Equal(res.Warnings, want) {
+		t.Fatalf("envelope warnings = %q, want %q", res.Warnings, want)
+	}
+	if got := durableRuntime(t, profile, inst.ID); got.Status != string(session.StatusError) {
+		t.Fatalf("durable runtime = %+v, want the error verdict saved", got)
+	}
+}
+
 func TestSessionRestartPartialSuccessIsAWarning(t *testing.T) {
 	requireTmux(t)
 	const profile = "_core_restart_partial"
