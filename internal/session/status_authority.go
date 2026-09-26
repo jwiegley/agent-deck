@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 type statusCommitFenceKey struct{}
@@ -132,6 +133,25 @@ func (i *Instance) statusProbeCurrentLocked(ctx context.Context, observed stated
 		return statusRuntimeConflict(observed, current)
 	}
 	return nil
+}
+
+// statusAbsenceIsForeignServerFn is the foreign-server guard the status probe
+// consults; tests replace it to stage a nested process without a second server.
+var statusAbsenceIsForeignServerFn = (*tmux.Session).AbsenceIsForeignServer
+
+// probeAbsenceIsForeignServer is called with i.mu held and returns with it
+// held. From inside another tmux server the guard lists the default server,
+// so, as in probeTmuxExists, status readers must not wait behind it, and a
+// runtime replacement or cancellation meanwhile discards the answer.
+func (i *Instance) probeAbsenceIsForeignServer(ctx context.Context, observed statedb.RuntimeState) (bool, error) {
+	s := i.tmuxSession
+	i.mu.Unlock()
+	foreign := statusAbsenceIsForeignServerFn(s)
+	i.mu.Lock()
+	if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
+		return false, err
+	}
+	return foreign, nil
 }
 
 func (i *Instance) reloadStatusWinner(db *statedb.StateDB, incarnation string) (statedb.RuntimeState, error) {

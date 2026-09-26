@@ -6637,7 +6637,11 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 		}
 	}
 	if !exists {
-		if i.tmuxSession.AbsenceIsForeignServer() {
+		foreign, err := i.probeAbsenceIsForeignServer(ctx, observed)
+		if err != nil {
+			return candidate, err
+		}
+		if foreign {
 			// This process runs inside another tmux server and its socket-less
 			// probe followed $TMUX there; the session is alive on the default
 			// server. No verdict: keep the last-known status rather than publish
