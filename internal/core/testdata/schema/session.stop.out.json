@@ -16,6 +16,10 @@
     },
     "title": {
       "type": "string"
+    },
+    "warning": {
+      "description": "Runtime durability warning of the drained session's start",
+      "type": "string"
     }
   },
   "required": [

@@ -78,6 +78,20 @@ func TestRuntimeLifecycle_HandleSessionStopCapturesBeforeProbes(t *testing.T) {
 	}
 }
 
+// The registry's session.stop is the default `session stop` path and is also
+// served by the daemon; it must freeze the operator's selection exactly like
+// the legacy handler above.
+func TestRuntimeLifecycle_CoreSessionStopCapturesBeforeProbes(t *testing.T) {
+	body := sourceFunctionBody(t, "../../internal/core/session_stop.go", "sessionStop")
+	requireCallOrder(t, body, "CaptureRuntimeSelection()", "inst.Exists()")
+	requireCallOrder(t, body, "CaptureRuntimeSelection()", "SyncSessionIDsFromTmux()")
+	requireCallOrder(t, body, "KillCaptured(selection)", "drainGroupQueue(")
+	requireCallOrder(t, body, "KillCaptured(selection)", "saveOr(")
+	if strings.Contains(body, "inst.Kill()") {
+		t.Fatalf("core sessionStop retains an unfenced kill")
+	}
+}
+
 func TestRuntimeLifecycle_HandleSessionAdoptRuntimeIsDryRunByDefault(t *testing.T) {
 	body := sourceFunctionBody(t, "session_cmd.go", "handleSessionAdoptRuntime")
 	dryRunStart := strings.Index(body, "if !*yes")

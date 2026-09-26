@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/core"
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/testutil"
 )
 
@@ -179,7 +181,53 @@ var equivalenceScript = [][]string{
 	{"session", "stop", "alpha"}, {"session", "stop", "beta", "--json"}, {"session", "stop", "gamma", "-q"},
 	{"session", "stop", "gamma", "--json"},
 	{"list", "--json"}, {"group", "list", "--json"},
+	// v1.9.1 group cap: q2 queues behind q1 and stopping q1 drains it. Parity
+	// alone cannot catch a bug both paths share, so mustSucceed pins what
+	// these must say. The drain runs in a later process, so it also proves
+	// the queued status reached the store.
+	{"session", "start", "q1"}, {markRunningStep, "q1"}, {"session", "start", "q2", "--json"},
+	{"session", "stop", "q1", "--json"}, {"list", "--json"}, {"session", "stop", "q2", "-q"},
 }
+
+// markRunningStep is a script step, not a command: it records the named
+// session as observed running in both sandboxes, standing in for the status
+// poller. The v1.9.1 group cap counts only running sessions, and a bare shell
+// never reports running on its own.
+const markRunningStep = "#mark-running"
+
+// markSessionRunning publishes a running observation for title through the
+// same status CAS the poller uses.
+func markSessionRunning(t *testing.T, home, title string) {
+	t.Helper()
+	db, err := statedb.Open(stateDBPath(t, home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.LoadInstances()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Title != title {
+			continue
+		}
+		state, found, err := db.ReadRuntimeState(row.ID)
+		if err != nil || !found {
+			t.Fatalf("runtime of %s: found=%v err=%v", title, found, err)
+		}
+		applied, err := db.WriteStatusIfVersion(row.ID, row.Incarnation, state.Generation, state.StatusRevision, string(session.StatusRunning))
+		if err != nil || !applied {
+			t.Fatalf("mark %s running: applied=%v err=%v", title, applied, err)
+		}
+		return
+	}
+	t.Fatalf("no session titled %s in %s", title, home)
+}
+
+// equivalenceExpectation pins the next script case with these args to a
+// substring its registry stdout must contain after a successful exit.
+type equivalenceExpectation struct{ args, want string }
 
 var (
 	equivTmuxSuffix = regexp.MustCompile(`(agentdeck_[A-Za-z0-9-]+)_[0-9a-f]{8}`)
@@ -207,14 +255,17 @@ func TestCoreRegistryMatchesLegacyHandlers(t *testing.T) {
 	}
 	seed := t.TempDir()
 	projects := filepath.Join(seed, "proj")
-	for _, name := range []string{"alpha", "beta", "gamma"} {
+	for _, name := range []string{"alpha", "beta", "gamma", "q1", "q2"} {
 		if err := os.MkdirAll(filepath.Join(projects, name), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	seedTmux := shortTempDir(t, "adsd")
 	seedEnv := []string{"TMUX_TMPDIR=" + seedTmux}
-	for _, s := range []struct{ title, group string }{{"alpha", "work"}, {"beta", "work/api"}, {"gamma", "misc"}} {
+	if _, stderr, code := runAgentDeckEnv(t, seed, "", seedEnv, "group", "create", "serial", "--max-concurrent=1"); code != 0 {
+		t.Fatalf("seed group create serial: exit %d: %s", code, stderr)
+	}
+	for _, s := range []struct{ title, group string }{{"alpha", "work"}, {"beta", "work/api"}, {"gamma", "misc"}, {"q1", "serial"}, {"q2", "serial"}} {
 		if _, stderr, code := runAgentDeckEnv(t, seed, "", seedEnv, "add", filepath.Join(projects, s.title), "-t", s.title, "-c", "bash", "-g", s.group); code != 0 {
 			t.Fatalf("seed add %s: exit %d: %s", s.title, code, stderr)
 		}
@@ -238,7 +289,7 @@ func TestCoreRegistryMatchesLegacyHandlers(t *testing.T) {
 			sb.env = append(sb.env, envCoreRegistry+"=0")
 		}
 		t.Cleanup(func() {
-			for _, title := range []string{"alpha", "beta", "gamma"} {
+			for _, title := range []string{"alpha", "beta", "gamma", "q1", "q2"} {
 				runAgentDeckEnv(t, sb.home, "", sb.env, "session", "stop", title)
 			}
 			testutil.KillTmuxServersUnder(sb.tmux)
@@ -250,27 +301,38 @@ func TestCoreRegistryMatchesLegacyHandlers(t *testing.T) {
 
 	// The first successful start and a forced restart --json must really
 	// succeed, so the comparison can't pass because both paths failed alike.
-	mustSucceed := map[string]string{
-		"session start alpha":                  "Started session: alpha",
-		"session restart alpha --force --json": `"success": true`,
+	// The queue cases must durably queue q2 and drain it on the next stop.
+	mustSucceed := []equivalenceExpectation{
+		{"session start alpha", "Started session: alpha"},
+		{"session restart alpha --force --json", `"success": true`},
+		{"session start q2 --json", `"status": "queued"`},
+		{"session stop q1 --json", `"drained_title": "q2"`},
 	}
 	for _, args := range equivalenceScript {
+		if args[0] == markRunningStep {
+			markSessionRunning(t, legacy.home, args[1])
+			markSessionRunning(t, registry.home, args[1])
+			continue
+		}
 		// Stored paths point into the seed dir, identical in both clones.
 		lOut, lErr, lCode := runAgentDeckEnv(t, legacy.home, "", legacy.env, args...)
 		rOut, rErr, rCode := runAgentDeckEnv(t, registry.home, "", registry.env, args...)
 		lOut, lErr = scrubEquivalence(lOut, legacy.home, legacy.tmux), scrubEquivalence(lErr, legacy.home, legacy.tmux)
 		rOut, rErr = scrubEquivalence(rOut, registry.home, registry.tmux), scrubEquivalence(rErr, registry.home, registry.tmux)
 		key := strings.Join(args, " ")
-		if want, ok := mustSucceed[key]; ok {
-			if rCode != 0 || !strings.Contains(rOut, want) {
+		if len(mustSucceed) > 0 && mustSucceed[0].args == key {
+			if want := mustSucceed[0].want; rCode != 0 || !strings.Contains(rOut, want) {
 				t.Errorf("%q: exit %d, stdout %q, want success containing %q (stderr %q)", key, rCode, rOut, want, rErr)
 			}
-			delete(mustSucceed, key)
+			mustSucceed = mustSucceed[1:]
 		}
 		if lCode != rCode || lOut != rOut || lErr != rErr {
 			t.Errorf("%q differs\nexit legacy=%d registry=%d\n--- legacy stdout ---\n%s\n--- registry stdout ---\n%s\n--- legacy stderr ---\n%s\n--- registry stderr ---\n%s",
 				strings.Join(args, " "), lCode, rCode, lOut, rOut, lErr, rErr)
 		}
+	}
+	if len(mustSucceed) != 0 {
+		t.Errorf("script never reached pinned cases %+v", mustSucceed)
 	}
 }
 

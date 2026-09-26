@@ -87,17 +87,18 @@ func (deps Deps) sessionRestart(ctx context.Context, in SessionRestartIn) (Sessi
 		return out, nil
 	}
 
-	if err := inst.RestartWithEnv(in.Env); err != nil {
+	runtime, err := restartRuntime(inst, in.Env)
+	err, persistenceWarning := consumeRuntime(inst, runtime, err)
+	if err != nil {
 		return SessionRestartOut{}, &Error{Code: CodeInvalid, Message: fmt.Sprintf("failed to restart session: %v", err), Cause: err}
 	}
 	if err := inst.VerifySpawned(SpawnVerifyWait); err != nil {
 		return SessionRestartOut{}, d.failSpawn("restart", inst, err)
 	}
-	inst.LastStartedAt = time.Now()
 	// A warning is both part of the typed result and an envelope warning;
 	// the duplication is intentional (typed field for the CLI shape, generic
 	// list for any client).
-	if warning := inst.ConsumeCodexRestartWarning(); warning != "" {
+	if warning := session.MergeRestartWarnings(inst.ConsumeCodexRestartWarning(), persistenceWarning); warning != "" {
 		out.Warning = warning
 		Warn(ctx, warning)
 		Emit(ctx, Event{Kind: EventRestartWarning, ID: inst.ID, Title: inst.Title, Message: warning})
@@ -140,7 +141,9 @@ func (d *sessionData) restartAll(ctx context.Context, in SessionRestartIn) (*Res
 		}
 
 		Emit(ctx, Event{Kind: EventRestartBegin, ID: inst.ID, Title: inst.Title})
-		if err := inst.RestartWithEnv(in.Env); err != nil {
+		runtime, err := restartRuntime(inst, in.Env)
+		err, persistenceWarning := consumeRuntime(inst, runtime, err)
+		if err != nil {
 			return fail(fmt.Sprintf("failed to restart session '%s': %v", inst.Title, err), err)
 		}
 		// #2099: a restart whose pane is already gone is a failure.
@@ -148,10 +151,9 @@ func (d *sessionData) restartAll(ctx context.Context, in SessionRestartIn) (*Res
 			row.SpawnFailure = newSpawnFailure("restart", inst, err).Record
 			return fail(spawnFailureMessage("restart", err), err)
 		}
-		inst.LastStartedAt = time.Now()
 		restarted = append(restarted, inst.ID)
 
-		warning := inst.ConsumeCodexRestartWarning()
+		warning := session.MergeRestartWarnings(inst.ConsumeCodexRestartWarning(), persistenceWarning)
 		if warning != "" {
 			Warn(ctx, warning)
 			Emit(ctx, Event{Kind: EventRestartWarning, ID: inst.ID, Title: inst.Title, Message: warning})
