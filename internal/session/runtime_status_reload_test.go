@@ -231,78 +231,129 @@ esac
 }
 
 // Every construction of an Instance's tmux wrapper carries the configured
-// per-session options. Runtime adoption (a reload that corrects the tool, or a
-// durable winner under another tmux name) built its wrapper bare, so the
+// per-session options and the Instance's group path, and a wrapper around a
+// live session that no Start or Restart configures afterwards also carries the
+// [tmux].options overrides. Runtime adoption (a reload that corrects the tool,
+// or a durable winner under another tmux name) built its wrapper bare: the
 // adopted session ignored inject_status_line, mouse, clear_on_restart, the
-// Indic zero-width-mark opt-in (#2334) and the terminal-chrome setting until
-// the process restarted.
+// Indic zero-width-mark opt-in (#2334) and the terminal-chrome setting, and the
+// next attach pushed agent-deck's status-bar defaults over the user's options
+// and cleared @agentdeck_group_path. Discovery is covered with a real server by
+// TestDiscoverExistingTmuxSessionsConfiguresImportedWrappers.
 func TestRuntimeLifecycle_EveryTmuxWrapperConstructionAppliesSettings(t *testing.T) {
+	home := configureNonDefaultTmuxWrapperSettings(t)
+	type site struct {
+		build func(t *testing.T) (*Instance, *tmux.Session)
+		// adopts marks a wrapper around a live session that no Start or
+		// Restart configures afterwards.
+		adopts bool
+	}
+	sites := map[string]site{
+		"NewInstance": {build: func(*testing.T) (*Instance, *tmux.Session) {
+			inst := NewInstance("settings", home)
+			return inst, inst.tmuxSession
+		}},
+		"NewInstanceWithTool": {build: func(*testing.T) (*Instance, *tmux.Session) {
+			inst := NewInstanceWithTool("settings", home, "claude")
+			return inst, inst.tmuxSession
+		}},
+		"recreateTmuxSession": {build: func(*testing.T) (*Instance, *tmux.Session) {
+			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/settings", TmuxSocketName: "isolated"}
+			inst.recreateTmuxSession()
+			return inst, inst.tmuxSession
+		}},
+		"storage load": {adopts: true, build: func(t *testing.T) (*Instance, *tmux.Session) {
+			instances, _, err := (&Storage{}).convertToInstances(&StorageData{Instances: []*InstanceData{{
+				ID: "settings", Title: "settings", Tool: "claude", ProjectPath: home, GroupPath: "work/settings",
+				TmuxSession: "agentdeck_settings",
+			}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return instances[0], instances[0].tmuxSession
+		}},
+		"runtime adoption": {adopts: true, build: func(*testing.T) (*Instance, *tmux.Session) {
+			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/settings", Tool: "claude", Command: "claude"}
+			inst.adoptRuntimeState(statedb.RuntimeState{
+				InstanceID: "settings", Generation: 2, TmuxSession: "agentdeck_settings_g2", TmuxSocketName: "isolated",
+				Status: string(StatusRunning),
+			})
+			return inst, inst.tmuxSession
+		}},
+		"tool-correcting reload": {adopts: true, build: func(t *testing.T) (*Instance, *tmux.Session) {
+			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/old", Tool: "shell", Command: "bash",
+				TmuxSocketName: "isolated", tmuxSession: &tmux.Session{Name: "agentdeck_settings", SocketName: "isolated"}}
+			loaded := &Instance{ID: "settings", Title: "settings", ProjectPath: home, GroupPath: "work/settings", Tool: "claude", Command: "claude",
+				TmuxSocketName: "isolated", tmuxSession: &tmux.Session{Name: "agentdeck_settings", SocketName: "isolated"}}
+			if !inst.MergeReloaded(loaded) {
+				t.Fatal("the reloaded row was not merged")
+			}
+			return inst, inst.GetTmuxSession()
+		}},
+	}
+	for name, site := range sites {
+		t.Run(name, func(t *testing.T) {
+			inst, sess := site.build(t)
+			assertTmuxWrapperConfigured(t, inst, sess, site.adopts)
+		})
+	}
+}
+
+// configureNonDefaultTmuxWrapperSettings writes a user config whose per-session
+// tmux settings all differ from both a new wrapper's defaults and a bare
+// wrapper's zero values, plus one [tmux].options override, and returns the
+// isolated HOME.
+func configureNonDefaultTmuxWrapperSettings(t *testing.T) string {
+	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	ClearUserConfigCache()
 	t.Cleanup(ClearUserConfigCache)
-	// Every value differs from the wrapper's own default.
 	inject, mouse, badge := false, false, true
 	if err := SaveUserConfig(&UserConfig{
-		Tmux:     TmuxSettings{InjectStatusLine: &inject, Mouse: &mouse, IndicZeroWidthMarks: true, ClearOnRestart: true},
+		Tmux: TmuxSettings{
+			InjectStatusLine: &inject, Mouse: &mouse, IndicZeroWidthMarks: true, ClearOnRestart: true,
+			Options: map[string]string{"status": "2"},
+		},
 		Terminal: TerminalSettings{ITermBadge: &badge},
 	}); err != nil {
 		t.Fatal(err)
 	}
+	return home
+}
 
-	sites := map[string]func(t *testing.T) *tmux.Session{
-		"NewInstance": func(*testing.T) *tmux.Session {
-			return NewInstance("settings", home).tmuxSession
-		},
-		"NewInstanceWithTool": func(*testing.T) *tmux.Session {
-			return NewInstanceWithTool("settings", home, "claude").tmuxSession
-		},
-		"recreateTmuxSession": func(*testing.T) *tmux.Session {
-			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, TmuxSocketName: "isolated"}
-			inst.recreateTmuxSession()
-			return inst.tmuxSession
-		},
-		"storage load": func(t *testing.T) *tmux.Session {
-			instances, _, err := (&Storage{}).convertToInstances(&StorageData{Instances: []*InstanceData{{
-				ID: "settings", Title: "settings", Tool: "claude", ProjectPath: home, TmuxSession: "agentdeck_settings",
-			}}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			return instances[0].tmuxSession
-		},
-		"runtime adoption": func(*testing.T) *tmux.Session {
-			inst := &Instance{ID: "settings", Title: "settings", ProjectPath: home, Tool: "claude", Command: "claude"}
-			inst.adoptRuntimeState(statedb.RuntimeState{
-				InstanceID: "settings", Generation: 2, TmuxSession: "agentdeck_settings_g2", TmuxSocketName: "isolated",
-				Status: string(StatusRunning),
-			})
-			return inst.tmuxSession
-		},
+// assertTmuxWrapperConfigured checks sess against the settings
+// configureNonDefaultTmuxWrapperSettings wrote. Every wrapper carries the
+// per-session settings and inst's group path; an adopting wrapper also carries
+// the option overrides that Start would otherwise install.
+func assertTmuxWrapperConfigured(t *testing.T, inst *Instance, sess *tmux.Session, adopts bool) {
+	t.Helper()
+	if inst == nil || sess == nil {
+		t.Fatalf("no tmux wrapper was constructed: instance=%v wrapper=%v", inst, sess)
 	}
-	for name, build := range sites {
-		t.Run(name, func(t *testing.T) {
-			sess := build(t)
-			if sess == nil {
-				t.Fatal("no tmux wrapper was constructed")
-			}
-			if sess.GetMouse() {
-				t.Error("mouse = true, want the configured false")
-			}
-			fields := reflect.ValueOf(sess).Elem()
-			for field, want := range map[string]bool{
-				"injectStatusLine":       false,
-				"indicZeroWidthMarks":    true,
-				"indicZeroWidthMarksSet": true,
-				"clearOnRestart":         true,
-				"terminalChromeEnabled":  true,
-			} {
-				if got := fields.FieldByName(field).Bool(); got != want {
-					t.Errorf("%s = %v, want the configured %v", field, got, want)
-				}
-			}
-		})
+	if sess.GetMouse() {
+		t.Error("mouse = true, want the configured false")
+	}
+	fields := reflect.ValueOf(sess).Elem()
+	for field, want := range map[string]bool{
+		"injectStatusLine":       false,
+		"indicZeroWidthMarks":    true,
+		"indicZeroWidthMarksSet": true,
+		"clearOnRestart":         true,
+		"terminalChromeEnabled":  true,
+	} {
+		if got := fields.FieldByName(field).Bool(); got != want {
+			t.Errorf("%s = %v, want the configured %v", field, got, want)
+		}
+	}
+	if got := sess.GetGroupPath(); got != inst.GroupPath {
+		t.Errorf("wrapper group path = %q, want the instance's %q", got, inst.GroupPath)
+	}
+	if adopts {
+		if got := sess.OptionOverrides["status"]; got != "2" {
+			t.Errorf("option overrides = %v, want the configured status=2", sess.OptionOverrides)
+		}
 	}
 }
 
