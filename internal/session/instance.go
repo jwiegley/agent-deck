@@ -6573,8 +6573,8 @@ func (i *Instance) updateStatusWithEvidence(pass *StatusUpdatePass, syncMetadata
 	ctx, evidence := withStatusProbeEvidence(context.Background())
 	committed, err := i.UpdateStatusObserved(ctx, selection.State, selection.Incarnation)
 	// A pass without a verdict is a no-op, as upstream's early return is.
-	if err == nil && syncMetadata && !evidence.noVerdict.Load() {
-		i.refreshStatusMetadataIfCurrent(committed, bindingObserved, evidence.paneSampled.Load(), pass)
+	if err == nil && !evidence.noVerdict.Load() {
+		i.refreshStatusMetadataIfCurrent(committed, bindingObserved, evidence.paneSampled.Load(), syncMetadata, pass)
 	}
 	return evidence, err
 }
@@ -7060,8 +7060,10 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 // publish tool IDs after its context has timed out. Tool detection and session
 // discovery also require a live pane sample (paneSampled): for an absent
 // session DetectTool's pane capture fails and reports "shell", which would
-// rename a stored claude, codex or gemini session.
-func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState, hookObservation RuntimeBindingObservation, paneSampled bool, pass *StatusUpdatePass) {
+// rename a stored claude, codex or gemini session. As upstream, only native
+// session-ID discovery is left to the poller (syncMetadata); read-only
+// listings still publish hook bindings and detect the tool.
+func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState, hookObservation RuntimeBindingObservation, paneSampled, syncMetadata bool, pass *StatusUpdatePass) {
 	i.mu.Lock()
 	if !sameStatusRuntime(committed, i.runtimeStateLocked()) {
 		i.mu.Unlock()
@@ -7106,7 +7108,7 @@ func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState
 		}
 	}
 
-	if i.Status != StatusRunning && i.Status != StatusWaiting {
+	if !syncMetadata || (i.Status != StatusRunning && i.Status != StatusWaiting) {
 		i.mu.Unlock()
 		return
 	}
