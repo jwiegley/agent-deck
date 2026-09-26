@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"testing"
@@ -15,22 +16,7 @@ import (
 // instance. It returns the instance built around sessionName.
 func importTmuxSessionForTest(t *testing.T, storage *Storage, socketName, sessionName string) *Instance {
 	t.Helper()
-	oldDefault := tmux.DefaultSocketName()
-	tmux.SetDefaultSocketName(socketName)
-	t.Cleanup(func() { tmux.SetDefaultSocketName(oldDefault) })
-	discovered, err := DiscoverExistingTmuxSessions(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var imported *Instance
-	for _, inst := range discovered {
-		if sess := inst.GetTmuxSession(); sess != nil && sess.Name == sessionName {
-			imported = inst
-		}
-	}
-	if imported == nil {
-		t.Fatalf("%q was not discovered among %d sessions", sessionName, len(discovered))
-	}
+	imported := discoveredSessionForTest(t, socketName, sessionName)
 	if imported.TmuxSocketName != socketName || imported.GetTmuxSession().SocketName != socketName {
 		t.Fatalf("imported runtime socket = %q (wrapper %q), want the socket it was found on %q",
 			imported.TmuxSocketName, imported.GetTmuxSession().SocketName, socketName)
@@ -148,8 +134,8 @@ func TestImportedRuntime_RestartReplacesTheImportedSession(t *testing.T) {
 	}
 }
 
-// discoveredSessionForTest imports sessionName without persisting it, for
-// checks of the stamp itself.
+// discoveredSessionForTest runs only the discovery half of the import, without
+// persisting anything, for checks of the stamp itself.
 func discoveredSessionForTest(t *testing.T, socketName, sessionName string) *Instance {
 	t.Helper()
 	oldDefault := tmux.DefaultSocketName()
@@ -168,15 +154,61 @@ func discoveredSessionForTest(t *testing.T, socketName, sessionName string) *Ins
 	return nil
 }
 
-// The import stamps the new instance's generation-zero identity into both
-// inventories' evidence: the environment the reconcile snapshot reads and the
-// session-local cleanup options a conditional kill compares.
-func TestImportedRuntime_StampNamesTheNewInstance(t *testing.T) {
+// assertTmuxSessionUnstamped fails when anything stamped sessionName: a
+// complete cleanup stamp for any instance, or the environment's instance ID.
+func assertTmuxSessionUnstamped(t *testing.T, socketName, sessionName, when string) {
+	t.Helper()
+	stamped, err := tmux.ListRuntimeCleanupCandidates(socketName, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range stamped {
+		if candidate.SessionName == sessionName {
+			t.Fatalf("%s: %q carries a cleanup stamp for %q", when, sessionName, candidate.InstanceID)
+		}
+	}
+	if out, err := exec.Command("tmux", "-L", socketName, "show-environment", "-t", "="+sessionName, "AGENTDECK_INSTANCE_ID").Output(); err == nil {
+		t.Fatalf("%s: %q carries %q", when, sessionName, out)
+	}
+}
+
+// The import's grant waits for the durable row. Discovery stamps nothing, so
+// an import whose insert fails leaves no session stamped for an instance that
+// was never persisted. The insert that commits stamps the instance's
+// generation-zero identity into both inventories' evidence: the environment
+// the reconcile snapshot reads and the session-local cleanup options a
+// conditional kill compares.
+func TestImportedRuntime_StampWaitsForTheCommittedInsert(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 	socketName := fmt.Sprintf("adtest-import-stamp-%d", time.Now().UnixNano())
 	startUnownedTmuxSession(t, socketName, "user-work")
 	inst := discoveredSessionForTest(t, socketName, "user-work")
+	assertTmuxSessionUnstamped(t, socketName, "user-work", "after discovery")
 
+	// Another writer already owns the instance's ID, so the insert fails.
+	lost, err := NewStorageWithProfile("_test_import_lost_insert")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lost.Close() })
+	winner := NewInstance("same id", t.TempDir())
+	winner.ID = inst.ID
+	if err := lost.InsertSessionAndVerify(winner, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := lost.InsertSessionAndVerify(inst, nil); !errors.Is(err, ErrSessionAlreadyExists) {
+		t.Fatalf("insert over an existing ID = %v, want ErrSessionAlreadyExists", err)
+	}
+	assertTmuxSessionUnstamped(t, socketName, "user-work", "after a failed insert")
+
+	storage, err := NewStorageWithProfile("_test_import_stamp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatal(err)
+	}
 	inventory, err := tmux.ListRuntimeGenerationCandidates(socketName, inst.ID)
 	if err != nil {
 		t.Fatal(err)

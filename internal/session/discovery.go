@@ -1,16 +1,16 @@
 package session
 
 import (
-	"log/slog"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
-// DiscoverExistingTmuxSessions finds all tmux sessions and converts them to instances
+// DiscoverExistingTmuxSessions finds all tmux sessions and converts them to instances.
+// It stamps nothing: an import's ownership grant runs only once
+// InsertSessionAndVerify has persisted the instance (runtime_import.go).
 func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, error) {
 	// Get all tmux sessions
 	tmuxSessions, err := tmux.DiscoverAllTmuxSessions()
@@ -75,20 +75,13 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 			Tool:                   tool,
 			TmuxSocketName:         sess.SocketName, // Inherit from the tmux session we discovered (#687)
 			tmuxSession:            sess,
+			// Importing is the user's grant of ownership, applied once the
+			// import's insert commits this instance (runtime_import.go).
+			importOwnershipPending: true,
 		}
 		// DiscoverAllTmuxSessions builds bare wrappers; configure this one the
 		// way storage load does before touching the live session with it.
 		inst.configureTmuxWrapperLocked(sess)
-		// Importing is the user's grant of ownership: stamp the session so
-		// stop, restart and delete can prove it is this instance's runtime.
-		// A session that cannot be stamped is still imported; its lifecycle
-		// operations refuse with the manual remedy instead.
-		if err := inst.grantImportedRuntimeOwnership(); err != nil {
-			sessionLog.Warn("import_ownership_stamp_failed",
-				slog.String("instance_id", inst.ID),
-				slog.String("tmux_session", logging.SanitizeValue(sess.Name)),
-				slog.String("error", err.Error()))
-		}
 
 		// Enable mouse mode for proper scrolling in imported sessions
 		// Ignore errors - non-fatal, older tmux versions may not support all options
