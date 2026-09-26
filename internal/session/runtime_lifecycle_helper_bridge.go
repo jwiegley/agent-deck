@@ -206,6 +206,7 @@ func RunRuntimeLifecycleCrashHelper(config RuntimeLifecycleHelperConfig) error {
 	oldRespawn := runtimeCandidateRespawnFn
 	oldGenerationInventory := runtimeGenerationCandidateInventoryFn
 	oldTerminate := terminateCapturedRuntimeFn
+	oldSelectedExists := selectedRuntimeSessionExistsFn
 	oldDiscoverChildren := discoverCapturedRuntimeChildrenFn
 	oldReserved := runtimeDestructionReservedFn
 	oldNow := nowFn
@@ -220,6 +221,7 @@ func RunRuntimeLifecycleCrashHelper(config RuntimeLifecycleHelperConfig) error {
 		runtimeCandidateRespawnFn = oldRespawn
 		runtimeGenerationCandidateInventoryFn = oldGenerationInventory
 		terminateCapturedRuntimeFn = oldTerminate
+		selectedRuntimeSessionExistsFn = oldSelectedExists
 		discoverCapturedRuntimeChildrenFn = oldDiscoverChildren
 		runtimeDestructionReservedFn = oldReserved
 		nowFn = oldNow
@@ -265,6 +267,20 @@ func RunRuntimeLifecycleCrashHelper(config RuntimeLifecycleHelperConfig) error {
 			})
 		}
 		return matching, nil
+	}
+	// A destruction that finds no candidate asks whether the selected session
+	// still answers; the same JSON oracle answers for it.
+	selectedRuntimeSessionExistsFn = func(socketName, sessionName string) (bool, error) {
+		candidates, err := readRuntimeLifecycleInventory(config.InventoryPath)
+		if err != nil {
+			return false, err
+		}
+		for _, candidate := range candidates {
+			if candidate.SocketName == socketName && candidate.SessionName == sessionName {
+				return true, nil
+			}
+		}
+		return false, nil
 	}
 	discoverCapturedRuntimeChildrenFn = func(*Instance, tmux.RuntimeGenerationCandidate) ([]tmux.ProcessIdentity, error) {
 		return nil, nil

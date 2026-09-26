@@ -40,6 +40,10 @@ func TestStorageTwoCLIProcesses(t *testing.T) {
 			require.NoError(t, os.MkdirAll(binDir, 0700))
 			require.NoError(t, os.WriteFile(filepath.Join(binDir, "tmux"), []byte(`#!/bin/sh
 for arg in "$@"; do
+  if [ "$arg" = "has-session" ] && [ -n "$STORAGE_NO_TMUX_SESSIONS" ]; then
+    echo "no server running on /tmp/storage-acceptance" >&2
+    exit 1
+  fi
   if [ "$arg" = "set-environment" ] && [ -n "$STORAGE_BARRIER" ]; then
     : > "$STORAGE_BARRIER.ready"
     attempts=0
@@ -55,6 +59,7 @@ exit 0
 `), 0700))
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer cancel()
+			var extraEnv []string
 			start := func(barrier string, args ...string) (*exec.Cmd, *bytes.Buffer) {
 				cmd := exec.CommandContext(ctx, channelsCLIBinary(t), args...)
 				for _, item := range cliEnvForIssue1031(home) {
@@ -65,6 +70,7 @@ exit 0
 				cmd.Env = append(cmd.Env, "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 					"XDG_CONFIG_HOME="+filepath.Join(home, ".config"), "XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),
 					"XDG_CACHE_HOME="+filepath.Join(home, ".cache"), "STORAGE_BARRIER="+barrier)
+				cmd.Env = append(cmd.Env, extraEnv...)
 				output := new(bytes.Buffer)
 				cmd.Stdout, cmd.Stderr = output, output
 				require.NoError(t, cmd.Start())
@@ -89,6 +95,11 @@ exit 0
 			case "disjoint account":
 				b, bOut = start("", "session", "set", "shared", "account", "seminno", "--json")
 			case "deleted row":
+				// The remover's tmux has no live session, as its empty
+				// list-sessions inventory says. A live session no inventory
+				// can prove is Agent Deck's is refused rather than recorded
+				// stopped, and this scenario is about the row, not tmux.
+				extraEnv = []string{"STORAGE_NO_TMUX_SESSIONS=1"}
 				b, bOut = start("", "rm", "shared")
 			case "new addition":
 				b, bOut = start("", "add", home, "--title", "bob", "--no-parent", "--json")

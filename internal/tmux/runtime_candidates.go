@@ -91,6 +91,7 @@ func snapshotRuntimeCandidatesOnSocket(socketName string) (map[string][]RuntimeC
 	}
 
 	byInstance := make(map[string][]RuntimeCandidate)
+	var unprefixed []RuntimeCandidate
 	for _, line := range strings.Split(strings.TrimSuffix(string(out), "\n"), "\n") {
 		if line == "" {
 			continue
@@ -101,16 +102,61 @@ func snapshotRuntimeCandidatesOnSocket(socketName string) (map[string][]RuntimeC
 		}
 		sessionID, name := strings.TrimSpace(fields[0]), strings.TrimSpace(fields[1])
 		paneID, instanceID := strings.TrimSpace(fields[2]), strings.TrimSpace(fields[3])
-		if name == "" || !strings.HasPrefix(name, SessionPrefix) || instanceID == "" {
+		if name == "" || instanceID == "" {
 			continue
 		}
 		if !validTmuxStableID(sessionID, '$') || !validTmuxStableID(paneID, '%') {
 			return nil, fmt.Errorf("tmux: invalid stable runtime candidate identity on socket %q", socketName)
 		}
 		candidate := runtimeCandidateFromFields(socketName, fields)
+		if !strings.HasPrefix(name, SessionPrefix) {
+			unprefixed = append(unprefixed, candidate)
+			continue
+		}
 		byInstance[instanceID] = append(byInstance[instanceID], candidate)
 	}
+	if err := admitStampedUnprefixedRuntimeCandidates(socketName, unprefixed, byInstance); err != nil {
+		return nil, err
+	}
 	return byInstance, nil
+}
+
+// admitStampedUnprefixedRuntimeCandidates admits a session whose name lacks
+// SessionPrefix only on Agent Deck's session-local cleanup stamp for the same
+// instance. Agent Deck starts a persisted runtime under whatever tmux name the
+// instance carries (an imported or fixture name included) and stamps it, so
+// the name is no evidence either way. Its #{E:} fields are not evidence
+// either: tmux falls back to the server's global environment, which a server
+// started from inside an Agent Deck pane inherits wholesale. The local stamp
+// is the authority the cleanup inventory and every conditional mutation
+// already require, and it costs one bounded batch only when such a session
+// exists.
+func admitStampedUnprefixedRuntimeCandidates(socketName string, claims []RuntimeCandidate, byInstance map[string][]RuntimeCandidate) error {
+	if len(claims) == 0 {
+		return nil
+	}
+	identities := make([]RuntimeBindingCandidate, 0, len(claims))
+	for _, claim := range claims {
+		identities = append(identities, RuntimeBindingCandidate{SessionID: claim.SessionID})
+	}
+	localOptions, err := runtimeCleanupLocalOptionsFn(socketName, identities)
+	if err != nil {
+		return fmt.Errorf("tmux: snapshot runtime candidates: %w", err)
+	}
+	for _, claim := range claims {
+		options := localOptions[claim.SessionID]
+		stamped := true
+		for _, name := range runtimeCleanupOptionNames {
+			if !options[name].present {
+				stamped = false
+				break
+			}
+		}
+		if stamped && options[runtimeCleanupInstanceOption].value == claim.InstanceID {
+			byInstance[claim.InstanceID] = append(byInstance[claim.InstanceID], claim)
+		}
+	}
+	return nil
 }
 
 func runtimeCandidateFromFields(socketName string, fields []string) RuntimeCandidate {
@@ -187,9 +233,11 @@ func (s RuntimeCandidateSnapshot) Candidates(instanceID string, socketNames ...s
 }
 
 // RevalidateRuntimeCandidate re-probes only a selected adoption target. It is
-// intentionally not used while building the socket snapshot.
+// intentionally not used while building the socket snapshot. It reads the
+// session's own environment (show-environment without -g), so it needs no
+// name convention: the snapshot already admitted the candidate.
 func RevalidateRuntimeCandidate(candidate RuntimeCandidate) (RuntimeCandidate, error) {
-	if candidate.InstanceID == "" || candidate.SessionName == "" || !strings.HasPrefix(candidate.SessionName, SessionPrefix) {
+	if candidate.InstanceID == "" || candidate.SessionName == "" {
 		return RuntimeCandidate{}, fmt.Errorf("tmux: invalid runtime candidate identity")
 	}
 	target := candidate.SessionName
@@ -230,6 +278,28 @@ func RevalidateRuntimeCandidate(candidate RuntimeCandidate) (RuntimeCandidate, e
 		}
 	}
 	return verified, nil
+}
+
+// SelectedRuntimeSessionExists asks the server on socketName whether the exact
+// tmux session a durable runtime tuple names still answers has-session. The
+// "=" target disables tmux's prefix and pattern matching, so a similarly named
+// neighbour never answers for it. Only a successful exit is presence. tmux's
+// canonical missing-session answer and the empty-server exits the runtime
+// inventories already read as empty are absence. Anything else is
+// indeterminate and returned as an error, so a destructive caller refuses
+// rather than recording a live process stopped.
+func SelectedRuntimeSessionExists(socketName, sessionName string) (bool, error) {
+	if sessionName == "" {
+		return false, fmt.Errorf("tmux: empty selected runtime session name")
+	}
+	_, err := runBoundedOutput(socketName, "has-session", "-t", "="+sessionName)
+	if err == nil {
+		return true, nil
+	}
+	if isCanonicalMissingSessionResult(err, sessionName) || isEmptyTmuxServerResult(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("tmux: probe selected runtime session %q on socket %q: %w", sessionName, socketName, err)
 }
 
 // ListRuntimeCandidates inventories exact AGENTDECK_INSTANCE_ID matches on one
