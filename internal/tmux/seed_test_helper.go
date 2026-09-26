@@ -75,6 +75,21 @@ func ExpireStartupWindowForTest(t testing.TB, s *Session) {
 	s.mu.Unlock()
 }
 
+// ResetDefaultServerSessionsForTest drops the foreign-server guard's cached
+// default-server listing (foreign_server.go), now and at cleanup, so a test
+// that stages a default server is not answered from a listing up to
+// defaultServerSessionsTTL old.
+func ResetDefaultServerSessionsForTest(t testing.TB) {
+	t.Helper()
+	reset := func() {
+		defaultServerSessions.Lock()
+		defaultServerSessions.names, defaultServerSessions.err, defaultServerSessions.at = nil, nil, time.Time{}
+		defaultServerSessions.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
+}
+
 // ExpirePaneInfoCacheForTest leaves the cache contents intact but rewinds the
 // timestamp past the freshness threshold so GetCachedPaneInfo treats it as
 // stale. Used to model the case where backgroundStatusUpdate hasn't run for a

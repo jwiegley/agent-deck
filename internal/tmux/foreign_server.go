@@ -50,14 +50,25 @@ var defaultServerSessions struct {
 	at    time.Time
 }
 
+// listDefaultServerSessions lists the default server for the guard below.
+// Unlike ListSessionNamesOnSocket it reports a missing default socket as an
+// error, not as a server with no sessions: this process computes that socket
+// from its own TMUX_TMPDIR, and "no default server exists" looks the same as
+// "the default server lives at a path I do not compute" (a TMUX_TMPDIR
+// mismatch, or a socket file unlinked under a live server).
+func listDefaultServerSessions() (map[string]struct{}, error) {
+	return listSessionNamesOnSocket(defaultTmuxSocketName, isNoTmuxServerResult)
+}
+
 // defaultServerHasSession answers from one cached `list-sessions` of the
-// default server. An indeterminate probe (timeout) counts as present: it is no
-// evidence that the session is gone.
+// default server. An indeterminate probe (timeout, or a default server this
+// process cannot reach) counts as present: it is no evidence that the session
+// is gone.
 func defaultServerHasSession(name string) bool {
 	defaultServerSessions.Lock()
 	defer defaultServerSessions.Unlock()
 	if defaultServerSessions.at.IsZero() || time.Since(defaultServerSessions.at) > defaultServerSessionsTTL {
-		defaultServerSessions.names, defaultServerSessions.err = ListSessionNamesOnSocket(defaultTmuxSocketName)
+		defaultServerSessions.names, defaultServerSessions.err = listDefaultServerSessions()
 		defaultServerSessions.at = time.Now()
 	}
 	if defaultServerSessions.err != nil {
