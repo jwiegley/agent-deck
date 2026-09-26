@@ -424,13 +424,30 @@ func TestRuntimeLifecycle_ReservedRecoveryBypassesLateLegacyWriter(t *testing.T)
 // private server) inventories the native default socket "" on that private
 // server. Its empty inventory is no proof that a reserved default-server
 // runtime is gone, so reconciliation keeps the reservation while the default
-// server cannot be listed. Once the default server answers without the
-// session, the runtime is gone everywhere and the destruction completes.
+// server cannot be listed or still has the session. Once the default server
+// answers without the session, the runtime is gone everywhere and the
+// destruction completes. A process outside tmux inventories the default
+// server itself and never consults the guard.
+//
+// The default server's answer is staged: this test runs in the SQLite-only
+// runtime-lifecycle gate, where tmux is a stub. The guard's reading of a real
+// server is TestAbsenceIsForeignServer_UnlistableDefaultServerFormsNoVerdict.
 func TestRuntimeLifecycle_ReservedDefaultSocketRuntimeNeedsVisibleServer(t *testing.T) {
-	skipIfNoTmuxBinary(t)
+	unreachable := errors.New("error connecting to /tmp/tmux-501/default (No such file or directory)")
 	for _, entrypoint := range []string{"direct", "snapshot"} {
-		for _, listable := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/default-server-listable=%t", entrypoint, listable), func(t *testing.T) {
+		for _, c := range []struct {
+			name      string
+			foreign   bool // this process runs inside another tmux server
+			listErr   error
+			listed    []string
+			keepsHeld bool
+		}{
+			{name: "default server unreachable", foreign: true, listErr: unreachable, keepsHeld: true},
+			{name: "default server has the session", foreign: true, listed: []string{"runtime-g0"}, keepsHeld: true},
+			{name: "default server answers without the session", foreign: true, listed: []string{"agentdeck_other"}},
+			{name: "outside tmux", listErr: unreachable},
+		} {
+			t.Run(entrypoint+"/"+c.name, func(t *testing.T) {
 				installRuntimeLifecycleTestSeams(t)
 				db, inst := runtimeLifecycleTestDBOnSocket(t, "pi", nil, "")
 				durable, found, err := db.ReadRuntimeState(inst.ID)
@@ -441,20 +458,12 @@ func TestRuntimeLifecycle_ReservedDefaultSocketRuntimeNeedsVisibleServer(t *test
 				if err != nil {
 					t.Fatal(err)
 				}
-				if !listable {
-					// The default socket this process computes does not exist
-					// (a TMUX_TMPDIR mismatch). Short /tmp root: sun_path.
-					tmpdir, err := os.MkdirTemp("/tmp", "adfs-")
-					if err != nil {
-						t.Fatal(err)
-					}
-					t.Cleanup(func() { _ = os.RemoveAll(tmpdir) })
-					t.Setenv("TMUX_TMPDIR", tmpdir)
+				tmuxEnv := ""
+				if c.foreign {
+					tmuxEnv = filepath.Join(t.TempDir(), "foreign") + ",1,0"
 				}
-				// Otherwise TMUX_TMPDIR stays the package's isolated one, whose
-				// default server (TestMain's bootstrap) lacks runtime-g0.
-				t.Setenv("TMUX", filepath.Join(t.TempDir(), "foreign")+",1,0")
-				tmux.ResetDefaultServerSessionsForTest(t)
+				t.Setenv("TMUX", tmuxEnv)
+				tmux.StageDefaultServerSessionsForTest(t, c.listErr, c.listed...)
 
 				var result RuntimeReconciliationResult
 				if entrypoint == "direct" {
@@ -472,7 +481,7 @@ func TestRuntimeLifecycle_ReservedDefaultSocketRuntimeNeedsVisibleServer(t *test
 				if readErr != nil || !found {
 					t.Fatalf("read durable after reconcile: state=%#v found=%v err=%v", got, found, readErr)
 				}
-				if !listable {
+				if c.keepsHeld {
 					var ambiguity *RuntimeReconciliationAmbiguityError
 					if !errors.As(err, &ambiguity) {
 						t.Fatalf("reconcile err=%v result=%#v, want an ambiguity that keeps the reservation", err, result)
