@@ -139,6 +139,15 @@ func TestSpawnDiedBeforeCommit_StartWithMessageReportsMessageUndelivered(t *test
 	require.Equal(t, before, partial.Runtime)
 	require.Equal(t, before, runtime)
 	require.Equal(t, before, durableRuntimeForTest(t, storage, inst.ID), "nothing was published")
+
+	// The operator is told the session exited, not that it started, and no
+	// reconciliation of a runtime that never lived is attempted or reported.
+	require.True(t, inst.ReconcileRestartResult(err) == err, "a spawn proved gone has nothing to reconcile")
+	canonical, failure, warning := ConsumePhysicalRuntimeResult(inst, runtime, err, nil)
+	require.NoError(t, failure)
+	require.Equal(t, "session "+inst.ID+" exited before its initial message could be delivered", warning)
+	require.Equal(t, before, canonical)
+	require.Equal(t, before, inst.RuntimeState())
 }
 
 // A restart whose replacement died before publication behaves the same way:

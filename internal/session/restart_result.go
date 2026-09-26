@@ -39,6 +39,10 @@ func (e *RestartPartialSuccessError) Error() string {
 	if e.NeedsReconciliation {
 		return fmt.Sprintf("%s completed for %s but runtime generation persistence failed: %v", operation, e.InstanceID, e.Err)
 	}
+	if e.MessageUndelivered && spawnedRuntimeGone(e.Err) {
+		// Nothing started: the pane died before its generation was published.
+		return fmt.Sprintf("session %s exited before its initial message could be delivered", e.InstanceID)
+	}
 	if e.MessageUndelivered {
 		return fmt.Sprintf("session %s started but its initial message was not delivered: %v", e.InstanceID, e.Err)
 	}
