@@ -2068,32 +2068,38 @@ func (s *StateDB) PersistInstanceStatusesTx(updates []InstanceStatusUpdate) erro
 
 // WriteClaudeSessionBinding atomically updates claude_session_id and
 // claude_detected_at inside the tool_data JSON column for the given
-// instance. Used by the hook-rebind path (UpdateHookStatus →
-// bindClaudeSessionFromHook) to persist the new session ID without a
-// whole-row INSERT OR REPLACE — which would clobber any concurrent
-// writes to other tool_data fields by writers holding a stale snapshot
-// of the instance.
+// instance and records the id as its authoritative recall link. It is
+// upstream's hook-rebind writer (UpdateHookStatus →
+// bindClaudeSessionFromHook). The fork's hook paths call neither it nor
+// its Codex and Gemini siblings: they publish a binding through the
+// runtime binding CAS, whose commit writes the same targeted json_set
+// projection of tool_data, and record the link after it
+// (Instance.confirmHookSessionLink, via LinkRuntimeBinding). No
+// production path calls these three writers; they remain for upstream
+// parity.
 //
-// PERSIST-12 (see instance.go:bindClaudeSessionFromHook doc comment)
-// originally deferred this to an external "save cycle", but none of the
-// three UpdateHookStatus callers (TUI tick, web refresh, CLI status
-// refresh) actually call Save after rebind. Without this targeted
-// write, tool_data.claude_session_id stays pinned at the pre-/clear
-// UUID indefinitely for any DB-direct consumer (claudopticon, etc.) —
-// and the lifecycle log accumulates fresh "rebind" entries forever
-// because concurrent processes keep reloading the stale row from disk
-// and clobbering the in-memory mutation.
+// The targeted json_set, rather than a whole-row INSERT OR REPLACE,
+// keeps a writer holding a stale snapshot of the instance from
+// clobbering concurrent writes to other tool_data fields.
+//
+// PERSIST-12 (see publishObservedRuntimeBindingLocked in
+// internal/session) originally deferred this to an external "save
+// cycle", but none of the three UpdateHookStatus callers (TUI tick, web
+// refresh, CLI status refresh) actually call Save after rebind. Without
+// a targeted write, tool_data.claude_session_id stays pinned at the
+// pre-/clear UUID indefinitely for any DB-direct consumer (claudopticon,
+// etc.) — and the lifecycle log accumulates fresh "rebind" entries
+// forever because concurrent processes keep reloading the stale row from
+// disk and clobbering the in-memory mutation.
 //
 // Wrapped in withBusyRetry: SQLite serializes writers through a single
 // write lock, so under contention with WriteStatus / SaveInstance /
 // heartbeat writers a transient SQLITE_BUSY would otherwise drop this
 // update — matching the WriteStatus rationale above.
 //
-// Recall phase 1: the same call also records the mapping in session_links
-// (authoritative), in the same transaction as the binding. The hook paths
-// publish bindings through the runtime binding CAS instead and record the
-// link after it (Instance.confirmHookSessionLink, via LinkRuntimeBinding);
-// the adoption arbitration retracts a rejected candidate via
+// Recall phase 1: the session_links row (authoritative) is upserted in
+// the same transaction as the binding, so the link never exists without
+// it. The adoption arbitration retracts a rejected candidate via
 // RetractSessionLink.
 func (s *StateDB) WriteClaudeSessionBinding(id, sessionID string, detectedAt time.Time) error {
 	return s.writeHarnessSessionBinding(id, sessionID, "claude", detectedAt)
@@ -2134,10 +2140,11 @@ func (s *StateDB) writeHarnessSessionBinding(id, sessionID, harness string, dete
 // WriteCodexSessionBinding is the Codex counterpart of
 // WriteClaudeSessionBinding: it atomically rewrites $.codex_session_id
 // and $.codex_detected_at inside the tool_data JSON column without
-// touching any unrelated keys. See WriteClaudeSessionBinding for the
-// full rationale (PERSIST-12, json_set vs. tool_data = ?, withBusyRetry).
-// This sibling exists because the Codex rebind path in
-// bindCodexSessionFromHook has the same in-memory-only mutation shape
+// touching any unrelated keys, and records the recall link. See
+// WriteClaudeSessionBinding for the full rationale (PERSIST-12, json_set
+// vs. tool_data = ?, withBusyRetry) and for what the fork's hook paths
+// use instead. Upstream added it because its Codex rebind path in
+// bindCodexSessionFromHook had the same in-memory-only mutation shape
 // that the Claude fix in #1140 addressed — tracked as #1139.
 func (s *StateDB) WriteCodexSessionBinding(id, sessionID string, detectedAt time.Time) error {
 	return s.writeHarnessSessionBinding(id, sessionID, "codex", detectedAt)
@@ -2145,9 +2152,9 @@ func (s *StateDB) WriteCodexSessionBinding(id, sessionID string, detectedAt time
 
 // WriteGeminiSessionBinding is the Gemini counterpart of
 // WriteClaudeSessionBinding. See that function's doc comment for the
-// PERSIST-12 / json_set / withBusyRetry rationale; the Gemini rebind
-// path in bindGeminiSessionFromHook had the same persistence gap
-// (#1139).
+// PERSIST-12 / json_set / withBusyRetry rationale and for what the
+// fork's hook paths use instead; upstream's Gemini rebind path in
+// bindGeminiSessionFromHook had the same persistence gap (#1139).
 func (s *StateDB) WriteGeminiSessionBinding(id, sessionID string, detectedAt time.Time) error {
 	return s.writeHarnessSessionBinding(id, sessionID, "gemini", detectedAt)
 }

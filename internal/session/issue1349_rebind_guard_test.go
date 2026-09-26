@@ -106,8 +106,9 @@ func bootstrapDaemonProfile(t *testing.T, profile string) (*TransitionDaemon, *S
 	}
 	t.Cleanup(func() { _ = storage.Close() })
 
-	// Wire the global DB so bindClaudeSessionFromHook's WriteClaudeSessionBinding
-	// persists into the same DB we read back from.
+	// Wire the global DB so bindClaudeSessionFromHook's runtime binding
+	// publish, and the recall link recorded after it, persist into the same
+	// DB we read back from.
 	statedb.SetGlobal(storage.GetDB())
 	t.Cleanup(func() { statedb.SetGlobal(nil) })
 
