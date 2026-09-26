@@ -212,7 +212,8 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 		inject func(*testing.T, string)
 		// reason opens the skip reason, and detail must appear later in it.
 		reason, detail string
-		// heartbeat is the heartbeat_enabled flag the skipped conductor keeps.
+		// heartbeat is the heartbeat_enabled flag the skipped conductor keeps,
+		// which its aborted entry must report.
 		heartbeat bool
 	}{
 		// A refused runtime action leaves the heartbeat and directory alone.
@@ -257,9 +258,10 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 						Removed  bool     `json:"removed"`
 						Teardown []string `json:"teardown"`
 						Aborted  []struct {
-							Name    string `json:"name"`
-							Profile string `json:"profile"`
-							Reason  string `json:"reason"`
+							Name      string `json:"name"`
+							Profile   string `json:"profile"`
+							Heartbeat *bool  `json:"heartbeat"`
+							Reason    string `json:"reason"`
 						} `json:"aborted"`
 					}
 					if err := json.Unmarshal([]byte(out), &result); err != nil {
@@ -271,6 +273,9 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 					if len(result.Aborted) != 1 || result.Aborted[0].Name != name || result.Aborted[0].Profile != "default" ||
 						!strings.HasPrefix(result.Aborted[0].Reason, tc.reason) || !strings.Contains(result.Aborted[0].Reason, tc.detail) {
 						t.Fatalf("aborted = %s, want %s with reason %q ... %q", out, name, tc.reason, tc.detail)
+					}
+					if heartbeat := result.Aborted[0].Heartbeat; heartbeat == nil || *heartbeat != tc.heartbeat {
+						t.Fatalf("aborted entry must report heartbeat %v: %s", tc.heartbeat, out)
 					}
 				} else {
 					if strings.Contains(out, "Teardown complete.") {
@@ -298,8 +303,10 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 }
 
 // A conductor directory that cannot be removed leaves the teardown incomplete
-// and fails the command too, although upstream only warns. It is not a
-// TestRuntimeLifecycle_ case: that gate counts the root skip as a failure.
+// and fails the command too, although upstream only warns. The session row and
+// heartbeat are already gone by then, so the report must say the heartbeat is
+// off. It is not a TestRuntimeLifecycle_ case: that gate counts the root skip
+// as a failure.
 func TestConductorTeardownReportsDirectoryRemovalFailure(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: a read-only directory would not block the removal")
@@ -344,8 +351,9 @@ func TestConductorTeardownReportsDirectoryRemovalFailure(t *testing.T) {
 					Success  *bool    `json:"success"`
 					Teardown []string `json:"teardown"`
 					Aborted  []struct {
-						Name   string `json:"name"`
-						Reason string `json:"reason"`
+						Name      string `json:"name"`
+						Heartbeat *bool  `json:"heartbeat"`
+						Reason    string `json:"reason"`
 					} `json:"aborted"`
 				}
 				if err := json.Unmarshal([]byte(out), &result); err != nil {
@@ -354,6 +362,9 @@ func TestConductorTeardownReportsDirectoryRemovalFailure(t *testing.T) {
 				if result.Success == nil || *result.Success || result.Teardown == nil || len(result.Teardown) != 0 ||
 					len(result.Aborted) != 1 || result.Aborted[0].Name != name || !strings.HasPrefix(result.Aborted[0].Reason, reason) {
 					t.Fatalf("teardown must report %s skipped with reason %q: %s", name, reason, out)
+				}
+				if heartbeat := result.Aborted[0].Heartbeat; heartbeat == nil || *heartbeat {
+					t.Fatalf("aborted entry must report the heartbeat off: %s", out)
 				}
 			} else {
 				summary := "Teardown incomplete: 1 of 1 conductor(s) not torn down:\n  " + name + " (profile: default): " + reason

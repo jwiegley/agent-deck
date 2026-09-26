@@ -763,12 +763,18 @@ func applyConductorRuntimeAction(target conductorRuntimeTarget, selection sessio
 }
 
 // conductorTeardownAbort is a conductor that teardown skipped, and why. Any
-// skip fails the command, because a zero exit tells the caller the heartbeat
-// is off and a skipped conductor may still have it on.
+// incomplete teardown fails the command, because a zero exit tells the caller
+// every target was fully torn down.
+//
+// Separately, some skipped conductors still have the heartbeat on: a skip
+// before the runtime action is confirmed leaves it as it was, while a later
+// skip has already turned it off. Heartbeat is its state after the skip,
+// under the `conductor status` key.
 type conductorTeardownAbort struct {
-	Name    string `json:"name"`
-	Profile string `json:"profile"`
-	Reason  string `json:"reason"`
+	Name      string `json:"name"`
+	Profile   string `json:"profile"`
+	Heartbeat bool   `json:"heartbeat"`
+	Reason    string `json:"reason"`
 }
 
 // handleConductorTeardown stops conductors and optionally removes directories
@@ -869,16 +875,21 @@ func handleConductorTeardown(_ string, args []string) {
 	removed := make([]string, 0, len(targets))
 	var aborted []conductorTeardownAbort
 	abort := func(meta session.ConductorMeta, reason string) {
-		aborted = append(aborted, conductorTeardownAbort{Name: meta.Name, Profile: meta.Profile, Reason: reason})
+		aborted = append(aborted, conductorTeardownAbort{
+			Name: meta.Name, Profile: meta.Profile, Heartbeat: meta.HeartbeatEnabled, Reason: reason,
+		})
 		if !*jsonOutput {
 			fmt.Fprintf(os.Stderr, "  Warning: %s\n", reason)
 		}
 	}
-	disableHeartbeat := func(name string) {
-		if err := session.UninstallHeartbeatDaemon(name); err != nil {
-			fmt.Fprintf(os.Stderr, "Error disabling heartbeat for %s: %v\n", name, err)
+	// disableHeartbeat also clears the loop's copy of the meta, so a later
+	// abort reports the heartbeat as off.
+	disableHeartbeat := func(conductor *session.ConductorMeta) {
+		if err := session.UninstallHeartbeatDaemon(conductor.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "Error disabling heartbeat for %s: %v\n", conductor.Name, err)
 			os.Exit(1)
 		}
+		conductor.HeartbeatEnabled = false
 	}
 conductorLoop:
 	for _, meta := range targets {
@@ -957,7 +968,7 @@ conductorLoop:
 				// verified, so the stale-generation fence no longer applies:
 				// disable the heartbeat as a completed removal would, but keep the
 				// directory so a rerun can finish the teardown.
-				disableHeartbeat(meta.Name)
+				disableHeartbeat(&meta)
 				abort(meta, fmt.Sprintf("failed to save groups in %s: %v", meta.Profile, saveErr))
 				continue
 			}
@@ -969,7 +980,7 @@ conductorLoop:
 
 		// Heartbeat and directory teardown are downstream of the conditional
 		// runtime action, so a stale generation cannot remove either one.
-		disableHeartbeat(meta.Name)
+		disableHeartbeat(&meta)
 		if *removeAll {
 			if err := session.TeardownConductor(meta.Name); err != nil {
 				abort(meta, fmt.Sprintf("failed to remove dir for %s: %v", meta.Name, err))
