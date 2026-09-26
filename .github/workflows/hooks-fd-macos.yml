@@ -134,9 +134,14 @@ jobs:
           set -e
           cat evidence/undo-base-red.log
           test "$undo_status" -eq 1
-          # The fork's lifecycle command prunes hooks before it reports, so undo
-          # cannot race cleanup. The async revision's handler schedules cleanup
-          # itself, outside that command, which is what let its undo race it.
+          # This red proves the report-handler invariant, not an undo-specific
+          # race: the async revision's handler schedules hook cleanup itself,
+          # outside the lifecycle command, and the delete and finish cases
+          # would trip the same check. That handler-side cleanup is what let the
+          # async revision's undo race cleanup; the fork's lifecycle command
+          # prunes hooks before it reports, so undo cannot race it. The test's
+          # undo-specific assertion ('undo offered before hook cleanup
+          # completed') has no baseline red of its own.
           grep -F -- 'deletion handler scheduled work outside lifecycle authority' evidence/undo-base-red.log
           grep -F -- '--- FAIL: TestHookCleanupDeletionKeepsUIResponsive/undo' evidence/undo-base-red.log
           run_tests head "$HEAD_REVISION" "$regression" ./internal/session ./internal/ui 2>&1 | tee evidence/cleanup-head-green.log
