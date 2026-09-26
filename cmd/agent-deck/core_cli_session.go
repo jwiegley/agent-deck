@@ -61,7 +61,11 @@ func cliSessionStart(profile string, args []string) {
 		Message: initialMessage,
 		Yolo:    *yoloMode,
 		NoWait:  *noWait,
-	}, nil)
+	}, func(ev core.Event) {
+		if ev.Kind == core.EventRuntimeWarning && !out.jsonMode && !out.quietMode {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", ev.Message)
+		}
+	})
 	if res.Err != nil {
 		exitCoreError(out, &jsonOutput, res, nil)
 	}
@@ -113,6 +117,9 @@ func cliSessionStart(profile string, args []string) {
 		"id":      started.ID,
 		"title":   started.Title,
 	}
+	if started.Warning != "" {
+		jsonData["warning"] = started.Warning
+	}
 	if started.Tmux != "" {
 		jsonData["tmux"] = started.Tmux
 	}
@@ -121,8 +128,8 @@ func cliSessionStart(profile string, args []string) {
 	}
 	if started.Message != "" {
 		jsonData["message"] = started.Message
-		jsonData["message_pending"] = false
-		out.Success(fmt.Sprintf("Started session: %s (message sent)", started.Title), jsonData)
+		jsonData["message_pending"] = started.MessagePending
+		out.Success(fmt.Sprintf("Started session: %s %s", started.Title, initialMessageOutcome(started.MessagePending)), jsonData)
 	} else {
 		out.Success(fmt.Sprintf("Started session: %s", started.Title), jsonData)
 	}
@@ -151,8 +158,16 @@ func cliSessionStop(profile string, args []string) {
 	out := NewCLIOutput(jsonOutput.enabled(), *quiet || *quietShort)
 
 	res := runCore(profile, &jsonOutput, core.IDSessionStop, core.SessionStopIn{Profile: profile, Session: fs.Arg(0)}, func(ev core.Event) {
-		if ev.Kind == core.EventQueueDrainFailed {
+		switch ev.Kind {
+		case core.EventQueueDrainFailed:
 			fmt.Fprintf(os.Stderr, "queue drain failed to start %s: %v\n", ev.Title, ev.Err)
+			if ev.Message != "" {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", ev.Message)
+			}
+		case core.EventRuntimeWarning:
+			if !out.jsonMode && !out.quietMode {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", ev.Message)
+			}
 		}
 	})
 	if res.Err != nil {
@@ -171,6 +186,9 @@ func cliSessionStop(profile string, args []string) {
 		if stopped.Drained != "" {
 			result["drained"] = stopped.Drained
 			result["drained_title"] = stopped.DrainedTitle
+		}
+		if stopped.Warning != "" {
+			result["warning"] = stopped.Warning
 		}
 		out.Success(fmt.Sprintf("Stopped session: %s", stopped.Title), result)
 	}

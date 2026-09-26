@@ -2,11 +2,13 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -161,6 +163,14 @@ func TestRuntimeLifecycle_PhysicalEntrypointRoutingContract(t *testing.T) {
 		{"CLI spawn failure", "cmd/agent-deck/session_cmd.go", "failSpawnVerification", []string{"PersistSpawnFailureStatus"}},
 		{"spawn failure verdict", "internal/session/status_authority.go", "PersistSpawnFailureStatus", []string{"ReconcileRuntime", "PersistSelectedStatus"}},
 		{"CLI queued recovery", "cmd/agent-deck/session_cmd.go", "drainGroupQueue", []string{"StartRuntime", "consumeRuntimeResult", "PersistSelectedStatus"}},
+		{"core start seam", "internal/core/runtime_authority.go", "startRuntime", []string{"StartRuntime", "StartWithMessageRuntime"}},
+		{"core restart seam", "internal/core/runtime_authority.go", "restartRuntime", []string{"RestartWithEnvRuntime"}},
+		{"core runtime consumer", "internal/core/runtime_authority.go", "consumeRuntime", []string{"ConsumePhysicalRuntimeResult"}},
+		{"core start", "internal/core/session_start.go", "sessionStart", []string{"startRuntime", "InitialMessageUndelivered", "consumeRuntime", "PersistSelectedStatus"}},
+		{"core restart", "internal/core/session_restart.go", "sessionRestart", []string{"restartRuntime", "consumeRuntime"}},
+		{"core restart all", "internal/core/session_restart.go", "restartAll", []string{"restartRuntime", "consumeRuntime"}},
+		{"core queued recovery", "internal/core/session_stop.go", "drainGroupQueue", []string{"startRuntime", "consumeRuntime", "PersistSelectedStatus"}},
+		{"core spawn failure", "internal/core/session_common.go", "failSpawn", []string{"PersistSpawnFailureStatus"}},
 		{"CLI fork", "cmd/agent-deck/session_cmd.go", "handleSessionFork", []string{"StartRuntime", "consumeRuntimeResult"}},
 		{"CLI plugin mutation", "cmd/agent-deck/plugin_cmd.go", "pluginAttachOrDetach", []string{"RestartRuntime", "consumeRuntimeResult"}},
 		{"CLI skill mutation", "cmd/agent-deck/skill_cmd.go", "restartProjectSkillsSession", []string{"RestartRuntime", "consumeRuntimeResult"}},
@@ -203,6 +213,89 @@ func TestRuntimeLifecycle_PhysicalEntrypointRoutingContract(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The core registry is the default path for session start/stop/restart and
+// is also served by `agent-deck daemon serve`. Its command bodies must reach
+// the runtime only through the seams above: an error-only lifecycle call drops
+// the exact transition tuple and turns a partial success into a retryable
+// failure, an uncaptured kill can take out a replacement adopted mid-command,
+// and a Status assignment is dropped by the snapshot save.
+func TestRuntimeLifecycle_CoreRegistryBypassesNoRuntimeAuthority(t *testing.T) {
+	root := runtimeLifecycleSourceRoot(t)
+	dir := filepath.Join(root, "internal", "core")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forbiddenCalls := map[string]bool{
+		"Start": true, "StartWithMessage": true, "Restart": true, "RestartWithEnv": true,
+		"Kill": true, "KillAndWait": true,
+	}
+	parsed := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || filepath.Ext(name) != ".go" || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed++
+		where := func(pos token.Pos) string {
+			return fmt.Sprintf("internal/core/%s:%d", name, fset.Position(pos).Line)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			switch n := node.(type) {
+			case *ast.CallExpr:
+				if sel, ok := n.Fun.(*ast.SelectorExpr); ok && forbiddenCalls[sel.Sel.Name] {
+					t.Errorf("%s: calls error-only lifecycle method %s", where(n.Pos()), sel.Sel.Name)
+				}
+			case *ast.AssignStmt:
+				for idx, lhs := range n.Lhs {
+					sel, ok := lhs.(*ast.SelectorExpr)
+					if !ok || idx >= len(n.Rhs) {
+						continue
+					}
+					if runtimeOwnedAssignment(sel.Sel.Name, n.Rhs[idx]) {
+						t.Errorf("%s: assigns runtime-owned field %s", where(n.Pos()), sel.Sel.Name)
+					}
+				}
+			}
+			return true
+		})
+	}
+	if parsed == 0 {
+		t.Fatalf("no internal/core sources found under %s", dir)
+	}
+}
+
+// runtimeOwnedAssignment matches `x.Status = session.Status*` and
+// `x.LastStartedAt = time.Now()`, the in-memory writes a snapshot save drops.
+func runtimeOwnedAssignment(field string, rhs ast.Expr) bool {
+	switch field {
+	case "Status":
+		sel, ok := rhs.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		return ok && pkg.Name == "session" && strings.HasPrefix(sel.Sel.Name, "Status")
+	case "LastStartedAt":
+		call, ok := rhs.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		return ok && pkg.Name == "time" && sel.Sel.Name == "Now"
+	}
+	return false
 }
 
 func runtimeLifecycleFunctionCalls(t *testing.T, path, function string) map[string]int {

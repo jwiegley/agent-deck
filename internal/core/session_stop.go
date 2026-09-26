@@ -20,6 +20,7 @@ type SessionStopOut struct {
 	Title        string `json:"title"`
 	Drained      string `json:"drained,omitempty" doc:"Id of the queued session started in the freed slot"`
 	DrainedTitle string `json:"drained_title,omitempty"`
+	Warning      string `json:"warning,omitempty" doc:"Runtime durability warning of the drained session's start"`
 }
 
 func (deps Deps) sessionStop(ctx context.Context, in SessionStopIn) (SessionStopOut, error) {
@@ -31,6 +32,10 @@ func (deps Deps) sessionStop(ctx context.Context, in SessionStopIn) (SessionStop
 	if err != nil {
 		return SessionStopOut{}, err
 	}
+	// Freeze the runtime the caller resolved before any probe: syncing ids
+	// publishes bindings and can adopt a newer durable generation, which this
+	// stop must never kill.
+	selection := inst.CaptureRuntimeSelection()
 	if !inst.Exists() {
 		return SessionStopOut{}, Errorf(CodeNotRunning, "session '%s' is not running", inst.Title)
 	}
@@ -38,16 +43,20 @@ func (deps Deps) sessionStop(ctx context.Context, in SessionStopIn) (SessionStop
 	// Capture tool conversation ids before Kill: show-environment fails on
 	// a dead tmux session.
 	inst.SyncSessionIDsFromTmux()
-	if err := inst.Kill(); err != nil {
+	if err := inst.KillCaptured(selection); err != nil {
 		return SessionStopOut{}, &Error{Code: CodeInvalid, Message: fmt.Sprintf("failed to stop session: %v", err), Cause: err}
 	}
 
-	drained := drainGroupQueue(ctx, inst.GroupPath, d.instances, d.groups)
+	drained, warning := drainGroupQueue(ctx, d.storage, inst.GroupPath, d.instances, d.groups)
+	if warning != "" {
+		Warn(ctx, warning)
+		Emit(ctx, Event{Kind: EventRuntimeWarning, ID: drained.ID, Title: drained.Title, Message: warning})
+	}
 	if err := d.saveOr("failed to save session state"); err != nil {
 		return SessionStopOut{}, err
 	}
 
-	out := SessionStopOut{ID: inst.ID, Title: inst.Title}
+	out := SessionStopOut{ID: inst.ID, Title: inst.Title, Warning: warning}
 	if drained != nil {
 		out.Drained = drained.ID
 		out.DrainedTitle = drained.Title
@@ -62,22 +71,32 @@ func (deps Deps) sessionStop(ctx context.Context, in SessionStopIn) (SessionStop
 }
 
 // drainGroupQueue starts the oldest queued instance in groupPath when a slot
-// is free and returns it. Best-effort: a failed start is reported through
-// EventQueueDrainFailed and marks that instance errored.
-func drainGroupQueue(ctx context.Context, groupPath string, instances []*session.Instance, groups []*session.GroupData) *session.Instance {
+// is free and returns it with the start's runtime durability warning.
+// Best-effort: a failed start is reported through EventQueueDrainFailed and
+// durably marks that instance errored (when storage is given), so later stops
+// do not retry it ahead of the rest of the queue.
+func drainGroupQueue(ctx context.Context, storage *session.Storage, groupPath string, instances []*session.Instance, groups []*session.GroupData) (*session.Instance, string) {
 	tree := session.NewGroupTreeWithGroups(instances, groups)
 	max := session.GroupMaxConcurrent(tree, groupPath)
 	if session.IsAtCap(session.CountRunningInGroup(instances, groupPath), max) {
-		return nil
+		return nil, ""
 	}
 	next := session.FindNextQueued(instances, groupPath)
 	if next == nil {
-		return nil
+		return nil, ""
 	}
-	if err := next.Start(); err != nil {
-		next.Status = session.StatusError
-		Emit(ctx, Event{Kind: EventQueueDrainFailed, ID: next.ID, Title: next.Title, Err: err})
-		return nil
+	runtime, err := startRuntime(next, "")
+	err, warning := consumeRuntime(next, runtime, err)
+	if err != nil {
+		ev := Event{Kind: EventQueueDrainFailed, ID: next.ID, Title: next.Title, Err: err}
+		if storage != nil {
+			if statusErr := session.PersistSelectedStatus(storage, next, session.StatusError); statusErr != nil {
+				ev.Message = fmt.Sprintf("failed to save session error status: %v", statusErr)
+				Warn(ctx, ev.Message)
+			}
+		}
+		Emit(ctx, ev)
+		return nil, ""
 	}
-	return next
+	return next, warning
 }

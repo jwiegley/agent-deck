@@ -19,8 +19,12 @@
       "type": "integer"
     },
     "message": {
-      "description": "Initial message that was sent",
+      "description": "Initial message requested for the session",
       "type": "string"
+    },
+    "message_pending": {
+      "description": "The initial message was not delivered; the session is live without it",
+      "type": "boolean"
     },
     "status": {
       "description": "started or queued",
@@ -31,6 +35,10 @@
     },
     "tmux": {
       "description": "tmux session name",
+      "type": "string"
+    },
+    "warning": {
+      "description": "Runtime durability warning of a start that completed",
       "type": "string"
     }
   },
