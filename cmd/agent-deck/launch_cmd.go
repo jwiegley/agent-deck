@@ -868,10 +868,12 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// --no-wait loses nothing.
 	promptRidesArgv := initialMessage != "" && newInstance.PromptRidesCommandLine()
 	persistenceWarning := ""
+	messageUndelivered := false
 
 	if initialMessage != "" && (!*noWait || promptRidesArgv) {
 		if err := creationRollback.run("start session", func() error {
 			runtime, startErr := newInstance.StartWithMessageRuntime(initialMessage)
+			messageUndelivered = session.InitialMessageUndelivered(startErr)
 			startErr, persistenceWarning = consumeRuntimeResult(newInstance, runtime, startErr)
 			return startErr
 		}); err != nil {
@@ -991,7 +993,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	}
 	if initialMessage != "" {
 		jsonData["message"] = initialMessage
-		jsonData["message_pending"] = *noWait
+		jsonData["message_pending"] = *noWait || messageUndelivered
 	}
 	if len(mcpFlags) > 0 {
 		jsonData["mcps"] = mcpFlags
@@ -1022,10 +1024,10 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 
 	msg := fmt.Sprintf("Launched session: %s", newInstance.Title)
 	if initialMessage != "" {
-		if *noWait {
+		if *noWait && !messageUndelivered {
 			msg += " (message sent with --no-wait)"
 		} else {
-			msg += " (message sent)"
+			msg += " " + initialMessageOutcome(messageUndelivered)
 		}
 	}
 	out.Success(msg, jsonData)

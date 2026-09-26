@@ -92,3 +92,15 @@ func TestRuntimeLifecycle_CLIKeepsEqualGenerationWinner(t *testing.T) {
 		t.Fatalf("CLI restored loser: got %#v want %#v", got, winner)
 	}
 }
+
+// F6: a start whose pane is live but whose initial message never reached it
+// keeps exit 0 but must not claim the message was sent. `session start` (both
+// paths) and `launch` share this wording.
+func TestInitialMessageOutcome(t *testing.T) {
+	if got := initialMessageOutcome(false); got != "(message sent)" {
+		t.Fatalf("delivered = %q", got)
+	}
+	if got := initialMessageOutcome(true); got != "(message not delivered)" {
+		t.Fatalf("undelivered = %q", got)
+	}
+}

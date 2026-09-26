@@ -15,12 +15,12 @@ func consumeRuntimeResult(inst *session.Instance, runtime statedb.RuntimeState, 
 	return failure, warning
 }
 
-func mergeRestartWarnings(first, second string) string {
-	if first == "" {
-		return second
+// initialMessageOutcome is the parenthetical a start with an initial message
+// reports. A partial success can leave the pane live without the message
+// (session.InitialMessageUndelivered); that start must not claim it was sent.
+func initialMessageOutcome(undelivered bool) string {
+	if undelivered {
+		return "(message not delivered)"
 	}
-	if second == "" {
-		return first
-	}
-	return first + "; " + second
+	return "(message sent)"
 }

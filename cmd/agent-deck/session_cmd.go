@@ -326,8 +326,13 @@ func handleSessionStart(profile string, args []string) {
 	tree := session.NewGroupTreeWithGroups(instances, groups)
 	max := session.GroupMaxConcurrent(tree, inst.GroupPath)
 	if session.ShouldQueue(instances, inst.GroupPath, max) {
-		inst.Status = session.StatusQueued
+		// The save persists the yolo override; the runtime-owned queued
+		// status goes through the status CAS, which a snapshot save cannot.
 		if err := saveSessionData(storage, instances, groups); err != nil {
+			out.Error(fmt.Sprintf("failed to save queued state: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		if err := session.PersistSelectedStatus(storage, inst, session.StatusQueued); err != nil {
 			out.Error(fmt.Sprintf("failed to save queued state: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
@@ -347,8 +352,10 @@ func handleSessionStart(profile string, args []string) {
 
 	// Start the session (with or without initial message)
 	persistenceWarning := ""
+	messageUndelivered := false
 	if initialMessage != "" {
 		runtime, startErr := inst.StartWithMessageRuntime(initialMessage)
+		messageUndelivered = session.InitialMessageUndelivered(startErr)
 		startErr, persistenceWarning = consumeRuntimeResult(inst, runtime, startErr)
 		if startErr != nil {
 			out.Error(fmt.Sprintf("failed to start session: %v", startErr), ErrCodeInvalidOperation)
@@ -427,8 +434,8 @@ func handleSessionStart(profile string, args []string) {
 	}
 	if initialMessage != "" {
 		jsonData["message"] = initialMessage
-		jsonData["message_pending"] = false
-		out.Success(fmt.Sprintf("Started session: %s (message sent)", inst.Title), jsonData)
+		jsonData["message_pending"] = messageUndelivered
+		out.Success(fmt.Sprintf("Started session: %s %s", inst.Title, initialMessageOutcome(messageUndelivered)), jsonData)
 	} else {
 		out.Success(fmt.Sprintf("Started session: %s", inst.Title), jsonData)
 	}
@@ -477,31 +484,12 @@ func spawnFailureOutput(verb string, inst *session.Instance, err error) (string,
 	return fmt.Sprintf("failed to %s session: %v", verb, err), data
 }
 
-// persistSpawnFailureStatus marks only the runtime generation that failed
-// verification. A concurrent replacement wins rather than inheriting the error.
-func persistSpawnFailureStatus(storage *session.Storage, inst *session.Instance) error {
-	selection := inst.CaptureRuntimeSelection()
-	applied, err := storage.GetDB().WriteStatusIfVersion(
-		inst.ID, selection.Incarnation, selection.State.Generation,
-		selection.State.StatusRevision, string(session.StatusError),
-	)
-	if err != nil {
-		return err
-	}
-	if !applied {
-		return statedb.ErrStatusRevisionConflict
-	}
-	next := selection.State
-	next.Status = string(session.StatusError)
-	next.StatusRevision++
-	inst.ApplyRuntimeState(next)
-	return nil
-}
-
-// failSpawnVerification persists whatever Start()/Restart() changed on the
-// instance (tmux name, timestamps), reports the spawn failure and exits 1.
+// failSpawnVerification marks only the runtime that failed verification
+// errored (a concurrent replacement wins rather than inheriting the error),
+// persists whatever Start()/Restart() changed on the instance (tmux name,
+// timestamps), reports the spawn failure and exits 1.
 func failSpawnVerification(out *CLIOutput, verb string, storage *session.Storage, instances []*session.Instance, groups []*session.GroupData, inst *session.Instance, err error) {
-	if statusErr := persistSpawnFailureStatus(storage, inst); statusErr != nil && !out.jsonMode {
+	if statusErr := session.PersistSpawnFailureStatus(storage, inst); statusErr != nil && !out.jsonMode {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save session error status: %v\n", statusErr)
 	}
 	if saveErr := saveSessionData(storage, instances, groups); saveErr != nil && !out.jsonMode {
@@ -579,7 +567,7 @@ func handleSessionStop(profile string, args []string) {
 	// queued sibling is waiting, start the oldest one. Only one drain per
 	// stop: if max_concurrent>=2 and multiple slots are now free, the next
 	// stop drains the next entry.
-	drained, drainWarning := drainGroupQueue(inst.GroupPath, instances, groups)
+	drained, drainWarning := drainGroupQueue(storage, inst.GroupPath, instances, groups)
 	if drainWarning != "" && !*jsonOutput && !quietMode {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", drainWarning)
 	}
@@ -893,7 +881,7 @@ func persistArchivedCLI(storage *session.Storage, inst *session.Instance, expect
 // drainGroupQueue starts the oldest queued instance in groupPath when a slot
 // is available. Returns the drained instance (or nil if nothing to drain).
 // The caller is responsible for persisting state afterward.
-func drainGroupQueue(groupPath string, instances []*session.Instance, groups []*session.GroupData) (*session.Instance, string) {
+func drainGroupQueue(storage *session.Storage, groupPath string, instances []*session.Instance, groups []*session.GroupData) (*session.Instance, string) {
 	tree := session.NewGroupTreeWithGroups(instances, groups)
 	max := session.GroupMaxConcurrent(tree, groupPath)
 	if session.IsAtCap(session.CountRunningInGroup(instances, groupPath), max) {
@@ -906,9 +894,14 @@ func drainGroupQueue(groupPath string, instances []*session.Instance, groups []*
 	runtime, startErr := next.StartRuntime()
 	startErr, persistenceWarning := consumeRuntimeResult(next, runtime, startErr)
 	if startErr != nil {
-		// Drain is best-effort. Surface as queued + log; don't fail the stop.
-		next.Status = session.StatusError
+		// Drain is best-effort: log and don't fail the stop. The error status
+		// goes through the status CAS (a snapshot save drops it) so later
+		// stops do not retry this session ahead of the rest of the queue.
+		statusErr := session.PersistSelectedStatus(storage, next, session.StatusError)
 		fmt.Fprintf(os.Stderr, "queue drain failed to start %s: %v\n", next.Title, startErr)
+		if statusErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to save session error status: %v\n", statusErr)
+		}
 		return nil, ""
 	}
 	return next, persistenceWarning
@@ -1018,7 +1011,7 @@ func handleSessionRestart(profile string, args []string) {
 	if err := inst.VerifySpawned(spawnVerifyWait); err != nil {
 		failSpawnVerification(out, "restart", storage, instances, groups, inst, err)
 	}
-	warning := mergeRestartWarnings(inst.ConsumeCodexRestartWarning(), persistenceWarning)
+	warning := session.MergeRestartWarnings(inst.ConsumeCodexRestartWarning(), persistenceWarning)
 	if warning != "" && !*jsonOutput {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
 	}
@@ -1117,7 +1110,7 @@ func restartAllSessions(profile string, out *CLIOutput, storage *session.Storage
 		}
 		restarted = append(restarted, inst.ID)
 
-		warning := mergeRestartWarnings(inst.ConsumeCodexRestartWarning(), persistenceWarning)
+		warning := session.MergeRestartWarnings(inst.ConsumeCodexRestartWarning(), persistenceWarning)
 		if warning != "" && !out.jsonMode {
 			fmt.Fprintf(os.Stderr, "  Warning: %s\n", warning)
 		}

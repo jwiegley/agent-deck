@@ -76,37 +76,6 @@ func TestIssue2099_SpawnFailureJSONShape(t *testing.T) {
 	}, got)
 }
 
-func TestIssue2099_SpawnFailureStatusUsesRuntimeCAS(t *testing.T) {
-	storage, err := session.NewStorageWithProfile("_test_issue2099_failure_status")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, storage.Close()) })
-
-	inst := session.NewInstanceWithTool("issue-2099-status", t.TempDir(), "customfail2099")
-	require.NoError(t, storage.InsertSessionAndVerify(inst, nil))
-	before := inst.RuntimeState()
-
-	require.NoError(t, persistSpawnFailureStatus(storage, inst))
-	after := inst.RuntimeState()
-	require.Equal(t, session.StatusError, inst.GetStatusThreadSafe())
-	require.Equal(t, before.StatusRevision+1, after.StatusRevision)
-	durable, found, err := storage.GetDB().ReadRuntimeState(inst.ID)
-	require.NoError(t, err)
-	require.True(t, found)
-	require.Equal(t, after, durable)
-
-	// A replacement started after our failed verification must stay untouched.
-	replacement := after
-	replacement.Generation++
-	replacement.StatusRevision = 0
-	replacement.Status = string(session.StatusRunning)
-	require.NoError(t, storage.GetDB().CommitRuntimeTransition(after.Generation, inst.PersistenceIncarnation(), replacement))
-	require.ErrorIs(t, persistSpawnFailureStatus(storage, inst), statedb.ErrStatusRevisionConflict)
-	durable, found, err = storage.GetDB().ReadRuntimeState(inst.ID)
-	require.NoError(t, err)
-	require.True(t, found)
-	require.Equal(t, replacement, durable)
-}
-
 // issue2099HelperEnv marks the re-exec'd test binary that runs the real
 // `session start` / `session restart` command (they call os.Exit).
 const issue2099HelperEnv = "AGENT_DECK_ISSUE2099_HELPER_PROCESS"
