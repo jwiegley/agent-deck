@@ -3,9 +3,13 @@ package ui
 import (
 	"testing"
 
-	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
+
+// hooks-fd-macos.yml overlays this file, together with
+// hook_cleanup_async_test.go, onto pinned upstream revisions that predate
+// runtime authority. Keep it to helpers that compile there; fixtures that need
+// the runtime tuple belong in runtime_status_fixture_test.go.
 
 // detachGlobalStateDB clears the process-global state database for a fixture
 // whose rows were never inserted through Storage. Lifecycle and status
@@ -17,27 +21,4 @@ func detachGlobalStateDB(t *testing.T) {
 	previous := statedb.GetGlobal()
 	statedb.SetGlobal(nil)
 	t.Cleanup(func() { statedb.SetGlobal(previous) })
-}
-
-// publishStatusThroughAuthority commits status the way UpdateStatusObserved
-// commits a probe result: a revision CAS on the durable runtime tuple, then the
-// in-memory copy. Fixtures without a tmux session use it where production
-// reaches the status probe; assigning Instance.Status would bypass authority,
-// and snapshot saves drop runtime-owned status.
-func publishStatusThroughAuthority(t *testing.T, storage *session.Storage, inst *session.Instance, status session.Status) {
-	t.Helper()
-	db := storage.GetDB()
-	observed, found, err := db.ReadRuntimeState(inst.ID)
-	if err != nil || !found {
-		t.Fatalf("read runtime for %s: found=%v err=%v", inst.ID, found, err)
-	}
-	applied, err := db.WriteStatusIfVersion(
-		inst.ID, inst.PersistenceIncarnation(), observed.Generation, observed.StatusRevision, string(status))
-	if err != nil || !applied {
-		t.Fatalf("publish %s for %s: applied=%v err=%v", status, inst.ID, applied, err)
-	}
-	committed, found, err := db.ReadRuntimeState(inst.ID)
-	if err != nil || !found || !inst.ApplyRuntimeState(committed) {
-		t.Fatalf("adopt committed runtime for %s: %#v found=%v err=%v", inst.ID, committed, found, err)
-	}
 }

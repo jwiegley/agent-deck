@@ -9,6 +9,7 @@ on:
       - 'internal/session/storage.go'
       - 'internal/ui/home.go'
       - 'internal/ui/hook_cleanup*'
+      - 'internal/ui/runtime_authority_fixture_test.go'
       - '.github/scripts/hooks-fd/**'
       - '.github/workflows/hooks-fd-macos.yml'
   workflow_dispatch:
@@ -51,15 +52,22 @@ jobs:
           test "$(git -C baseline rev-parse HEAD)" = "$BASE_REVISION"
           test "$(git -C head rev-parse HEAD)" = "$HEAD_REVISION"
           git -C baseline diff --exit-code
-          for file in internal/ui/hook_cleanup_async_test.go internal/session/hook_cleanup_targeted_test.go; do
+          # The UI test drives the fork's lifecycle commands and borrows
+          # detachGlobalStateDB from runtime_authority_fixture_test.go, which is
+          # kept compilable against these pinned upstream revisions.
+          overlay=(internal/ui/hook_cleanup_async_test.go internal/ui/runtime_authority_fixture_test.go)
+          for file in "${overlay[@]}" internal/session/hook_cleanup_targeted_test.go; do
             sha256sum "head/$file"
             cp "head/$file" "baseline/$file"
           done
           test "$(git -C async-baseline rev-parse HEAD)" = "$ASYNC_REVISION"
           git -C async-baseline diff --exit-code
-          # Only the test file: its undo case never reads the search golden,
-          # so the pinned revision's own overlay rendering cannot mask the red.
-          cp head/internal/ui/hook_cleanup_async_test.go async-baseline/internal/ui/
+          # Only the test files: the undo case fails at the report handler,
+          # before it reads the search golden, so the pinned revision's own
+          # overlay rendering cannot mask the red.
+          for file in "${overlay[@]}"; do
+            cp "head/$file" "async-baseline/$file"
+          done
           # The containers run with --network none, so the image must hold the
           # module graph of EVERY checkout it tests. The pinned baselines keep
           # their own go.mod/go.sum (older dependency versions than head), and
@@ -126,7 +134,10 @@ jobs:
           set -e
           cat evidence/undo-base-red.log
           test "$undo_status" -eq 1
-          grep -F -- 'undo restarted before hook cleanup completed' evidence/undo-base-red.log
+          # The fork's lifecycle command prunes hooks before it reports, so undo
+          # cannot race cleanup. The async revision's handler schedules cleanup
+          # itself, outside that command, which is what let its undo race it.
+          grep -F -- 'deletion handler scheduled work outside lifecycle authority' evidence/undo-base-red.log
           grep -F -- '--- FAIL: TestHookCleanupDeletionKeepsUIResponsive/undo' evidence/undo-base-red.log
           run_tests head "$HEAD_REVISION" "$regression" ./internal/session ./internal/ui 2>&1 | tee evidence/cleanup-head-green.log
           run_tests head "$HEAD_REVISION" 'TestHookCleanup|TestPolling' ./internal/session ./internal/fswatch ./internal/ui 2>&1 | tee evidence/hooks-race-green.log
