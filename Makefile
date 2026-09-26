@@ -228,7 +228,7 @@ test-runtime-lifecycle:
 # change (CORE-PLAN.md section 7). Never run this to make a red suite green
 # without reading the diff first — see testdata/goldens/README.md.
 goldens-update:
-	AGENTDECK_UPDATE_GOLDENS=1 go test ./cmd/agent-deck/ -run 'TestCLIGoldens$$|TestStorageBytesGoldens$$' -v
+	bash scripts/test.sh -count=1 -v -run 'TestCLIGoldens$$|TestStorageBytesGoldens$$' ./cmd/agent-deck/ -args -update-goldens
 
 # Run hard-gated walltime regression tests (Track B). Honors PERF_BUDGET_MULTIPLIER
 # (default 1.0 locally; CI sets 2.0). See docs/perf-budget-suite.md.
