@@ -41,14 +41,58 @@ func durableRuntimeForTest(t *testing.T, storage *Storage, id string) statedb.Ru
 	return state
 }
 
-// commitSeesSpawnGone makes commitPhysicalRuntime's live check find the pane
+// commitProbesSpawn replaces commitPhysicalRuntime's exact liveness probe of
+// the pane tmux just accepted.
+func commitProbesSpawn(t *testing.T, live bool, probeErr error) {
+	t.Helper()
+	old := runtimeCandidateExistsFn
+	t.Cleanup(func() { runtimeCandidateExistsFn = old })
+	runtimeCandidateExistsFn = func(*tmux.Session) (bool, error) { return live, probeErr }
+}
+
+// commitSeesSpawnGone makes commitPhysicalRuntime's live check prove the pane
 // tmux just accepted already gone: the process died before its generation
 // could be published.
 func commitSeesSpawnGone(t *testing.T) {
 	t.Helper()
-	old := runtimeCandidateExistsFn
-	t.Cleanup(func() { runtimeCandidateExistsFn = old })
-	runtimeCandidateExistsFn = func(*tmux.Session) bool { return false }
+	commitProbesSpawn(t, false, nil)
+}
+
+// Only proven absence makes a spawn gone. An indeterminate liveness probe (a
+// permission error, a server that exited unexpectedly) proves nothing either
+// way, so the spawn goes on to its stamp and CAS, which are the proof of life:
+// a live pane is published as usual instead of being dropped as dead.
+func TestSpawnDiedBeforeCommit_IndeterminateProbePublishesLiveSpawn(t *testing.T) {
+	storage, inst := spawnOnPrivateSocket(t, "_test_spawn_probe_indeterminate")
+	before := durableRuntimeForTest(t, storage, inst.ID)
+	commitProbesSpawn(t, false, errors.New("error connecting to the server (Permission denied)"))
+
+	runtime, err := inst.StartRuntime()
+	require.NoError(t, err)
+	require.Equal(t, before.Generation+1, runtime.Generation, "the live spawn is published")
+	require.Equal(t, runtime, durableRuntimeForTest(t, storage, inst.ID))
+	require.Equal(t, runtime, inst.RuntimeState())
+}
+
+// When the stamp fails as well, the result is the reconciling partial success
+// of a spawn that could not be published, never the silent nil of a spawn
+// proved gone.
+func TestSpawnDiedBeforeCommit_IndeterminateProbeKeepsReconcilingPartialSuccess(t *testing.T) {
+	storage, inst := spawnOnPrivateSocket(t, "_test_spawn_probe_partial")
+	before := durableRuntimeForTest(t, storage, inst.ID)
+	commitProbesSpawn(t, false, errors.New("server exited unexpectedly"))
+	oldStamp := runtimeCandidateStampFn
+	t.Cleanup(func() { runtimeCandidateStampFn = oldStamp })
+	runtimeCandidateStampFn = func(*tmux.Session, statedb.RuntimeState, string, string) error {
+		return errors.New("server exited unexpectedly")
+	}
+
+	_, err := inst.StartRuntime()
+	var partial *RestartPartialSuccessError
+	require.ErrorAs(t, err, &partial, "start = %v, want a partial success", err)
+	require.True(t, partial.NeedsReconciliation)
+	require.Equal(t, "start", partial.Operation)
+	require.Equal(t, before, durableRuntimeForTest(t, storage, inst.ID), "nothing was published")
 }
 
 // A start whose pane died before publication published nothing and left

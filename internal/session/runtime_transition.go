@@ -319,7 +319,7 @@ var (
 	runtimeCandidateInventoryFn   = tmux.ListRuntimeCandidates
 	runtimeCandidateSnapshotFn    = tmux.SnapshotRuntimeCandidates
 	runtimeCandidateRevalidateFn  = tmux.RevalidateRuntimeCandidate
-	runtimeCandidateExistsFn      = func(session *tmux.Session) bool { return session != nil && session.Exists() }
+	runtimeCandidateExistsFn      = probeSpawnedRuntime
 	runtimeCandidateStampFn       = stampRuntimeCandidate
 	runtimeCandidateSetEnvFn      = func(session *tmux.Session, key, value string) error { return session.SetEnvironment(key, value) }
 	runtimeCleanupIdentityStampFn = tmux.StampRuntimeCleanupIdentity
@@ -329,6 +329,16 @@ var (
 	}
 	runtimeDuplicateSweepFn = func(i *Instance, observedSockets ...string) { i.sweepDuplicateToolSessions(observedSockets...) }
 )
+
+// probeSpawnedRuntime is a spawn's liveness probe before publication. It is
+// tri-state: (false, nil) only once tmux proved the exact session gone, and a
+// non-nil error when the answer is indeterminate.
+func probeSpawnedRuntime(session *tmux.Session) (bool, error) {
+	if session == nil {
+		return false, nil
+	}
+	return tmux.ProbeExactSession(session.SocketName, session.Name)
+}
 
 var runtimeBindingKinds = []string{"claude", "copilot", "codex", "gemini", "opencode"}
 
@@ -1066,7 +1076,11 @@ func (i *Instance) commitPhysicalRuntime(authority *runtimeTransitionAuthority) 
 	if next.TmuxSession == "" {
 		return next, nil, false, fmt.Errorf("physical runtime for %s has no tmux identity", i.ID)
 	}
-	if !runtimeCandidateExistsFn(i.tmuxSession) {
+	// Only proven absence means the spawn died before publication. An
+	// indeterminate probe (a permission error, a server that exited
+	// unexpectedly) proves nothing either way: the stamp and the CAS below are
+	// the proof of life, and a failure there is a reconciling partial success.
+	if live, probeErr := runtimeCandidateExistsFn(i.tmuxSession); !live && probeErr == nil {
 		return next, nil, false, fmt.Errorf("physical runtime %s was not verified live: %w", next.TmuxSession, errSpawnedRuntimeGone)
 	}
 	plan = authority.bindingPlanForCommit(i)

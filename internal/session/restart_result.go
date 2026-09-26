@@ -45,8 +45,9 @@ func (e *RestartPartialSuccessError) Error() string {
 	return fmt.Sprintf("%s completed for %s but post-commit cleanup was interrupted: %v", operation, e.InstanceID, e.Err)
 }
 
-// errSpawnedRuntimeGone marks commitPhysicalRuntime finding the runtime tmux
-// just accepted already gone, before its generation could be published.
+// errSpawnedRuntimeGone marks commitPhysicalRuntime's exact probe proving the
+// runtime tmux just accepted already gone, before its generation could be
+// published. An indeterminate probe is never this error.
 var errSpawnedRuntimeGone = errors.New("the spawned runtime exited before its generation was published")
 
 // spawnedRuntimeGone reports a start or restart whose spawn tmux accepted but

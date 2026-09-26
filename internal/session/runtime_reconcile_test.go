@@ -81,7 +81,7 @@ func installRuntimeLifecycleTestSeams(t *testing.T) {
 	runtimeTransitionFaultFn = func(RuntimeTransitionStage, statedb.RuntimeState) error { return nil }
 	runtimeCandidateInventoryFn = func(string, string) ([]tmux.RuntimeCandidate, error) { return nil, nil }
 	runtimeCandidateRevalidateFn = func(candidate tmux.RuntimeCandidate) (tmux.RuntimeCandidate, error) { return candidate, nil }
-	runtimeCandidateExistsFn = func(*tmux.Session) bool { return true }
+	runtimeCandidateExistsFn = func(*tmux.Session) (bool, error) { return true, nil }
 	runtimeCandidateStampFn = func(*tmux.Session, statedb.RuntimeState, string, string) error { return nil }
 	runtimeCandidateSetEnvFn = func(*tmux.Session, string, string) error { return nil }
 	runtimeCleanupIdentityStampFn = func(*tmux.Session, string, uint64, string, string) error { return nil }
