@@ -135,12 +135,21 @@ func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 			go func() { result <- cmd() }()
 			writer, early := openWriter(result)
 			if writer == nil {
-				// The command reported without reaching cleanup, so cleanup
-				// was left to someone else. Apply the report as production
-				// would: a handler that cleans up itself blocks or schedules
-				// work and fails with its own message.
-				require.Nil(t, update(early), outsideAuthority)
-				t.Fatal("deletion reported before hook cleanup ran")
+				// The command reported without reaching cleanup: either its
+				// deletion failed (an authority refusal) or it left cleanup
+				// to someone else. Apply the report as production would: a
+				// handler that cleans up itself blocks or schedules work and
+				// fails with its own message. Either failure names the
+				// report's error, which tells the two causes apart.
+				var reportErr error
+				switch report := early.(type) {
+				case sessionDeletedMsg:
+					reportErr = report.killErr
+				case worktreeFinishResultMsg:
+					reportErr = report.err
+				}
+				require.Nil(t, update(early), "%s (early %T, error: %v)", outsideAuthority, early, reportErr)
+				t.Fatalf("deletion reported before hook cleanup ran: %T, error: %v", early, reportErr)
 			}
 			defer writer.Close()
 			select {
