@@ -91,6 +91,99 @@ func TestQuitAsksBeforeAbandoningABackgroundWorktreeFinish(t *testing.T) {
 	require.True(t, ok, "confirming must schedule the ordinary quit")
 }
 
+// The finish can report while its quit confirmation is open. The confirmation
+// must then stop claiming the finish is running, and it must stay open: the
+// user asked to quit and has not answered yet. Closing it would drop that
+// request, and quitting for them would drop a cancel already on its way and
+// hide a failure. So the question stays with its buttons, keys and focus
+// unchanged, and it now says how the finish ended.
+func TestQuitConfirmationReportsTheFinishThatEndedUnderIt(t *testing.T) {
+	left := tea.KeyMsg{Type: tea.KeyLeft}
+	enter := tea.KeyMsg{Type: tea.KeyEnter}
+	for _, tc := range []struct {
+		name string
+		// focus is pressed before the finish reports; Enter answers after.
+		focus    []tea.KeyMsg
+		err      error
+		title    string
+		body     []string
+		wantQuit bool
+	}{
+		{
+			name:  "completed, Enter keeps meaning Cancel",
+			title: "Worktree Finish Done",
+			body:  []string{"Finished worktree:", `"running"`, "The finish has completed"},
+		},
+		{
+			name:     "failed, Enter keeps meaning Quit",
+			focus:    []tea.KeyMsg{left},
+			err:      errors.New("merge into main failed"),
+			title:    "Worktree Finish Failed",
+			body:     []string{"Could not finish worktree:", `"running"`, "merge into main failed", "The finish has stopped"},
+			wantQuit: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, running, _, pressFinish := newWorktreeFinishFixture(t)
+			dismissFinishIntoBackground(t, h, running, pressFinish)
+			h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+			for _, key := range tc.focus {
+				h.Update(key)
+			}
+			focused := h.confirmDialog.GetFocusedButton()
+
+			_, cmd := h.Update(worktreeFinishResultMsg{sessionID: running.ID, sessionTitle: running.Title, err: tc.err})
+			require.Nil(t, cmd, "the finish's result must not answer the quit question")
+			require.False(t, h.isQuitting, "the finish's result must not answer the quit question")
+			require.False(t, h.worktreeFinishDialog.IsExecuting())
+			require.True(t, h.confirmDialog.IsVisible(), "the user's quit request must stay open")
+			require.Equal(t, ConfirmQuitWithWorktreeFinish, h.confirmDialog.GetConfirmType())
+			require.Equal(t, focused, h.confirmDialog.GetFocusedButton(), "the focused button must keep its meaning")
+			view := stripAnsi(h.View())
+			require.NotContains(t, view, "Still finishing worktree", "the confirmation must not claim a finished finish still runs")
+			require.NotContains(t, view, "Quit anyway")
+			require.Contains(t, view, tc.title)
+			for _, want := range tc.body {
+				require.Contains(t, view, want)
+			}
+
+			_, cmd = h.Update(enter)
+			require.False(t, h.confirmDialog.IsVisible())
+			require.Equal(t, tc.wantQuit, h.isQuitting)
+			if !tc.wantQuit {
+				require.Nil(t, cmd)
+				require.EqualError(t, h.err, "Finished worktree 'running'", "the status line keeps the finish's outcome")
+				// Nothing runs any more, so q quits without asking.
+				_, cmd = h.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+				require.False(t, h.confirmDialog.IsVisible())
+				require.True(t, h.isQuitting)
+			}
+			require.NotNil(t, cmd)
+			_, ok := cmd().(quitMsg)
+			require.True(t, ok, "quitting must schedule the ordinary quit")
+		})
+	}
+}
+
+// A finish's result updates only the confirmation opened over that finish,
+// and a later confirmation, over the next finish, starts out running again.
+func TestQuitConfirmationTracksOnlyItsOwnFinish(t *testing.T) {
+	c := NewConfirmDialog()
+	c.ShowQuitWithWorktreeFinish("a", "a")
+	c.NoteWorktreeFinishEnded("b", nil)
+	require.Contains(t, stripAnsi(c.View()), "Still finishing worktree:", "another session's finish must not end this one")
+	c.NoteWorktreeFinishEnded("a", errors.New("boom"))
+	require.Contains(t, stripAnsi(c.View()), "Worktree Finish Failed")
+
+	c.Hide()
+	c.ShowQuitWithWorktreeFinish("b", "b")
+	require.Contains(t, stripAnsi(c.View()), "Still finishing worktree:", "a new confirmation must not inherit the last finish's outcome")
+	c.ShowQuitWithPool(2)
+	c.NoteWorktreeFinishEnded("b", nil)
+	require.Equal(t, ConfirmQuitWithPool, c.GetConfirmType())
+	require.Contains(t, stripAnsi(c.View()), "MCP Pool Running", "any other dialog is left alone")
+}
+
 // The restart_deck key (ctrl+t) and auto_restart (on by default) end in the
 // same quit as q, followed by a re-exec, so they would stop a background
 // finish partway just the same. Neither can ask first, since auto_restart has

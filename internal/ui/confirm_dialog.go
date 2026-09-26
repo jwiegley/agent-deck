@@ -42,7 +42,9 @@ const (
 	ConfirmArchiveDestinationSwitch
 	ConfirmKillWindow
 	// ConfirmQuitWithWorktreeFinish asks before quitting while a worktree
-	// finish dismissed into the background (Esc) is still running.
+	// finish dismissed into the background (Esc) is still running. If the
+	// finish reports first, the question stays open and says how the finish
+	// ended (NoteWorktreeFinishEnded).
 	ConfirmQuitWithWorktreeFinish
 )
 
@@ -82,6 +84,12 @@ type ConfirmDialog struct {
 	// Notice (ConfirmNotice) carries an acknowledge-only title/body.
 	noticeTitle string
 	noticeBody  string
+
+	// worktreeFinishEnded marks a ConfirmQuitWithWorktreeFinish whose finish
+	// has reported since the dialog opened; worktreeFinishFailure is that
+	// finish's error text, empty when it succeeded.
+	worktreeFinishEnded   bool
+	worktreeFinishFailure string
 
 	// focusedButton tracks which button has arrow-key focus.
 	// 0 = confirm (left), 1 = cancel (right).
@@ -456,14 +464,35 @@ func (c *ConfirmDialog) ShowQuitWithPool(mcpCount int) {
 }
 
 // ShowQuitWithWorktreeFinish shows confirmation for quitting while the finish
-// of the named worktree session is still running in the background.
-func (c *ConfirmDialog) ShowQuitWithWorktreeFinish(sessionTitle string) {
+// of the given worktree session is still running in the background.
+func (c *ConfirmDialog) ShowQuitWithWorktreeFinish(sessionID, sessionTitle string) {
 	c.visible = true
 	c.confirmType = ConfirmQuitWithWorktreeFinish
-	c.targetID = ""
+	c.targetID = sessionID
 	c.targetName = sessionTitle
+	c.worktreeFinishEnded = false
+	c.worktreeFinishFailure = ""
 	c.buttonCount = 2
 	c.focusedButton = 1 // default to Cancel: a finish stopped partway cannot resume
+}
+
+// NoteWorktreeFinishEnded updates an open ConfirmQuitWithWorktreeFinish once
+// the finish of sessionID has reported, with its error (nil on success). The
+// dialog stays open: the user asked to quit and has not answered, so closing
+// it would drop that request, and quitting on their behalf would drop a
+// cancel they may be pressing and bury a failure. It only stops claiming the
+// finish is running. The buttons, their keys and the focused button keep
+// their meaning, so a key already on its way still does what it was pressed
+// for. Any other dialog, or another session's finish, is left alone.
+func (c *ConfirmDialog) NoteWorktreeFinishEnded(sessionID string, err error) {
+	if !c.visible || c.confirmType != ConfirmQuitWithWorktreeFinish || c.targetID != sessionID {
+		return
+	}
+	c.worktreeFinishEnded = true
+	c.worktreeFinishFailure = ""
+	if err != nil {
+		c.worktreeFinishFailure = err.Error()
+	}
 }
 
 // ShowCreateDirectory shows confirmation for creating a missing directory.
@@ -811,15 +840,30 @@ func (c *ConfirmDialog) View() string {
 			hintStyle.Render(glueHintGroups("k keep · s shut down · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmQuitWithWorktreeFinish:
-		title = "Worktree Finish Running"
-		warning = fmt.Sprintf("Still finishing worktree:\n\n  \"%s\"", c.targetName)
-		details = "Quitting stops the finish partway: a merge may land while the\nsession stays listed, or the session may be deleted while its\nworktree and branch remain."
+		quitLabel, quitColor, quitHint := "Quit anyway", ColorRed, "y quit anyway"
 		borderColor = ColorYellow
+		switch {
+		case !c.worktreeFinishEnded:
+			title = "Worktree Finish Running"
+			warning = fmt.Sprintf("Still finishing worktree:\n\n  \"%s\"", c.targetName)
+			details = "Quitting stops the finish partway: a merge may land while the\nsession stays listed, or the session may be deleted while its\nworktree and branch remain."
+		case c.worktreeFinishFailure != "":
+			title = "Worktree Finish Failed"
+			warning = fmt.Sprintf("Could not finish worktree:\n\n  \"%s\"", c.targetName)
+			details = c.worktreeFinishFailure + "\n\nThe finish has stopped, so quitting no longer interrupts it."
+			quitLabel, quitColor, quitHint = "Quit", ColorGreen, "y quit"
+		default:
+			title = "Worktree Finish Done"
+			warning = fmt.Sprintf("Finished worktree:\n\n  \"%s\"", c.targetName)
+			details = "The finish has completed, so quitting no longer interrupts it."
+			quitLabel, quitColor, quitHint = "Quit", ColorGreen, "y quit"
+			borderColor = ColorAccent
+		}
 		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
-			renderButton("Quit anyway", ColorRed, c.focusedButton == 0), "  ",
+			renderButton(quitLabel, quitColor, c.focusedButton == 0), "  ",
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
-			hintStyle.Render(glueHintGroups("y quit anyway · n cancel · ←/→ navigate · Enter select · Esc")))
+			hintStyle.Render(glueHintGroups(quitHint+" · n cancel · ←/→ navigate · Enter select · Esc")))
 
 	case ConfirmCreateDirectory:
 		title = "📁  Directory Not Found"
