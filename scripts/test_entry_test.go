@@ -35,6 +35,7 @@ tmp_root=$(cd /tmp && pwd -P)
 [[ $HOME == "$(cd "$HOME" && pwd -P)" ]]
 [[ $USERPROFILE == "$HOME" && $TMP == "$TMPDIR" && $TEMP == "$TMPDIR" ]]
 [[ -d $TMPDIR && -d $TMUX_TMPDIR && $GOCACHE == "$GOMODCACHE" ]]
+[[ ${SHELL##*/} == bash && -x $SHELL ]] || { echo "shell $SHELL" >&2; exit 8; }
 for name in OPENAI_API_KEY CLAUDE_CONFIG_DIR CODEX_HOME AGENTDECK_INSTANCE_ID SSH_AUTH_SOCK TMUX TMUX_PANE XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_RUNTIME_DIR; do
     [[ ! ${!name+x} ]] || { echo "inherited $name" >&2; exit 9; }
 done
@@ -49,7 +50,7 @@ printf '%s\n' "$HOME" "$*" > "$GOCACHE/receipt"
 				args = append(args, "fail")
 			}
 			cmd := exec.Command("bash", args...)
-			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+root)
+			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+root, "SHELL=/bin/zsh")
 			for _, key := range []string{"OPENAI_API_KEY", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENTDECK_INSTANCE_ID", "SSH_AUTH_SOCK", "TMUX", "TMUX_PANE", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"} {
 				cmd.Env = append(cmd.Env, key+"=synthetic-test-value")
 			}
