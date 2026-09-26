@@ -240,6 +240,33 @@ func TestRecallLinkMarksTolerateRetractionOutsideTheInstanceLock(t *testing.T) {
 	}
 }
 
+// A missing link is written under BEGIN IMMEDIATE, which can wait on SQLite's
+// writer reservation. Like the binding CAS before it, it must run outside
+// i.mu, or every status reader queues behind a peer's write.
+func TestHookRecallLinkWriteRunsOutsideTheInstanceLock(t *testing.T) {
+	db := isolateHookRecallLinkHome(t)
+	inst := newHookRecallLinkInstance(t, db, "hook-codex-link-unlocked", "codex", `{}`)
+	const id = "7a3b9c10-0000-0000-0000-000000000c01"
+	calls, underLock := 0, 0
+	prev := linkRuntimeBindingFn
+	linkRuntimeBindingFn = func(s *statedb.StateDB, instanceID, incarnation, kind, value string) (bool, error) {
+		calls++
+		if inst.mu.TryLock() {
+			inst.mu.Unlock()
+		} else {
+			underLock++
+		}
+		return prev(s, instanceID, incarnation, kind, value)
+	}
+	t.Cleanup(func() { linkRuntimeBindingFn = prev })
+
+	inst.UpdateHookStatus(&HookStatus{Status: "running", SessionID: id, Event: "SessionStart", UpdatedAt: time.Now()})
+	requireRecallLinks(t, db, inst.ID, "codex", map[string]bool{id: true})
+	if calls == 0 || underLock != 0 {
+		t.Fatalf("link writes: %d, %d of them under i.mu; want at least one and none under it", calls, underLock)
+	}
+}
+
 // A link write that fails leaves the published binding in place. The next
 // hook confirming that id retries the link instead of trusting a marker set
 // for a write that never landed.
