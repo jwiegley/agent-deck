@@ -298,3 +298,67 @@ func TestRuntimeLifecycle_CodexDetectionStopsOnceItsRuntimeIsReplaced(t *testing
 		t.Fatalf("detection of the replaced runtime bound %q to its replacement, want nothing bound", got)
 	}
 }
+
+// runUnorderedAndAlive runs each function in its own goroutine, ordered with
+// the other by nothing, and keeps both goroutines alive until both functions
+// have returned: the race detector can lose an access made by a goroutine
+// that has exited once a new goroutine reuses its slot.
+func runUnorderedAndAlive(fns ...func()) {
+	var worked, exited sync.WaitGroup
+	finished := make(chan struct{})
+	worked.Add(len(fns))
+	exited.Add(len(fns))
+	for _, fn := range fns {
+		go func() {
+			defer exited.Done()
+			fn()
+			worked.Done()
+			<-finished
+		}()
+	}
+	worked.Wait()
+	close(finished)
+	exited.Wait()
+}
+
+// Every status pass observes the active binding under i.mu without the spawn
+// lock (updateStatusWithEvidence → captureActiveRuntimeBindingObservation), so
+// the TUI's status worker observes it while a restart the operator started
+// sets or clears it under the spawn lock alone. Those writes therefore take
+// i.mu. Each case runs one restart write beside one observation, ordered by
+// nothing else, so the race detector reports an unlocked write whichever runs
+// first. The fresh clear runs on a Claude instance because its Codex branch
+// took i.mu for the pending warning right after clearing the thread, which
+// orders an observation that comes later and would hide the race.
+func TestRuntimeLifecycle_RestartWritesTheObservedBindingUnderLock(t *testing.T) {
+	const stale = "019c9ffa-c9d6-7be1-9e1c-000000000000"
+	for n, c := range []struct {
+		name, tool, bound, kind, want string
+		write                         func(*Instance)
+	}{
+		{name: "restart adopts the Codex thread", tool: "codex", kind: "codex",
+			want:  codexDetectionLockThread,
+			write: func(inst *Instance) { inst.adoptCodexSessionForRestart() }},
+		{name: "relaunch drops a Codex thread without a rollout", tool: "codex", bound: stale, kind: "codex",
+			write: func(inst *Instance) { inst.buildCodexCommand(inst.Command) }},
+		{name: "fresh restart clears the binding", tool: "claude", bound: stale, kind: "claude",
+			write: func(inst *Instance) { inst.clearSessionBindingForFreshStart() }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			projectPath := t.TempDir()
+			stageCodexDetectionProbe(t, projectPath)
+			inst := newCodexDetectionLockInstance(projectPath, false, fmt.Sprintf("restart-binding-%d", n))
+			inst.Tool, inst.Command = c.tool, c.tool
+			if c.bound != "" {
+				inst.CodexSessionID, inst.ClaudeSessionID = c.bound, c.bound
+			}
+
+			runUnorderedAndAlive(
+				func() { c.write(inst) },
+				func() { inst.captureActiveRuntimeBindingObservation() })
+			if got, _ := inst.currentRuntimeBinding(c.kind); got != c.want {
+				t.Fatalf("%s binding after the restart write = %q, want %q", c.kind, got, c.want)
+			}
+		})
+	}
+}
