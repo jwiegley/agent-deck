@@ -277,6 +277,9 @@ func TestRuntimeLifecycle_CoreRegistryBypassesNoRuntimeAuthority(t *testing.T) {
 					}
 				}
 			}
+			for _, ident := range untypedStartStatusNames(node) {
+				t.Errorf("%s: %s must be declared as a StartStatus, not by := or as a parameter", where(ident.Pos()), ident.Name)
+			}
 			return true
 		})
 	}
@@ -295,7 +298,15 @@ var runtimeOwnedFields = map[string]bool{"LastStartedAt": true, "RuntimeGenerati
 
 // runtimeOwnedSetters are the Instance methods that write a runtime-owned
 // field in memory only; the snapshot save drops that write too.
-var runtimeOwnedSetters = map[string]string{"SetStatusThreadSafe": "Status"}
+// ApplyStatusIfRuntimeVersion and AcceptStatusRevision are the in-memory
+// halves of a status CAS some other writer already committed, and
+// SeedLiveStatusPrior carries one long-lived pass's verdict to the next.
+var runtimeOwnedSetters = map[string]string{
+	"SetStatusThreadSafe":         "Status",
+	"SeedLiveStatusPrior":         "Status",
+	"ApplyStatusIfRuntimeVersion": "Status",
+	"AcceptStatusRevision":        "StatusRevision",
+}
 
 // runtimeOwnedWrite reports the runtime-owned field that node writes in
 // memory, whatever the written value. Status is also a field of core's own
@@ -342,6 +353,50 @@ func provablyNotSessionStatus(value ast.Expr) bool {
 		return v.Op == token.AND
 	}
 	return false
+}
+
+// untypedStartStatusNames reports the StartStatus* identifiers node declares
+// without a type the guard can see: by := (including a type switch's or a
+// select case's), in a range clause, or as a parameter, result or receiver.
+// provablyNotSessionStatus exempts StartStatus* by name, which holds only
+// while every such name is a var or const the ValueSpec check keeps typed
+// StartStatus; `StartStatusX := session.StatusError` or a parameter named
+// StartStatusX would otherwise make `inst.Status = StartStatusX` pass.
+func untypedStartStatusNames(node ast.Node) []*ast.Ident {
+	var names []*ast.Ident
+	add := func(exprs ...ast.Expr) {
+		for _, expr := range exprs {
+			if ident, ok := expr.(*ast.Ident); ok && strings.HasPrefix(ident.Name, "StartStatus") {
+				names = append(names, ident)
+			}
+		}
+	}
+	addFields := func(fields *ast.FieldList) {
+		if fields == nil {
+			return
+		}
+		for _, field := range fields.List {
+			for _, name := range field.Names {
+				add(name)
+			}
+		}
+	}
+	switch n := node.(type) {
+	case *ast.AssignStmt:
+		if n.Tok == token.DEFINE {
+			add(n.Lhs...)
+		}
+	case *ast.RangeStmt:
+		if n.Tok == token.DEFINE {
+			add(n.Key, n.Value)
+		}
+	case *ast.FuncType:
+		addFields(n.Params)
+		addFields(n.Results)
+	case *ast.FuncDecl:
+		addFields(n.Recv)
+	}
+	return names
 }
 
 // runtimeOwnedInstanceKey reports a runtime-owned key in a session.Instance
@@ -413,6 +468,9 @@ func TestRuntimeLifecycle_CoreRuntimeOwnedWriteClassifier(t *testing.T) {
 		{"inst.RuntimeGeneration = 0", "RuntimeGeneration"},
 		{"inst.StatusRevision++", "StatusRevision"},
 		{"inst.SetStatusThreadSafe(session.StatusError)", "Status"},
+		{"inst.SeedLiveStatusPrior(session.StatusRunning, false)", "Status"},
+		{"inst.ApplyStatusIfRuntimeVersion(generation, revision, session.StatusError)", "Status"},
+		{"inst.AcceptStatusRevision(generation, revision)", "StatusRevision"},
 		{"inst = &session.Instance{ID: id, Status: session.StatusRunning}", "Status"},
 		{"return session.Instance{LastStartedAt: now}", "LastStartedAt"},
 		{"use(session.Instance{RuntimeGeneration: 1})", "RuntimeGeneration"},
@@ -444,6 +502,46 @@ func TestRuntimeLifecycle_CoreRuntimeOwnedWriteClassifier(t *testing.T) {
 		})
 		if ok != (c.want != "") || field != c.want {
 			t.Errorf("runtimeOwnedWrite(%s) = %q, %v; want %q", c.stmt, field, ok, c.want)
+		}
+	}
+}
+
+// The StartStatus* exemption is sound only if the guard sees every
+// declaration of such a name: pin each declaration form that carries no
+// visible StartStatus type, and the forms that must pass.
+func TestRuntimeLifecycle_CoreUntypedStartStatusNameClassifier(t *testing.T) {
+	cases := []struct {
+		decl string
+		want []string
+	}{
+		{"func f() { StartStatusX := session.StatusError; use(StartStatusX) }", []string{"StartStatusX"}},
+		{"func f() { status, StartStatusX := next(); use(status, StartStatusX) }", []string{"StartStatusX"}},
+		{"func f(values []session.Status) { for _, StartStatusX := range values { use(StartStatusX) } }", []string{"StartStatusX"}},
+		{"func f(v any) { switch StartStatusX := v.(type) { default: use(StartStatusX) } }", []string{"StartStatusX"}},
+		{"func f(ch chan session.Status) { select { case StartStatusX := <-ch: use(StartStatusX) } }", []string{"StartStatusX"}},
+		{"func f(StartStatusX session.Status) {}", []string{"StartStatusX"}},
+		{"func f() (StartStatusX session.Status) { return }", []string{"StartStatusX"}},
+		{"func f() { use(func(StartStatusX session.Status) {}) }", []string{"StartStatusX"}},
+		{"func (StartStatusX T) f() {}", []string{"StartStatusX"}},
+		{"func f() { status := StartStatusQueued; use(status) }", nil},
+		{"func f() { var StartStatusX StartStatus = StartStatusQueued; use(StartStatusX) }", nil},
+		{"func f(status session.Status) { out.Status = StartStatusStarted }", nil},
+		{"func f() { for i := range 3 { use(i) } }", nil},
+	}
+	for _, c := range cases {
+		file, err := parser.ParseFile(token.NewFileSet(), "case.go", "package p\n"+c.decl+"\n", 0)
+		if err != nil {
+			t.Fatalf("%s: %v", c.decl, err)
+		}
+		var got []string
+		ast.Inspect(file, func(node ast.Node) bool {
+			for _, ident := range untypedStartStatusNames(node) {
+				got = append(got, ident.Name)
+			}
+			return true
+		})
+		if strings.Join(got, ",") != strings.Join(c.want, ",") {
+			t.Errorf("untypedStartStatusNames(%s) = %v, want %v", c.decl, got, c.want)
 		}
 	}
 }
