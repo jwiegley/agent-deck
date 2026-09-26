@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
@@ -15,12 +17,57 @@ func consumeRuntimeResult(inst *session.Instance, runtime statedb.RuntimeState, 
 	return failure, warning
 }
 
-// initialMessageOutcome is the parenthetical a start with an initial message
-// reports. A partial success can leave the pane live without the message
-// (session.InitialMessageUndelivered); that start must not claim it was sent.
-func initialMessageOutcome(undelivered bool) string {
-	if undelivered {
-		return "(message not delivered)"
+// startSuccess is the verdict of a start that completed: `session start` on
+// the legacy and registry paths, and `launch`.
+type startSuccess struct {
+	// verb heads the success line: "Started" or "Launched".
+	verb  string
+	id    string
+	title string
+	// warning is the runtime durability warning of a partial success.
+	warning string
+	// tmux and claudeSessionID are the spawn receipt `session start` echoes.
+	// launch leaves them empty and reports the committed row's instead
+	// (addLaunchStateJSON).
+	tmux            string
+	claudeSessionID string
+	message         string
+	// messageUndelivered: the pane is live but the initial message never
+	// reached it (session.InitialMessageUndelivered).
+	messageUndelivered bool
+	// messageDeferred: the message is sent after the start returns (launch
+	// --no-wait), so it is still pending when the start reports.
+	messageDeferred bool
+}
+
+// renderStartSuccess adds a completed start's fields to jsonData and returns
+// its success line. It is the one rendering of an initial message's outcome,
+// so no surface can report a message as sent that the start left undelivered.
+func renderStartSuccess(s startSuccess, jsonData map[string]interface{}) string {
+	jsonData["success"] = true
+	jsonData["id"] = s.id
+	jsonData["title"] = s.title
+	if s.warning != "" {
+		jsonData["warning"] = s.warning
 	}
-	return "(message sent)"
+	if s.tmux != "" {
+		jsonData["tmux"] = s.tmux
+	}
+	if s.claudeSessionID != "" {
+		jsonData["claude_session_id"] = s.claudeSessionID
+	}
+	line := fmt.Sprintf("%s session: %s", s.verb, s.title)
+	if s.message == "" {
+		return line
+	}
+	jsonData["message"] = s.message
+	jsonData["message_pending"] = s.messageUndelivered || s.messageDeferred
+	switch {
+	case s.messageUndelivered:
+		return line + " (message not delivered)"
+	case s.messageDeferred:
+		return line + " (message sent with --no-wait)"
+	default:
+		return line + " (message sent)"
+	}
 }

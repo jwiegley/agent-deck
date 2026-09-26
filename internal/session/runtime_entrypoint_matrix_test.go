@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -156,9 +157,10 @@ func TestRuntimeLifecycle_PhysicalEntrypointRoutingContract(t *testing.T) {
 		{"StartWithMessage core", "internal/session/instance.go", "startWithMessage", []string{"beginRuntimeTransition", "commitPhysicalRuntime"}},
 		{"fallback authority", "internal/session/instance.go", "restart", []string{"beginRuntimeTransition", "restartWithTransition"}},
 		{"fallback core", "internal/session/instance.go", "restartWithTransition", []string{"commitPhysicalRuntime"}},
-		{"CLI start", "cmd/agent-deck/session_cmd.go", "handleSessionStart", []string{"StartRuntime", "StartWithMessageRuntime", "InitialMessageUndelivered", "consumeRuntimeResult", "PersistSelectedStatus"}},
+		{"CLI start", "cmd/agent-deck/session_cmd.go", "handleSessionStart", []string{"StartRuntime", "StartWithMessageRuntime", "InitialMessageUndelivered", "consumeRuntimeResult", "PersistSelectedStatus", "renderStartSuccess"}},
+		{"core CLI start", "cmd/agent-deck/core_cli_session.go", "cliSessionStart", []string{"renderStartSuccess"}},
 		{"CLI launch entry", "cmd/agent-deck/launch_cmd.go", "handleLaunch", []string{"handleLaunchCommand"}},
-		{"CLI launch", "cmd/agent-deck/launch_cmd.go", "handleLaunchCommand", []string{"StartRuntime", "StartWithMessageRuntime", "InitialMessageUndelivered", "consumeRuntimeResult"}},
+		{"CLI launch", "cmd/agent-deck/launch_cmd.go", "handleLaunchCommand", []string{"StartRuntime", "StartWithMessageRuntime", "InitialMessageUndelivered", "consumeRuntimeResult", "renderStartSuccess"}},
 		{"CLI restart", "cmd/agent-deck/session_cmd.go", "handleSessionRestart", []string{"RestartWithEnvRuntime", "consumeRuntimeResult"}},
 		{"CLI spawn failure", "cmd/agent-deck/session_cmd.go", "failSpawnVerification", []string{"PersistSpawnFailureStatus"}},
 		{"spawn failure verdict", "internal/session/status_authority.go", "PersistSpawnFailureStatus", []string{"ReconcileRuntime", "PersistSelectedStatus"}},
@@ -296,6 +298,51 @@ func runtimeOwnedAssignment(field string, rhs ast.Expr) bool {
 		return ok && pkg.Name == "time" && sel.Sel.Name == "Now"
 	}
 	return false
+}
+
+// F6: the outcome of a start's initial message is rendered in one place,
+// renderStartSuccess. A start surface that wrote message_pending itself could
+// report a message the start left undelivered as sent.
+func TestRuntimeLifecycle_StartMessageOutcomeHasOneRenderer(t *testing.T) {
+	dir := filepath.Join(runtimeLifecycleSourceRoot(t), "cmd", "agent-deck")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || filepath.Ext(name) != ".go" || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, declaration := range file.Decls {
+			decl, ok := declaration.(*ast.FuncDecl)
+			if !ok || decl.Body == nil {
+				continue
+			}
+			ast.Inspect(decl.Body, func(node ast.Node) bool {
+				lit, ok := node.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING || lit.Value != strconv.Quote("message_pending") {
+					return true
+				}
+				if decl.Name.Name == "renderStartSuccess" {
+					rendered++
+				} else {
+					t.Errorf("cmd/agent-deck/%s:%d: %s writes message_pending outside renderStartSuccess",
+						name, fset.Position(lit.Pos()).Line, decl.Name.Name)
+				}
+				return true
+			})
+		}
+	}
+	if rendered == 0 {
+		t.Fatal("renderStartSuccess no longer renders message_pending")
+	}
 }
 
 func runtimeLifecycleFunctionCalls(t *testing.T, path, function string) map[string]int {
