@@ -24,8 +24,7 @@ func preQueuedCountConductorInstructionsTemplate(template string) string {
 // migrating, so any user customization is preserved.
 func previousConductorInstructionsTemplate(template string) string {
 	template = preQueuedCountConductorInstructionsTemplate(template)
-	template = strings.Replace(template,
-		`| `+"`"+`agent-deck -p <PROFILE> status --json`+"`"+` | **Always triage with this compact count summary first:** `+"`"+`{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}`+"`"+` |`,
+	template = strings.Replace(template, preQueuedCountStatusRow,
 		`| `+"`"+`agent-deck -p <PROFILE> status --json`+"`"+` | Get counts: `+"`"+`{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}`+"`"+` |`, 1)
 	template = strings.Replace(template,
 		`| `+"`"+`agent-deck -p <PROFILE> list --json`+"`"+` | Expensive full inventory; use only when the user explicitly needs details for every profile session, never for status triage or polling |`,
