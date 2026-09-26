@@ -106,8 +106,11 @@ func TestHookCleanupDeletionKeepsUIResponsive(t *testing.T) {
 			// Confirming the deletion is the UI handler; it must only dispatch.
 			var keys []tea.KeyMsg
 			if tc.finish {
-				// A non-repository root keeps the finish's git steps inert.
-				h.worktreeFinishDialog.Show(inst.ID, inst.Title, "gone-branch", t.TempDir(), filepath.Join(t.TempDir(), "missing"), "main")
+				// A root with no repository at or above it keeps the finish's
+				// git steps inert, wherever the test's temporary directory is.
+				root := t.TempDir()
+				t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(root))
+				h.worktreeFinishDialog.Show(inst.ID, inst.Title, "gone-branch", root, filepath.Join(root, "missing"), "main")
 				keys = []tea.KeyMsg{
 					{Type: tea.KeySpace, Runes: []rune{' '}}, // no merge
 					{Type: tea.KeyEnter},
