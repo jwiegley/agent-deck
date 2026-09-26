@@ -1,6 +1,7 @@
 package tmux
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRuntimeLifecycle_RuntimeCandidateSnapshotScalesWithSocketsNotInstances(t *testing.T) {
@@ -180,6 +182,105 @@ func TestRuntimeLifecycle_RuntimeCandidateSnapshotUnprefixedStampReadFailureIsIn
 
 	if _, err := ListRuntimeCandidates("isolated", "stamped"); !errors.Is(err, blocked) {
 		t.Fatalf("inventory error = %v, want the failed local stamp read", err)
+	}
+}
+
+// The cleanup inventory, and so every destructive capture and lower-generation
+// sweep, sees a runtime Agent Deck stamped whatever its tmux name. A session
+// without the complete local stamp stays invisible, prefixed or not.
+func TestRuntimeLifecycle_RuntimeCleanupInventoryAdmitsStampedUnprefixedSession(t *testing.T) {
+	oldOutput := runtimeBindingCandidateOutputFn
+	t.Cleanup(func() { runtimeBindingCandidateOutputFn = oldOutput })
+	runtimeBindingCandidateOutputFn = func(socketName string, args ...string) ([]byte, error) {
+		if socketName != "isolated" || len(args) != 3 || args[0] != "list-sessions" || args[2] != runtimeCleanupCandidateFormat() {
+			t.Fatalf("inventory command = %q %q", socketName, args)
+		}
+		rows := []string{
+			tmuxFmt("$1", "agentdeck_prefixed", "%1", "4101"),
+			tmuxFmt("$2", "ad-golden-sess-shell", "%2", "4102"),
+			tmuxFmt("$3", "user-work", "%3", "4103"),
+			tmuxFmt("$4", "agentdeck_unstamped", "%4", "4104"),
+		}
+		return []byte(strings.Join(rows, "\n") + "\n"), nil
+	}
+	stubRuntimeCleanupLocalOptions(t, map[string]map[string]runtimeCleanupLocalOption{
+		"$1": runtimeCleanupLocalOptionsForTest("prefixed", 3, "", ""),
+		"$2": runtimeCleanupLocalOptionsForTest("stamped", 5, "", ""),
+	})
+
+	inventory, err := ListRuntimeCleanupCandidates("isolated", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, candidate := range inventory {
+		names = append(names, candidate.SessionName)
+	}
+	if want := []string{"agentdeck_prefixed", "ad-golden-sess-shell"}; !reflect.DeepEqual(names, want) {
+		t.Fatalf("cleanup inventory = %q, want only the stamped sessions %q", names, want)
+	}
+	candidates, err := ListRuntimeGenerationCandidates("isolated", "stamped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := RuntimeGenerationCandidate{
+		SessionName: "ad-golden-sess-shell", SessionID: "$2", SocketName: "isolated",
+		PaneID: "%2", PanePID: 4102, InstanceID: "stamped", Generation: 5, GenerationKnown: true,
+	}
+	if len(candidates) != 1 || candidates[0] != want {
+		t.Fatalf("generation candidates = %#v, want %#v", candidates, want)
+	}
+}
+
+// The conditional kill proves ownership by the local stamp and the exact
+// stable identity, so an unprefixed stamped runtime is killed like any other,
+// with its exact name in the tmux-server condition.
+func TestRuntimeLifecycle_KillRuntimeGenerationCandidateKillsStampedUnprefixedSession(t *testing.T) {
+	stubProcessStartIdentityForTest(t)
+	oldTree := runtimeGenerationProcessTreeFn
+	oldKill := runtimeBindingConditionalKillFn
+	oldEnsure := runtimeGenerationEnsurePIDsDeadFn
+	t.Cleanup(func() {
+		runtimeGenerationProcessTreeFn = oldTree
+		runtimeBindingConditionalKillFn = oldKill
+		runtimeGenerationEnsurePIDsDeadFn = oldEnsure
+	})
+	candidate := RuntimeGenerationCandidate{
+		SessionName: "ad-golden-sess-shell", SessionID: "$2", SocketName: "isolated",
+		PaneID: "%2", PanePID: 4102, InstanceID: "stamped", Generation: 5, GenerationKnown: true,
+	}
+	stubRuntimeCleanupLocalOptions(t, map[string]map[string]runtimeCleanupLocalOption{
+		"$2": runtimeCleanupLocalOptionsForTest("stamped", 5, "", ""),
+	})
+	runtimeGenerationProcessTreeFn = func(string, string) ([]int, error) { return []int{candidate.PanePID}, nil }
+	var condition string
+	runtimeBindingConditionalKillFn = func(_ context.Context, socketName string, args ...string) ([]byte, error) {
+		if socketName != "isolated" || len(args) != 7 || args[0] != "if-shell" {
+			t.Fatalf("conditional kill = %q %q", socketName, args)
+		}
+		condition = args[4]
+		return nil, nil
+	}
+	reaped := false
+	runtimeGenerationEnsurePIDsDeadFn = func([]ProcessIdentity, time.Duration) error {
+		reaped = true
+		return nil
+	}
+
+	if err := KillRuntimeGenerationCandidate(candidate, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, check := range []string{
+		"#{==:#{session_name},#{l:ad-golden-sess-shell}}",
+		"#{==:#{" + runtimeCleanupInstanceOption + "},#{l:stamped}}",
+		"#{==:#{" + runtimeCleanupGenerationOption + "},#{l:5}}",
+	} {
+		if !strings.Contains(condition, check) {
+			t.Fatalf("kill condition %q lacks %q", condition, check)
+		}
+	}
+	if !reaped {
+		t.Fatal("killed runtime's process tree was not reaped")
 	}
 }
 

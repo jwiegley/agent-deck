@@ -216,6 +216,55 @@ func TestUnprefixedRuntime_StampedRuntimeIsLiveToReconciliation(t *testing.T) {
 	}
 }
 
+// Stop kills the runtime Agent Deck stamped under an unprefixed name and
+// records it stopped, and a later status observation keeps it stopped: the
+// storage goldens' "ad-golden-sess-shell" read back idle because stop used to
+// leave this pane running.
+func TestUnprefixedRuntime_StampedStopKillsAndStaysStopped(t *testing.T) {
+	storage, inst, socketName, sessionName := startStampedUnprefixedRuntime(t, "_test_unprefixed_stop")
+
+	if err := inst.KillCaptured(inst.CaptureRuntimeSelection()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if tmuxSessionAnswers(socketName, sessionName) {
+		t.Fatalf("stop left %q running", sessionName)
+	}
+	stopped, found, err := storage.GetDB().ReadRuntimeState(inst.ID)
+	if err != nil || !found || stopped.Status != string(StatusStopped) {
+		t.Fatalf("stored runtime after stop = %#v found=%v err=%v", stopped, found, err)
+	}
+	if reconciled, err := inst.ReconcileRuntime(); err != nil || reconciled.Live {
+		t.Fatalf("reconciliation after stop = %+v err=%v, want no live runtime", reconciled, err)
+	}
+
+	// Observe the way `session show` does: a freshly loaded instance, past the
+	// tmux start grace window, probing its runtime and committing the verdict.
+	time.Sleep(1600 * time.Millisecond)
+	loaded, err := storage.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var observer *Instance
+	for _, candidate := range loaded {
+		if candidate.ID == inst.ID {
+			observer = candidate
+		}
+	}
+	if observer == nil {
+		t.Fatalf("instance %s did not reload", inst.ID)
+	}
+	if err := observer.UpdateStatus(); err != nil {
+		t.Fatalf("status observation: %v", err)
+	}
+	if got := observer.GetStatusThreadSafe(); got != StatusStopped {
+		t.Fatalf("observed status after stop = %q, want stopped", got)
+	}
+	durable, _, err := storage.GetDB().ReadRuntimeState(inst.ID)
+	if err != nil || durable.Status != string(StatusStopped) {
+		t.Fatalf("stored runtime after observation = %#v err=%v, want stopped", durable, err)
+	}
+}
+
 // An instance whose durable runtime names a live tmux session Agent Deck never
 // stamped (an imported session, or one from before the stamp) must not be
 // reported stopped while that process keeps running: stop refuses, and the

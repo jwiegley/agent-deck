@@ -1057,9 +1057,11 @@ func TestRuntimeLifecycle_RuntimeBindingCandidatesCaptureStableSessionAndPaneIde
 			return []byte(tmuxFmt("$7", "agentdeck_peer", "%9", "4242") + "\n" +
 				tmuxFmt("$8", "ordinary", "%10", "4343") + "\n"), nil
 		case "display-message":
+			// Every session's local options are read; only the stamp, never the
+			// name, separates the runtime from the ordinary session.
 			candidate := runtimeBindingCandidateForTest()
 			return runtimeCleanupLocalOutputForTest(
-				[]RuntimeBindingCandidate{candidate},
+				[]RuntimeBindingCandidate{candidate, {SessionID: "$8"}},
 				map[string]map[string]runtimeCleanupLocalOption{
 					candidate.SessionID: runtimeCleanupLocalOptionsForTest(
 						candidate.InstanceID, candidate.Generation, candidate.BindingKey, candidate.BindingValue,
