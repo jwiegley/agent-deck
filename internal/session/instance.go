@@ -3880,7 +3880,9 @@ func (i *Instance) codexSessionScanDue(allowUnscoped bool) bool {
 }
 
 // shouldRunCodexProcessProbe returns whether we should run Codex process/file
-// probing right now.
+// probing right now. The caller must not hold i.mu: it holds the spawn lock
+// (the status pass, a restart), but a storage reload rebinds the thread under
+// i.mu without that lock, so the binding is read under i.mu.
 func (i *Instance) shouldRunCodexProcessProbe(force bool) bool {
 	if force {
 		i.lastCodexProbeAt = time.Now()
@@ -3891,8 +3893,11 @@ func (i *Instance) shouldRunCodexProcessProbe(force bool) bool {
 	// bounded by discovery succeeding within seconds. Once an ID is known the
 	// probe is just a rotation safety net behind the notify hook and tmux env,
 	// so it backs off to the rotation cadence (issue #1552).
+	i.mu.RLock()
+	bound := i.CodexSessionID != ""
+	i.mu.RUnlock()
 	interval := codexBootstrapScanInterval
-	if i.CodexSessionID != "" {
+	if bound {
 		interval = codexRotationScanInterval
 	}
 
@@ -4549,20 +4554,12 @@ func (i *Instance) queryCodexSessionCandidateForPass(excludeIDs map[string]bool,
 	}
 
 	if i.shouldRunCodexProcessProbe(forceProbe) {
+		// Every ID the probe returns has passed its subagent gate
+		// (filterCodexProcessProbeCandidate), which records the rejections.
 		sessionID, missingDep, probeErr := i.queryCodexSessionFromProcessFiles()
 		if sessionID != "" {
-			if i.shouldRejectCodexSubagentRebind(sessionID) {
-				_ = WriteSessionIDLifecycleEvent(SessionIDLifecycleEvent{
-					InstanceID: i.ID, Tool: tool, Action: "reject",
-					Source: "process_probe", OldID: currentID, Candidate: sessionID,
-					Reason: "candidate_is_subagent_thread",
-				})
-				sessionLog.Debug("codex_session_probe_rejected_subagent",
-					slog.String("old_id", currentID), slog.String("candidate", sessionID))
-			} else {
-				candidate.id, candidate.source = sessionID, "process_probe"
-				return candidate
-			}
+			candidate.id, candidate.source = sessionID, "process_probe"
+			return candidate
 		}
 		if missingDep != "" {
 			candidate.missingDependency = missingDep
