@@ -917,37 +917,38 @@ func TestRuntimeLifecycle_CandidateRespawnClaimSpansOnlyTheMutation(t *testing.T
 
 // TestRuntimeLifecycle_CandidateRespawnDeadlineStartsAfterClaim: a restart can
 // wait behind expireStartupHandover, which holds session.mu across its own
-// bounded hold respawn. That wait must not spend the conditional's deadline.
+// bounded hold respawn. That wait must not spend the conditional's deadline,
+// so the whole budget must still remain when the claim is released.
 func TestRuntimeLifecycle_CandidateRespawnDeadlineStartsAfterClaim(t *testing.T) {
 	binding := runtimeBindingCandidateForTest()
 	candidate := runtimeGenerationCandidateFromBinding(binding)
 	stubRuntimeBindingCandidateProcessTreeForTest(t, binding)
 	stubCompleteRuntimeCleanupLocalOptions(t, binding)
-	oldTimeout := tmuxMutationTimeout
-	tmuxMutationTimeout = 200 * time.Millisecond
+	captured := signalCandidateCaptureForTest(t)
 	oldMutation := runtimeBindingConditionalKillFn
-	t.Cleanup(func() {
-		tmuxMutationTimeout = oldTimeout
-		runtimeBindingConditionalKillFn = oldMutation
-	})
-	var remaining time.Duration
+	t.Cleanup(func() { runtimeBindingConditionalKillFn = oldMutation })
+	var deadline time.Time
 	runtimeBindingConditionalKillFn = func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
-		deadline, _ := ctx.Deadline()
-		remaining = time.Until(deadline)
+		deadline, _ = ctx.Deadline()
 		return nil, nil
 	}
 	session := &Session{Name: candidate.SessionName, SocketName: candidate.SocketName, InstanceID: candidate.InstanceID}
 
-	session.mu.Lock() // a claim held for longer than the whole mutation budget
+	session.mu.Lock() // the claim the respawn must wait behind
 	done := make(chan error, 1)
 	go func() { done <- RespawnRuntimeGenerationCandidate(session, candidate, "") }()
-	time.Sleep(2 * tmuxMutationTimeout)
+	parkErr := awaitRespawnParkedOnClaim(captured)
+	released := time.Now()
 	session.mu.Unlock()
 	if err := <-done; err != nil {
 		t.Fatalf("candidate respawn after waiting for the claim: %v", err)
 	}
-	if remaining < tmuxMutationTimeout/2 {
-		t.Fatalf("conditional respawn deadline remaining = %v of %v; the claim wait spent it", remaining, tmuxMutationTimeout)
+	if parkErr != nil {
+		t.Fatal(parkErr)
+	}
+	if budget := released.Add(tmuxMutationTimeout); deadline.Before(budget) {
+		t.Fatalf("conditional respawn deadline %v is %v short of the claim release plus its %v budget; the claim wait spent it",
+			deadline, budget.Sub(deadline), tmuxMutationTimeout)
 	}
 }
 
