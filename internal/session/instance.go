@@ -3615,8 +3615,15 @@ func (e codexSessionExclusions) contains(id string) bool {
 // Selection strategy:
 //  1. Prefer sessions whose JSONL metadata matches this instance's project path.
 //  2. Optionally allow unscoped fallback (no cwd metadata) for initial bootstrap.
+//
+// The caller must not hold i.mu. The inputs are read under it once, as in
+// queryCodexSessionFromProcessFiles, and the walk, which can outlive its
+// timeout, reads only that snapshot.
 func (i *Instance) queryCodexSession(exclusions codexSessionExclusions, allowUnscoped bool) string {
-	sessionsDir := filepath.Join(i.getCodexHomeDir(), "sessions")
+	i.mu.RLock()
+	codexHome, projectPath, codexStartedAt := i.getCodexHomeDir(), i.ProjectPath, i.CodexStartedAt
+	i.mu.RUnlock()
+	sessionsDir := filepath.Join(codexHome, "sessions")
 	if _, err := os.Stat(sessionsDir); os.IsNotExist(err) {
 		return ""
 	}
@@ -3628,7 +3635,7 @@ func (i *Instance) queryCodexSession(exclusions codexSessionExclusions, allowUns
 	var bestUnscopedID string
 	var bestUnscopedTime time.Time
 
-	normalizedProjectPath := normalizePath(i.ProjectPath)
+	normalizedProjectPath := normalizePath(projectPath)
 
 	var walkErr error
 	if !runWithTimeout(codexWalkDirTimeout, func() {
@@ -3656,7 +3663,7 @@ func (i *Instance) queryCodexSession(exclusions codexSessionExclusions, allowUns
 			// best user-sourced match instead of returning nothing when the
 			// most-recent match happens to be a subagent. See
 			// codex_subagent_gate.go.
-			if i.shouldRejectCodexSubagentRebind(sessionID) {
+			if CodexSubagentThread(sessionID, codexHome) {
 				return nil
 			}
 
@@ -3666,8 +3673,8 @@ func (i *Instance) queryCodexSession(exclusions codexSessionExclusions, allowUns
 			}
 
 			// Only consider sessions created after we started this instance.
-			if i.CodexStartedAt > 0 {
-				startTime := time.UnixMilli(i.CodexStartedAt)
+			if codexStartedAt > 0 {
+				startTime := time.UnixMilli(codexStartedAt)
 				if info.ModTime().Before(startTime) {
 					return nil
 				}
@@ -3864,12 +3871,19 @@ func (i *Instance) PaneProcessTreePIDs() ([]int, error) {
 // non-nil error means the returned process forest may be incomplete. Its
 // error strings are prefixed "codex process probe" for historical reasons
 // (its first caller); it is not codex-specific — see PaneProcessTreePIDs.
+//
+// The caller must not hold i.mu. The wrapper and socket are read under it:
+// detectCodexSessionAsync probes while the runtime commit that follows a
+// start or restart adopts them under i.mu.
 func (i *Instance) collectTmuxPaneProcessTreePIDs() ([]int, error) {
-	if i.tmuxSession == nil || !i.tmuxSession.Exists() {
+	i.mu.RLock()
+	tmuxSession, socketName := i.tmuxSession, i.TmuxSocketName
+	i.mu.RUnlock()
+	if tmuxSession == nil || !tmuxSession.Exists() {
 		return nil, errors.New("codex process probe: tmux session is unavailable")
 	}
 
-	target := i.tmuxSession.Name
+	target := tmuxSession.Name
 	// Target the same tmux server the session was created on (issue #687).
 	// A session on an isolated agent-deck socket would return no panes from
 	// the default server and we would mistakenly treat it as empty.
@@ -3877,7 +3891,7 @@ func (i *Instance) collectTmuxPaneProcessTreePIDs() ([]int, error) {
 	// a tmux client that has exhausted its fd table never exits, so this probe
 	// would hang the caller forever. -s makes list-panes cover every window in
 	// the session rather than only the target's current window.
-	out, err := tmux.OutputBounded(i.TmuxSocketName, "list-panes", "-s", "-t", target, "-F", "#{pane_pid}")
+	out, err := tmux.OutputBounded(socketName, "list-panes", "-s", "-t", target, "-F", "#{pane_pid}")
 	if err != nil {
 		return nil, fmt.Errorf("codex process probe: list tmux panes: %w", err)
 	}
@@ -4224,7 +4238,10 @@ fi`,
 }
 
 func (i *Instance) queryCodexSessionFromDockerProcFD() (string, string, error) {
-	if strings.TrimSpace(i.SandboxContainer) == "" {
+	i.mu.RLock()
+	container := i.SandboxContainer
+	i.mu.RUnlock()
+	if strings.TrimSpace(container) == "" {
 		return "", "", errors.New("codex process probe: sandbox container is unavailable")
 	}
 
@@ -4232,7 +4249,7 @@ func (i *Instance) queryCodexSessionFromDockerProcFD() (string, string, error) {
 	// #nosec G204 -- "docker exec" with internal SandboxContainer name and a
 	// hardcoded shell probe script (the sentinels are compile-time constants);
 	// no external input flows here.
-	out, err := exec.Command("docker", "exec", i.SandboxContainer, "sh", "-lc", script).Output()
+	out, err := exec.Command("docker", "exec", container, "sh", "-lc", script).Output()
 	if sessionID := i.extractAcceptedCodexSessionIDFromOutput(out); sessionID != "" {
 		return sessionID, "", nil
 	}
@@ -4312,9 +4329,16 @@ func (i *Instance) queryCodexSessionFromHostLsof(pids []int) (string, string, er
 // the active session UUID inferred from open rollout JSONL files. Empty ID with
 // nil error means definitely absent; a non-nil error means undetermined. The
 // second return value names a missing dependency, when applicable.
+//
+// The caller must not hold i.mu: every step reads the Instance under it,
+// because detectCodexSessionAsync probes beside the runtime commit and the
+// metadata reloads that write those fields under i.mu.
 func (i *Instance) queryCodexSessionFromProcessFiles() (string, string, error) {
+	i.mu.RLock()
+	sandboxed := i.IsSandboxed()
+	i.mu.RUnlock()
 	// Sandboxed sessions run Codex inside Docker; probe container /proc.
-	if i.IsSandboxed() {
+	if sandboxed {
 		return i.queryCodexSessionFromDockerProcFD()
 	}
 
@@ -7624,7 +7648,7 @@ func (i *Instance) bindCodexSessionFromHook(observation RuntimeBindingObservatio
 		slog.String("new_id", sessionID),
 		slog.String("event", hookEvent),
 	)
-	i.recordCodexOwnership(sessionID)
+	i.recordCodexOwnershipLocked(sessionID)
 	i.hookSessionID = sessionID
 
 	if i.tmuxSession != nil && i.tmuxSession.Exists() {
