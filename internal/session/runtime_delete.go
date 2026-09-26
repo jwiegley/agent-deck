@@ -175,15 +175,15 @@ func legacyRuntimeAdoptionOffered(db *statedb.StateDB, expected statedb.RuntimeS
 
 // legacyRuntimeAdoptionCommand is the adoption a refusal offers. It resolves
 // the instance in this process's profile (sessionProfileEnvValue, whose
-// storage refused), but a bare agent-deck command opens the configured
-// default profile, so any other profile is named with the global -p flag,
-// which must precede the subcommand.
+// storage refused), and it always names that profile with the global -p flag,
+// which must precede the subcommand. A bare agent-deck command resolves
+// AGENTDECK_PROFILE and then CLAUDE_CONFIG_DIR before it falls back to the
+// configured default, and ensureProfileEnv exports AGENTDECK_PROFILE in every
+// Agent Deck pane. So no profile, not even the configured default, is one a
+// bare command is sure to open in the shell the operator pastes it into.
 func legacyRuntimeAdoptionCommand(instanceID string) string {
-	command := "agent-deck "
-	if profile := sessionProfileEnvValue(); profile != configuredDefaultProfile() {
-		command += "-p " + shellescape.Quote(profile) + " "
-	}
-	return command + "session adopt-runtime " + instanceID + " --yes"
+	return "agent-deck -p " + shellescape.Quote(sessionProfileEnvValue()) +
+		" session adopt-runtime " + instanceID + " --yes"
 }
 
 // discoverCapturedRuntimeChildrenFn returns, but does not register, descendants
