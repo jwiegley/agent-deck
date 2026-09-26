@@ -4373,17 +4373,15 @@ func (i *Instance) updateCodexSessionForPass(excludeIDs map[string]bool, forcePr
 	}
 	defer release()
 	observation := i.CaptureRuntimeBindingObservation("codex")
-	if observation.value == "" {
-		if pass == nil {
-			pass = &StatusUpdatePass{}
-		}
-		if excludeIDs == nil {
-			i.codexExclusions(pass)
-		}
-		codexBootstrapMu.Lock()
-		defer codexBootstrapMu.Unlock()
+	if observation.value == "" && pass == nil {
+		pass = &StatusUpdatePass{}
 	}
-	candidate := i.queryCodexSessionCandidateForPass(excludeIDs, forceProbe, observation.value, pass)
+	// The disk fallback takes the bootstrap claim just before it selects, and
+	// it is held through publication below. The tmux environment read and the
+	// process probe are authoritative and never wait for it.
+	var bootstrap codexBootstrapClaim
+	defer bootstrap.release()
+	candidate := i.queryCodexSessionCandidateForPass(excludeIDs, forceProbe, observation.value, pass, &bootstrap)
 	if candidate.id != "" {
 		if err := i.publishRuntimeBindingObservationLocked(observation, candidate.id, time.Now()); err != nil {
 			sessionLog.Debug("codex_binding_rejected",
@@ -4396,11 +4394,37 @@ func (i *Instance) updateCodexSessionForPass(excludeIDs map[string]bool, forcePr
 	return candidate.missingDependency
 }
 
-func (i *Instance) queryCodexSessionCandidate(excludeIDs map[string]bool, forceProbe bool, currentID string) codexSessionCandidate {
-	return i.queryCodexSessionCandidateForPass(excludeIDs, forceProbe, currentID, nil)
+// codexBootstrapClaim holds codexBootstrapMu from the moment the disk fallback
+// starts selecting until its caller has published the result, so peers sharing
+// a project cannot claim one rollout from the same ownership snapshot. It is
+// taken lazily, only on the way into the fallback: authoritative evidence is
+// read without it, as codexBootstrapMu's contract requires. The zero value
+// holds nothing, and release is idempotent.
+type codexBootstrapClaim struct{ held bool }
+
+func (c *codexBootstrapClaim) acquire() {
+	if !c.held {
+		codexBootstrapMu.Lock()
+		c.held = true
+	}
 }
 
-func (i *Instance) queryCodexSessionCandidateForPass(excludeIDs map[string]bool, forceProbe bool, currentID string, pass *StatusUpdatePass) codexSessionCandidate {
+func (c *codexBootstrapClaim) release() {
+	if c.held {
+		c.held = false
+		codexBootstrapMu.Unlock()
+	}
+}
+
+func (i *Instance) queryCodexSessionCandidate(excludeIDs map[string]bool, forceProbe bool, currentID string) codexSessionCandidate {
+	return i.queryCodexSessionCandidateForPass(excludeIDs, forceProbe, currentID, nil, nil)
+}
+
+// queryCodexSessionCandidateForPass reads the tmux environment and the process
+// probe, then falls back to the disk scan. A non-nil bootstrap is acquired
+// just before that scan and left held for the caller to release once it has
+// published the candidate.
+func (i *Instance) queryCodexSessionCandidateForPass(excludeIDs map[string]bool, forceProbe bool, currentID string, pass *StatusUpdatePass, bootstrap *codexBootstrapClaim) codexSessionCandidate {
 	i.mu.RLock()
 	tool := i.Tool
 	tmuxSession := i.tmuxSession
@@ -4448,6 +4472,12 @@ func (i *Instance) queryCodexSessionCandidateForPass(excludeIDs map[string]bool,
 	allowUnscoped := candidate.envID == "" && startedAt > 0
 	if !i.codexSessionScanDue(allowUnscoped) {
 		return candidate
+	}
+	if bootstrap != nil {
+		if excludeIDs == nil {
+			i.codexExclusions(pass) // Fetch peer ownership before the claim; no subprocess runs under it.
+		}
+		bootstrap.acquire()
 	}
 	if excludeIDs == nil {
 		excludeIDs = i.codexExclusions(pass)
