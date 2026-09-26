@@ -130,10 +130,13 @@ func TestCodexHookPublication_RechecksPreviouslyUnflushedCandidate(t *testing.T)
 		t.Fatal(err)
 	}
 	childID := uniqueSID(t)
-	// Codex may emit the first hook before flushing its rollout. Preserve the
-	// existing fail-open behavior, including the fingerprint publication cache.
+	// Codex may emit a thread's first hooks (thread start, prompt submit)
+	// before flushing its rollout. Preserve the existing fail-open behavior for
+	// them, including the fingerprint publication cache. A turn end cannot be
+	// that early: a real thread's rollout is on disk from its turn start, so a
+	// turn end without one is an ephemeral helper (CodexUnbackedTurnEnd).
 	hs := &HookStatus{
-		Status: "running", Event: "agent-turn-complete", SessionID: childID,
+		Status: "waiting", Event: "thread-started", SessionID: childID,
 		UpdatedAt: time.Now(), Fingerprint: HookStatusFingerprint{1},
 	}
 	inst.UpdateHookStatus(hs)
@@ -143,6 +146,23 @@ func TestCodexHookPublication_RechecksPreviouslyUnflushedCandidate(t *testing.T)
 	before, found, err := storage.db.ReadRuntimeBinding(inst.ID, "codex")
 	if err != nil || !found {
 		t.Fatalf("accepted binding: found=%v err=%v", found, err)
+	}
+
+	// A thread-title helper's turn end names a thread that never writes a
+	// rollout. It must neither rebind nor displace the accepted candidate's
+	// hook evidence or publication cache.
+	inst.UpdateHookStatus(&HookStatus{
+		Status: "waiting", Event: "agent-turn-complete", SessionID: uniqueSID(t),
+		UpdatedAt: time.Now(), Fingerprint: HookStatusFingerprint{2},
+	})
+	if inst.CodexSessionID != childID || inst.hookSessionID != childID ||
+		inst.hookEvent != hs.Event || inst.hookFingerprint != hs.Fingerprint ||
+		inst.validatedHookBindings["codex"].value != childID {
+		t.Fatalf("unbacked turn end displaced the accepted candidate: binding=%q hook=%q event=%q",
+			inst.CodexSessionID, inst.hookSessionID, inst.hookEvent)
+	}
+	if current, found, err := storage.db.ReadRuntimeBinding(inst.ID, "codex"); err != nil || !found || current != before {
+		t.Fatalf("unbacked turn end changed the durable binding: before=%+v after=%+v found=%v err=%v", before, current, found, err)
 	}
 
 	seedCodexRolloutWithMeta(t, codexHome, childID, "subagent", uniqueSID(t), true)
