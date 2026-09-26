@@ -17,6 +17,13 @@ import (
 
 func runtimeLifecycleTestDB(t *testing.T, tool string, toolData json.RawMessage) (*statedb.StateDB, *Instance) {
 	t.Helper()
+	return runtimeLifecycleTestDBOnSocket(t, tool, toolData, "isolated")
+}
+
+// runtimeLifecycleTestDBOnSocket is runtimeLifecycleTestDB with the runtime on
+// socketName ("" is tmux's native default socket).
+func runtimeLifecycleTestDBOnSocket(t *testing.T, tool string, toolData json.RawMessage, socketName string) (*statedb.StateDB, *Instance) {
+	t.Helper()
 	db, err := statedb.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +37,7 @@ func runtimeLifecycleTestDB(t *testing.T, tool string, toolData json.RawMessage)
 	}
 	parent := &statedb.InstanceRow{
 		ID: "one", Title: "one", ProjectPath: "/tmp/one", GroupPath: "my-sessions",
-		Tool: tool, Status: "idle", TmuxSession: "runtime-g0", TmuxSocketName: "isolated",
+		Tool: tool, Status: "idle", TmuxSession: "runtime-g0", TmuxSocketName: socketName,
 		CreatedAt: time.Unix(1, 0).UTC(), ToolData: toolData,
 	}
 	if err := db.SaveInstance(parent); err != nil {
@@ -38,8 +45,8 @@ func runtimeLifecycleTestDB(t *testing.T, tool string, toolData json.RawMessage)
 	}
 	inst := &Instance{
 		ID: "one", Title: "one", ProjectPath: "/tmp/one", GroupPath: "my-sessions",
-		Tool: tool, Status: StatusIdle, TmuxSocketName: "isolated", owningDB: db,
-		tmuxSession: &tmux.Session{Name: "runtime-g0", SocketName: "isolated", InstanceID: "one"},
+		Tool: tool, Status: StatusIdle, TmuxSocketName: socketName, owningDB: db,
+		tmuxSession: &tmux.Session{Name: "runtime-g0", SocketName: socketName, InstanceID: "one"},
 	}
 	inst.adoptPersistenceIncarnation(parent.Incarnation)
 	return db, inst
@@ -401,6 +408,79 @@ func TestRuntimeLifecycle_ReservedRecoveryBypassesLateLegacyWriter(t *testing.T)
 				if result.State.Status != wantStatus || result.State.StatusRevision != claimed.StatusRevision+1 || result.Live != live {
 					t.Fatalf("result=%#v, want status=%q revision=%d live=%v",
 						result, wantStatus, claimed.StatusRevision+1, live)
+				}
+			})
+		}
+	}
+}
+
+// A process inside a foreign tmux server (a nested TUI whose $TMUX names a
+// private server) inventories the native default socket "" on that private
+// server. Its empty inventory is no proof that a reserved default-server
+// runtime is gone, so reconciliation keeps the reservation while the default
+// server cannot be listed. Once the default server answers without the
+// session, the runtime is gone everywhere and the destruction completes.
+func TestRuntimeLifecycle_ReservedDefaultSocketRuntimeNeedsVisibleServer(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	for _, entrypoint := range []string{"direct", "snapshot"} {
+		for _, listable := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/default-server-listable=%t", entrypoint, listable), func(t *testing.T) {
+				installRuntimeLifecycleTestSeams(t)
+				db, inst := runtimeLifecycleTestDBOnSocket(t, "pi", nil, "")
+				durable, found, err := db.ReadRuntimeState(inst.ID)
+				if err != nil || !found {
+					t.Fatalf("read durable: state=%#v found=%v err=%v", durable, found, err)
+				}
+				claimed, err := db.ReserveRuntimeDestruction(durable, inst.PersistenceIncarnation())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !listable {
+					// The default socket this process computes does not exist
+					// (a TMUX_TMPDIR mismatch). Short /tmp root: sun_path.
+					tmpdir, err := os.MkdirTemp("/tmp", "adfs-")
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = os.RemoveAll(tmpdir) })
+					t.Setenv("TMUX_TMPDIR", tmpdir)
+				}
+				// Otherwise TMUX_TMPDIR stays the package's isolated one, whose
+				// default server (TestMain's bootstrap) lacks runtime-g0.
+				t.Setenv("TMUX", filepath.Join(t.TempDir(), "foreign")+",1,0")
+				tmux.ResetDefaultServerSessionsForTest(t)
+
+				var result RuntimeReconciliationResult
+				if entrypoint == "direct" {
+					result, err = inst.ReconcileRuntime()
+				} else {
+					snapshot := make(tmux.RuntimeCandidateSnapshot)
+					for _, socketName := range inst.runtimeCandidateSocketNames(claimed) {
+						snapshot[socketName] = tmux.RuntimeCandidateSocketSnapshot{
+							CandidatesByInstance: map[string][]tmux.RuntimeCandidate{},
+						}
+					}
+					result, err = inst.ReconcileRuntimeFromSnapshot(snapshot)
+				}
+				got, found, readErr := db.ReadRuntimeState(inst.ID)
+				if readErr != nil || !found {
+					t.Fatalf("read durable after reconcile: state=%#v found=%v err=%v", got, found, readErr)
+				}
+				if !listable {
+					var ambiguity *RuntimeReconciliationAmbiguityError
+					if !errors.As(err, &ambiguity) {
+						t.Fatalf("reconcile err=%v result=%#v, want an ambiguity that keeps the reservation", err, result)
+					}
+					if got != claimed || !statedb.IsRuntimeDestructionReserved(got) {
+						t.Fatalf("durable state=%#v, want the untouched reservation %#v", got, claimed)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result.Live || got.Status != string(StatusStopped) || got.StatusRevision != claimed.StatusRevision+1 {
+					t.Fatalf("result=%#v durable=%#v, want the destruction completed as stopped", result, got)
 				}
 			})
 		}

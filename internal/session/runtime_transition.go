@@ -1201,6 +1201,9 @@ func (i *Instance) reconcileRuntimeCandidatesLocked(db *statedb.StateDB, durable
 	result := RuntimeReconciliationResult{State: durable, Candidates: candidates}
 	if len(candidates) == 0 {
 		if statedb.IsRuntimeDestructionReserved(durable) {
+			if runtimeAbsenceIsForeignServer(durable) {
+				return result, i.runtimeAmbiguity("reserved runtime's tmux server is not visible from this process", candidates)
+			}
 			completed, err := db.CompleteRuntimeDestruction(durable, incarnation, string(StatusStopped))
 			if err != nil {
 				return result, err
@@ -1343,6 +1346,20 @@ func (i *Instance) reconcileRuntimeCandidatesLocked(db *statedb.StateDB, durable
 		runtimeDuplicateSweepFn(i, runtimeCandidateObservedSocketNames(candidates)...)
 	}
 	return result, nil
+}
+
+// runtimeAbsenceIsForeignServer reports whether an empty inventory is no
+// evidence that state's runtime is gone. A runtime on the native default
+// socket is inventoried with socket-less tmux calls, which a process inside
+// another tmux server sends to its $TMUX server instead; unless the default
+// server answers without the session, that process cannot see the runtime and
+// must form no verdict (tmux.Session.AbsenceIsForeignServer).
+func runtimeAbsenceIsForeignServer(state statedb.RuntimeState) bool {
+	if state.TmuxSession == "" {
+		return false
+	}
+	target := &tmux.Session{Name: state.TmuxSession, SocketName: state.TmuxSocketName}
+	return target.AbsenceIsForeignServer()
 }
 
 func sameRuntimeCandidateSnapshot(snapshot, verified tmux.RuntimeCandidate) bool {

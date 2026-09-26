@@ -460,7 +460,10 @@ var (
 // An error means the probe was indeterminate (timed out). Callers MUST treat
 // that as "assume alive" — never as "no sessions" — or a briefly-wedged server
 // will look like a pile of dead sessions. A successful probe returning an empty
-// set is authoritative (server present, no sessions / no server running).
+// set is authoritative for the socket path this process computes (server
+// present with no sessions, no server running, or no socket file). A caller
+// that may compute a different path than the server's own must not read a
+// missing socket as empty (see listDefaultServerSessions).
 func ListSessionNamesOnSocket(socketName string) (map[string]struct{}, error) {
 	return listSessionsOnSocket(socketName)
 }
@@ -469,18 +472,25 @@ func ListSessionNamesOnSocket(socketName string) (map[string]struct{}, error) {
 // tmux socket via a single bounded `list-sessions`. A server with no sessions
 // (or no server at all) is an empty set, not an error.
 func defaultListSessionsOnSocket(socketName string) (map[string]struct{}, error) {
+	return listSessionNamesOnSocket(socketName, isEmptyTmuxServerResult)
+}
+
+// listSessionNamesOnSocket runs the bounded `list-sessions` behind
+// defaultListSessionsOnSocket. empty decides which tmux exits are an
+// authoritative empty set.
+func listSessionNamesOnSocket(socketName string, empty func(error) bool) (map[string]struct{}, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
 	defer cancel()
 
 	out, err := commandOutput(tmuxExecContext(ctx, socketName, "list-sessions", "-F", "#{session_name}"))
 	if err != nil {
-		// "no server running" / "no sessions" are legitimate empty results; any
-		// other failure (timeout, exec error) is reported so the caller keeps
-		// the previous entry instead of flapping every session to "gone".
+		// An empty-server exit is a legitimate empty result; any other failure
+		// (timeout, exec error) is reported so the caller keeps the previous
+		// entry instead of flapping every session to "gone".
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, ctx.Err()
 		}
-		if isEmptyTmuxServerResult(err) {
+		if empty(err) {
 			return map[string]struct{}{}, nil
 		}
 		return nil, err
@@ -496,18 +506,37 @@ func defaultListSessionsOnSocket(socketName string) (map[string]struct{}, error)
 }
 
 // isEmptyTmuxServerResult distinguishes tmux's expected empty-server exits
-// from launch, permission, and other probe failures. exec.Cmd.Output stores
-// the command's stderr on ExitError; err.Error() alone does not include it.
+// from launch, permission, and other probe failures: the server reported no
+// sessions, or no server exists at the socket path this process computed.
 func isEmptyTmuxServerResult(err error) bool {
+	return isNoTmuxServerResult(err) || isMissingTmuxSocketResult(err)
+}
+
+// isNoTmuxServerResult reports tmux's own "no server running" / "no sessions"
+// exits. exec.Cmd.Output stores the command's stderr on ExitError; err.Error()
+// alone does not include it.
+func isNoTmuxServerResult(err error) bool {
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {
 		return false
 	}
 	stderr := strings.ToLower(string(exitErr.Stderr))
 	return strings.Contains(stderr, "no server running") ||
-		strings.Contains(stderr, "no sessions") ||
-		(strings.Contains(stderr, "error connecting to ") &&
-			strings.Contains(stderr, "(no such file or directory)"))
+		strings.Contains(stderr, "no sessions")
+}
+
+// isMissingTmuxSocketResult reports that the socket file this process computed
+// does not exist. That proves the server absent only where the computed path
+// is the server's own; it is no evidence for a process that may compute a
+// different path (foreign_server.go).
+func isMissingTmuxSocketResult(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	stderr := strings.ToLower(string(exitErr.Stderr))
+	return strings.Contains(stderr, "error connecting to ") &&
+		strings.Contains(stderr, "(no such file or directory)")
 }
 
 // sessionExistsOnSocketCached answers "is <name> live on <socketName>?" from
