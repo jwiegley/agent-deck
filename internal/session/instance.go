@@ -6647,7 +6647,9 @@ func (i *Instance) updateStatusWithEvidence(pass *StatusUpdatePass, syncMetadata
 }
 
 // graceWindowStatus settles a probe inside the tmux grace window, while the
-// spawn has no session to look at yet. Running, idle and queued are kept; any
+// spawn has no session to look at yet. Running, idle and queued are kept, and
+// so is stopped: stopped and queued are operator intent, as they are with no
+// tmux session at all, and a poll must not publish starting over a stop. Any
 // other status reads starting. The window observes nothing, so a status that
 // stays what it was, starting included, forms no verdict: finalizing it would
 // mark the status sampled live and release an auth hold on no evidence. Only a
@@ -6655,7 +6657,7 @@ func (i *Instance) updateStatusWithEvidence(pass *StatusUpdatePass, syncMetadata
 func graceWindowStatus(ctx context.Context, current Status) Status {
 	candidate := current
 	switch current {
-	case StatusRunning, StatusIdle, StatusQueued:
+	case StatusRunning, StatusIdle, StatusQueued, StatusStopped:
 	default:
 		candidate = StatusStarting
 	}
