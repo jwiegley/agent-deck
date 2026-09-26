@@ -30,23 +30,24 @@ func TestRuntimeLifecycle_DestructionRefusesLiveSessionWithoutOwnershipProof(t *
 	}
 	operations := []struct {
 		name string
+		op   string
 		run  func(*Instance, *statedb.StateDB, statedb.RuntimeState) error
 	}{
-		{name: "kill", run: func(inst *Instance, _ *statedb.StateDB, _ statedb.RuntimeState) error {
+		{name: "kill", op: "stop", run: func(inst *Instance, _ *statedb.StateDB, _ statedb.RuntimeState) error {
 			return inst.KillCaptured(inst.CaptureRuntimeSelection())
 		}},
-		{name: "kill and wait", run: func(inst *Instance, _ *statedb.StateDB, _ statedb.RuntimeState) error {
+		{name: "kill and wait", op: "stop", run: func(inst *Instance, _ *statedb.StateDB, _ statedb.RuntimeState) error {
 			return inst.KillAndWaitCaptured(inst.CaptureRuntimeSelection())
 		}},
-		{name: "delete", run: func(inst *Instance, _ *statedb.StateDB, _ statedb.RuntimeState) error {
+		{name: "delete", op: "delete", run: func(inst *Instance, _ *statedb.StateDB, _ statedb.RuntimeState) error {
 			return inst.DeleteCaptured(inst.CaptureRuntimeSelection())
 		}},
-		{name: "restart predecessor", run: func(inst *Instance, db *statedb.StateDB, state statedb.RuntimeState) error {
+		{name: "restart predecessor", op: "restart", run: func(inst *Instance, db *statedb.StateDB, state statedb.RuntimeState) error {
 			return inst.terminateTransitionPredecessor(&runtimeTransitionAuthority{
 				expected: state, incarnation: inst.PersistenceIncarnation(), durable: true, db: db,
 			})
 		}},
-		{name: "non-durable restart predecessor", run: func(inst *Instance, _ *statedb.StateDB, state statedb.RuntimeState) error {
+		{name: "non-durable restart predecessor", op: "restart", run: func(inst *Instance, _ *statedb.StateDB, state statedb.RuntimeState) error {
 			return inst.terminateTransitionPredecessor(&runtimeTransitionAuthority{
 				expected: state, incarnation: inst.PersistenceIncarnation(),
 			})
@@ -83,6 +84,12 @@ func TestRuntimeLifecycle_DestructionRefusesLiveSessionWithoutOwnershipProof(t *
 				err := operation.run(inst, db, state)
 				if !errors.Is(err, ErrRuntimeOwnershipUnproven) || !strings.Contains(err.Error(), state.TmuxSession) {
 					t.Fatalf("%s error = %v, want ErrRuntimeOwnershipUnproven naming %q", operation.name, err, state.TmuxSession)
+				}
+				// The refusal names the operation and hands over the exact
+				// command that ends the session by hand.
+				const kill = "`tmux -L isolated kill-session -t =runtime-g1`"
+				if !strings.HasPrefix(err.Error(), operation.op+" refused: ") || !strings.Contains(err.Error(), kill) {
+					t.Fatalf("%s refusal = %q, want it to begin %q and name %s", operation.name, err, operation.op+" refused: ", kill)
 				}
 				if want := []string{state.TmuxSocketName + "/" + state.TmuxSession}; !reflect.DeepEqual(probed, want) {
 					t.Fatalf("selected-session probes = %q, want %q", probed, want)
@@ -349,5 +356,56 @@ func TestStoppedRuntime_StopsReadingLive(t *testing.T) {
 	}
 	if inst.Exists() {
 		t.Fatalf("stopped runtime %q still reads live", sessionName)
+	}
+}
+
+// A pre-stamp runtime that still holds its one-time migration record is
+// refused like any unproven one, and the refusal points at the adoption that
+// stamps it. Without the record only the manual remedy is offered, and so it
+// is for a name legacy adoption does not accept.
+func TestRuntimeLifecycle_UnprovenLegacyRuntimeRefusalOffersAdoption(t *testing.T) {
+	db, inst, state, _ := legacyRuntimeAdoptionFixture(t)
+	installRuntimeLifecycleTestSeams(t)
+	oldGenerationInventory := runtimeGenerationCandidateInventoryFn
+	t.Cleanup(func() { runtimeGenerationCandidateInventoryFn = oldGenerationInventory })
+	runtimeGenerationCandidateInventoryFn = func(string, string) ([]tmux.RuntimeGenerationCandidate, error) { return nil, nil }
+	selectedRuntimeSessionExistsFn = func(string, string) (bool, error) { return true, nil }
+
+	const adopt = "run `agent-deck session adopt-runtime legacy-one --yes` to bring it under Agent Deck"
+	const kill = "`tmux -L legacy-socket kill-session -t =agentdeck_legacy_one`"
+	unprefixed := state
+	unprefixed.TmuxSession = "user-work"
+	if !legacyRuntimeAdoptionOffered(db, state) || legacyRuntimeAdoptionOffered(db, unprefixed) || legacyRuntimeAdoptionOffered(nil, state) {
+		t.Fatal("legacy adoption must be offered exactly for a recorded runtime whose name adoption accepts")
+	}
+	err := inst.KillCaptured(inst.CaptureRuntimeSelection())
+	if !errors.Is(err, ErrRuntimeOwnershipUnproven) || !strings.HasPrefix(err.Error(), "stop refused: ") ||
+		!strings.Contains(err.Error(), adopt) || !strings.Contains(err.Error(), kill) {
+		t.Fatalf("stop of an unadopted legacy runtime = %v, want a refusal offering %q and %s", err, adopt, kill)
+	}
+
+	if _, execErr := db.DB().Exec(`DELETE FROM instance_legacy_runtime_adoption WHERE instance_id = ?`, state.InstanceID); execErr != nil {
+		t.Fatal(execErr)
+	}
+	err = inst.DeleteCaptured(inst.CaptureRuntimeSelection())
+	if !errors.Is(err, ErrRuntimeOwnershipUnproven) || !strings.HasPrefix(err.Error(), "delete refused: ") ||
+		strings.Contains(err.Error(), "adopt-runtime") || !strings.Contains(err.Error(), kill) {
+		t.Fatalf("delete without a migration record = %v, want only the manual remedy %s", err, kill)
+	}
+}
+
+// The manual remedy names the session's own server, spelling the native
+// default socket out, and an exact target the shell passes intact.
+func TestRuntimeLifecycle_TmuxKillSessionCommandTargetsTheExactSession(t *testing.T) {
+	for _, tc := range []struct {
+		socket, session, want string
+	}{
+		{socket: "", session: "agentdeck_native", want: "tmux -L default kill-session -t =agentdeck_native"},
+		{socket: "isolated", session: "user work", want: "tmux -L isolated kill-session -t '=user work'"},
+	} {
+		got := tmuxKillSessionCommand(statedb.RuntimeState{TmuxSocketName: tc.socket, TmuxSession: tc.session})
+		if got != tc.want {
+			t.Fatalf("kill command for %q/%q = %q, want %q", tc.socket, tc.session, got, tc.want)
+		}
 	}
 }

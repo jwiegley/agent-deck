@@ -95,7 +95,7 @@ func TestRuntimeLifecycle_DestructiveSelectionPreservesNativeDefaultSocket(t *te
 		return []tmux.RuntimeGenerationCandidate{want}, nil
 	}
 	inst := &Instance{ID: expected.InstanceID}
-	selected, err := inst.captureDestructiveRuntimeCandidateLocked(nil, expected, "", false)
+	selected, err := inst.captureDestructiveRuntimeCandidateLocked(nil, destroyForStop, expected, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
