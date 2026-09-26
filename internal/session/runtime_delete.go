@@ -131,8 +131,8 @@ func requireSelectedRuntimeGone(db *statedb.StateDB, operation string, expected 
 	case live:
 		remedy := fmt.Sprintf("end it yourself with `%s`, then retry the %s", kill, operation)
 		if legacyRuntimeAdoptionOffered(db, expected) {
-			remedy = fmt.Sprintf("run `agent-deck session adopt-runtime %s --yes` to bring it under Agent Deck, or %s",
-				expected.InstanceID, remedy)
+			remedy = fmt.Sprintf("run `%s` to bring it under Agent Deck, or %s",
+				legacyRuntimeAdoptionCommand(expected.InstanceID), remedy)
 		}
 		return fmt.Errorf("%s refused: tmux session %q of %s is still live, but no Agent Deck ownership stamp proves it is runtime generation %d (Agent Deck neither started it nor took it over on import, or its stamp names another instance); %s: %w",
 			operation, expected.TmuxSession, expected.InstanceID, expected.Generation, remedy, ErrRuntimeOwnershipUnproven)
@@ -171,6 +171,19 @@ func legacyRuntimeAdoptionOffered(db *statedb.StateDB, expected statedb.RuntimeS
 	}
 	_, found, err := db.ReadLegacyRuntimeAdoption(expected.InstanceID)
 	return err == nil && found
+}
+
+// legacyRuntimeAdoptionCommand is the adoption a refusal offers. It resolves
+// the instance in this process's profile (sessionProfileEnvValue, whose
+// storage refused), but a bare agent-deck command opens the configured
+// default profile, so any other profile is named with the global -p flag,
+// which must precede the subcommand.
+func legacyRuntimeAdoptionCommand(instanceID string) string {
+	command := "agent-deck "
+	if profile := sessionProfileEnvValue(); profile != configuredDefaultProfile() {
+		command += "-p " + shellescape.Quote(profile) + " "
+	}
+	return command + "session adopt-runtime " + instanceID + " --yes"
 }
 
 // discoverCapturedRuntimeChildrenFn returns, but does not register, descendants

@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"reflect"
 	"strings"
@@ -418,10 +419,34 @@ func TestStoppedRuntime_StopsReadingLive(t *testing.T) {
 	}
 }
 
+// configureDefaultProfileForTest makes profile config.json's default_profile,
+// the profile a bare agent-deck command opens, and restores the file after.
+func configureDefaultProfileForTest(t *testing.T, profile string) {
+	t.Helper()
+	path, err := GetConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous, readErr := os.ReadFile(path)
+	t.Cleanup(func() {
+		if readErr == nil {
+			_ = os.WriteFile(path, previous, 0o600)
+		} else {
+			_ = os.Remove(path)
+		}
+	})
+	if err := SaveConfig(&Config{DefaultProfile: profile, Version: 1}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A pre-stamp runtime that still holds its one-time migration record is
 // refused like any unproven one, and the refusal points at the adoption that
-// stamps it. Without the record only the manual remedy is offered, and so it
-// is for a name legacy adoption does not accept.
+// stamps it. The adoption names the refusing profile unless a bare command
+// already opens it: without -p it resolved the instance in the configured
+// default profile and failed with not-found. Without the record only the
+// manual remedy is offered, and so it is for a name legacy adoption does not
+// accept.
 func TestRuntimeLifecycle_UnprovenLegacyRuntimeRefusalOffersAdoption(t *testing.T) {
 	db, inst, state, _ := legacyRuntimeAdoptionFixture(t)
 	installRuntimeLifecycleTestSeams(t)
@@ -430,23 +455,42 @@ func TestRuntimeLifecycle_UnprovenLegacyRuntimeRefusalOffersAdoption(t *testing.
 	runtimeGenerationCandidateInventoryFn = func(string, string) ([]tmux.RuntimeGenerationCandidate, error) { return nil, nil }
 	selectedRuntimeSessionExistsFn = func(string, string) (bool, error) { return true, nil }
 
-	const adopt = "run `agent-deck session adopt-runtime legacy-one --yes` to bring it under Agent Deck"
 	const kill = "`tmux -L legacy-socket kill-session -t =agentdeck_legacy_one`"
 	unprefixed := state
 	unprefixed.TmuxSession = "user-work"
 	if !legacyRuntimeAdoptionOffered(db, state) || legacyRuntimeAdoptionOffered(db, unprefixed) || legacyRuntimeAdoptionOffered(nil, state) {
 		t.Fatal("legacy adoption must be offered exactly for a recorded runtime whose name adoption accepts")
 	}
-	err := inst.KillCaptured(inst.CaptureRuntimeSelection())
-	if !errors.Is(err, ErrRuntimeOwnershipUnproven) || !strings.HasPrefix(err.Error(), "stop refused: ") ||
-		!strings.Contains(err.Error(), adopt) || !strings.Contains(err.Error(), kill) {
-		t.Fatalf("stop of an unadopted legacy runtime = %v, want a refusal offering %q and %s", err, adopt, kill)
+	for _, tc := range []struct {
+		name, profile, configuredDefault, adoption string
+	}{
+		{name: "another profile", profile: "_test_adoption",
+			adoption: "agent-deck -p _test_adoption session adopt-runtime legacy-one --yes"},
+		{name: "the default profile", profile: DefaultProfile,
+			adoption: "agent-deck session adopt-runtime legacy-one --yes"},
+		{name: "the configured default profile", profile: "work", configuredDefault: "work",
+			adoption: "agent-deck session adopt-runtime legacy-one --yes"},
+		{name: "the default profile beside a configured default", profile: DefaultProfile, configuredDefault: "work",
+			adoption: "agent-deck -p default session adopt-runtime legacy-one --yes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AGENTDECK_PROFILE", tc.profile)
+			if tc.configuredDefault != "" {
+				configureDefaultProfileForTest(t, tc.configuredDefault)
+			}
+			adopt := "run `" + tc.adoption + "` to bring it under Agent Deck"
+			err := inst.KillCaptured(inst.CaptureRuntimeSelection())
+			if !errors.Is(err, ErrRuntimeOwnershipUnproven) || !strings.HasPrefix(err.Error(), "stop refused: ") ||
+				!strings.Contains(err.Error(), adopt) || !strings.Contains(err.Error(), kill) {
+				t.Fatalf("stop of an unadopted legacy runtime = %v, want a refusal offering %q and %s", err, adopt, kill)
+			}
+		})
 	}
 
 	if _, execErr := db.DB().Exec(`DELETE FROM instance_legacy_runtime_adoption WHERE instance_id = ?`, state.InstanceID); execErr != nil {
 		t.Fatal(execErr)
 	}
-	err = inst.DeleteCaptured(inst.CaptureRuntimeSelection())
+	err := inst.DeleteCaptured(inst.CaptureRuntimeSelection())
 	if !errors.Is(err, ErrRuntimeOwnershipUnproven) || !strings.HasPrefix(err.Error(), "delete refused: ") ||
 		strings.Contains(err.Error(), "adopt-runtime") || !strings.Contains(err.Error(), kill) {
 		t.Fatalf("delete without a migration record = %v, want only the manual remedy %s", err, kill)
