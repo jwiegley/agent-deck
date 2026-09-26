@@ -210,27 +210,29 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 		name   string
 		remove bool
 		inject func(*testing.T, string)
-		// reason opens the skip reason, and detail must appear later in it.
-		reason, detail string
+		// reason opens the skip reason, and each detail must appear later in it.
+		reason  string
+		details []string
 		// heartbeat is the heartbeat_enabled flag the skipped conductor keeps,
 		// which its aborted entry must report.
 		heartbeat bool
 	}{
 		// A refused runtime action leaves the heartbeat and directory alone.
-		{"runtime-action", false, registerLiveLegacyWriter, "runtime action aborted for conductor-abort-ops: " + statedb.ErrIncompatibleWriterSchema.Error(), "", true},
-		{"runtime-action-remove", true, registerLiveLegacyWriter, "runtime action aborted for conductor-abort-ops: " + statedb.ErrIncompatibleWriterSchema.Error(), "", true},
+		{"runtime-action", false, registerLiveLegacyWriter, "runtime action aborted for conductor-abort-ops: " + statedb.ErrIncompatibleWriterSchema.Error(), nil, true},
+		{"runtime-action-remove", true, registerLiveLegacyWriter, "runtime action aborted for conductor-abort-ops: " + statedb.ErrIncompatibleWriterSchema.Error(), nil, true},
 		// A store that cannot be opened or loaded leaves the runtime
 		// unobserved and unstopped.
-		{"store-open", true, corruptProfileStore, "failed to open profile default: ", "", true},
-		{"store-load", true, failProfileLoad, "failed to load profile default: ", `"expanded"`, true},
+		{"store-open", true, corruptProfileStore, "failed to open profile default: ", nil, true},
+		{"store-load", true, failProfileLoad, "failed to load profile default: ", []string{`"expanded"`}, true},
 		// The runtime row is already deleted, so its heartbeat goes with it;
 		// only the directory stays for the rerun.
-		{"group-save", true, failGroupWrites, "failed to save groups in default: ", "injected group write failure", false},
+		{"group-save", true, failGroupWrites, "failed to save groups in default: ", []string{"injected group write failure"}, false},
 		// A row that survives its conditional delete keeps the heartbeat on,
-		// even when the group save failed too: the verify is decided first.
-		{"verify", true, resurrectInstanceRows, "failed to verify conditional removal ", ": exists=true err=<nil>", true},
+		// even when the group save failed too: the verify is decided first,
+		// and the group save's root cause still reaches the reason.
+		{"verify", true, resurrectInstanceRows, "failed to verify conditional removal ", []string{": exists=true err=<nil>"}, true},
 		{"verify+group-save", true, resurrectInstanceRowsAndFailGroupWrites, "failed to verify conditional removal ",
-			": exists=true err=<nil>; group save also failed: failed to save groups: ", true},
+			[]string{": exists=true err=<nil>; group save also failed: failed to save groups: ", "injected group write failure"}, true},
 	} {
 		for _, jsonOutput := range []bool{true, false} {
 			mode := "human"
@@ -271,8 +273,13 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 						t.Fatalf("teardown must report failure and an empty teardown list: %s", out)
 					}
 					if len(result.Aborted) != 1 || result.Aborted[0].Name != name || result.Aborted[0].Profile != "default" ||
-						!strings.HasPrefix(result.Aborted[0].Reason, tc.reason) || !strings.Contains(result.Aborted[0].Reason, tc.detail) {
-						t.Fatalf("aborted = %s, want %s with reason %q ... %q", out, name, tc.reason, tc.detail)
+						!strings.HasPrefix(result.Aborted[0].Reason, tc.reason) {
+						t.Fatalf("aborted = %s, want %s with reason %q", out, name, tc.reason)
+					}
+					for _, detail := range tc.details {
+						if !strings.Contains(result.Aborted[0].Reason, detail) {
+							t.Fatalf("skip reason %q must contain %q", result.Aborted[0].Reason, detail)
+						}
 					}
 					if heartbeat := result.Aborted[0].Heartbeat; heartbeat == nil || *heartbeat != tc.heartbeat {
 						t.Fatalf("aborted entry must report heartbeat %v: %s", tc.heartbeat, out)
@@ -286,8 +293,11 @@ func TestRuntimeLifecycle_ConductorTeardownReportsAbortedTarget(t *testing.T) {
 					if !found {
 						t.Fatalf("stderr must name the skipped conductor and why, want %q in %q", summary, stderr)
 					}
-					if line, _, _ := strings.Cut(reason, "\n"); !strings.Contains(line, tc.detail) {
-						t.Fatalf("skip reason %q must contain %q", line, tc.detail)
+					line, _, _ := strings.Cut(reason, "\n")
+					for _, detail := range tc.details {
+						if !strings.Contains(line, detail) {
+							t.Fatalf("skip reason %q must contain %q", line, detail)
+						}
 					}
 				}
 				meta, err := session.LoadConductorMeta(name)
