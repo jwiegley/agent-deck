@@ -10,10 +10,12 @@ import (
 	"io/fs"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -566,6 +568,103 @@ func stubRuntimeBindingCandidateProcessTreeForTest(t *testing.T, candidate Runti
 		runtimeGenerationProcessTreeFn = oldTree
 		runtimeGenerationEnsurePIDsDeadFn = oldEnsure
 	})
+}
+
+// trackRuntimeGenerationEscalationsForTest makes every candidate respawn's
+// post-respawn escalation observable. An escalation outlives its respawn by
+// the retry delay and reap grace while it reads the process-tree and
+// process-identity seams other tests replace, so no test may return while one
+// runs. The returned wait blocks until every escalation started so far has
+// finished; cleanup waits the same way before restoring the launcher.
+func trackRuntimeGenerationEscalationsForTest(t *testing.T) (wait func()) {
+	t.Helper()
+	var escalations sync.WaitGroup
+	launch := runtimeGenerationEscalationGoFn
+	runtimeGenerationEscalationGoFn = func(escalate func()) {
+		escalations.Add(1)
+		launch(func() {
+			defer escalations.Done()
+			escalate()
+		})
+	}
+	t.Cleanup(func() {
+		escalations.Wait()
+		runtimeGenerationEscalationGoFn = launch
+	})
+	return escalations.Wait
+}
+
+// signalCandidateCaptureForTest closes the returned channel once a candidate
+// respawn's stable capture has taken its second, confirming process-tree
+// probe: the respawn is past the probes that fork ps/pgrep, which run
+// outside session.mu and can take arbitrarily long on a loaded runner.
+func signalCandidateCaptureForTest(t *testing.T) <-chan struct{} {
+	t.Helper()
+	captured := make(chan struct{})
+	probe := runtimeGenerationProcessTreeFn
+	var probes atomic.Int32
+	runtimeGenerationProcessTreeFn = func(socketName, paneID string) ([]int, error) {
+		pids, err := probe(socketName, paneID)
+		if probes.Add(1) == 2 {
+			close(captured)
+		}
+		return pids, err
+	}
+	t.Cleanup(func() { runtimeGenerationProcessTreeFn = probe })
+	return captured
+}
+
+// awaitRespawnParkedOnClaim returns once a candidate respawn is past its
+// capture (see signalCandidateCaptureForTest) and parked on the generation
+// claim the caller holds. It never fails the test itself, so a caller holding
+// session.mu can release it before reporting the error.
+func awaitRespawnParkedOnClaim(captured <-chan struct{}) error {
+	deadline := time.After(10 * time.Second)
+	select {
+	case <-captured:
+	case <-deadline:
+		return errors.New("candidate respawn never finished its process-tree capture")
+	}
+	for !respawnParkedOnClaim() {
+		select {
+		case <-deadline:
+			return errors.New("candidate respawn never waited on the held generation claim")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	return nil
+}
+
+// respawnParkedOnClaim reports whether some goroutine is inside
+// RespawnRuntimeGenerationCandidate's own session.mu.Lock call: the frame
+// that function called is sync.(*Mutex).Lock. sync.Mutex exposes no waiters,
+// and a fixed sleep proves nothing about a goroutine that is still capturing,
+// so this reads the goroutine stacks. The function name comes from the symbol
+// itself, so a rename makes the wait fail loudly instead of pass vacuously.
+func respawnParkedOnClaim() bool {
+	respawn := runtime.FuncForPC(reflect.ValueOf(RespawnRuntimeGenerationCandidate).Pointer()).Name()
+	stacks := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(stacks, true)
+		if n < len(stacks) {
+			stacks = stacks[:n]
+			break
+		}
+		stacks = make([]byte, 2*len(stacks))
+	}
+	for _, goroutine := range strings.Split(string(stacks), "\n\n") {
+		callee := ""
+		for _, line := range strings.Split(goroutine, "\n")[1:] {
+			if line == "" || strings.HasPrefix(line, "\t") {
+				continue // the source position of the frame above
+			}
+			if strings.HasPrefix(line, respawn+"(") && strings.HasPrefix(callee, "sync.(*Mutex).Lock(") {
+				return true
+			}
+			callee = line
+		}
+	}
+	return false
 }
 
 func processIdentityPIDsForTest(identities []ProcessIdentity) []int {
