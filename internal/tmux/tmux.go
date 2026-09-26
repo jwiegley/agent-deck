@@ -3386,7 +3386,9 @@ func (s *Session) ExistsCached() bool {
 // Uses the cached pane info (refreshed once per tick) for zero-cost lookups.
 // Falls back to a direct tmux query of the session's first window, addressed
 // by ^ rather than index 0 so a user's base-index or pane-base-index cannot
-// make the probe miss (and so read every dead pane as alive).
+// make the probe miss (and so read every dead pane as alive). Only the
+// primary pane's line is read (see primaryPaneLine), so the other panes of a
+// split window can neither mask nor fake its exit.
 func (s *Session) IsPaneDead() bool {
 	if info, ok := GetCachedPaneInfo(s.Name); ok {
 		return info.Dead
@@ -3403,7 +3405,7 @@ func (s *Session) IsPaneDead() bool {
 	if err != nil {
 		return false
 	}
-	return strings.TrimSpace(string(out)) == "1"
+	return primaryPaneLine(string(out)) == "1"
 }
 
 // PaneDeadExitStatus returns the exit code of the process that ran in the
@@ -3431,13 +3433,25 @@ func (s *Session) PaneDeadExitStatus() (int, bool) {
 	return parsePaneDeadStatus(string(out))
 }
 
+// primaryPaneLine returns the first line of a list-panes result. list-panes
+// expands a window target to every pane in that window, in pane-index order,
+// so the first line describes the lowest-index pane: the primary pane, as the
+// list-panes -a cache also defines it (parseListPanesOutput). That is the
+// pane the session was created with unless the user split before it (-b) or
+// swapped panes.
+func primaryPaneLine(raw string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(raw), "\n")
+	return strings.TrimSpace(line)
+}
+
 // parsePaneDeadStatus interprets the "#{pane_dead}|#{pane_dead_status}" line
-// tmux emits for a pane. It returns (code, true) only for a dead pane whose
+// tmux emits for the primary pane, the first line of a window's list-panes
+// result. It returns (code, true) only for a dead pane whose
 // exit status is a parseable integer — i.e. one preserved by remain-on-exit.
 // A live pane ("0|..."), or a dead pane with an empty status field (no
 // remain-on-exit), yields (0, false). Pure so the parsing is unit-testable.
 func parsePaneDeadStatus(raw string) (int, bool) {
-	dead, status, ok := strings.Cut(strings.TrimSpace(raw), "|")
+	dead, status, ok := strings.Cut(primaryPaneLine(raw), "|")
 	if !ok || dead != "1" {
 		return 0, false // pane not dead → no meaningful exit status
 	}
