@@ -2,10 +2,28 @@ package session
 
 import "strings"
 
-// previousConductorInstructionsTemplate reconstructs the immediately previous
-// generated template. Installers compare its fully rendered form byte-for-byte
-// before migrating, so any user customization is preserved.
+// queuedCountStatusRow and preQueuedCountStatusRow are the shared template's
+// `status --json` row with and without the fork's additive `queued` count.
+const (
+	queuedCountStatusRow    = `| ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` | **Always triage with this compact count summary first:** ` + "`" + `{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "queued": N, "total": N}` + "`" + ` |`
+	preQueuedCountStatusRow = `| ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` | **Always triage with this compact count summary first:** ` + "`" + `{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}` + "`" + ` |`
+)
+
+// preQueuedCountConductorInstructionsTemplate reconstructs the generated
+// template v1.16.11-v1.16.17 shipped, before this fork documented the queued
+// count `status --json` gained once status probes keep queued sessions
+// queued. Per-name templates never documented the counts, so this is a no-op
+// for them.
+func preQueuedCountConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, queuedCountStatusRow, preQueuedCountStatusRow, 1)
+}
+
+// previousConductorInstructionsTemplate reconstructs the v1.11.0-v1.16.10
+// generated template: it first reverts the queued count, then the v1.16.11
+// changes. Installers compare its fully rendered form byte-for-byte before
+// migrating, so any user customization is preserved.
 func previousConductorInstructionsTemplate(template string) string {
+	template = preQueuedCountConductorInstructionsTemplate(template)
 	template = strings.Replace(template,
 		`| `+"`"+`agent-deck -p <PROFILE> status --json`+"`"+` | **Always triage with this compact count summary first:** `+"`"+`{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}`+"`"+` |`,
 		`| `+"`"+`agent-deck -p <PROFILE> status --json`+"`"+` | Get counts: `+"`"+`{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}`+"`"+` |`, 1)
@@ -54,14 +72,19 @@ func preSubstateGuidanceConductorInstructionsTemplate(template string) string {
 //
 // Verified against fixtures rendered from the actual shipped source
 // (testdata/conductor_templates_shipped.tsv): this reconstructs the
-// v1.11.0-v1.16.10 generation and the v1.10.9-v1.10.11 generation. It does
-// NOT reconstruct v1.9.73 or v1.9.70, which shipped further template
-// changes (Codex `session approve` docs, the local-first rewrite) that are
-// not reverted here; a conductor instructions file last written by one of
-// those releases is treated as user-edited and left alone.
+// v1.16.11-v1.16.17 generation, the v1.11.0-v1.16.10 generation and the
+// v1.10.9-v1.10.11 generation. It does NOT reconstruct v1.9.73 or v1.9.70,
+// which shipped further template changes (Codex `session approve` docs,
+// the local-first rewrite) that are not reverted here; a conductor
+// instructions file last written by one of those releases is treated as
+// user-edited and left alone.
 func conductorInstructionsGenerations(template string) []string {
+	var gens []string
+	if shipped := preQueuedCountConductorInstructionsTemplate(template); shipped != template {
+		gens = append(gens, shipped)
+	}
 	previous := previousConductorInstructionsTemplate(template)
-	gens := []string{previous}
+	gens = append(gens, previous)
 	if older := preSubstateGuidanceConductorInstructionsTemplate(previous); older != previous {
 		gens = append(gens, older)
 	}
@@ -83,7 +106,7 @@ Each conductor has its own identity in its subdirectory and its own policy in PO
 ### Status & Listing
 | Command | Description |
 |---------|-------------|
-| ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` | **Always triage with this compact count summary first:** ` + "`" + `{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}` + "`" + ` |
+| ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` | **Always triage with this compact count summary first:** ` + "`" + `{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "queued": N, "total": N}` + "`" + ` |
 | ` + "`" + `agent-deck -p <PROFILE> list --json` + "`" + ` | Expensive full inventory; use only when the user explicitly needs details for every profile session, never for status triage or polling |
 | ` + "`" + `agent-deck -p <PROFILE> session children --follow --until-done` + "`" + ` | Block in one shell call while children run; emits every waiting/error transition and exits when all children are terminal |
 | ` + "`" + `agent-deck -p <PROFILE> session show --json <id_or_title>` + "`" + ` | Full details for one session |
