@@ -174,7 +174,7 @@ func (i *Instance) mergeReloaded(loaded *Instance, mergeMetadata, mergeRuntime b
 			i.hookFingerprint = HookStatusFingerprint{}
 			i.validatedHookBindings = nil
 		} else if i.tmuxSession != nil {
-			i.refreshKeptTmuxWrapperLocked(i.tmuxSession)
+			i.refreshKeptTmuxWrapperLocked()
 		}
 		if !mergeRuntime {
 			i.SandboxContainer = currentSandboxContainer
@@ -695,12 +695,20 @@ func (i *Instance) adoptRuntimeStateLocked(state statedb.RuntimeState) {
 		return
 	}
 	if i.tmuxSession == nil || i.tmuxSession.Name != state.TmuxSession || i.tmuxSession.SocketName != state.TmuxSocketName {
-		sess := tmux.ReconnectSessionLazy(state.TmuxSession, i.Title, i.EffectiveWorkingDir(), i.Command, statusToString(i.Status))
-		sess.SocketName = state.TmuxSocketName
-		sess.InstanceID = i.ID
-		i.configureTmuxWrapperLocked(sess)
-		i.tmuxSession = sess
+		i.tmuxSession = i.newTmuxWrapperLocked(state.TmuxSession, state.TmuxSocketName)
 	}
+}
+
+// newTmuxWrapperLocked builds a configured wrapper around the running tmux
+// session name on socket, as storage load does: ReconnectSessionLazy restores
+// the acknowledgment state from i.Status, and configureTmuxWrapperLocked
+// installs the per-instance configuration.
+func (i *Instance) newTmuxWrapperLocked(name, socket string) *tmux.Session {
+	sess := tmux.ReconnectSessionLazy(name, i.Title, i.EffectiveWorkingDir(), i.Command, statusToString(i.Status))
+	sess.SocketName = socket
+	sess.InstanceID = i.ID
+	i.configureTmuxWrapperLocked(sess)
+	return sess
 }
 
 // configureTmuxWrapperLocked gives a wrapper around a live tmux session the
@@ -723,26 +731,42 @@ func (i *Instance) configureTmuxWrapperLocked(sess *tmux.Session) {
 	i.loadCustomPatternsFromConfig(sess)
 }
 
-// refreshKeptTmuxWrapperLocked brings the wrapper a metadata reload keeps (same
-// tmux session, same tool) up to date with the merged fields it was configured
-// from: the display name, the group path, and the option overrides, whose
-// remain-on-exit follows the sandbox and one-shot settings. Upstream replaced
-// the Instance on every reload; a kept wrapper otherwise carries the metadata
-// it was built with, and after a move, rename or sandbox change committed by
-// another process the next attach's EnsureConfigured writes the old
-// @agentdeck_group_path and display name back over tmux. The wrapper is live,
-// and the tmux layer reads DisplayName and OptionOverrides without its lock
-// (SyncTmuxDisplayName writes DisplayName the same way), so each is written
-// only when it changed.
-func (i *Instance) refreshKeptTmuxWrapperLocked(sess *tmux.Session) {
-	if sess.DisplayName != i.Title {
-		sess.DisplayName = i.Title
+// refreshKeptTmuxWrapperLocked brings the wrapper of a metadata reload that
+// keeps the tmux session and tool up to date with the merged fields it was
+// configured from: the display name, the working directory (the project name
+// the status bar and terminal title show), the option overrides, whose
+// remain-on-exit follows the sandbox and one-shot settings, and the group
+// path. Upstream replaced the Instance on every reload. A kept wrapper
+// otherwise carries the metadata it was built with, and after a move, rename
+// or sandbox change committed by another process the next attach writes the
+// old values back over tmux.
+//
+// The wrapper is shared, and the tmux layer reads DisplayName, WorkDir and
+// OptionOverrides with no lock at all (GetStatus runs after the status probe
+// drops i.mu), so none of them is ever written on it. When one changed, the
+// reload builds a fresh wrapper for the same tmux session, as adoption does,
+// and publishes it under i.mu. A reader still holding the old wrapper reads
+// values that nobody writes. The fresh wrapper keeps the old one's launch
+// settings (how the pane was launched, and the vim-mode guard its sends use)
+// and, like an adopted wrapper, restores its acknowledgment from the status.
+// It starts without the old wrapper's capture caches and startup clock, as
+// every wrapper did after an upstream reload. The group path has its own lock
+// (SetGroupPath), so a change to it alone is applied in place.
+func (i *Instance) refreshKeptTmuxWrapperLocked() {
+	sess := i.tmuxSession
+	if sess.DisplayName != i.Title || sess.WorkDir != i.EffectiveWorkingDir() ||
+		!maps.Equal(i.buildTmuxOptionOverrides(), sess.OptionOverrides) {
+		next := i.newTmuxWrapperLocked(sess.Name, sess.SocketName)
+		next.RunCommandAsInitialProcess = sess.RunCommandAsInitialProcess
+		next.VimMode = sess.VimMode
+		next.LaunchInUserScope = sess.LaunchInUserScope
+		next.LaunchAs = sess.LaunchAs
+		next.WorkDirIsPlaceholder = sess.WorkDirIsPlaceholder
+		i.tmuxSession = next
+		return
 	}
 	if sess.GetGroupPath() != i.GroupPath {
 		sess.SetGroupPath(i.GroupPath)
-	}
-	if overrides := i.buildTmuxOptionOverrides(); !maps.Equal(overrides, sess.OptionOverrides) {
-		sess.OptionOverrides = overrides
 	}
 }
 

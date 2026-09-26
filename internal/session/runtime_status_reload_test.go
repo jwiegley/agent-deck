@@ -3,9 +3,11 @@ package session
 import (
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -155,7 +157,11 @@ func TestRuntimeLifecycle_ReloadUnchangedToolPreservesDetection(t *testing.T) {
 		hookStatus:  "waiting", hookSessionID: "conversation",
 	}
 	prior := canonical.tmuxSession
-	loaded := &Instance{ID: "one", Tool: "claude", Command: "claude", Title: "renamed"}
+	// The title is the wrapper's display name, so the reload changes only
+	// metadata the wrapper was not configured from. A rename publishes a fresh
+	// wrapper and still keeps the hook caches (see
+	// TestRuntimeLifecycle_ReloadRefreshesKeptWrapperMetadata).
+	loaded := &Instance{ID: "one", Tool: "claude", Command: "claude", Title: "one", Notes: "edited elsewhere"}
 	loaded.adoptRuntimeState(canonical.RuntimeState())
 	canonical.MergeReloaded(loaded)
 	if canonical.tmuxSession != prior || canonical.hookStatus != "waiting" || canonical.hookSessionID != "conversation" {
@@ -416,13 +422,39 @@ func assertTmuxWrapperConfigured(t *testing.T, inst *Instance, sess *tmux.Sessio
 	}
 }
 
-// A reload that keeps the wrapper (same tmux session, same tool) still brings
-// it up to date with the metadata another process committed. After a
-// cross-process `session move`, rename or sandbox change the kept wrapper
-// carried the old group path, display name and remain-on-exit, and the next
-// attach's EnsureConfigured wrote them back over the tmux options the
-// committing process had published. A deferred reload merges the same
-// metadata once the transition that deferred it has finished.
+// newKeptWrapperInstance returns a canonical Instance whose wrapper a
+// same-session, same-tool reload keeps, running claude on socket "isolated".
+func newKeptWrapperInstance(projectPath string) *Instance {
+	inst := &Instance{ID: "kept", Title: "before", ProjectPath: projectPath, GroupPath: "work/old", Tool: "claude",
+		Command: "claude", Status: StatusRunning, RuntimeGeneration: 2, StatusRevision: 1, TmuxSocketName: "isolated"}
+	inst.adoptRuntimeState(statedb.RuntimeState{
+		InstanceID: "kept", Generation: 2, StatusRevision: 1, TmuxSession: "agentdeck_kept", TmuxSocketName: "isolated",
+		Status: string(StatusRunning),
+	})
+	return inst
+}
+
+// keptWrapperReload returns the row another process saved for inst, with the
+// given merged metadata and inst's runtime.
+func keptWrapperReload(inst *Instance, title, projectPath, group string, sandbox *SandboxConfig) *Instance {
+	loaded := &Instance{ID: inst.ID, Title: title, ProjectPath: projectPath, GroupPath: group, Tool: "claude",
+		Command: "claude", Sandbox: sandbox}
+	loaded.adoptRuntimeState(inst.RuntimeState())
+	return loaded
+}
+
+// A reload that keeps the tmux session and tool still brings the wrapper up to
+// date with the metadata another process committed. After a cross-process
+// `session move`, rename or sandbox change the kept wrapper carried the old
+// group path, display name, project directory and remain-on-exit, and the next
+// attach wrote them back over the tmux options the committing process had
+// published. A deferred reload merges the same metadata once the transition
+// that deferred it has finished. The tmux layer reads a wrapper's display
+// name, directory and overrides without a lock, so a change to any of them
+// publishes a fresh wrapper for the same session. That wrapper keeps the
+// settings the pane was launched with, and the shared wrapper is never
+// written. A change to the group alone, whose setter is locked, keeps the
+// wrapper.
 func TestRuntimeLifecycle_ReloadRefreshesKeptWrapperMetadata(t *testing.T) {
 	configureNonDefaultTmuxWrapperSettings(t)
 	for _, deferred := range []bool{false, true} {
@@ -431,45 +463,126 @@ func TestRuntimeLifecycle_ReloadRefreshesKeptWrapperMetadata(t *testing.T) {
 			name = "deferred"
 		}
 		t.Run(name, func(t *testing.T) {
-			canonical := &Instance{ID: "kept", Title: "before", GroupPath: "work/old", Tool: "claude", Command: "claude",
-				Status: StatusRunning, RuntimeGeneration: 2, StatusRevision: 1, TmuxSocketName: "isolated"}
-			canonical.adoptRuntimeState(statedb.RuntimeState{
-				InstanceID: "kept", Generation: 2, StatusRevision: 1, TmuxSession: "agentdeck_kept", TmuxSocketName: "isolated",
-				Status: string(StatusRunning),
-			})
-			kept := canonical.GetTmuxSession()
-			merge := func(title, group string, sandbox *SandboxConfig) {
+			project := t.TempDir()
+			canonical := newKeptWrapperInstance(project)
+			canonical.hookStatus, canonical.hookSessionID = "waiting", "conversation"
+			// Start's launch settings, which adoption does not install.
+			launched := canonical.GetTmuxSession()
+			launched.VimMode = true
+			launched.LaunchAs = "direct"
+			launched.RunCommandAsInitialProcess = true
+			merge := func(title, projectPath, group string, sandbox *SandboxConfig) *tmux.Session {
 				t.Helper()
-				loaded := &Instance{ID: "kept", Title: title, GroupPath: group, Tool: "claude", Command: "claude", Sandbox: sandbox}
-				loaded.adoptRuntimeState(canonical.RuntimeState())
+				shared := canonical.GetTmuxSession()
+				sharedTitle, sharedDir := shared.DisplayName, shared.WorkDir
+				sharedOverrides := maps.Clone(shared.OptionOverrides)
 				merged := canonical.MergeReloaded
 				if deferred {
 					merged = canonical.MergeDeferredReload
 				}
-				if !merged(loaded) {
+				if !merged(keptWrapperReload(canonical, title, projectPath, group, sandbox)) {
 					t.Fatal("the reloaded row was not merged")
 				}
-				if canonical.GetTmuxSession() != kept {
-					t.Fatal("a metadata-only reload replaced the wrapper")
+				if shared.DisplayName != sharedTitle || shared.WorkDir != sharedDir ||
+					!maps.Equal(shared.OptionOverrides, sharedOverrides) {
+					t.Fatalf("the reload wrote the shared wrapper: title %q, directory %q, overrides %v",
+						shared.DisplayName, shared.WorkDir, shared.OptionOverrides)
 				}
-				if got := kept.GetGroupPath(); got != group {
-					t.Errorf("kept wrapper group path = %q, want the moved group %q", got, group)
+				sess := canonical.GetTmuxSession()
+				if sess.Name != "agentdeck_kept" || sess.SocketName != "isolated" || sess.InstanceID != "kept" {
+					t.Fatalf("refreshed wrapper names %s on %q for %q, want the kept session", sess.Name, sess.SocketName, sess.InstanceID)
 				}
-				if kept.DisplayName != title {
-					t.Errorf("kept wrapper display name = %q, want the new title %q", kept.DisplayName, title)
+				if got := sess.GetGroupPath(); got != group {
+					t.Errorf("wrapper group path = %q, want the moved group %q", got, group)
 				}
-				if got := kept.OptionOverrides["status"]; got != "2" {
-					t.Errorf("kept wrapper option overrides = %v, want the configured status=2 kept", kept.OptionOverrides)
+				if sess.DisplayName != title {
+					t.Errorf("wrapper display name = %q, want the new title %q", sess.DisplayName, title)
 				}
+				if sess.WorkDir != projectPath {
+					t.Errorf("wrapper directory = %q, want the moved project %q", sess.WorkDir, projectPath)
+				}
+				if got := sess.OptionOverrides["status"]; got != "2" {
+					t.Errorf("wrapper option overrides = %v, want the configured status=2 kept", sess.OptionOverrides)
+				}
+				if !sess.VimMode || sess.LaunchAs != "direct" || !sess.RunCommandAsInitialProcess {
+					t.Errorf("wrapper launch settings = vim %v, launch-as %q, initial process %v; want the launched pane's",
+						sess.VimMode, sess.LaunchAs, sess.RunCommandAsInitialProcess)
+				}
+				if canonical.hookStatus != "waiting" || canonical.hookSessionID != "conversation" {
+					t.Errorf("hook caches = %q/%q, want the unchanged tool's waiting/conversation kept",
+						canonical.hookStatus, canonical.hookSessionID)
+				}
+				return sess
 			}
 
-			merge("after", "work/new", &SandboxConfig{Enabled: true})
-			if got := kept.OptionOverrides["remain-on-exit"]; got != "on" {
+			sandboxed := merge("after", project, "work/new", &SandboxConfig{Enabled: true})
+			if sandboxed == launched {
+				t.Fatal("a rename and sandbox change kept the shared wrapper")
+			}
+			if got := sandboxed.OptionOverrides["remain-on-exit"]; got != "on" {
 				t.Errorf("sandboxed wrapper remain-on-exit = %q, want on", got)
 			}
-			merge("after", "work/new", nil)
-			if got, ok := kept.OptionOverrides["remain-on-exit"]; ok {
+			unsandboxed := merge("after", project, "work/new", nil)
+			if unsandboxed == sandboxed {
+				t.Fatal("dropping the sandbox kept the shared wrapper")
+			}
+			if got, ok := unsandboxed.OptionOverrides["remain-on-exit"]; ok {
 				t.Errorf("unsandboxed wrapper remain-on-exit = %q, want it dropped", got)
+			}
+			moved := t.TempDir()
+			if merge("after", moved, "work/new", nil) == unsandboxed {
+				t.Fatal("a project move kept the shared wrapper")
+			}
+			kept := canonical.GetTmuxSession()
+			if merge("after", moved, "work/newer", nil) != kept {
+				t.Fatal("a group-only change replaced the wrapper")
+			}
+		})
+	}
+}
+
+// The tmux layer reads a wrapper's display name, directory and option
+// overrides without a lock: GetStatus does after the status probe drops i.mu,
+// and so does the attach's terminal-title push. A reload that changes one of
+// them must publish a fresh wrapper under i.mu and leave the shared one
+// unwritten. Each case runs those readers on the shared wrapper beside one
+// such reload, with nothing else ordering the two, so the race detector
+// reports an in-place write in whichever order they run.
+func TestRuntimeLifecycle_ReloadRefreshLeavesSharedWrapperUnwritten(t *testing.T) {
+	configureNonDefaultTmuxWrapperSettings(t)
+	for _, c := range []struct {
+		name   string
+		reload func(t *testing.T, inst *Instance) *Instance
+	}{
+		{"rename", func(_ *testing.T, inst *Instance) *Instance {
+			return keptWrapperReload(inst, "renamed", inst.ProjectPath, inst.GroupPath, nil)
+		}},
+		{"project move", func(t *testing.T, inst *Instance) *Instance {
+			return keptWrapperReload(inst, inst.Title, t.TempDir(), inst.GroupPath, nil)
+		}},
+		{"sandbox change", func(_ *testing.T, inst *Instance) *Instance {
+			return keptWrapperReload(inst, inst.Title, inst.ProjectPath, inst.GroupPath, &SandboxConfig{Enabled: true})
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			canonical := newKeptWrapperInstance(t.TempDir())
+			loaded := c.reload(t, canonical)
+			shared := canonical.GetTmuxSession()
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				_, _ = shared.GetStatus()
+				shared.ConfigureTerminalTitle()
+			}()
+			go func() {
+				defer wg.Done()
+				canonical.MergeReloaded(loaded)
+			}()
+			wg.Wait()
+			if canonical.GetTmuxSession() == shared {
+				t.Fatal("the reload kept the shared wrapper for a changed field")
 			}
 		})
 	}
