@@ -6586,7 +6586,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 	if time.Since(graceTime) < 1500*time.Millisecond {
 		// Only skip if tmux session doesn't exist yet
 		if i.tmuxSession == nil {
-			if candidate != StatusRunning && candidate != StatusIdle {
+			if candidate != StatusRunning && candidate != StatusIdle && candidate != StatusQueued {
 				candidate = StatusStarting
 			}
 			return candidate, ctx.Err()
@@ -6597,7 +6597,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 		}
 		checkedExists = true
 		if !exists {
-			if candidate != StatusRunning && candidate != StatusIdle {
+			if candidate != StatusRunning && candidate != StatusIdle && candidate != StatusQueued {
 				candidate = StatusStarting
 			}
 			return candidate, ctx.Err()
@@ -6611,7 +6611,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 			// A session that was added but never started has no tmux yet; it is
 			// not an error, just not-yet-running. Keep it idle (✕ → ○).
 			candidate = StatusIdle
-		} else if candidate != StatusStopped {
+		} else if candidate != StatusStopped && candidate != StatusQueued {
 			candidate = i.terminatedPaneStatus()
 			// Was this death a credential failure? If so the status stays error
 			// but the substate now says auth-401, and the automatic boot paths
@@ -6624,9 +6624,9 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 	// Optimization: Skip expensive Exists() check for sessions already in error/stopped status
 	// Ghost sessions (in JSON but not in tmux) only get rechecked every 30 seconds
 	// This reduces subprocess spawns from 74/sec to ~5/sec for 28 ghost sessions
-	if (candidate == StatusError || candidate == StatusStopped) && !i.lastErrorCheck.IsZero() &&
+	if (candidate == StatusError || candidate == StatusStopped || candidate == StatusQueued) && !i.lastErrorCheck.IsZero() &&
 		time.Since(i.lastErrorCheck) < errorRecheckInterval {
-		return candidate, ctx.Err() // Skip - still in error/stopped, checked recently
+		return candidate, ctx.Err() // Skip - still in error/stopped/queued, checked recently
 	}
 
 	// Check if tmux session exists
@@ -6644,12 +6644,15 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 			// error for a session this process cannot see (rc 2026-09-23).
 			return candidate, ctx.Err()
 		}
+		// Queued is operator intent, like stopped: the session waits for group
+		// capacity and was never started, so an absent tmux session is expected
+		// and no death is classified. Only the queue drain's start replaces it.
 		if i.addedThisProcess && i.lastStartTime.IsZero() &&
 			(candidate == StatusIdle || candidate == StatusStarting) {
 			// Added but never started: no tmux session was ever created, so an
 			// absent tmux is expected — classify as idle, not error (✕ → ○).
 			candidate = StatusIdle
-		} else {
+		} else if candidate != StatusQueued {
 			// tmux session is non-nil here, so the exit-status probe can block;
 			// applyTerminatedPaneStatus drops i.mu for the query and keeps the
 			// stopped-state guard on write.
