@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
-	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // isolateStatusFleetDB detaches the process-global state database for a fleet
@@ -17,9 +16,7 @@ import (
 // would make every probe lose its commit instead of updating the row.
 func isolateStatusFleetDB(t *testing.T) {
 	t.Helper()
-	previous := statedb.GetGlobal()
-	statedb.SetGlobal(nil)
-	t.Cleanup(func() { statedb.SetGlobal(previous) })
+	detachGlobalStateDB(t)
 }
 
 // priorityFleet is 100 running rows behind a tmux shim that answers every
