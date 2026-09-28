@@ -2082,7 +2082,12 @@ func (s *StateDB) PersistInstanceStatusesTx(updates []InstanceStatusUpdate) erro
 // its Codex and Gemini siblings: they publish a binding through the
 // runtime binding CAS, whose commit writes the same targeted json_set
 // projection of tool_data, and record the link after it
-// (Instance.confirmHookSessionLink, via LinkRuntimeBinding). No
+// (Instance.confirmHookSessionLink, via LinkRuntimeBinding). Upstream's
+// launch, output, archive and stop Codex identity persistence (#2396,
+// #2400) wrote through WriteCodexSessionBinding; the fork's form publishes
+// through the same CAS instead (Instance.BindLiveCodexThread), because
+// LoadInstances rebuilds the tool_data binding keys from
+// instance_runtime_binding and every metadata save drops them. No
 // production path calls these three writers; they remain for upstream
 // parity.
 //

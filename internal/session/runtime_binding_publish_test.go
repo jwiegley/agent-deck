@@ -4,8 +4,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -853,5 +855,84 @@ func TestRuntimeLifecycle_CopilotBindingRoundTrip(t *testing.T) {
 	}
 	if decoded.CopilotSessionID != inst.CopilotSessionID || !decoded.CopilotDetectedAt.Equal(detectedAt) {
 		t.Fatalf("InstanceData Copilot JSON round trip = %+v", decoded)
+	}
+}
+
+// BindLiveCodexThread is the fork's form of upstream's Codex launch, output,
+// archive and stop identity persistence (#2396, #2400): the thread the pane's
+// live Codex holds open becomes a durable runtime binding. Launch still runs
+// startup detection, which may publish the same thread between the call's
+// token capture and its own publication; that counts as bound. A thread
+// another instance owns is refused, and the instance stays unbound.
+func TestRuntimeLifecycle_BindLiveCodexThreadPublishesARuntimeBinding(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		// before runs ahead of the call; during runs inside its probe.
+		before, during func(t *testing.T, storage *Storage, inst *Instance, thread string)
+		wantErr        error
+	}{
+		{name: "unbound instance"},
+		{name: "startup detection publishes the same thread first",
+			during: func(t *testing.T, _ *Storage, inst *Instance, thread string) {
+				if err := inst.publishRuntimeBinding("codex", thread, time.Now()); err != nil {
+					t.Fatalf("detection publish: %v", err)
+				}
+			}},
+		{name: "another instance owns the thread", wantErr: ErrRuntimeBindingOwnership,
+			before: func(t *testing.T, storage *Storage, _ *Instance, thread string) {
+				owner := runtimeBindingTestInstance("bind-live-codex-owner")
+				if err := storage.InsertSessionAndVerify(owner, nil); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := storage.db.CommitRuntimeBinding(owner.ID, owner.PersistenceIncarnation(), 0, "codex", 0, thread); err != nil {
+					t.Fatal(err)
+				}
+			}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			projectPath := t.TempDir()
+			thread := stageCodexDetectionProbe(t, projectPath)
+			rollout := filepath.Join(os.Getenv("CODEX_HOME"), "sessions", "2026", "09", "25",
+				"rollout-2026-09-25T00-00-00-"+thread+".jsonl")
+			storage := runtimeBindingTestStorage(t)
+			inst := runtimeBindingTestInstance("bind-live-codex")
+			inst.Tool, inst.Command, inst.ProjectPath = "codex", "codex", projectPath
+			if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+				t.Fatal(err)
+			}
+			if c.before != nil {
+				c.before(t, storage, inst, thread)
+			}
+			stubCodexPaneProcessPIDs(t, []int{4242}, nil)
+			var once sync.Once
+			restore := codexPaneOpenPaths
+			t.Cleanup(func() { codexPaneOpenPaths = restore })
+			codexPaneOpenPaths = func(*Instance) ([]string, error) {
+				if c.during != nil {
+					once.Do(func() { c.during(t, storage, inst, thread) })
+				}
+				return []string{rollout}, nil
+			}
+
+			got, err := inst.BindLiveCodexThread(0)
+			durable, found, readErr := storage.db.ReadRuntimeBinding(inst.ID, "codex")
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if c.wantErr != nil {
+				if !errors.Is(err, c.wantErr) || got != "" || found || inst.CodexSessionID != "" {
+					t.Fatalf("BindLiveCodexThread = (%q, %v), durable %+v found=%v, memory %q; want %v and no binding",
+						got, err, durable, found, inst.CodexSessionID, c.wantErr)
+				}
+				return
+			}
+			if err != nil || got != thread {
+				t.Fatalf("BindLiveCodexThread = (%q, %v), want (%q, nil)", got, err, thread)
+			}
+			if !found || durable.Value != thread || inst.CodexSessionID != thread {
+				t.Fatalf("durable binding %+v found=%v, memory %q; want the live thread %q",
+					durable, found, inst.CodexSessionID, thread)
+			}
+		})
 	}
 }

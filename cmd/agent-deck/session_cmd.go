@@ -657,9 +657,11 @@ func handleSessionArchive(profile string, args []string) {
 	// session's normal lifecycle already persists its tool ids.
 	//
 	// Codex is the exception: launch left its identity unpersisted, and the
-	// live process is the only evidence of it, so bind it with the targeted
-	// Codex write before the kill destroys that evidence (#2400).
-	adoptLiveCodexIdentity(storage, inst)
+	// live process is the only evidence of it, so publish its runtime binding
+	// before the kill destroys that evidence (#2400). A dead pane has none.
+	if inst.Exists() {
+		adoptLiveCodexIdentity(storage, inst)
+	}
 	runtime, err := inst.KillCapturedRuntime(selection)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to stop selected runtime: %v", err), ErrCodeInvalidOperation)

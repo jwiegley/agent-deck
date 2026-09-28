@@ -389,6 +389,60 @@ func NormalizeCodexSessionID(value string) (string, error) {
 	return normalizeToolSessionID(FieldCodexSessionID, value)
 }
 
+// BindLiveCodexThread publishes the thread the pane's live Codex process holds
+// open (its rollout or writer lock, past the subagent gate) as the instance's
+// Codex binding, waiting up to wait for that evidence. It returns the bound
+// thread, or "" when the process owns none. A bound instance is left alone and
+// its binding is returned.
+//
+// This is the fork's form of upstream's launch, output, archive and stop
+// identity persistence (#2396, #2400), which wrote tool_data through
+// WriteCodexSessionBinding: LoadInstances rebuilds that key from the runtime
+// binding and every save drops it, so only a published binding survives. Each
+// probe captures its binding token first, so a thread read from an older
+// runtime cannot bind its replacement. Launch's own startup detection may
+// publish the same thread first, which counts as bound. The caller must hold
+// neither i.mu nor the instance spawn lock.
+func (i *Instance) BindLiveCodexThread(wait time.Duration) (string, error) {
+	if i == nil {
+		return "", nil
+	}
+	i.mu.RLock()
+	codex := IsCodexCompatible(i.Tool)
+	i.mu.RUnlock()
+	if !codex {
+		return "", nil
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		observation := i.CaptureRuntimeBindingObservation("codex")
+		if observation.value != "" {
+			return observation.value, nil
+		}
+		if threadID, live := i.liveCodexBootstrapEvidence(); live && threadID != "" {
+			if err := i.PublishRuntimeBindingObservation(observation, threadID, time.Now()); err != nil {
+				if bound, _ := i.currentRuntimeBinding("codex"); bound != threadID {
+					return "", err
+				}
+			}
+			i.mu.RLock()
+			tmuxSession := i.tmuxSession
+			i.mu.RUnlock()
+			if tmuxSession != nil && tmuxSession.Exists() {
+				_ = tmuxSession.SetEnvironment("CODEX_SESSION_ID", threadID)
+			}
+			// A failed link write is logged, and the next send's hydration
+			// repairs the missing link; the binding itself is durable.
+			_ = i.RecordRecallLink("codex")
+			return threadID, nil
+		}
+		if !time.Now().Before(deadline) {
+			return "", nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // rejectRuntimeBindingConflictLocked runs while PublishRuntimeBindingObservation
 // holds the instance lifecycle lock.
 func (i *Instance) rejectRuntimeBindingConflictLocked(observation RuntimeBindingObservation, cause error) error {
