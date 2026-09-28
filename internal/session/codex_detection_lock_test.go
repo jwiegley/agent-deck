@@ -170,6 +170,51 @@ func TestRuntimeLifecycle_CodexDetectionReadsInstanceUnderLock(t *testing.T) {
 	}
 }
 
+// The #2394 live-thread evidence decides from the Instance whether the pane's
+// rollout is local and which Codex home holds its writer lock: the tool, SSH
+// host, sandbox and command. Detection attempts and status passes read that
+// evidence beside a TUI storage reload, which rewrites those fields under i.mu
+// without the spawn lock, so LiveCodexThreadID reads them under i.mu. Here the
+// reload runs while the probe lists the pane's Codex processes, and only a
+// directory the probe polls for orders the two, so the race detector reports
+// an unlocked read that follows the reload.
+func TestRuntimeLifecycle_CodexLiveThreadEvidenceReadsInstanceUnderLock(t *testing.T) {
+	projectPath := t.TempDir()
+	want := stageCodexDetectionProbe(t, projectPath)
+	rollout := filepath.Join(os.Getenv("CODEX_HOME"), "sessions", "2026", "09", "25",
+		"rollout-2026-09-25T00-00-00-"+want+".jsonl")
+	inst := newCodexDetectionLockInstance(projectPath, false, "codex-live-thread")
+	reloaded := newCodexDetectionLockInstance(projectPath, false, "codex-live-thread")
+	stubCodexPaneOpenPaths(t, []string{rollout}, nil)
+
+	merged := filepath.Join(t.TempDir(), "merged")
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	restore := codexPaneProcessPIDs
+	t.Cleanup(func() { codexPaneProcessPIDs = restore })
+	codexPaneProcessPIDs = func(*Instance) ([]int, error) {
+		go func() {
+			inst.MergeReloaded(reloaded)
+			_ = os.Mkdir(merged, 0o700)
+			<-done // stay alive (see runUnorderedAndAlive)
+		}()
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			if _, err := os.Stat(merged); err == nil {
+				return []int{4242}, nil
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the storage reload never finished")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	if got, live := inst.liveCodexBootstrapEvidence(); !live || got != want {
+		t.Fatalf("live evidence = (%q, %v), want the thread the pane holds open (%q, true)", got, live, want)
+	}
+}
+
 // installCodexDetectionSpawnLock stands held in for inst's spawn lock. Every
 // acquisition for inst reports its number on entered, then runs before (when
 // set) with that number, then takes held. Other instances keep the real lock.
