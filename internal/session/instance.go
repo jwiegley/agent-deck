@@ -10400,26 +10400,29 @@ func (i *Instance) restartWithEnv(env map[string]string, result *statedb.Runtime
 	return i.restartRecorded(env, result)
 }
 
-// restartRecorded restarts and records session.end(restart) on success.
+// restartRecorded restarts and records session.end(restart) on success. A
+// lock loser that adopted the winner replaced nothing and records nothing.
 func (i *Instance) restartRecorded(env map[string]string, result *statedb.RuntimeState) error {
-	err := i.restart(env, false, result)
-	if err == nil {
+	adopted, err := i.restart(env, false, result)
+	if !adopted && err == nil {
 		i.RecordTelemetryEnd(telemetry.EndRestart)
 	}
 	return err
 }
 
-func (i *Instance) restart(env map[string]string, fresh bool, result *statedb.RuntimeState) (err error) {
+// restart reports adopted when it returned a concurrent winner's runtime
+// without stopping or spawning anything.
+func (i *Instance) restart(env map[string]string, fresh bool, result *statedb.RuntimeState) (adopted bool, err error) {
 	transition, winner, transitionErr := i.beginRuntimeTransition(fresh)
 	if transitionErr != nil {
-		return transitionErr
+		return false, transitionErr
 	}
 	if winner != nil {
 		captureRuntimeResult(result, *winner)
-		return nil
+		return true, nil
 	}
 	defer transition.close()
-	return i.restartWithTransition(transition, env, result)
+	return false, i.restartWithTransition(transition, env, result)
 }
 
 // restartWithTransition performs the physical replacement after its caller has
@@ -11089,7 +11092,7 @@ func (i *Instance) RestartFresh() error {
 }
 
 func (i *Instance) restartFresh(result *statedb.RuntimeState) error {
-	if err := i.restart(nil, true, result); err != nil {
+	if _, err := i.restart(nil, true, result); err != nil {
 		if !IsRestartPartialSuccess(err) {
 			i.Status = StatusError
 		}
