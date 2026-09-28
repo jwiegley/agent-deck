@@ -7439,7 +7439,6 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 	// A rejected candidate must never be read as evidence that the agent is
 	// interactive — see the disarm condition further down.
 	rejected := false
-	prevInvalidatingGen := i.codexInvalidatingGeneration
 	restoreHook := func() {
 		rejected = true
 		i.hookStatus, i.hookEvent, i.hookLastUpdate = prevHookStatus, prevHookEvent, prevHookLastUpdate
@@ -10389,7 +10388,7 @@ func (i *Instance) killInternalLocked(selection RuntimeSelection, sync, deleteRo
 // caller that observed an older generation adopts the durable winner without
 // stamping, spawning, persisting, or sweeping.
 func (i *Instance) Restart() error {
-	return i.restartRecorded(nil, false, nil)
+	return i.restartRecorded(nil, nil)
 }
 
 // RestartWithEnv restarts the session with one-shot environment overrides.
@@ -10405,11 +10404,11 @@ func (i *Instance) restartWithEnv(env map[string]string, result *statedb.Runtime
 			return fmt.Errorf("invalid environment variable name %q", key)
 		}
 	}
-	return i.restartRecorded(env)
+	return i.restartRecorded(env, result)
 }
 
 // restartRecorded restarts and records session.end(restart) on success.
-func (i *Instance) restartRecorded(env map[string]string) error {
+func (i *Instance) restartRecorded(env map[string]string, result *statedb.RuntimeState) error {
 	err := i.restart(env, false, result)
 	if err == nil {
 		i.RecordTelemetryEnd(telemetry.EndRestart)
