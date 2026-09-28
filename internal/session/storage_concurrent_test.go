@@ -133,3 +133,40 @@ func TestStaleSnapshotPreservesDisjointFieldUpdate(t *testing.T) {
 	assert.Equal(t, "renamed", got[0].Title)
 	assert.Equal(t, StatusRunning, got[0].Status, "stale title save must preserve disjoint CLI status update")
 }
+
+// TestInstanceToRowCopiesRuntimeBindingsUnderInstanceLock pins that the save
+// row never shares the live RuntimeBindings map. Status goroutines write that
+// map in place under i.mu (applyRuntimeBindingLocked), so a save iterating an
+// alias of it could die with "concurrent map iteration and map write".
+func TestInstanceToRowCopiesRuntimeBindingsUnderInstanceLock(t *testing.T) {
+	binding := func(value string, revision uint64) statedb.RuntimeBinding {
+		return statedb.RuntimeBinding{InstanceID: "bindings-copy", Kind: "codex", Generation: 1, Revision: revision, Value: value}
+	}
+	inst := &Instance{
+		ID: "bindings-copy", Title: "bindings-copy", ProjectPath: "/tmp/x", GroupPath: DefaultGroupPath,
+		Tool: "codex", Status: StatusStopped, CreatedAt: time.Unix(1, 0).UTC(),
+		RuntimeBindings: map[string]statedb.RuntimeBinding{"codex": binding("a", 1)},
+	}
+
+	row, err := instanceToRow(inst)
+	require.NoError(t, err)
+	row.RuntimeBindings["codex"] = statedb.RuntimeBinding{Value: "row-only"}
+	require.Equal(t, "a", inst.RuntimeBindings["codex"].Value, "the save row must not alias the live bindings map")
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for k := 0; k < 2000; k++ {
+			inst.mu.Lock()
+			inst.RuntimeBindings["codex"] = binding("a", uint64(k))
+			inst.mu.Unlock()
+		}
+	}()
+	for k := 0; k < 2000; k++ {
+		row, err := instanceToRow(inst)
+		require.NoError(t, err)
+		_ = statedb.CloneInstanceRow(row)
+	}
+	wg.Wait()
+}
