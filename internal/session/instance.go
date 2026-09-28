@@ -10400,11 +10400,13 @@ func (i *Instance) restartWithEnv(env map[string]string, result *statedb.Runtime
 	return i.restartRecorded(env, result)
 }
 
-// restartRecorded restarts and records session.end(restart) on success. A
-// lock loser that adopted the winner replaced nothing and records nothing.
+// restartRecorded restarts and records session.end(restart) once the
+// replacement is live: on success, and on a partial success, which every
+// caller adopts as completed. A lock loser that adopted the winner replaced
+// nothing and records nothing.
 func (i *Instance) restartRecorded(env map[string]string, result *statedb.RuntimeState) error {
 	adopted, err := i.restart(env, false, result)
-	if !adopted && err == nil {
+	if !adopted && (err == nil || IsRestartPartialSuccess(err)) {
 		i.RecordTelemetryEnd(telemetry.EndRestart)
 	}
 	return err
