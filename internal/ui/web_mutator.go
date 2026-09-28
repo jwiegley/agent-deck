@@ -110,6 +110,15 @@ func (m *WebMutator) clearDeleteTokenAndReload(id string, token uint64) {
 	m.requestReload()
 }
 
+// tombstoned reports whether a live web delete already removed inst's row and
+// only a reload has yet to evict it from h.instances (see DeleteSession).
+func (m *WebMutator) tombstoned(inst *session.Instance) bool {
+	m.h.durableDeleteMu.Lock()
+	defer m.h.durableDeleteMu.Unlock()
+	deleted, ok := m.h.durableDeleteTombstones[inst.ID]
+	return ok && deleted.matches(inst)
+}
+
 // WithUndoWindow overrides the undo grace period (useful for tests that
 // need to force expiry without sleeping).
 func (m *WebMutator) WithUndoWindow(d time.Duration) *WebMutator {
@@ -814,12 +823,16 @@ func (m *WebMutator) MoveSessionToGroup(id, groupPath string) (string, bool, err
 	}
 	defer unlock()
 
-	m.h.instancesMu.Lock()
+	m.h.instancesMu.RLock()
 	inst := m.h.instanceByID[id]
-	if inst == nil {
-		m.h.instancesMu.Unlock()
+	m.h.instancesMu.RUnlock()
+	// The tombstone-aware save would silently skip a live-deleted instance, so
+	// a stale tab moving it must get a 404, not a group nothing stored.
+	if inst == nil || m.tombstoned(inst) {
 		return "", false, web.ErrSessionNotFound
 	}
+
+	m.h.instancesMu.Lock()
 	// Seed the new-group default in case the target must be auto-created.
 	if cfg, _ := session.LoadUserConfig(); cfg != nil {
 		m.h.groupTree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
@@ -837,7 +850,7 @@ func (m *WebMutator) MoveSessionToGroup(id, groupPath string) (string, bool, err
 		return "", false, fmt.Errorf("open storage: %w", err)
 	}
 	defer storage.Close()
-	if err := storage.SaveWithGroups(instances, m.h.groupTree); err != nil {
+	if err := m.h.saveWithGroups(storage, instances, m.h.groupTree); err != nil {
 		return "", false, fmt.Errorf("save session: %w", err)
 	}
 	return target, restartRequired, nil
