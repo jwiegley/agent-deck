@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1366,9 +1367,13 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	}, nil
 }
 
+// The row must not share the live map: status goroutines write it in place
+// under i.mu while saves iterate it.
 func runtimeBindingsForSave(inst *Instance) map[string]statedb.RuntimeBinding {
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
 	if inst.RuntimeBindings != nil {
-		return inst.RuntimeBindings
+		return maps.Clone(inst.RuntimeBindings)
 	}
 	bindings := make(map[string]statedb.RuntimeBinding)
 	add := func(kind, value string, detectedAt time.Time) {
