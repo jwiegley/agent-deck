@@ -209,7 +209,7 @@ func TestRunExecDedicatedAttemptUsesOriginalDeadlineAndOptions(t *testing.T) {
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$SSH_CALL_LOG"
 case "$*" in
-  *ControlPath=none*) sleep 1; printf '[]'; exit 0 ;;
+  *ControlPath=none*) sleep 5; printf '[]'; exit 0 ;;
 esac
 printf 'mux_client_request_session: session request failed: Session open refused by peer\n' >&2
 exit 255
@@ -220,14 +220,21 @@ exit 255
 	t.Setenv("SSH_CALL_LOG", logPath)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	r := &SSHRunner{Host: "fixture.example"}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	// The deadline must cover two fork/execs of the shim under -race, which
+	// take up to ~130ms each on a loaded host: a tighter one kills the
+	// dedicated attempt (or even the shared one) before it logs its argv.
+	// The elapsed bound is fixed slack over the deadline plus sshWaitDelay: a
+	// dedicated attempt that escapes onto a budget of its own fails it once
+	// that budget passes about 2.4s, and a longer escape outlives the shim's
+	// sleep, succeeds, and fails the error check.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	started := time.Now()
 	_, err := r.runExec(ctx, "agent-deck list --json", true)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("deadline error=%v", err)
 	}
-	if elapsed := time.Since(started); elapsed > 750*time.Millisecond {
+	if elapsed := time.Since(started); elapsed > 2500*time.Millisecond {
 		t.Fatalf("dedicated attempt exceeded original deadline: %s", elapsed)
 	}
 	calls, err := os.ReadFile(logPath)
