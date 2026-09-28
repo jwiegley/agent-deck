@@ -851,25 +851,37 @@ func (m *WebMutator) MoveSessionToGroup(id, groupPath string) (string, bool, err
 	}
 
 	m.h.instancesMu.Lock()
+	// Resolve the tree once: the save and any rollback must see the tree the
+	// move was applied to.
+	tree := m.h.groupTree
 	// Seed the new-group default in case the target must be auto-created.
 	if cfg, _ := session.LoadUserConfig(); cfg != nil {
-		m.h.groupTree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
+		tree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
 	}
-	target := m.h.groupTree.ResolveMoveTargetGroup(groupPath)
+	restore := tree.CaptureSessionPlacement(inst)
+	target := tree.ResolveMoveTargetGroup(groupPath)
 	restartRequired := session.IsClaudeCompatible(inst.Tool) &&
 		session.GetClaudeConfigDirForInstanceInGroup(inst, target) != session.GetClaudeConfigDirForInstance(inst)
-	m.h.groupTree.MoveSessionToGroup(inst, target)
+	tree.MoveSessionToGroup(inst, target)
 	instances := make([]*session.Instance, len(m.h.instances))
 	copy(instances, m.h.instances)
 	m.h.instancesMu.Unlock()
 
+	fail := func(err error) (string, bool, error) {
+		// The handler answers 500 and the client reverts; retract the move
+		// too, or the TUI's next save would persist it.
+		m.h.instancesMu.Lock()
+		restore()
+		m.h.instancesMu.Unlock()
+		return "", false, err
+	}
 	storage, release, err := m.saveStorage()
 	if err != nil {
-		return "", false, fmt.Errorf("open storage: %w", err)
+		return fail(fmt.Errorf("open storage: %w", err))
 	}
 	defer release()
-	if err := m.h.saveWithGroups(storage, instances, m.h.groupTree); err != nil {
-		return "", false, fmt.Errorf("save session: %w", err)
+	if err := m.h.saveWithGroups(storage, instances, tree); err != nil {
+		return fail(fmt.Errorf("save session: %w", err))
 	}
 	return target, restartRequired, nil
 }

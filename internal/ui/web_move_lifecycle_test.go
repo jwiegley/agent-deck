@@ -95,3 +95,38 @@ func TestRuntimeLifecycle_WebMoveKeepsLiveInstancesOnOpenDatabase(t *testing.T) 
 		}
 	}
 }
+
+// A move is applied in memory before it is saved. When the save fails the
+// handler answers 500 and the client reverts, so the move must be retracted
+// too: otherwise the TUI's next save persists a move the client was told
+// failed. An external `rm` of another session is one ordinary way to fail it.
+func TestRuntimeLifecycle_WebMoveSaveFailureRestoresPlacement(t *testing.T) {
+	h, storage, m := newLiveWebMoveFixture(t, "_test_web_move_rollback",
+		"web-move-first", "web-move-mover", "web-move-last", "web-move-removed")
+	mover := h.instanceByID["web-move-mover"]
+	tree := h.groupTree
+	priorGroup, priorOrder, priorSlot := mover.GroupPath, mover.Order, tree.SessionPosition(mover)
+	priorGroups := tree.GroupCount()
+	if priorSlot != 1 {
+		t.Fatalf("fixture: mover slot = %d, want 1 (between two sessions)", priorSlot)
+	}
+	if err := storage.DeleteInstance("web-move-removed"); err != nil {
+		t.Fatalf("external delete: %v", err)
+	}
+
+	if _, _, err := m.MoveSessionToGroup(mover.ID, "Work"); err == nil {
+		t.Fatal("move over an external delete unexpectedly saved")
+	}
+	if mover.GroupPath != priorGroup || mover.Order != priorOrder {
+		t.Fatalf("failed move left group=%q order=%d, want %q/%d", mover.GroupPath, mover.Order, priorGroup, priorOrder)
+	}
+	if got := tree.SessionPosition(mover); got != priorSlot {
+		t.Fatalf("failed move left the session at slot %d, want %d", got, priorSlot)
+	}
+	if _, ok := tree.Groups["Work"]; ok || tree.GroupCount() != priorGroups {
+		t.Fatalf("failed move left its auto-created group behind (groups %d, want %d)", tree.GroupCount(), priorGroups)
+	}
+	if got := storedGroupPath(t, storage, mover.ID); got != priorGroup {
+		t.Fatalf("stored group after failed move = %q, want %q", got, priorGroup)
+	}
+}
