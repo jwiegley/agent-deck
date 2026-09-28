@@ -4581,6 +4581,10 @@ func (i *Instance) queryCodexSessionCandidateForPass(excludeIDs map[string]bool,
 	if !i.codexSessionScanDue(allowUnscoped) {
 		return candidate
 	}
+	// Stamped before the live-process check as well as the disk scan: a live
+	// Codex that owns no thread yet would otherwise walk the pane's process
+	// tree and list its open files on every pass.
+	i.lastCodexScanAt = time.Now()
 	// When a Codex process runs in the pane, only the thread it holds open (its
 	// rollout or thread writer lock) may bind: a child launched without a
 	// message has no rollout yet, and the newest rollout in the project is a
@@ -4606,7 +4610,6 @@ func (i *Instance) queryCodexSessionCandidateForPass(excludeIDs map[string]bool,
 		}
 	}
 	exclusions := codexSessionExclusions{explicit: excludeIDs}
-	i.lastCodexScanAt = time.Now()
 	if sessionID := i.queryCodexSession(exclusions, allowUnscoped); sessionID != "" {
 		candidate.id, candidate.source = sessionID, "disk"
 	}

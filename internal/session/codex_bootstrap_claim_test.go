@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,4 +161,29 @@ func TestCodexBootstrapClaimSerializesDiskFallback(t *testing.T) {
 		t.Fatal("the disk fallback kept the bootstrap claim after publishing")
 	}
 	codexBootstrapMu.Unlock()
+}
+
+// The #2394 live-process check runs on the bootstrap scan's cadence, as
+// upstream's shouldScanCodexSession stamps it. While the pane's live Codex
+// owns no thread (composer not up, an update prompt, a Codex older than 0.155
+// idle before its first turn), each check walks the pane's process tree and
+// lists its open files, so it must not repeat on every status pass.
+func TestCodexLiveEvidenceCheckRunsOnTheBootstrapScanCadence(t *testing.T) {
+	inst, _ := newUnboundCodexForBootstrap(t)
+	var probes atomic.Int32
+	restore := codexPaneProcessPIDs
+	t.Cleanup(func() { codexPaneProcessPIDs = restore })
+	codexPaneProcessPIDs = func(*Instance) ([]int, error) {
+		probes.Add(1)
+		return []int{4242}, nil
+	}
+	stubCodexPaneOpenPaths(t, []string{"/dev/null"}, nil)
+
+	for n := 0; n < 5; n++ {
+		inst.UpdateCodexSession(map[string]bool{})
+	}
+	if got := probes.Load(); got != 1 {
+		t.Fatalf("five back-to-back passes ran the live-process check %d times, want once per %v",
+			got, codexBootstrapScanInterval)
+	}
 }
