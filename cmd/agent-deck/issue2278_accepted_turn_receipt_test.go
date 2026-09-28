@@ -630,6 +630,53 @@ func TestLegacyCodexIdentityHydrationKeepsPublishedIdentityWhenRecallLinkFails(t
 	}
 }
 
+// A state.db stamped at the current schema by a build that predates the
+// recall tables has no session_links. The startup Migrate must create it, so
+// the first hydration of an unbound Codex identity records its link instead
+// of refusing the send.
+func TestLegacyCodexIdentityHydrationLinksOnCurrentSchemaWithoutRecallTables(t *testing.T) {
+	isolateCodexIdentityStore(t)
+	home := filepath.Join(t.TempDir(), "codex")
+	t.Setenv("CODEX_HOME", home)
+	project := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const identity = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	writeLegacyCodexRollout(t, home, identity, "15")
+
+	inst := session.NewInstanceWithTool("legacy-no-recall-tables", project, "codex")
+	storage, err := session.NewStorageWithProfile("legacy_no_recall_tables")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	if err := storage.SaveWithGroups([]*session.Instance{inst}, nil); err != nil {
+		t.Fatal(err)
+	}
+	db := storage.GetDB()
+	for _, table := range []string{"session_hints", "session_tags", "session_links"} {
+		if _, err := db.DB().Exec(`DROP TABLE ` + table); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("startup Migrate: %v", err)
+	}
+	stageLegacyCodexPaneIdentity(t, func(*session.Instance) (string, bool) { return identity, false })
+
+	if err := hydrateLegacyCodexIdentity(inst, []*session.Instance{inst}, storage); err != nil {
+		t.Fatalf("hydration on a current-schema database without recall tables: %v", err)
+	}
+	if persisted := persistedCodexIdentity(t, storage, inst.ID); persisted != identity {
+		t.Fatalf("persisted identity = %q, want %q", persisted, identity)
+	}
+	links, err := db.ListSessionLinks(inst.ID)
+	if err != nil || len(links) != 1 || links[0].Harness != "codex" || links[0].NativeID != identity || !links[0].Authoritative {
+		t.Fatalf("links after hydration = %+v err=%v, want one authoritative codex/%s", links, err, identity)
+	}
+}
+
 func TestFailedLegacyCodexHydrationPreservesOtherIdentities(t *testing.T) {
 	inst := session.NewInstanceWithTool("legacy-unrelated-identities", t.TempDir(), "codex")
 	inst.ClaudeSessionID = "claude-before"
