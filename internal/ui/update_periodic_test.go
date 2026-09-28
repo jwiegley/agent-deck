@@ -220,6 +220,41 @@ func TestPeriodicUpdateCheck_HonoursSuppression(t *testing.T) {
 	}
 }
 
+// TestUpdateCheck_OffWithCheckDisabled pins [updates] check_enabled = false
+// for every check the TUI starts on its own: the startup check in Init, the
+// periodic tick and the re-checks after an install all stay off, so the deck
+// never asks GitHub and auto_install never gets a result to act on. The
+// install key stays a manual action.
+func TestUpdateCheck_OffWithCheckDisabled(t *testing.T) {
+	stubUpdateSettings(t, session.UpdateSettings{CheckEnabled: boolPtr(false)})
+	available := &update.UpdateInfo{Available: true, CurrentVersion: "1.16.0", LatestVersion: "1.16.1"}
+	stubUpdateCheck(t, available, nil)
+
+	manual := newRestartTestHome(t)
+	manual.updateInfo = available
+	if _, cmd := manual.tryInstallUpdate(); cmd == nil || manual.err != nil {
+		t.Fatalf("install key: cmd=%v err=%v, want the manual updater to run", cmd, manual.err)
+	}
+
+	h := newRestartTestHome(t)
+	t.Cleanup(h.cancel)
+	h.sysStatsCollector = nil
+	h.intervalHookRunner = nil
+	h.Init()
+	if h.updateCheckInFlight || !h.lastUpdateCheck.IsZero() {
+		t.Fatal("Init must not start the startup update check")
+	}
+	h.autoUpdateSuppressedReason = "" // go test suppresses; only check_enabled may stop the tick here
+	if cmd := h.periodicUpdateCheck(time.Now()); cmd != nil {
+		t.Fatal("the periodic tick must not check")
+	}
+	h.Update(unattendedInstallFinishedMsg{version: "1.16.1"})
+	h.handleUpdateInstallFinished(updateInstallFinishedMsg{})
+	if h.updateCheckInFlight || !h.lastUpdateCheck.IsZero() {
+		t.Fatal("the install-finished handlers must not check")
+	}
+}
+
 // runTickBatch executes the command a tick returned and delivers every
 // message it produces of type T back into h (the Bubble Tea runtime would
 // do the same); other messages are dropped. Sub-commands that are still

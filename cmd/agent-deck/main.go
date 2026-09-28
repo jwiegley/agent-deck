@@ -1386,7 +1386,8 @@ func startHeadlessSelfRestart(ctx context.Context, idle func() bool) {
 // web` (lock-protected, so a TUI or the timer doing the same is harmless).
 // startHeadlessSelfRestart then re-execs into the new file at the next
 // idle point. Same gates as the restart: nothing when the process is test-,
-// CI- or script-driven (issue #2251) or Homebrew owns the binary.
+// CI- or script-driven (issue #2251) or Homebrew owns the binary; and
+// nothing, not even the check, with [updates].check_enabled = false.
 func startHeadlessAutoInstall(ctx context.Context) {
 	exe, err := os.Executable()
 	if err != nil || exe == "" {
@@ -1408,6 +1409,10 @@ func newHeadlessAutoInstaller(exe string, homebrewManaged func() bool) *update.I
 	webLog := logging.ForComponent(logging.CompWeb)
 	if reason := headlessAutoUpdateSuppressed(); reason != "" {
 		webLog.Info("auto_install_suppressed", slog.String("reason", reason))
+		return nil
+	}
+	if !session.GetUpdateSettings().GetCheckEnabled() {
+		webLog.Info("auto_install_disabled", slog.String("reason", "check_enabled is off"))
 		return nil
 	}
 	if homebrewManaged() {
