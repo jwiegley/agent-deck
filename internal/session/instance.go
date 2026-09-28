@@ -11525,7 +11525,32 @@ func (i *Instance) CanFork() bool {
 	if i.ClaudeSessionID == "" {
 		return false
 	}
-	return time.Since(i.ClaudeDetectedAt) < 5*time.Minute
+	return time.Since(i.claudeSessionConfirmedAt()) < 5*time.Minute
+}
+
+// claudeSessionConfirmedAt is when the Claude session ID was last confirmed as
+// this session's conversation, the recency CanFork gates on. Upstream restamps
+// ClaudeDetectedAt from the live pane during status polls. Here the runtime
+// binding is authoritative and a repeated observation keeps its original
+// detection time (a spawn binding has none), so the binding is the
+// confirmation instead: the current-generation binding of a live runtime is
+// confirmed now, and after that runtime stops, its start is the latest
+// confirmation on record. A superseded binding, or an ID with no binding,
+// keeps upstream's detection time.
+func (i *Instance) claudeSessionConfirmedAt() time.Time {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	binding, ok := i.RuntimeBindings["claude"]
+	if !ok || i.RuntimeGeneration == 0 || binding.Generation != i.RuntimeGeneration || binding.Value != i.ClaudeSessionID {
+		return i.ClaudeDetectedAt
+	}
+	if isLiveSessionStatus(i.Status) || i.Status == StatusStarting {
+		return time.Now()
+	}
+	if i.LastStartedAt.After(i.ClaudeDetectedAt) {
+		return i.LastStartedAt
+	}
+	return i.ClaudeDetectedAt
 }
 
 // CanForkOpenCode returns true if this OpenCode session can be forked
