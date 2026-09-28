@@ -74,3 +74,24 @@ func TestRuntimeLifecycle_WebMoveHonorsLiveDeleteTombstone(t *testing.T) {
 		t.Fatalf("move resurrected the deleted row: %#v, err=%v", row, err)
 	}
 }
+
+// Storage.SaveWithGroups binds every saved instance to its own database
+// handle. A move must not leave the Tea-owned instances bound to a transient
+// handle it closes on return, or their runtime-authority writes fail with
+// "sql: database is closed" until the next reload.
+func TestRuntimeLifecycle_WebMoveKeepsLiveInstancesOnOpenDatabase(t *testing.T) {
+	h, _, m := newLiveWebMoveFixture(t, "_test_web_move_open_db", "web-move-target", "web-move-bystander")
+	bystander := h.instanceByID["web-move-bystander"]
+	if _, err := bystander.ReconcileOwnership(); err != nil {
+		t.Fatalf("control ReconcileOwnership: %v", err)
+	}
+
+	if _, _, err := m.MoveSessionToGroup("web-move-target", "Work"); err != nil {
+		t.Fatalf("MoveSessionToGroup: %v", err)
+	}
+	for _, inst := range []*session.Instance{h.instanceByID["web-move-target"], bystander} {
+		if _, err := inst.ReconcileOwnership(); err != nil {
+			t.Fatalf("%s ReconcileOwnership after web move: %v", inst.ID, err)
+		}
+	}
+}

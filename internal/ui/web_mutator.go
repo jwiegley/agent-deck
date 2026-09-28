@@ -119,6 +119,24 @@ func (m *WebMutator) tombstoned(inst *session.Instance) bool {
 	return ok && deleted.matches(inst)
 }
 
+// saveStorage returns the Storage a web mutation saves the Home's instances
+// through, and a release the caller must defer. SaveWithGroups binds every
+// saved instance to its Storage's database handle, so saving the Tea-owned
+// instances through a transient Storage closed on return would leave their
+// runtime-authority writes (status CAS, captured kill/delete, binding
+// publishes) failing with "sql: database is closed" until the next reload.
+// A transient Storage is opened only for a Home that has none.
+func (m *WebMutator) saveStorage() (*session.Storage, func(), error) {
+	if m.h.storage != nil {
+		return m.h.storage, func() {}, nil
+	}
+	storage, err := session.NewStorageWithProfile(m.h.profile)
+	if err != nil {
+		return nil, nil, err
+	}
+	return storage, func() { _ = storage.Close() }, nil
+}
+
 // WithUndoWindow overrides the undo grace period (useful for tests that
 // need to force expiry without sleeping).
 func (m *WebMutator) WithUndoWindow(d time.Duration) *WebMutator {
@@ -845,11 +863,11 @@ func (m *WebMutator) MoveSessionToGroup(id, groupPath string) (string, bool, err
 	copy(instances, m.h.instances)
 	m.h.instancesMu.Unlock()
 
-	storage, err := session.NewStorageWithProfile(m.h.profile)
+	storage, release, err := m.saveStorage()
 	if err != nil {
 		return "", false, fmt.Errorf("open storage: %w", err)
 	}
-	defer storage.Close()
+	defer release()
 	if err := m.h.saveWithGroups(storage, instances, m.h.groupTree); err != nil {
 		return "", false, fmt.Errorf("save session: %w", err)
 	}
