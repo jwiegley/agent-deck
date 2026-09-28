@@ -6868,9 +6868,15 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 		i.lastKnownActivity = currentTS
 	}
 
-	// Discard older cached child evidence before calculating or publishing status.
+	// Discard older cached foreign evidence before calculating or publishing
+	// status: a rollout may acquire its subagent metadata after the hook was
+	// first read, or an older reader may have cached a turn-end from a helper
+	// thread without a rollout. The bound thread's own turn-end is never
+	// foreign (codexHookFromForeignThread).
 	if IsCodexCompatible(i.Tool) && i.hookSessionID != "" &&
-		i.shouldRejectCodexSubagentRebind(i.hookSessionID) {
+		(i.shouldRejectCodexSubagentRebind(i.hookSessionID) ||
+			(i.hookSessionID != i.CodexSessionID &&
+				i.shouldRejectCodexUnbackedTurnEnd(i.hookSessionID, i.hookEvent))) {
 		i.clearRejectedCodexHookLocked(i.hookSessionID)
 	}
 
