@@ -368,6 +368,28 @@ func (a *runtimeTransitionAuthority) close() {
 	}
 }
 
+// adoptStatusObservation refreshes expected from the durable row while this
+// authority is held. The lifecycle lock pins the physical runtime, but a status
+// observation (the TUI poller, the transition daemon, a one-pass CLI
+// observation) commits through its own revision CAS without that lock. A
+// status-only advance of the same runtime is adopted into expected and into
+// memory; anything else, including a reserved destruction, is left in place
+// for the caller's destructive check to refuse.
+func (a *runtimeTransitionAuthority) adoptStatusObservation(i *Instance) error {
+	if !a.durable || a.db == nil {
+		return nil
+	}
+	durable, found, err := a.db.ReadRuntimeState(i.ID)
+	if err != nil {
+		return err
+	}
+	if found && samePhysicalRuntime(durable, a.expected) && !statedb.IsRuntimeDestructionReserved(durable) {
+		a.expected = durable
+		i.ApplyRuntimeState(durable)
+	}
+	return nil
+}
+
 // RuntimeReconciliationResult describes a read-only inventory or a completed
 // recovery. Live is true only when one exact, generation-proved candidate is
 // the durable winner. Ambiguous candidates are returned in the error instead.

@@ -287,7 +287,10 @@ func ExecuteHarnessSwitch(cfg *UserConfig, inst *Instance, opts HarnessSwitchOpt
 			resultErr = opts.Storage.CommitNativeHarnessSwitch(inst, result)
 		}
 	}()
-	if !sameDestructiveRuntime(authority.expected, selection.State) || sourceIdentity != nativeSwitchStorageIdentity(identityForInstance(inst)) {
+	// Status is liveness, not identity (#2344): a status observation committed
+	// since the source was loaded or captured must not cancel the switch. The
+	// lifecycle lock now pins the generation and tmux identity compared here.
+	if !samePhysicalRuntime(authority.expected, selection.State) || sourceIdentity != nativeSwitchStorageIdentity(identityForInstance(inst)) {
 		return nil, fmt.Errorf("native switch source changed before runtime authority was acquired")
 	}
 	if IsClaudeCompatible(preview.SourceTool) && IsClaudeCompatible(preview.TargetHarness) {
@@ -773,6 +776,10 @@ func executeClaudeCodexSwitch(cfg *UserConfig, inst *Instance, preview *SwitchPr
 	return result, nil
 }
 
+// nativeSwitchStopAttempts bounds the stop's retries when a status observation
+// wins the destruction reservation's revision CAS.
+const nativeSwitchStopAttempts = 3
+
 // Narrow seams keep native executor regressions filesystem-only: tests inject
 // lifecycle state, stop/start outcomes, and journal failures without creating
 // a tmux session.
@@ -782,10 +789,22 @@ var (
 	}
 	nativeSwitchRunning = func(inst *Instance) bool { return inst.Exists() }
 	nativeSwitchStop    = func(inst *Instance, authority *runtimeTransitionAuthority) error {
-		selection := RuntimeSelection{State: authority.expected, Incarnation: authority.incarnation}
+		// A status observation that lands while the source is staged, or
+		// between this re-read and the destruction reservation, is adopted
+		// rather than failing the confirmed switch (#2344).
 		var runtime statedb.RuntimeState
-		if err := inst.killInternalLocked(selection, true, false, true, &runtime, nil); err != nil {
-			return err
+		for attempt := 1; ; attempt++ {
+			if err := authority.adoptStatusObservation(inst); err != nil {
+				return err
+			}
+			selection := RuntimeSelection{State: authority.expected, Incarnation: authority.incarnation}
+			err := inst.killInternalLocked(selection, true, false, true, &runtime, nil)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, statedb.ErrStatusRevisionConflict) || attempt == nativeSwitchStopAttempts {
+				return err
+			}
 		}
 		authority.expected = runtime
 		authority.predecessorTerminated = true

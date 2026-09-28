@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/stretchr/testify/require"
 )
@@ -136,6 +138,179 @@ config_dir = "~/.claude-work"
 				require.NotEmpty(t, result.Warnings)
 			}
 			require.NoError(t, storage.CommitNativeHarnessSwitch(inst, result))
+		})
+	}
+}
+
+// A status observation is liveness, not identity (#2344). Whether the TUI
+// poller commits it in-process or another process (the transition daemon, a
+// one-pass CLI observation) commits it through the same revision CAS, it must
+// not cancel a confirmed native account switch: not before the switch starts,
+// which leaves the in-memory runtime trailing the durable row; not between the
+// runtime capture and transition authority; not while the source is staged
+// before its stop; and not between the stop's final read and its destruction
+// reservation. A replaced physical runtime must still refuse.
+func TestNativeHarnessSwitch_StatusObservationDoesNotCancelSwitch(t *testing.T) {
+	const (
+		beforeSwitch       = "before switch"
+		beforeAuthority    = "before authority"
+		beforeStop         = "before stop"
+		atReservation      = "at reservation"
+		replacedGeneration = "replaced generation"
+	)
+	for _, tc := range []struct {
+		tool, window string
+		poller       bool // the in-process TUI poller rather than another process
+	}{
+		{tool: "claude", window: beforeSwitch},
+		{tool: "claude", window: beforeAuthority},
+		{tool: "claude", window: beforeAuthority, poller: true},
+		{tool: "claude", window: beforeStop},
+		{tool: "claude", window: beforeStop, poller: true},
+		{tool: "claude", window: atReservation},
+		{tool: "codex", window: beforeSwitch},
+		{tool: "codex", window: beforeStop, poller: true},
+		{tool: "claude", window: replacedGeneration},
+	} {
+		source := "other process"
+		if tc.poller {
+			source = "tui poller"
+		}
+		t.Run(tc.tool+"/"+source+"/"+tc.window, func(t *testing.T) {
+			home := withTempAgentDeckHome(t, `
+[profiles.personal.claude]
+config_dir = "~/.claude-personal"
+[profiles.work.claude]
+config_dir = "~/.claude-work"
+[profiles.personal.codex]
+config_dir = "~/.codex-personal"
+[profiles.work.codex]
+config_dir = "~/.codex-work"
+`)
+			cfg, err := LoadUserConfig()
+			require.NoError(t, err)
+			project := filepath.Join(home, "project")
+			require.NoError(t, os.MkdirAll(project, 0o700))
+			const sid = "11111111-2222-3333-4444-555555555555"
+			inst := &Instance{ID: "native-status-tick", Title: "source", ProjectPath: project, GroupPath: "test", Tool: tc.tool, Command: tc.tool, Account: "personal", Status: StatusWaiting, CreatedAt: time.Now(), TmuxSocketName: "isolated", tmuxSession: &tmux.Session{Name: "runtime-g0", SocketName: "isolated", InstanceID: "native-status-tick"}}
+			sourcePath := filepath.Join(home, ".claude-personal", "projects", ConvertToClaudeDirName(project), sid+".jsonl")
+			transcript := []byte(`{"sessionId":"` + sid + `","type":"user","message":"hi"}` + "\n")
+			inst.ClaudeSessionID = sid
+			if tc.tool == "codex" {
+				inst.ClaudeSessionID, inst.CodexSessionID = "", sid
+				sourcePath = filepath.Join(home, ".codex-personal", "sessions", "2026", "09", "28", "rollout-2026-09-28T00-00-00-"+sid+".jsonl")
+				transcript = []byte(`{"type":"session_meta","payload":{"id":"` + sid + `"}}` + "\n")
+			}
+			require.NoError(t, os.MkdirAll(filepath.Dir(sourcePath), 0o700))
+			require.NoError(t, os.WriteFile(sourcePath, transcript, 0o600))
+
+			installRuntimeLifecycleTestSeams(t)
+			storage := newTestStorage(t)
+			require.NoError(t, storage.Save([]*Instance{inst}))
+			selection := inst.CaptureRuntimeSelection()
+			installRuntimeDeletionCandidateSeams(t, selection.State)
+			oldTerminate, oldRunning, oldStart, oldStop, oldInventory := terminateCapturedRuntimeFn, nativeSwitchRunning, nativeSwitchStart, nativeSwitchStop, runtimeGenerationCandidateInventoryFn
+			t.Cleanup(func() {
+				terminateCapturedRuntimeFn, nativeSwitchRunning, nativeSwitchStart, nativeSwitchStop, runtimeGenerationCandidateInventoryFn = oldTerminate, oldRunning, oldStart, oldStop, oldInventory
+			})
+			setStatusProbeOverride(t, func(context.Context, *Instance, statedb.RuntimeState) (Status, error) {
+				return StatusIdle, nil
+			})
+
+			// One status commit through the CAS that the TUI poller, the
+			// transition daemon and a one-pass CLI observation all use.
+			ticks := 0
+			tick := func() {
+				if ticks > 0 {
+					return
+				}
+				ticks++
+				if tc.poller {
+					observed := inst.runtimeStateSnapshot()
+					next, err := inst.UpdateStatusObserved(context.Background(), observed, inst.PersistenceIncarnation())
+					require.NoError(t, err)
+					require.Equal(t, observed.StatusRevision+1, next.StatusRevision, "the poller tick did not commit")
+					return
+				}
+				durable, found, err := storage.db.ReadRuntimeState(inst.ID)
+				require.NoError(t, err)
+				require.True(t, found)
+				applied, err := storage.db.WriteStatusIfVersion(inst.ID, selection.Incarnation, durable.Generation, durable.StatusRevision, string(StatusIdle))
+				require.NoError(t, err)
+				require.True(t, applied, "the other process's tick did not commit")
+			}
+			stopping := false
+			switch tc.window {
+			case beforeSwitch:
+				tick()
+				require.Equal(t, selection.State, inst.CaptureRuntimeSelection().State, "memory must trail the durable row")
+			case beforeAuthority:
+				runtimeTransitionObservedFn = tick
+			case beforeStop:
+				nativeSwitchStop = func(i *Instance, a *runtimeTransitionAuthority) error {
+					tick()
+					return oldStop(i, a)
+				}
+			case atReservation:
+				nativeSwitchStop = func(i *Instance, a *runtimeTransitionAuthority) error {
+					stopping = true
+					return oldStop(i, a)
+				}
+				inventory := runtimeGenerationCandidateInventoryFn
+				runtimeGenerationCandidateInventoryFn = func(socketName, instanceID string) ([]tmux.RuntimeGenerationCandidate, error) {
+					if stopping {
+						tick()
+					}
+					return inventory(socketName, instanceID)
+				}
+			case replacedGeneration:
+				// Another process restarted the source after it was loaded.
+				binding, found, err := storage.db.ReadRuntimeBinding(inst.ID, "claude")
+				require.NoError(t, err)
+				require.True(t, found)
+				next := selection.State
+				next.Generation++
+				next.StatusRevision = 0
+				next.TmuxSession = "runtime-g1-elsewhere"
+				next.Status = string(StatusRunning)
+				require.NoError(t, storage.db.CommitRuntimeTransitionWithBindingPlan(selection.State.Generation, selection.Incarnation, next, []statedb.RuntimeBindingTransition{{
+					Kind: "claude", ExpectedRevision: binding.Revision, NextValue: binding.Value, DetectedAt: binding.DetectedAt,
+				}}))
+				installRuntimeDeletionCandidateSeams(t, next)
+			}
+
+			running := true
+			terminated := 0
+			nativeSwitchRunning = func(*Instance) bool { return running }
+			terminateCapturedRuntimeFn = func(candidate tmux.RuntimeGenerationCandidate, wait bool) error {
+				require.True(t, runtimeGenerationCandidateMatchesState(candidate, selection.State))
+				terminated++
+				running = false
+				return nil
+			}
+			nativeSwitchStart = func(i *Instance, authority *runtimeTransitionAuthority) error {
+				setRuntimeTestCandidate(i, "runtime-g1")
+				_, _, committed, err := i.commitPhysicalRuntime(authority)
+				require.NoError(t, err)
+				require.True(t, committed)
+				return nil
+			}
+
+			result, err := ExecuteHarnessSwitch(cfg, inst, HarnessSwitchOptions{Target: SwitchPreviewTarget{Harness: tc.tool, Account: "work"}, Storage: storage})
+			if tc.window == replacedGeneration {
+				require.ErrorContains(t, err, "native switch source changed before runtime authority was acquired", "a replaced runtime is not the source the operator confirmed")
+				require.Zero(t, terminated, "the replacement runtime must not be stopped")
+				require.Equal(t, "personal", inst.Account)
+				return
+			}
+			require.NoError(t, err, "a status observation cancelled the confirmed switch")
+			require.Equal(t, 1, ticks, "the status observation was never committed")
+			require.True(t, result.Committed)
+			require.Equal(t, 1, terminated, "the source must be stopped exactly once")
+			require.Equal(t, "work", inst.Account)
+			stored, err := storage.db.LoadInstances()
+			require.NoError(t, err)
+			require.Equal(t, "work", stored[0].Account)
 		})
 	}
 }
