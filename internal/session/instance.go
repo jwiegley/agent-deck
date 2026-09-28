@@ -6913,16 +6913,6 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 		}
 	}
 
-	// Recheck cached evidence too: a rollout may acquire its subagent metadata
-	// after the hook was first read, or an older reader may have cached a
-	// foreign turn-end from a thread without a rollout.
-	if IsCodexCompatible(i.Tool) && i.hookSessionID != "" &&
-		(i.shouldRejectCodexSubagentRebind(i.hookSessionID) ||
-			i.shouldRejectCodexUnbackedTurnEnd(i.hookSessionID, i.hookEvent)) {
-		i.hookStatus, i.hookEvent, i.hookSessionID = "", "", ""
-		i.hookLastUpdate = time.Time{}
-	}
-
 	// HOOK FAST PATH: hook-based status for tools that emit lifecycle events.
 	// Freshness is tool- and state-specific (e.g. Codex running vs waiting).
 	// When this path is stale/missing, control naturally falls through to tmux
