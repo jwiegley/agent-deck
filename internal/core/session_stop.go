@@ -6,6 +6,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/health"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 )
 
 // SessionStopIn is the input of session.stop.
@@ -52,6 +53,7 @@ func (deps Deps) sessionStop(ctx context.Context, in SessionStopIn) (SessionStop
 	if err := inst.KillCaptured(selection); err != nil {
 		return SessionStopOut{}, &Error{Code: CodeInvalid, Message: fmt.Sprintf("failed to stop session: %v", err), Cause: err}
 	}
+	inst.RecordTelemetryEnd(telemetry.EndStop)
 
 	drained, warning := drainGroupQueue(ctx, d.storage, inst.GroupPath, d.instances, d.groups)
 	if warning != "" {
