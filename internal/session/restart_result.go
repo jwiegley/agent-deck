@@ -198,7 +198,7 @@ func (i *Instance) StartWithMessageRuntime(message string) (runtime statedb.Runt
 }
 
 func (i *Instance) RestartRuntime() (runtime statedb.RuntimeState, err error) {
-	_, err = i.restart(nil, false, &runtime)
+	err = i.restartRecorded(nil, &runtime)
 	return runtime, err
 }
 

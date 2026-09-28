@@ -71,6 +71,36 @@ func grantTelemetryForTest(t *testing.T) func(telemetry.EndKind) int {
 	}
 }
 
+// Every restart entry point that replaces the process records one
+// session.end(restart), as upstream's Restart does. The TUI, web, MCP, skill,
+// plugin, move and fleet surfaces restart through RestartRuntime, and the
+// session restart command through RestartWithEnvRuntime. A fresh recovery is
+// not a restart and records nothing, as upstream's RestartFresh.
+func TestRestartTelemetry_EachReplacementRecordsOneSessionEnd(t *testing.T) {
+	ends := grantTelemetryForTest(t)
+	_, inst := spawnOnPrivateSocket(t, "_test_restart_telemetry")
+	require.NoError(t, inst.Start())
+
+	for _, step := range []struct {
+		name    string
+		restart func() error
+		want    int
+	}{
+		{"RestartRuntime", func() error { _, err := inst.RestartRuntime(); return err }, 1},
+		{"RestartWithEnvRuntime", func() error {
+			_, err := inst.RestartWithEnvRuntime(map[string]string{"TELEMETRY_RESTART": "1"})
+			return err
+		}, 1},
+		{"Restart", inst.Restart, 1},
+		{"RestartFreshRuntime", func() error { _, err := inst.RestartFreshRuntime(); return err }, 0},
+	} {
+		before, recorded := inst.RuntimeState().Generation, ends(telemetry.EndRestart)
+		require.NoError(t, step.restart(), step.name)
+		require.Greater(t, inst.RuntimeState().Generation, before, "%s replaced the process", step.name)
+		require.Equal(t, step.want, ends(telemetry.EndRestart)-recorded, "%s session.end(restart) events", step.name)
+	}
+}
+
 // A lock loser that adopts a concurrent durable winner stops and spawns
 // nothing. The winner's own restart records the replacement, so the loser
 // records no session.end(restart) of its own.

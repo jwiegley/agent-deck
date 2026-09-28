@@ -150,8 +150,10 @@ func TestRuntimeLifecycle_PhysicalEntrypointRoutingContract(t *testing.T) {
 	}{
 		{"Start result", "internal/session/restart_result.go", "StartRuntime", []string{"start"}},
 		{"StartWithMessage result", "internal/session/restart_result.go", "StartWithMessageRuntime", []string{"startWithMessage"}},
-		{"restart result", "internal/session/restart_result.go", "RestartRuntime", []string{"restart"}},
+		{"restart result", "internal/session/restart_result.go", "RestartRuntime", []string{"restartRecorded"}},
 		{"restart-with-env result", "internal/session/restart_result.go", "RestartWithEnvRuntime", []string{"restartWithEnv"}},
+		{"restart-with-env adapter", "internal/session/instance.go", "restartWithEnv", []string{"restartRecorded"}},
+		{"recorded restart", "internal/session/instance.go", "restartRecorded", []string{"restart", "RecordTelemetryEnd"}},
 		{"fresh-recovery result", "internal/session/restart_result.go", "RestartFreshRuntime", []string{"restartFresh"}},
 		{"Start core", "internal/session/instance.go", "start", []string{"beginRuntimeTransition", "commitPhysicalRuntime"}},
 		{"StartWithMessage core", "internal/session/instance.go", "startWithMessage", []string{"beginRuntimeTransition", "commitPhysicalRuntime"}},
