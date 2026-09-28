@@ -1,6 +1,9 @@
 package tmux
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +52,41 @@ func TestIssue2099_ProbeExistsIsExactAndUncached(t *testing.T) {
 	exists, err = live.ProbeExists()
 	require.NoError(t, err)
 	assert.False(t, exists, "a killed session must probe as gone regardless of the cache")
+}
+
+func TestProbeExists_CompletedClientFailureIsNotAbsence(t *testing.T) {
+	for _, tc := range []struct {
+		name, diagnostic string
+		absent           bool
+	}{
+		// tmux names an exact ("=") target without its "=" (tmux 3.7c).
+		{"missing session", "can't find session: <name>", true},
+		{"missing server", "no server running on /tmp/probe.sock", true},
+		{"client failure", "server exited unexpectedly", false},
+		{"permission denied", "error connecting to /tmp/probe.sock (Permission denied)", false},
+		// No socket file does not prove no server (isMissingTmuxSocketResult).
+		{"missing socket file", "error connecting to /tmp/probe.sock (No such file or directory)", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewSession("probe-unknown", t.TempDir())
+			diagnostic := strings.ReplaceAll(tc.diagnostic, "<name>", s.Name)
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte("#!/bin/sh\nprintf '%s\\n' \""+diagnostic+"\" >&2\nexit 1\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir)
+			exists, err := s.ProbeExists()
+			if exists {
+				t.Fatal("failed client cannot prove the session exists")
+			}
+			if tc.absent && err != nil {
+				t.Fatalf("confirmed absence returned an error: %v", err)
+			}
+			if !tc.absent && err == nil {
+				t.Fatal("inconclusive client failure was treated as absence")
+			}
+		})
+	}
 }
 
 // #1873 relies on ProbeExists separating "tmux said the session is gone" from

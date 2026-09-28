@@ -3300,16 +3300,18 @@ func (s *Session) killAfterPaneCwdFailure(cwdErr error) error {
 //
 // The `=` target prefix makes tmux match the name exactly instead of by
 // prefix, so a sibling named like this session plus a suffix cannot answer
-// for it. Only a tmux client that ran to completion and exited non-zero is
-// "gone"; a probe that timed out, was refused by a protocol-mismatched server,
-// or never produced a completed tmux client (the binary could not be launched,
-// the client was killed by a signal) is indeterminate and reported as an
-// error, never as either verdict. Callers deciding whether a session's process
-// tree may be treated as absent (#1873) depend on that distinction.
+// for it. A completed client proves absence only with tmux's canonical
+// answer that this exact session or the server is missing
+// (isCanonicalMissingSessionResult, as for probeSessionExistence). Other
+// failures are indeterminate and reported as errors, never as either verdict:
+// a probe that timed out, was refused by a protocol-mismatched server, never
+// produced a completed tmux client, or completed with any other diagnostic.
+// Callers deciding whether a session's process tree may be treated as absent
+// (#1873) depend on that distinction.
 func (s *Session) ProbeExists() (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
 	defer cancel()
-	err := commandRun(s.tmuxCmdContext(ctx, "has-session", "-t", "="+s.Name))
+	_, err := commandOutput(s.tmuxCmdContext(ctx, "has-session", "-t", "="+s.Name))
 	if err == nil {
 		return true, nil
 	}
@@ -3323,7 +3325,10 @@ func (s *Session) ProbeExists() (bool, error) {
 	if !errors.As(err, &exitErr) || !exitErr.Exited() {
 		return false, fmt.Errorf("tmux has-session probe for %q did not complete: %w", s.Name, err)
 	}
-	return false, nil
+	if isCanonicalMissingSessionResult(err, s.Name) {
+		return false, nil
+	}
+	return false, fmt.Errorf("tmux has-session probe for %q was inconclusive: %w", s.Name, err)
 }
 
 // Exists checks if the tmux session exists
