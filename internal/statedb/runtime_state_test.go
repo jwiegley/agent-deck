@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -863,6 +864,98 @@ func TestRuntimeLifecycle_CurrentSchemaFastPathSkipsMigrationBody(t *testing.T) 
 	}
 	if runtimeRows != 0 {
 		t.Fatal("current-schema migration repeated per-instance runtime backfill")
+	}
+}
+
+// Upstream adds the recall tables without a schema bump, so a database a
+// pre-recall build stamped at the current version has none of them. The
+// current-schema fast path must create them without entering the migration
+// body, and must write nothing once they exist.
+func TestRuntimeLifecycle_CurrentSchemaFastPathCreatesMissingRecallTables(t *testing.T) {
+	db := newRuntimeTestDB(t)
+	for _, table := range []string{"session_hints", "session_tags", "session_links"} {
+		if _, err := db.DB().Exec(`DROP TABLE ` + table); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const recallObjects = 6
+	countRecallObjects := func() int {
+		t.Helper()
+		var n int
+		if err := db.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name IN
+			('session_hints', 'session_tags', 'session_links', 'idx_hints_scope', 'idx_hints_kv', 'idx_tags_tag')`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := countRecallObjects(); n != 0 {
+		t.Fatalf("precondition: %d recall objects remain after DROP", n)
+	}
+
+	// data_version on a pinned connection changes only when another
+	// connection commits, and Migrate writes through its own connection.
+	ctx := context.Background()
+	probe, err := db.DB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close()
+	dataVersion := func() int64 {
+		t.Helper()
+		var v int64
+		if err := probe.QueryRowContext(ctx, `PRAGMA data_version`).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	beforeRepair := dataVersion()
+
+	reachedDDL := false
+	db.testBeforeMigrationDDL = func() { reachedDDL = true }
+	defer func() { db.testBeforeMigrationDDL = nil }()
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate on current schema without recall tables: %v", err)
+	}
+	if reachedDDL {
+		t.Fatal("recall repair entered the migration body")
+	}
+	if n := countRecallObjects(); n != recallObjects {
+		t.Fatalf("recall objects after Migrate = %d, want %d", n, recallObjects)
+	}
+	afterRepair := dataVersion()
+	if afterRepair == beforeRepair {
+		t.Fatal("data_version probe did not observe the repair commit")
+	}
+	var version string
+	if err := db.DB().QueryRow(`SELECT value FROM metadata WHERE key = 'schema_version'`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != strconv.Itoa(SchemaVersion) {
+		t.Fatalf("schema_version = %q, want %d", version, SchemaVersion)
+	}
+
+	if err := db.SetSessionHint(HintScopeInstance, "inst", "ticket", "SB-1", HintSourceAnnotate, ""); err != nil {
+		t.Fatalf("SetSessionHint after repair: %v", err)
+	}
+	if err := db.AddSessionTag(HintScopeInstance, "inst", "urgent", HintSourceAnnotate); err != nil {
+		t.Fatalf("AddSessionTag after repair: %v", err)
+	}
+	if err := db.UpsertSessionLink("inst", "codex", "native", "", true); err != nil {
+		t.Fatalf("UpsertSessionLink after repair: %v", err)
+	}
+	if links, err := db.ListSessionLinks("inst"); err != nil || len(links) != 1 || !links[0].Authoritative {
+		t.Fatalf("links after repair = %+v err=%v, want one authoritative link", links, err)
+	}
+
+	beforeRerun := dataVersion()
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("second Migrate: %v", err)
+	}
+	if reachedDDL {
+		t.Fatal("second Migrate entered the migration body")
+	}
+	if after := dataVersion(); after != beforeRerun {
+		t.Fatalf("second Migrate wrote to the database: data_version %d -> %d", beforeRerun, after)
 	}
 }
 

@@ -499,7 +499,15 @@ func (s *StateDB) migrateOnce() error {
 				return fmt.Errorf("%w: database=%d binary=%d", ErrFutureSchema, version, SchemaVersion)
 			}
 			if version == SchemaVersion {
-				return nil
+				// The migration body stays skipped: its backfills and writer-epoch
+				// check belong to version transitions. Upstream adds the recall
+				// tables without a schema bump, so a database a pre-recall build
+				// stamped at this version never ran their DDL. It is additive and
+				// idempotent, and writes nothing once the tables exist.
+				if err := migrateRecallTables(tx); err != nil {
+					return err
+				}
+				return tx.Commit()
 			}
 		}
 	}
