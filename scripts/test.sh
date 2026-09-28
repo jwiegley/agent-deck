@@ -30,7 +30,10 @@ test_env=(
     "LANG=en_US.UTF-8"
     "SHELL=$bash_path"
 )
-for name in GOTOOLCHAIN GOFLAGS CGO_ENABLED CC CXX SDKROOT DEVELOPER_DIR MACOSX_DEPLOYMENT_TARGET CI GITHUB_ACTIONS; do
+# Toolchain settings and the test knobs a caller sets on purpose (CI's
+# PERF_BUDGET_MULTIPLIER, tools/visualcheck's binary and sandbox switches).
+for name in GOTOOLCHAIN GOFLAGS CGO_ENABLED CC CXX SDKROOT DEVELOPER_DIR MACOSX_DEPLOYMENT_TARGET CI GITHUB_ACTIONS \
+    PERF_BUDGET_MULTIPLIER VISUALCHECK_BINARY VISUALCHECK_KEEP_SANDBOX; do
     if [[ ${!name+x} ]]; then
         test_env+=("$name=${!name}")
     fi

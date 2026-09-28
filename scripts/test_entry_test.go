@@ -39,6 +39,10 @@ tmp_root=$(cd /tmp && pwd -P)
 for name in OPENAI_API_KEY CLAUDE_CONFIG_DIR CODEX_HOME AGENTDECK_INSTANCE_ID SSH_AUTH_SOCK TMUX TMUX_PANE XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_RUNTIME_DIR; do
     [[ ! ${!name+x} ]] || { echo "inherited $name" >&2; exit 9; }
 done
+[[ ${PERF_BUDGET_MULTIPLIER-} == 2.5 && ${VISUALCHECK_BINARY-} == /synthetic/agent-deck && ${VISUALCHECK_KEEP_SANDBOX-} == 1 ]] || {
+    echo "test knobs dropped: PERF_BUDGET_MULTIPLIER=${PERF_BUDGET_MULTIPLIER-} VISUALCHECK_BINARY=${VISUALCHECK_BINARY-} VISUALCHECK_KEEP_SANDBOX=${VISUALCHECK_KEEP_SANDBOX-}" >&2
+    exit 10
+}
 printf '%s\n' "$HOME" "$*" > "$GOCACHE/receipt"
 [[ $* != 'test fail' ]] || exit 7
 `
@@ -50,7 +54,8 @@ printf '%s\n' "$HOME" "$*" > "$GOCACHE/receipt"
 				args = append(args, "fail")
 			}
 			cmd := exec.Command("bash", args...)
-			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+root, "SHELL=/bin/zsh")
+			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+root, "SHELL=/bin/zsh",
+				"PERF_BUDGET_MULTIPLIER=2.5", "VISUALCHECK_BINARY=/synthetic/agent-deck", "VISUALCHECK_KEEP_SANDBOX=1")
 			for _, key := range []string{"OPENAI_API_KEY", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENTDECK_INSTANCE_ID", "SSH_AUTH_SOCK", "TMUX", "TMUX_PANE", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"} {
 				cmd.Env = append(cmd.Env, key+"=synthetic-test-value")
 			}
