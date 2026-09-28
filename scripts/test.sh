@@ -41,4 +41,15 @@ done
 if [[ $# -eq 0 ]]; then
     set -- -race -count=1 ./...
 fi
-env -i "${test_env[@]}" go test "$@"
+status=0
+env -i "${test_env[@]}" go test "$@" || status=$?
+# tools/visualcheck leaves its contact sheet, report and redraw frames in
+# $TMPDIR/visualcheck-artifacts for a reviewer to judge a DIFF. Move them out
+# of the sandbox before it is removed, but only when the run failed.
+artifact_tmp=${TMPDIR:-/tmp}
+if [[ $status -ne 0 && -d $sandbox/tmp/visualcheck-artifacts ]] &&
+    kept=$(mktemp -d "${artifact_tmp%/}/agent-deck-test-artifacts.XXXXXX") &&
+    mv -- "$sandbox/tmp/visualcheck-artifacts" "$kept/"; then
+    echo "scripts/test.sh: kept visualcheck artifacts in $kept/visualcheck-artifacts" >&2
+fi
+exit "$status"

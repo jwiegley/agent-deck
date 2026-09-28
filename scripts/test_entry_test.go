@@ -43,6 +43,8 @@ done
     echo "test knobs dropped: PERF_BUDGET_MULTIPLIER=${PERF_BUDGET_MULTIPLIER-} VISUALCHECK_BINARY=${VISUALCHECK_BINARY-} VISUALCHECK_KEEP_SANDBOX=${VISUALCHECK_KEEP_SANDBOX-}" >&2
     exit 10
 }
+mkdir "$TMPDIR/visualcheck-artifacts"
+printf 'sheet\n' > "$TMPDIR/visualcheck-artifacts/contact-sheet.html"
 printf '%s\n' "$HOME" "$*" > "$GOCACHE/receipt"
 [[ $* != 'test fail' ]] || exit 7
 `
@@ -54,7 +56,7 @@ printf '%s\n' "$HOME" "$*" > "$GOCACHE/receipt"
 				args = append(args, "fail")
 			}
 			cmd := exec.Command("bash", args...)
-			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+root, "SHELL=/bin/zsh",
+			cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+root, "TMPDIR="+root, "SHELL=/bin/zsh",
 				"PERF_BUDGET_MULTIPLIER=2.5", "VISUALCHECK_BINARY=/synthetic/agent-deck", "VISUALCHECK_KEEP_SANDBOX=1")
 			for _, key := range []string{"OPENAI_API_KEY", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENTDECK_INSTANCE_ID", "SSH_AUTH_SOCK", "TMUX", "TMUX_PANE", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"} {
 				cmd.Env = append(cmd.Env, key+"=synthetic-test-value")
@@ -77,6 +79,16 @@ printf '%s\n' "$HOME" "$*" > "$GOCACHE/receipt"
 			}
 			if !failure && lines[1] != "test -race -count=1 ./..." {
 				t.Fatalf("default test args = %q", lines[1])
+			}
+			kept, err := filepath.Glob(filepath.Join(root, "agent-deck-test-artifacts.*", "visualcheck-artifacts", "contact-sheet.html"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case failure && (len(kept) != 1 || !strings.Contains(string(output), filepath.Dir(kept[0]))):
+				t.Fatalf("failed run did not keep and name the visualcheck artifacts: %v: %s", kept, output)
+			case !failure && len(kept) != 0:
+				t.Fatalf("passing run kept visualcheck artifacts: %v", kept)
 			}
 		})
 	}
