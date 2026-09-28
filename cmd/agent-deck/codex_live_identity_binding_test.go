@@ -43,13 +43,14 @@ func TestCodexLaunchPublishesTheLiveThreadAsItsRuntimeBinding(t *testing.T) {
 }
 
 // A composer that takes its thread only after launch stopped waiting has no
-// pane CODEX_SESSION_ID for stop's tmux sync to read. Stop binds the live
-// thread before the kill destroys the only evidence of it.
+// pane CODEX_SESSION_ID for stop's tmux sync to read. Both stop paths bind
+// the live thread before the kill destroys the only evidence of it.
 func TestCodexStopBindsAThreadTakenAfterLaunch(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		env  []string
 	}{
+		{name: "registry stop"},
 		{name: "legacy stop", env: []string{envCoreRegistry + "=0"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {

@@ -43,6 +43,12 @@ func (deps Deps) sessionStop(ctx context.Context, in SessionStopIn) (SessionStop
 	// Capture tool conversation ids before Kill: show-environment fails on
 	// a dead tmux session.
 	inst.SyncSessionIDsFromTmux()
+	// A Codex thread the pane's process took after launch stopped waiting
+	// for it is in no pane variable, and Kill destroys the only evidence of
+	// it (#2400), so bind it from the live process as the legacy stop does.
+	if _, err := inst.BindLiveCodexThread(0); err != nil {
+		Warn(ctx, fmt.Sprintf("could not persist Codex session identity: %v", err))
+	}
 	if err := inst.KillCaptured(selection); err != nil {
 		return SessionStopOut{}, &Error{Code: CodeInvalid, Message: fmt.Sprintf("failed to stop session: %v", err), Cause: err}
 	}
