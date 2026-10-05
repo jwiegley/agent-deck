@@ -89,11 +89,12 @@ func (h *Home) checkForUpdate() tea.Cmd {
 }
 
 // requestUpdateCheck is the one gate every check the TUI starts on its
-// own goes through (startup, the periodic tick, after an install): at most
-// one in flight, and each one stamps lastUpdateCheck so the periodic
-// schedule counts from the latest. Returns nil while one is running.
+// own goes through (startup, the periodic tick, after an install): none
+// with check_enabled = false, at most one in flight, and each one stamps
+// lastUpdateCheck so the periodic schedule counts from the latest. Returns
+// nil while one is running or checks are off.
 func (h *Home) requestUpdateCheck(now time.Time) tea.Cmd {
-	if h.updateCheckInFlight {
+	if h.updateCheckInFlight || !loadUpdateSettings().GetCheckEnabled() {
 		return nil
 	}
 	h.lastUpdateCheck = now
@@ -110,7 +111,7 @@ func (h *Home) periodicUpdateCheck(now time.Time) tea.Cmd {
 	if h.updateCheckInFlight || now.Before(update.NextRecheck(h.lastUpdateCheck, h.lastUpdateCheckFailed)) {
 		return nil
 	}
-	if h.autoUpdateSuppressedReason != "" || !loadUpdateSettings().GetCheckEnabled() {
+	if h.autoUpdateSuppressedReason != "" {
 		return nil
 	}
 	return h.requestUpdateCheck(now)
