@@ -291,7 +291,8 @@ func (s *Storage) StartQueued(inst *Instance) (QueuedStart, error) {
 // an explicit config root (-account, conductor, group, env or profile
 // config_dir) the session runs with CLAUDE_CONFIG_DIR=<dir> and reads
 // <dir>/.claude.json, so seeding only ~/.claude.json left it stuck on the
-// trust prompt (#2673). The home root is still seeded too, as before.
+// trust prompt (#2673). Only that file is seeded
+// (ClaudeTrustConfigPathForInstance); the unused home root is left alone.
 //
 // Only a folder the FX-8 rule allows is seeded (folderTrustAllowed); for any
 // other a stderr note says how to allow it, and the FOLDER_NOT_TRUSTED
@@ -310,18 +311,7 @@ func PreAcceptLaunchTrust(inst *Instance) *LaunchWarning {
 		fmt.Fprintln(os.Stderr, folderTrustHint(trustDir))
 		return folderNotTrustedWarning(trustDir)
 	}
-	targets := []string{GetUserMCPRootPath()}
-	if IsClaudeConfigDirExplicitForInstance(inst) {
-		if dir := GetClaudeConfigDirForInstance(inst); dir != "" {
-			if p := filepath.Join(dir, ".claude.json"); p != targets[0] {
-				targets = append(targets, p)
-			}
-		}
-	}
-	for _, claudeJSON := range targets {
-		if claudeJSON == "" {
-			continue
-		}
+	if claudeJSON := ClaudeTrustConfigPathForInstance(inst); claudeJSON != "" {
 		if err := PreAcceptClaudeTrust(claudeJSON, trustDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: folder trust pre-seed for %q in %s failed (Claude launch may stall on the trust prompt): %v\n", trustDir, claudeJSON, err)
 		}

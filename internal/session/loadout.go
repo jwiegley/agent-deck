@@ -135,7 +135,8 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 	syncPluginChannels(inst)
 
 	// Project-scope plugins only load when the cwd's realpath is trusted in
-	// ~/.claude.json (projects[<realpath>].hasTrustDialogAccepted). Seed it
+	// the .claude.json the session's Claude reads (projects[<realpath>].
+	// hasTrustDialogAccepted; see ClaudeTrustConfigPathForInstance). Seed it
 	// here — the same one-key trust the conductor setup pre-accepts
 	// (PreAcceptClaudeTrust) — so a materialized skill loadout, which is what
 	// carries plugins/hooks, actually loads instead of being silently skipped
@@ -152,7 +153,7 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 		if folderTrustAllowed(inst, trustDir) == "" {
 			folderTrustSkipped("claude", inst, trustDir)
 			warn("workspace %q is not trusted by agent-deck ([security] trusted_folders), so project plugins load only after you accept Claude's trust prompt", trustDir)
-		} else if err := preAcceptClaudeTrustForInstance(inst, trustDir); err != nil {
+		} else if err := PreAcceptClaudeTrust(ClaudeTrustConfigPathForInstance(inst), trustDir); err != nil {
 			warn("workspace trust seed for %q failed (plugins may not load): %v", trustDir, err)
 		} else {
 			sessionLog.Info("loadout_trust_seeded",
