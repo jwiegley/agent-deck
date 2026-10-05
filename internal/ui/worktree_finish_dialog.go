@@ -120,11 +120,25 @@ func (d *WorktreeFinishDialog) GetOptions() (mergeEnabled bool, targetBranch str
 	return d.mergeEnabled, target, d.keepBranch
 }
 
+// IsExecuting reports whether a confirmed finish is still running, including
+// one whose progress dialog was dismissed into the background.
+func (d *WorktreeFinishDialog) IsExecuting() bool {
+	return d.isExecuting
+}
+
 // HandleKey processes a key event and returns the action to take.
-// Returns: action string ("close", "confirm", ""), and whether the dialog handled the key.
+// Returns: action string ("close", "confirm", "background", ""), and whether the dialog handled the key.
 func (d *WorktreeFinishDialog) HandleKey(key string) (action string) {
 	if d.isExecuting {
-		return "" // Block input while executing
+		// The finish command also prunes hook artifacts, which can wait on
+		// arbitrarily slow IO. It cannot be cancelled, but Esc hides its
+		// progress so the rest of the TUI stays usable; the dialog keeps the
+		// in-flight state until the result arrives. Other keys stay blocked.
+		if key == "esc" {
+			d.visible = false
+			return "background"
+		}
+		return ""
 	}
 
 	if d.step == 1 {
@@ -356,6 +370,8 @@ func (d *WorktreeFinishDialog) viewConfirm(titleStyle, labelStyle, errStyle, foo
 		b.WriteString(titleStyle.Render("Finishing Worktree..."))
 		b.WriteString("\n\n")
 		b.WriteString(labelStyle.Render("  Please wait..."))
+		b.WriteString("\n\n")
+		b.WriteString(footerStyle.Render("Esc continue in background"))
 		dialog := boxStyle.Render(b.String())
 		return lipgloss.Place(d.width, d.height, lipgloss.Center, lipgloss.Center, dialog)
 	}
