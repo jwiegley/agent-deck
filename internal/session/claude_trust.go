@@ -69,6 +69,23 @@ func PreAcceptClaudeTrust(claudeJSONPath, parentDir string) error {
 	return nil
 }
 
+// ClaudeTrustConfigPathForInstance returns the Claude config file that a
+// Claude process spawned for inst reads per-directory trust from. When the
+// instance resolves an explicit config dir, agent-deck exports
+// CLAUDE_CONFIG_DIR and Claude keys trust in <config dir>/.claude.json,
+// never consulting the root ~/.claude.json; a worker-scratch home mirrors
+// that same file. Otherwise Claude uses the root ~/.claude.json.
+func ClaudeTrustConfigPathForInstance(inst *Instance) string {
+	if inst == nil || !IsClaudeConfigDirExplicitForInstance(inst) {
+		return GetUserMCPRootPath()
+	}
+	configDir := GetClaudeConfigDirForInstance(inst)
+	if configDir == "" {
+		return GetUserMCPRootPath()
+	}
+	return filepath.Join(configDir, ".claude.json")
+}
+
 // WriteMultiRepoParentClaudeMD writes a .claude/CLAUDE.md to parentDir telling
 // Claude that this is a multi-repo session, which subdirectories contain real
 // repos, how to scope commands, and @path imports for each child project's
