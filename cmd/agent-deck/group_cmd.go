@@ -134,6 +134,9 @@ func buildGroupListJSON(groupTree *session.GroupTree) ([]byte, error) {
 		Idle    int `json:"idle"`
 		Error   int `json:"error"`
 		Stopped int `json:"stopped"`
+		// Queued is additive (see core.GroupStatus): status probes keep a
+		// queued session queued, so the counts sum to session_count.
+		Queued int `json:"queued"`
 	}
 
 	type groupJSON struct {
@@ -163,6 +166,8 @@ func buildGroupListJSON(groupTree *session.GroupTree) ([]byte, error) {
 						status.Error++
 					case session.StatusStopped:
 						status.Stopped++
+					case session.StatusQueued:
+						status.Queued++
 					}
 				}
 			}

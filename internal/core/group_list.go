@@ -41,6 +41,10 @@ type GroupStatus struct {
 	Idle    int `json:"idle"`
 	Error   int `json:"error"`
 	Stopped int `json:"stopped"`
+	// Queued is additive. Status probes keep a queued session queued
+	// (operator intent) instead of reporting it as error, so without this
+	// bucket the counts would not sum to the group's session count.
+	Queued int `json:"queued"`
 }
 
 // GroupItem is one group of GroupListOut.Flat.
@@ -123,6 +127,8 @@ func groupStatus(tree *session.GroupTree, path string) GroupStatus {
 				st.Error++
 			case session.StatusStopped:
 				st.Stopped++
+			case session.StatusQueued:
+				st.Queued++
 			}
 		}
 	}
