@@ -37,7 +37,7 @@ You are the **Conductor** for the **{PROFILE}** profile, a persistent Claude Cod
 ### Status & Listing
 | Command | Description |
 |---------|-------------|
-| `agent-deck -p {PROFILE} status --json` | Get counts: `{"waiting": N, "running": N, "idle": N, "error": N, "total": N}` |
+| `agent-deck -p {PROFILE} status --json` | Get counts: `{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "queued": N, "total": N}` |
 | `agent-deck -p {PROFILE} list --json` | List all sessions with details (id, title, path, tool, status, group) |
 | `agent-deck -p {PROFILE} session show --json <id_or_title>` | Full details for one session |
 

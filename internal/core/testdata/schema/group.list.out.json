@@ -64,6 +64,9 @@
         "idle": {
           "type": "integer"
         },
+        "queued": {
+          "type": "integer"
+        },
         "running": {
           "type": "integer"
         },
@@ -77,6 +80,7 @@
       "required": [
         "error",
         "idle",
+        "queued",
         "running",
         "stopped",
         "waiting"

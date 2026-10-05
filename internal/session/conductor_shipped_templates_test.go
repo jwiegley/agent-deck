@@ -45,17 +45,18 @@ func loadShippedConductorTemplates(t *testing.T) []shippedConductorTemplate {
 }
 
 // TestShippedConductorTemplatesAreRecognizedAsGenerated proves, against the
-// templates that actually shipped (v1.15.0, v1.16.5, v1.16.8, v1.16.10 for
-// generation 0; v1.10.9, v1.10.10, v1.10.11 for generation 1; v1.11.0 as the
-// generation-0 boundary), that a conductor left on any released instructions
-// file is recognised as generated and migrated in place through the full
+// templates that actually shipped (v1.16.28-v1.16.29, v1.16.24,
+// v1.16.11-v1.16.17, v1.11.0-v1.16.10, and v1.10.9-v1.10.11), that a
+// conductor left on any released instructions file is recognised as
+// generated and migrated in place through the full
 // conductorInstructionsGenerations list, while a hand-written file is left
 // alone.
 //
-// Fixture rows span exactly 4 distinct blobs: v1.16.28/v1.16.29 (the shared
+// Fixture rows span exactly 5 distinct blobs: v1.16.28/v1.16.29 (the shared
 // template before the /cmd quick command and no-op notice rule), v1.16.24 (the shared template
-// before the #2469 human-tier reply format), v1.11.0-v1.16.10 share one, and
-// v1.10.9-v1.10.11 share the other (predating #1814's substate-guidance row).
+// before the #2469 human-tier reply format), v1.16.11-v1.16.17 (the shared
+// template before the #2469 heartbeat redesign), v1.11.0-v1.16.10 share one,
+// and v1.10.9-v1.10.11 share the other (predating #1814's substate-guidance row).
 // v1.9.73 and v1.9.70 are intentionally not covered; see the tsv header.
 func TestShippedConductorTemplatesAreRecognizedAsGenerated(t *testing.T) {
 	rows := loadShippedConductorTemplates(t)
@@ -66,10 +67,10 @@ func TestShippedConductorTemplatesAreRecognizedAsGenerated(t *testing.T) {
 		blobs[r.blob] = true
 		tags[r.tag] = true
 	}
-	if len(blobs) != 4 {
-		t.Fatalf("shipped templates span %d distinct blobs %v; conductorInstructionsGenerations reconstructs exactly 4 prior generations, update the fixture and the generation count together", len(blobs), blobs)
+	if len(blobs) != 5 {
+		t.Fatalf("shipped templates span %d distinct blobs %v; conductorInstructionsGenerations reconstructs exactly 5 prior released generations, update the fixture and the generation count together", len(blobs), blobs)
 	}
-	for _, tag := range []string{"v1.16.29", "v1.16.28", "v1.16.24", "v1.15.0", "v1.16.5", "v1.16.8", "v1.16.10", "v1.11.0", "v1.10.9", "v1.10.10", "v1.10.11"} {
+	for _, tag := range []string{"v1.16.29", "v1.16.28", "v1.16.24", "v1.16.17", "v1.16.11", "v1.15.0", "v1.16.5", "v1.16.8", "v1.16.10", "v1.11.0", "v1.10.9", "v1.10.10", "v1.10.11"} {
 		if !tags[tag] {
 			t.Fatalf("fixture is missing shipped tag %s", tag)
 		}
@@ -93,13 +94,16 @@ func TestShippedConductorTemplatesAreRecognizedAsGenerated(t *testing.T) {
 
 			oldGenerations := renderConductorInstructionsGenerations(template, name, DefaultProfile, spec)
 			var shipped string
+			var candidateHashes []string
 			for _, rendered := range oldGenerations {
-				if fmtHash(rendered) == r.sha256 {
+				hash := fmtHash(rendered)
+				candidateHashes = append(candidateHashes, hash)
+				if hash == r.sha256 {
 					shipped = rendered
 				}
 			}
 			if shipped == "" {
-				t.Fatalf("no reconstructed generation matches what %s shipped (%s): a conductor from that release would not be migrated", r.tag, r.sha256)
+				t.Fatalf("no reconstructed generation matches what %s shipped (%s), candidates %v: a conductor from that release would not be migrated", r.tag, r.sha256, candidateHashes)
 			}
 
 			dir := t.TempDir()
@@ -202,6 +206,48 @@ func TestShippedV11628SharedTemplateMigratesToHarnessControl(t *testing.T) {
 	}
 }
 
+// TestForkV11629SharedTemplateMigrates pins that the shared instructions file
+// this fork wrote on its v1.16.29 base (upstream's v1.16.25-v1.16.29
+// generation plus the queued count; hash rendered from that fork source,
+// identical for every agent) is a reconstructed generation, so a conductor
+// left on it migrates in place instead of being treated as user-edited.
+func TestForkV11629SharedTemplateMigrates(t *testing.T) {
+	const forkV11629Shared = "aa6c4e3312fae2e6056219b696d0cb86b788c474e408a83a15dafe7fa9ed8db9"
+	for _, agent := range []string{ConductorAgentClaude, ConductorAgentCodex, ConductorAgentHermes, ConductorAgentPi} {
+		t.Run(agent, func(t *testing.T) {
+			spec, err := GetConductorAgentSpec(agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := renderConductorInstructionsTemplate(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
+			oldGenerations := renderConductorInstructionsGenerations(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
+			var written string
+			for _, g := range oldGenerations {
+				if fmtHash(g) == forkV11629Shared {
+					written = g
+				}
+			}
+			if written == "" {
+				t.Fatalf("no reconstructed generation is what the fork wrote on v1.16.29 (%s)", forkV11629Shared)
+			}
+			path := filepath.Join(t.TempDir(), spec.InstructionsFileName)
+			if err := os.WriteFile(path, []byte(written), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeGeneratedFileOrMigrate(path, oldGenerations, current, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !matchesTemplateContent(string(got), current) {
+				t.Fatal("the fork's v1.16.29 shared instructions were not migrated")
+			}
+		})
+	}
+}
+
 // Review M2: the no-op notice rule and the /cmd quick command land in
 // separate PRs, so a release can carry the rule without /cmd. The shared
 // file that release writes is the newest reconstructed generation and
@@ -214,7 +260,8 @@ func TestNoOpRuleOnlySharedTemplateMigratesToHarnessControl(t *testing.T) {
 				t.Fatal(err)
 			}
 			current := renderConductorInstructionsTemplate(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
-			ruleOnly := renderConductorInstructionsTemplate(preHarnessControlConductorInstructionsTemplate(conductorSharedClaudeMDTemplate), "", DefaultProfile, spec)
+			// Upstream's release wrote it without the fork's queued count.
+			ruleOnly := renderConductorInstructionsTemplate(preHarnessControlConductorInstructionsTemplate(preQueuedCountConductorInstructionsTemplate(conductorSharedClaudeMDTemplate)), "", DefaultProfile, spec)
 			if ruleOnly == current || !strings.Contains(ruleOnly, "**No-op notices get no reply.**") || strings.Contains(ruleOnly, "/cmd <session>") {
 				t.Fatal("the rule-only generation must carry the no-op rule and no /cmd row")
 			}
