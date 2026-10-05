@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // setupClaudeConfigWithTwoJSONLs writes two JSONL files (stale + fresh) into
@@ -65,6 +66,10 @@ func setupClaudeConfigWithTwoJSONLs(t *testing.T, projectPath, staleID, staleTex
 // and getSessionContent reads whatever JSONL the stale ClaudeSessionID points
 // to. Post-fix, the live ID from tmux env wins.
 func TestGetSessionContentWithLive_PrefersFreshIDOverStoredStaleID(t *testing.T) {
+	previousDB := statedb.GetGlobal()
+	statedb.SetGlobal(nil)
+	t.Cleanup(func() { statedb.SetGlobal(previousDB) })
+
 	tempProject := t.TempDir()
 	cleanup := setupClaudeConfigWithTwoJSONLs(t, tempProject,
 		"stale-uuid", "OLD_CONTENT_FROM_PRIOR_SESSION",

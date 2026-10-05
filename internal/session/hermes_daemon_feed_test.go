@@ -28,9 +28,7 @@ func TestHermesDaemonFeedAdmitsOnlyCurrentAfterAgent(t *testing.T) {
 			now := time.Now()
 			child := &Instance{ID: childID, Title: "hermes-worker", ProjectPath: "/tmp/" + childID, GroupPath: DefaultGroupPath, ParentSessionID: parentID, Tool: "hermes", Status: StatusRunning, CreatedAt: now}
 			parent := &Instance{ID: parentID, Title: "orchestrator", ProjectPath: "/tmp/" + parentID, GroupPath: DefaultGroupPath, Tool: "claude", Status: StatusRunning, CreatedAt: now}
-			if err := storage.SaveWithGroups([]*Instance{child, parent}, nil); err != nil {
-				t.Fatal(err)
-			}
+			insertTestInstances(t, storage, []*Instance{child, parent}, nil)
 			db := storage.GetDB()
 			if err := db.RegisterInstance(false); err != nil {
 				t.Fatal(err)

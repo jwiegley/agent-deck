@@ -275,7 +275,7 @@ func TestSessionFork_WithState_RejectsExistingDestinationWorktree(t *testing.T) 
 //     includeIgnored argument, so --with-state-and-gitignored actually
 //     flips on ignored-file inclusion.
 //  3. The sessionForkBeforeStartHook is invoked with the resolved
-//     git.WorktreeStateOptions before forkedInst.Start(), so contract tests can
+//     git.WorktreeStateOptions before forkedInst.StartRuntime(), so contract tests can
 //     short-circuit before tmux mutation.
 //
 // (ClaudeOptions has no WithState / IncludeGitignored fields; the with-state
@@ -297,7 +297,7 @@ func TestSessionFork_WithStateOptionsPropagatedBeforeStart(t *testing.T) {
 			folded)
 	}
 
-	// The hook must fire BEFORE forkedInst.Start() so tests can capture the
+	// The hook must fire BEFORE forkedInst.StartRuntime() so tests can capture the
 	// prepared fork without spawning a real tmux session.
 	hookIdx := strings.Index(folded, "sessionForkBeforeStartHook(inst, forkedInst, git.WorktreeStateOptions{WithState: wantState, WithIgnored: *withStateGitignored})")
 	if hookIdx < 0 {
@@ -305,14 +305,14 @@ func TestSessionFork_WithStateOptionsPropagatedBeforeStart(t *testing.T) {
 			"forkedInst, git.WorktreeStateOptions{WithState: wantState, "+
 			"WithIgnored: *withStateGitignored}); folded body:\n%s", folded)
 	}
-	startIdx := strings.Index(folded, "forkedInst.Start()")
+	startIdx := strings.Index(folded, "forkedInst.StartRuntime()")
 	if startIdx < 0 {
-		t.Fatalf("handleSessionFork must call forkedInst.Start(); folded body:\n%s",
+		t.Fatalf("handleSessionFork must call forkedInst.StartRuntime(); folded body:\n%s",
 			folded)
 	}
 	if hookIdx > startIdx {
 		t.Errorf("sessionForkBeforeStartHook must be invoked BEFORE "+
-			"forkedInst.Start() (hook idx %d > start idx %d); folded body:\n%s",
+			"forkedInst.StartRuntime() (hook idx %d > start idx %d); folded body:\n%s",
 			hookIdx, startIdx, folded)
 	}
 
@@ -320,7 +320,7 @@ func TestSessionFork_WithStateOptionsPropagatedBeforeStart(t *testing.T) {
 	// mutation never run when the hook is set.
 	hookBlock := folded[hookIdx:]
 	cutEnd := len(hookBlock)
-	if idx := strings.Index(hookBlock, "forkedInst.Start()"); idx >= 0 {
+	if idx := strings.Index(hookBlock, "forkedInst.StartRuntime()"); idx >= 0 {
 		cutEnd = idx
 	}
 	if !strings.Contains(hookBlock[:cutEnd], "return") {
@@ -357,8 +357,8 @@ func TestSessionFork_WithStateHookCapturesResolvedStateBeforeStart(t *testing.T)
 	if err != nil {
 		t.Fatalf("NewStorageWithProfile: %v", err)
 	}
-	if err := storage.SaveWithGroups([]*session.Instance{parent}, session.NewGroupTreeWithGroups([]*session.Instance{parent}, nil)); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(parent, session.NewGroupTreeWithGroups([]*session.Instance{parent}, nil)); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	var capturedParent *session.Instance
@@ -555,8 +555,8 @@ func TestSessionFork_WithState_JujutsuMaterializesWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStorageWithProfile: %v", err)
 	}
-	if err := storage.SaveWithGroups([]*session.Instance{parent}, session.NewGroupTreeWithGroups([]*session.Instance{parent}, nil)); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(parent, session.NewGroupTreeWithGroups([]*session.Instance{parent}, nil)); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	var capturedFork *session.Instance

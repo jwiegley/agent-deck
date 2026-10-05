@@ -45,8 +45,8 @@ config_dir = "~/.claude-spare"
 	})
 	var stops, starts int
 	nativeSwitchRunning = func(*Instance) bool { return true }
-	nativeSwitchStop = func(*Instance) error { stops++; return nil }
-	nativeSwitchStart = func(*Instance) error { starts++; return nil }
+	nativeSwitchStop = func(*Instance, *runtimeTransitionAuthority) error { stops++; return nil }
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error { starts++; return nil }
 
 	storage := newTestStorage(t)
 	inst := &Instance{ID: "switch-source", Title: "source", ProjectPath: project, GroupPath: "test", Tool: "claude", Command: "claude", Account: "personal", ClaudeSessionID: sid, Status: StatusWaiting, CreatedAt: time.Now()}
@@ -89,6 +89,8 @@ config_dir = "~/.claude-spare"
 	cfg, err := LoadUserConfig()
 	require.NoError(t, err)
 	inst := &Instance{ID: "switch-recovery", Title: "source", ProjectPath: filepath.Join(home, "project"), GroupPath: "test", Tool: "claude", Command: "claude", Account: "personal", ClaudeSessionID: "11111111-2222-3333-4444-555555555555", Status: StatusWaiting, CreatedAt: time.Now()}
+	storage := newTestStorage(t)
+	require.NoError(t, storage.Save([]*Instance{inst}))
 	source := identityForInstance(inst)
 	target := source
 	target.Account = "spare"
@@ -103,8 +105,8 @@ config_dir = "~/.claude-spare"
 	})
 	var lifecycleCalls int
 	nativeSwitchRunning = func(*Instance) bool { lifecycleCalls++; return true }
-	nativeSwitchStop = func(*Instance) error { lifecycleCalls++; return nil }
-	nativeSwitchStart = func(*Instance) error { lifecycleCalls++; return nil }
+	nativeSwitchStop = func(*Instance, *runtimeTransitionAuthority) error { lifecycleCalls++; return nil }
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error { lifecycleCalls++; return nil }
 
 	result, err := ExecuteHarnessSwitch(cfg, inst, HarnessSwitchOptions{Target: SwitchPreviewTarget{Harness: "claude", Account: "spare"}})
 	require.NoError(t, err)
@@ -112,8 +114,6 @@ config_dir = "~/.claude-spare"
 	require.Equal(t, 0, lifecycleCalls, "completed recovery must not replay lifecycle")
 	require.Equal(t, "personal", inst.Account, "storage repair owns the account mutation")
 
-	storage := newTestStorage(t)
-	require.NoError(t, storage.Save([]*Instance{inst}))
 	require.NoError(t, storage.CommitNativeHarnessSwitch(inst, result))
 	stored, err := storage.Load()
 	require.NoError(t, err)
@@ -138,6 +138,8 @@ config_dir = "~/.claude-spare"
 	require.NoError(t, err)
 
 	inst := &Instance{ID: "legacy-v2-recovery", Title: "source", ProjectPath: filepath.Join(home, "project"), GroupPath: "test", Tool: "claude", Command: "claude", Account: "personal", ClaudeSessionID: "11111111-2222-3333-4444-555555555555", Status: StatusWaiting, CreatedAt: time.Now()}
+	storage := newTestStorage(t)
+	require.NoError(t, storage.Save([]*Instance{inst}))
 	source := identityForInstance(inst)
 	source.StorageTool = "" // version 2 did not persist this field.
 	target := source
@@ -166,8 +168,8 @@ config_dir = "~/.claude-spare"
 	})
 	var lifecycleCalls int
 	nativeSwitchRunning = func(*Instance) bool { lifecycleCalls++; return true }
-	nativeSwitchStop = func(*Instance) error { lifecycleCalls++; return nil }
-	nativeSwitchStart = func(*Instance) error { lifecycleCalls++; return nil }
+	nativeSwitchStop = func(*Instance, *runtimeTransitionAuthority) error { lifecycleCalls++; return nil }
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error { lifecycleCalls++; return nil }
 
 	result, err := ExecuteHarnessSwitch(cfg, inst, HarnessSwitchOptions{Target: SwitchPreviewTarget{Harness: "claude", Account: "spare"}})
 	require.NoError(t, err)
@@ -182,8 +184,6 @@ config_dir = "~/.claude-spare"
 	require.NoError(t, err)
 	require.Equal(t, failedBefore, failedAfter, "the failed version-3 descendant must remain immutable evidence")
 
-	storage := newTestStorage(t)
-	require.NoError(t, storage.Save([]*Instance{inst}))
 	require.NoError(t, storage.CommitNativeHarnessSwitch(inst, result))
 	stored, err := storage.Load()
 	require.NoError(t, err)
@@ -281,7 +281,7 @@ config_dir = "~/.claude-spare"
 	})
 	var starts int
 	nativeSwitchRunning = func(*Instance) bool { return false }
-	nativeSwitchStart = func(*Instance) error { starts++; return nil }
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error { starts++; return nil }
 
 	storage := newTestStorage(t)
 	base := &Instance{ID: "ack-reload", Title: "source", ProjectPath: project, GroupPath: "test", Tool: "claude", Command: "claude", Account: "personal", ClaudeSessionID: sid, Status: StatusWaiting, CreatedAt: time.Now()}
@@ -367,8 +367,8 @@ config_dir = "~/.claude-spare"
 	})
 	var lifecycleCalls int
 	nativeSwitchRunning = func(*Instance) bool { lifecycleCalls++; return false }
-	nativeSwitchStop = func(*Instance) error { lifecycleCalls++; return nil }
-	nativeSwitchStart = func(*Instance) error { lifecycleCalls++; return nil }
+	nativeSwitchStop = func(*Instance, *runtimeTransitionAuthority) error { lifecycleCalls++; return nil }
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error { lifecycleCalls++; return nil }
 	_, err = ExecuteHarnessSwitch(cfg, inst, HarnessSwitchOptions{Target: SwitchPreviewTarget{Harness: "claude", Account: "spare"}, NoStart: true})
 	require.ErrorContains(t, err, "unsupported uncertain legacy version-1 journal")
 	require.Zero(t, lifecycleCalls)
@@ -399,7 +399,9 @@ func TestCommitNativeHarnessSwitch_PreservesConcurrentMonitorAndUnrelatedEdits(t
 	require.NoError(t, err)
 	for _, inst := range monitor {
 		if inst.ID == base.ID {
-			inst.Status = StatusRunning
+			applied, err := storage.db.WriteStatusIfVersion(inst.ID, inst.persistenceIncarnationSnapshot(), inst.RuntimeGeneration, inst.StatusRevision, string(StatusRunning))
+			require.NoError(t, err)
+			require.True(t, applied)
 		} else {
 			inst.Title = "unrelated edit"
 		}
@@ -427,11 +429,13 @@ func TestCommitNativeHarnessSwitch_PreservesConcurrentMonitorAndUnrelatedEdits(t
 
 func TestCommitNativeHarnessSwitch_RefusesMeaningfulSourceConflicts(t *testing.T) {
 	for name, mutate := range map[string]func(*Instance){
-		"account":   func(inst *Instance) { inst.Account = "other" },
-		"tool":      func(inst *Instance) { inst.Tool = "shell" },
-		"command":   func(inst *Instance) { inst.Command = "claude --other" },
-		"path":      func(inst *Instance) { inst.ProjectPath = t.TempDir() },
-		"native ID": func(inst *Instance) { inst.ClaudeSessionID = "native-other" },
+		"account": func(inst *Instance) { inst.Account = "other" },
+		"tool":    func(inst *Instance) { inst.Tool = "shell" },
+		"command": func(inst *Instance) { inst.Command = "claude --other" },
+		"path":    func(inst *Instance) { inst.ProjectPath = t.TempDir() },
+		"native ID": func(inst *Instance) {
+			require.NoError(t, inst.PublishRuntimeBindingObservation(inst.CaptureRuntimeBindingObservation("claude"), "native-other", time.Now()))
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			storage := newTestStorage(t)

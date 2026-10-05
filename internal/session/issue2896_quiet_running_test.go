@@ -30,7 +30,7 @@ func startQuietPiPane(t *testing.T, name, tool string) *Instance {
 	t.Cleanup(func() { _ = inst.Kill() })
 	time.Sleep(2 * time.Second)
 	inst.Tool = tool
-	inst.loadCustomPatternsFromConfig() // the pane reads with the tool's patterns
+	inst.loadCustomPatternsFromConfig(inst.tmuxSession) // the pane reads with the tool's patterns
 	return inst
 }
 

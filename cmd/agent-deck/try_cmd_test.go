@@ -8,7 +8,42 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/experiments"
+	"github.com/asheshgoplani/agent-deck/internal/session"
 )
+
+func TestRuntimeLifecycle_InsertTrySessionCreatesParentRuntimeAndGroup(t *testing.T) {
+	storage, err := session.NewStorageWithProfile("_test_try_explicit_insert")
+	if err != nil {
+		t.Fatalf("NewStorageWithProfile: %v", err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+
+	inst := session.NewInstanceWithGroup("experiment", t.TempDir(), "experiments")
+	inst.Command = "pi"
+	inst.Tool = "pi"
+	if err := insertTrySession(storage, inst, []*session.Instance{inst}, nil); err != nil {
+		t.Fatalf("insertTrySession: %v", err)
+	}
+	if row, err := storage.GetDB().LoadInstanceByID(inst.ID); err != nil || row == nil {
+		t.Fatalf("parent row=%#v err=%v", row, err)
+	}
+	if runtime, found, err := storage.GetDB().ReadRuntimeState(inst.ID); err != nil || !found {
+		t.Fatalf("runtime=%#v found=%v err=%v", runtime, found, err)
+	}
+	groups, err := storage.GetDB().LoadGroups()
+	if err != nil {
+		t.Fatalf("LoadGroups: %v", err)
+	}
+	foundGroup := false
+	for _, group := range groups {
+		if group.Path == "experiments" {
+			foundGroup = true
+		}
+	}
+	if !foundGroup {
+		t.Fatalf("experiments group not persisted: %#v", groups)
+	}
+}
 
 func TestTryCommand_CreateExperiment(t *testing.T) {
 	tmpDir := t.TempDir()

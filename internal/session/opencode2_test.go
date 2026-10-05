@@ -367,7 +367,9 @@ func TestOpenCode2DiscoveryUsesSelectedLauncherAndNestedAPITimes(t *testing.T) {
 	if got := inst.queryOpenCodeSession(); got != "ses_v2" {
 		t.Fatalf("v2 session binding = %q", got)
 	}
-	inst.setOpenCodeSession("ses_v2")
+	// Discovery publishes the binding with a fresh detection time
+	// (publishOpenCodeSessionCandidate); the fork gate keys on that recency.
+	inst.OpenCodeDetectedAt = time.Now()
 	if !inst.CanFork() {
 		t.Fatal("discovered v2 session must enable fork and quick fork")
 	}

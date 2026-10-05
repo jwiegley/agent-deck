@@ -431,13 +431,14 @@ func (i *Instance) GetLastResponseBestEffort() (*ResponseOutput, error) {
 	// Claude-specific recovery path
 	if IsClaudeCompatible(i.Tool) {
 		// Refresh from tmux env (fast path)
+		observation := i.CaptureRuntimeBindingObservation("claude")
 		if sessionID := i.GetSessionIDFromTmux(); sessionID != "" {
-			i.ClaudeSessionID = sessionID
-			// #1815: own pane env — weak vouch.
-			i.noteClaudeSessionIDFromOwnPane()
-			i.ClaudeDetectedAt = time.Now()
-			if recovered, recoverErr := i.getClaudeLastResponse(); recoverErr == nil {
-				return recovered, nil
+			if publishErr := i.PublishRuntimeBindingObservation(observation, sessionID, time.Now()); publishErr == nil {
+				// #1815: own pane env is a weak vouch, after durable acceptance.
+				i.noteClaudeSessionIDFromOwnPane()
+				if recovered, recoverErr := i.getClaudeLastResponse(); recoverErr == nil {
+					return recovered, nil
+				}
 			}
 		}
 
@@ -467,18 +468,17 @@ func (i *Instance) GetLastResponseBestEffort() (*ResponseOutput, error) {
 		// alone is sufficient and rollover recovery must not be blocked by
 		// the bound id's own file having not appeared yet.
 		if !i.LastStartedAt.IsZero() || i.GetJSONLPath() != "" {
-			if id, recovered := i.findLatestClaudeTranscriptOnDisk(); recovered != nil {
+
+			if _, recovered := i.findLatestClaudeTranscriptOnDisk(); recovered != nil {
 				// #1815: this is an mtime-based disk scan — the same evidence
 				// class as the restart discovery prelude, and in a shared working
 				// directory the newest transcript can belong to another session.
-				// Good enough to READ a last response from; never ownership. Mark
-				// it unverified so it cannot authorize a later `--resume`, and do
-				// NOT write it into this pane's CLAUDE_SESSION_ID: that would
+				// Good enough to READ a last response from; never ownership. Keep
+				// it local to this read and do NOT publish it as ClaudeSessionID or
+				// write it into this pane's CLAUDE_SESSION_ID: that would
 				// launder a scanned id into a "bound from my own tmux env" one on
 				// the next status poll, which is exactly the resume this guard
 				// exists to prevent.
-				i.adoptDiscoveredClaudeSessionID(id)
-				i.ClaudeDetectedAt = time.Now()
 				return recovered, nil
 			}
 		}

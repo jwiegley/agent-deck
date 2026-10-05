@@ -140,22 +140,29 @@ func TestTargetedWritesLandInOwningProfile(t *testing.T) {
 		{name: "MarkAccessed", write: func(t *testing.T, inst *Instance) { inst.MarkAccessed() },
 			read: col(`SELECT CAST(last_accessed AS TEXT) FROM instances WHERE id = ?`)},
 		{name: "claude binding", write: func(t *testing.T, inst *Instance) {
-			inst.bindClaudeSessionFromHook("11111111-1111-4111-8111-111111111111", "test", "SessionStart", "test")
+			publishHookBindingForTest(t, inst, "claude", "11111111-1111-4111-8111-111111111111")
 		}, read: col(`SELECT json_extract(tool_data, '$.claude_session_id') FROM instances WHERE id = ?`)},
 		{name: "codex binding", write: func(t *testing.T, inst *Instance) {
-			if err := inst.bindCodexSessionFromHook("22222222-2222-4222-8222-222222222222", "SessionStart"); err != nil {
-				t.Fatalf("bindCodexSessionFromHook: %v", err)
-			}
+			publishHookBindingForTest(t, inst, "codex", "22222222-2222-4222-8222-222222222222")
 		}, read: col(`SELECT json_extract(tool_data, '$.codex_session_id') FROM instances WHERE id = ?`)},
 		{name: "gemini binding", write: func(t *testing.T, inst *Instance) {
-			inst.bindGeminiSessionFromHook("33333333-3333-4333-8333-333333333333", "SessionStart")
+			publishHookBindingForTest(t, inst, "gemini", "33333333-3333-4333-8333-333333333333")
 		}, read: col(`SELECT json_extract(tool_data, '$.gemini_session_id') FROM instances WHERE id = ?`)},
 		{name: "hermes binding", write: func(t *testing.T, inst *Instance) {
 			inst.persistHermesSessionBinding("hermes-44444444")
 		}, read: col(`SELECT json_extract(tool_data, '$.hermes_session_id') FROM instances WHERE id = ?`)},
-		{name: "claude session link", write: func(t *testing.T, inst *Instance) {
-			inst.confirmClaudeSessionLink("55555555-5555-4555-8555-555555555555", "test")
-		}, read: col(`SELECT CAST(COUNT(*) AS TEXT) FROM session_links WHERE session_id = ?`)},
+		{name: "claude session link",
+			// A recall link names the instance's durable binding
+			// (statedb.LinkRuntimeBinding), so the bound id is seeded.
+			seed: func(inst *Instance) {
+				inst.ClaudeSessionID = "55555555-5555-4555-8555-555555555555"
+				inst.ClaudeDetectedAt = time.Now()
+			},
+			write: func(t *testing.T, inst *Instance) {
+				inst.mu.Lock()
+				inst.confirmHookSessionLink("claude", "55555555-5555-4555-8555-555555555555", "test")
+				inst.mu.Unlock()
+			}, read: col(`SELECT CAST(COUNT(*) AS TEXT) FROM session_links WHERE session_id = ?`)},
 		{name: "claude candidate link retract",
 			seedDB: func(t *testing.T, db *statedb.StateDB, id string) {
 				if err := db.UpsertSessionLink(id, "claude", candidate, "", false); err != nil {
@@ -182,12 +189,14 @@ func TestTargetedWritesLandInOwningProfile(t *testing.T) {
 				}
 			},
 			read: col(`SELECT json_extract(tool_data, '$.generic_session_id') FROM instances WHERE id = ?`)},
+		// The runtime transition records a restarted tmux name together with
+		// its generation; the outcome write then proves that runtime is still
+		// current and stamps the store (statedb.WriteRestartOutcome).
 		{name: "restart outcome", write: func(t *testing.T, inst *Instance) {
-			inst.tmuxSession = tmux.ReconnectSessionLazy("agentdeck_identity_new_"+randomString(6), inst.ID, inst.ProjectPath, "shell", "running")
-			if _, err := inst.writeRestartOutcome(); err != nil {
+			if _, err := inst.writeRestartOutcome(inst.RuntimeState(), inst.PersistenceIncarnation()); err != nil {
 				t.Fatalf("writeRestartOutcome: %v", err)
 			}
-		}, read: col(`SELECT tmux_session FROM instances WHERE id = ?`)},
+		}, read: col(`SELECT value FROM metadata WHERE key = 'last_modified' AND ? <> ''`)},
 	}
 
 	type mode struct {
@@ -446,8 +455,14 @@ func TestOwningWriteNeverResurrectsADeletedProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := inst.bindCodexSessionFromHook("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "SessionStart"); err == nil {
-		t.Error("codex binding for a deleted profile reported success")
+	const deletedSID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	observation := inst.CaptureRuntimeBindingObservation("codex")
+	inst.mu.Lock()
+	inst.bindCodexSessionFromHook(observation, deletedSID, "test", "SessionStart", HookStatusFingerprint{})
+	adopted := inst.CodexSessionID
+	inst.mu.Unlock()
+	if adopted == deletedSID {
+		t.Error("codex binding for a deleted profile was published")
 	}
 	inst.MarkAccessed()
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
@@ -461,6 +476,35 @@ func TestOwningWriteNeverResurrectsADeletedProfile(t *testing.T) {
 		if p == gone {
 			t.Fatalf("ListProfiles lists the deleted profile %q again", gone)
 		}
+	}
+}
+
+// publishHookBindingForTest binds id as a hook would: the fork publishes hook
+// bindings through the runtime binding CAS, entered with i.mu held
+// (publishObservedRuntimeBindingLocked). It fails the test unless the binding
+// was published and adopted.
+func publishHookBindingForTest(t *testing.T, inst *Instance, kind, id string) {
+	t.Helper()
+	observation := inst.CaptureRuntimeBindingObservation(kind)
+	inst.mu.Lock()
+	var adopted string
+	switch kind {
+	case "claude":
+		inst.bindClaudeSessionFromHook(observation, id, "test", "SessionStart", "test", HookStatusFingerprint{})
+		adopted = inst.ClaudeSessionID
+	case "codex":
+		inst.bindCodexSessionFromHook(observation, id, "test", "SessionStart", HookStatusFingerprint{})
+		adopted = inst.CodexSessionID
+	case "gemini":
+		inst.bindGeminiSessionFromHook(observation, id, "test", "SessionStart", HookStatusFingerprint{})
+		adopted = inst.GeminiSessionID
+	default:
+		inst.mu.Unlock()
+		t.Fatalf("publishHookBindingForTest: unsupported kind %q", kind)
+	}
+	inst.mu.Unlock()
+	if adopted != id {
+		t.Fatalf("%s hook binding not published: bound %q, want %q", kind, adopted, id)
 	}
 }
 

@@ -24,8 +24,8 @@ import (
 // owned by the test. It registers the PID via RegisterMCPChild and then
 // asserts that the PID is dead/gone after Kill().
 func TestSessionStop_ReapsMcpChildren_RegressionFor965(t *testing.T) {
-	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		t.Skipf("unix-only: this test relies on syscall.Kill semantics")
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux pidfds for identity-bound signaling")
 	}
 
 	// Spawn a fake MCP child: sleep 120s. The test must reap it itself

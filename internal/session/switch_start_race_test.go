@@ -48,8 +48,8 @@ func stubStartRace(t *testing.T, live bool) *int {
 	})
 	starts := 0
 	nativeSwitchRunning = func(*Instance) bool { return true }
-	nativeSwitchStop = func(*Instance) error { return nil }
-	nativeSwitchStart = func(*Instance) error {
+	nativeSwitchStop = func(*Instance, *runtimeTransitionAuthority) error { return nil }
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error {
 		starts++
 		return errors.New("failed to start tmux session: failed to create tmux session: exit status 1 (output: duplicate session: agentdeck_Germany-Immigration_2e8e1169)")
 	}

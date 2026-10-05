@@ -1,14 +1,44 @@
 package session
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
 
+func TestRuntimeLifecycle_CommitSwitchAccountPersistsNewAccountOrRollsBack(t *testing.T) {
+	withTempAgentDeckHome(t, twoAccountConfig)
+	t.Run("persists before replacement spawn", func(t *testing.T) {
+		inst := NewInstanceWithTool("switch-commit", t.TempDir(), "claude")
+		inst.Account = "work"
+		persisted := ""
+		old, err := commitSwitchAccount(inst, "personal", func() error {
+			persisted = inst.Account
+			return nil
+		})
+		if err != nil || old != "work" || persisted != "personal" || inst.Account != "personal" {
+			t.Fatalf("old=%q persisted=%q current=%q err=%v", old, persisted, inst.Account, err)
+		}
+	})
+
+	t.Run("restores old account when persistence fails", func(t *testing.T) {
+		inst := NewInstanceWithTool("switch-rollback", t.TempDir(), "claude")
+		inst.Account = "work"
+		persistErr := errors.New("injected persistence failure")
+		old, err := commitSwitchAccount(inst, "personal", func() error { return persistErr })
+		if !errors.Is(err, persistErr) {
+			t.Fatalf("error = %v, want persistence failure", err)
+		}
+		if old != "work" || inst.Account != "work" {
+			t.Fatalf("old=%q current=%q, want rollback to old", old, inst.Account)
+		}
+	})
+}
+
 // #1815 Guard 2: SwitchAccount already produced the right diagnosis ("no
 // conversation to migrate, fresh session") and then let the restart proceed.
 // A failed transcript verification must STOP the sequence.
-func TestSwitchAccountRestartUnsafe(t *testing.T) {
+func TestRuntimeLifecycle_SwitchAccountRestartUnsafe(t *testing.T) {
 	ranBefore := func() *Instance {
 		inst := NewInstanceWithTool("switch-guard", t.TempDir(), "claude")
 		inst.ClaudeSessionID = ""

@@ -20,7 +20,6 @@ import (
 	"al.essio.dev/pkg/shellescape"
 
 	"github.com/asheshgoplani/agent-deck/internal/logging"
-	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // GetOpenCodePort returns the event-server port with lock protection.
@@ -75,8 +74,11 @@ func (i *Instance) detectOpenCodeSessionAsync() {
 			time.Sleep(delay)
 		}
 
+		observation := i.CaptureRuntimeBindingObservation("opencode")
 		if sessionID := i.queryOpenCodeSession(); sessionID != "" {
-			i.setOpenCodeSession(sessionID)
+			if !i.publishOpenCodeSessionCandidate(observation, sessionID, time.Now()) {
+				return
+			}
 			sessionLog.Debug(
 				"opencode_session_detected",
 				slog.String("session_id", sessionID),
@@ -113,16 +115,16 @@ func (i *Instance) watchForOpenCodeSession() {
 		time.Sleep(pollInterval)
 		attempt++
 
-		i.mu.RLock()
-		alreadyDetected := i.OpenCodeSessionID != ""
-		i.mu.RUnlock()
-		if alreadyDetected {
+		if value, _ := i.currentRuntimeBinding("opencode"); value != "" {
 			sessionLog.Debug("opencode_watcher_already_set")
 			return
 		}
 
+		observation := i.CaptureRuntimeBindingObservation("opencode")
 		if sessionID := i.queryOpenCodeSession(); sessionID != "" {
-			i.setOpenCodeSession(sessionID)
+			if !i.publishOpenCodeSessionCandidate(observation, sessionID, time.Now()) {
+				return
+			}
 			sessionLog.Debug(
 				"opencode_watcher_detected",
 				slog.String("session_id", sessionID),
@@ -137,29 +139,26 @@ func (i *Instance) watchForOpenCodeSession() {
 	sessionLog.Debug("opencode_watcher_timeout", slog.Duration("max_duration", maxDuration))
 }
 
-// setOpenCodeSession sets the session ID and stores it in tmux environment.
-func (i *Instance) setOpenCodeSession(sessionID string) {
+func (i *Instance) publishOpenCodeSessionCandidate(observation RuntimeBindingObservation, sessionID string, detectedAt time.Time) bool {
+	if sessionID == "" {
+		return false
+	}
+	if err := i.PublishRuntimeBindingObservation(observation, sessionID, detectedAt); err != nil {
+		sessionLog.Debug("opencode_binding_rejected",
+			slog.String("session_id", sessionID), slog.String("error", err.Error()))
+		return false
+	}
+
 	i.mu.Lock()
-	i.setOpenCodeSessionLocked(sessionID)
+	i.OpenCodeStartedAt = 0
 	tmuxSession := i.tmuxSession
 	i.mu.Unlock()
-	i.syncOpenCodeSessionEnvironment(tmuxSession, sessionID)
-}
-
-// setOpenCodeSessionLocked updates in-memory binding state. The caller must
-// hold i.mu for writing.
-func (i *Instance) setOpenCodeSessionLocked(sessionID string) {
-	i.OpenCodeSessionID = sessionID
-	i.OpenCodeDetectedAt = time.Now()
-	i.OpenCodeStartedAt = 0
-}
-
-func (i *Instance) syncOpenCodeSessionEnvironment(tmuxSession *tmux.Session, sessionID string) {
 	if tmuxSession != nil {
 		if err := tmuxSession.SetEnvironment("OPENCODE_SESSION_ID", sessionID); err != nil {
 			sessionLog.Warn("opencode_set_env_failed", slog.String("error", err.Error()))
 		}
 	}
+	return true
 }
 
 type openCodeSessionMetadata struct {
@@ -588,6 +587,13 @@ func parseOpenCodeServiceSessionPage(output []byte) ([]openCodeSessionMetadata, 
 		sessions = append(sessions, session.flatten())
 	}
 	return sessions, page.Cursor.Next, true
+}
+
+// QueryOpenCodeSessionCandidate returns the best current OpenCode candidate
+// without claiming or mutating the instance binding. Callers that publish the
+// result must capture a RuntimeBindingObservation before invoking this query.
+func (i *Instance) QueryOpenCodeSessionCandidate() string {
+	return i.queryOpenCodeSession()
 }
 
 // normalizePath normalizes a file path for comparison

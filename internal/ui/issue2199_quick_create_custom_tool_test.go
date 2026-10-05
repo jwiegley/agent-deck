@@ -14,6 +14,9 @@ import (
 // downgrading to the underlying binary (issue #2199).
 func TestIssue2199_QuickCreatePreservesCustomTool(t *testing.T) {
 	skipIfNoTmuxBinaryUI(t)
+	// A storage-less Home seeds no row, so the created runtime falls back to
+	// the process-global state database. Keep that fallback empty here.
+	detachGlobalStateDB(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	configDir := filepath.Join(home, ".config", "agent-deck")
@@ -206,6 +209,7 @@ func TestIssue2199_QuickCreate_RemoteSessionNotApplicable(t *testing.T) {
 // default_tool is a custom tool or cursor, rather than assigning the bare tool identifier.
 func TestIssue2199_QuickCreateSessionAt_CustomDefaultTool(t *testing.T) {
 	skipIfNoTmuxBinaryUI(t)
+	detachGlobalStateDB(t) // Storage-less Home: see TestIssue2199_QuickCreatePreservesCustomTool.
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	configDir := filepath.Join(home, ".config", "agent-deck")

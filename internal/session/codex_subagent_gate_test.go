@@ -11,6 +11,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/testutil"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // Tests for the codex subagent-thread rebind gate and restart safety net
@@ -94,6 +95,27 @@ func newCodexGateInstance(t *testing.T) (*Instance, string) {
 		t.Fatalf("mkdir project: %v", err)
 	}
 	return NewInstanceWithTool("codex-gate", projectPath, "codex"), codexHome
+}
+
+func adoptSavedCodexGateInstance(t *testing.T, db *statedb.StateDB, inst *Instance) {
+	t.Helper()
+	rows, err := db.LoadInstances()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.ID == inst.ID {
+			inst.adoptPersistenceIncarnation(row.Incarnation)
+			inst.RuntimeBindings = row.RuntimeBindings
+			break
+		}
+	}
+	state, found, err := db.ReadRuntimeState(inst.ID)
+	if err != nil || !found {
+		t.Fatalf("saved Codex runtime: found=%v err=%v", found, err)
+	}
+	inst.ApplyRuntimeState(state)
+	inst.setOwningDB(db)
 }
 
 // uniqueSID returns a UUID-shaped session id unique across the test binary,
@@ -299,6 +321,7 @@ func TestBuildCodexCommand_ResumesGuardianReviewParent(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	adoptSavedCodexGateInstance(t, db, inst)
 
 	inst.CodexSessionID = guardianSID
 	cmd := inst.buildCodexCommand("codex")
@@ -330,7 +353,7 @@ func TestBuildCodexCommand_RepairsGuardianBindingInOwningDB(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	inst.restartDB.Store(ownerDB)
+	adoptSavedCodexGateInstance(t, ownerDB, inst)
 	_ = withTempGlobalStateDB(t) // An unrelated profile is the process-wide database.
 
 	inst.CodexSessionID = guardianSID
@@ -365,7 +388,7 @@ func TestBuildCodexCommand_ForksWhenGuardianRepairWriteFails(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	inst.restartDB.Store(db)
+	inst.setOwningDB(db)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +493,7 @@ func TestBuildCodexCommand_DoesNotBypassReadOnlyOwningDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = readOnly.Close() })
-	inst.restartDB.Store(readOnly)
+	inst.setOwningDB(readOnly)
 	if cmd := inst.buildCodexCommand("codex"); !strings.Contains(cmd, "fork "+guardianSID) {
 		t.Fatalf("read-only storage must retain the failed-write fallback: got %q", cmd)
 	}
@@ -586,6 +609,7 @@ func seedCodexRolloutCwd(t *testing.T, codexHome, sid, threadSource, cwd string)
 func TestResolveCodexDetectionCandidateRejectsSubagent(t *testing.T) {
 	testutil.RequireTmux(t)
 	inst, codexHome := newCodexGateInstance(t)
+	installFreshCodexOwnershipSnapshot(t)
 	userSID := uniqueSID(t)
 	subSID := uniqueSID(t)
 	seedCodexRolloutCwd(t, codexHome, userSID, "user", inst.ProjectPath)
@@ -607,6 +631,19 @@ func TestResolveCodexDetectionCandidateRejectsGuardianReview(t *testing.T) {
 	if got := inst.resolveCodexDetectionCandidate(guardianSID, nil); got != userSID {
 		t.Fatalf("guardian probe candidate resolved to %q, want user thread %q", got, userSID)
 	}
+}
+
+func installFreshCodexOwnershipSnapshot(t *testing.T) {
+	t.Helper()
+	resetCodexOwnershipCache(t)
+	codexOwnershipCache.Lock()
+	codexOwnershipCache.bySocket[tmux.DefaultSocketName()] = codexOwnershipSnapshot{
+		at: time.Now(),
+		claims: &codexOwnershipClaims{
+			bySession: map[string]string{},
+		},
+	}
+	codexOwnershipCache.Unlock()
 }
 
 func TestRejectedSubagentProbePreservesIncompleteResult(t *testing.T) {
@@ -647,6 +684,10 @@ func TestRejectedSubagentProbePreservesIncompleteResult(t *testing.T) {
 func TestUpdateCodexSession_DiskScan_PrefersUserOverSubagent(t *testing.T) {
 	inst, codexHome := newCodexGateInstance(t)
 	inst.lastCodexProbeAt = time.Now().Add(time.Hour) // This test isolates disk selection.
+	storage := runtimeBindingTestStorage(t)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(inst.ProjectPath, 0o755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
 	}
@@ -658,7 +699,7 @@ func TestUpdateCodexSession_DiskScan_PrefersUserOverSubagent(t *testing.T) {
 	seedCodexRolloutCwd(t, codexHome, userSID, "user", inst.ProjectPath)
 	seedCodexRolloutCwd(t, codexHome, subSID, "subagent", inst.ProjectPath)
 
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(map[string]bool{})
 
 	if inst.CodexSessionID == subSID {
 		t.Fatalf("disk scan adopted the subagent thread %q — codex refuses user "+
@@ -679,7 +720,10 @@ func TestUpdateCodexSession_DiskScan_RejectsLoneSubagent(t *testing.T) {
 	subSID := uniqueSID(t)
 	seedCodexRolloutCwd(t, codexHome, subSID, "subagent", inst.ProjectPath)
 
-	inst.UpdateCodexSession(nil)
+	inst.UpdateCodexSession(map[string]bool{})
+	if inst.lastCodexScanAt.IsZero() {
+		t.Fatal("disk scan did not run")
+	}
 
 	if inst.CodexSessionID != "" {
 		t.Fatalf("disk scan must leave the session unbound when only a subagent "+

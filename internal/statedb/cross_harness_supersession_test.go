@@ -17,7 +17,7 @@ func supersessionRow(id, tool, account, command, nativeID string, archived bool)
 		data["codex_session_id"] = nativeID
 	}
 	encoded, _ := json.Marshal(data)
-	row := &InstanceRow{ID: id, Title: id, Tool: tool, Account: account, ProjectPath: "/project", Command: command, GroupPath: "group", Order: 7, CreatedAt: time.Unix(100, 0), ToolData: encoded}
+	row := &InstanceRow{ID: id, Incarnation: "incarnation-" + id, Title: id, Tool: tool, Account: account, ProjectPath: "/project", Command: command, GroupPath: "group", Order: 7, CreatedAt: time.Unix(100, 0), ToolData: encoded}
 	if archived {
 		row.ArchivedAt = time.Unix(200, 0).UTC()
 	}
@@ -26,7 +26,7 @@ func supersessionRow(id, tool, account, command, nativeID string, archived bool)
 
 func supersessionIdentity(row *InstanceRow) NativeHarnessSwitchIdentity {
 	claudeID, codexID, _ := nativeSessionIDs(row.ToolData)
-	return NativeHarnessSwitchIdentity{ID: row.ID, Tool: row.Tool, Account: row.Account, ProjectPath: row.ProjectPath, Command: row.Command, ClaudeSessionID: claudeID, CodexSessionID: codexID, ParentSessionID: row.ParentSessionID}
+	return NativeHarnessSwitchIdentity{ID: row.ID, Incarnation: row.Incarnation, Tool: row.Tool, Account: row.Account, ProjectPath: row.ProjectPath, Command: row.Command, ClaudeSessionID: claudeID, CodexSessionID: codexID, ParentSessionID: row.ParentSessionID}
 }
 
 func rowByID(t *testing.T, db *StateDB, id string) *InstanceRow {

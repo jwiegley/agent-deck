@@ -489,9 +489,7 @@ session_id_env = "REBOOT_SESSION_ID"
 	inst.Tool = "reboot-tool"
 	inst.Command = "reboot-tool"
 	inst.GenericSessionID = "cold-sid-123"
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	loaded, _, err := storage.LoadWithGroups()
 	if err != nil {

@@ -16,9 +16,9 @@ type sessSpooled struct {
 	P map[string]any `json:"p"`
 }
 
-// grantTelemetryForTest isolates HOME, pins a terminal and grants consent,
+// grantErrorTelemetryForTest isolates HOME, pins a terminal and grants consent,
 // so recorded events land in the test's spool.
-func grantTelemetryForTest(t *testing.T) {
+func grantErrorTelemetryForTest(t *testing.T) {
 	t.Helper()
 	telemetry.EnableForTest(t)
 	home := t.TempDir()
@@ -77,7 +77,7 @@ func wantOneError(t *testing.T, area, kind string) {
 
 // A session start that fails reports error area=session_start.
 func TestSessionStartFailureRecordsError(t *testing.T) {
-	grantTelemetryForTest(t)
+	grantErrorTelemetryForTest(t)
 	inst := &Instance{ID: "telemetry-start-fail", Title: "t", Tool: "claude"}
 	if err := inst.Start(); err == nil {
 		t.Fatal("Start without a tmux session succeeded")
@@ -87,7 +87,7 @@ func TestSessionStartFailureRecordsError(t *testing.T) {
 
 // StartWithMessage reports the same failure class.
 func TestSessionStartWithMessageFailureRecordsError(t *testing.T) {
-	grantTelemetryForTest(t)
+	grantErrorTelemetryForTest(t)
 	inst := &Instance{ID: "telemetry-startmsg-fail", Title: "t", Tool: "claude"}
 	if err := inst.StartWithMessage("hi"); err == nil {
 		t.Fatal("StartWithMessage without a tmux session succeeded")
@@ -97,7 +97,7 @@ func TestSessionStartWithMessageFailureRecordsError(t *testing.T) {
 
 // A failed MCP attach/detach write reports error area=mcp.
 func TestMCPWriteFailureRecordsError(t *testing.T) {
-	grantTelemetryForTest(t)
+	grantErrorTelemetryForTest(t)
 	inst := &Instance{ID: "telemetry-mcp-fail", Title: "t", Tool: "shell", ProjectPath: t.TempDir()}
 	if err := inst.WriteLocalMCPConfig([]string{"github"}); err == nil {
 		t.Fatal("WriteLocalMCPConfig for an unsupported tool succeeded")

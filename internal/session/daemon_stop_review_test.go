@@ -1,9 +1,12 @@
 package session
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/stretchr/testify/require"
 )
@@ -66,8 +69,13 @@ func TestDaemonPreservesStopCommittedDuringProbe(t *testing.T) {
 
 	originalProbe := updateInstanceStatus.Load()
 	t.Cleanup(func() { updateInstanceStatus.Store(originalProbe) })
+	originalCandidate := statusProbeCandidateOverride
+	t.Cleanup(func() { statusProbeCandidateOverride = originalCandidate })
+	statusProbeCandidateOverride = func(context.Context, *Instance, statedb.RuntimeState) (Status, error) {
+		return StatusError, nil
+	}
 	probeDone := make(chan error, 1)
-	updateInstanceStatus.Store(statusProbeFunc(func(sample *Instance) error {
+	updateInstanceStatus.Store(statusProbeFunc(func(ctx context.Context, sample *Instance, observed statedb.RuntimeState, incarnation string) (statedb.RuntimeState, error) {
 		// A separate writer commits the stop after the daemon loaded running,
 		// while its in-flight probe still derives error from the missing pane.
 		stopErr := storage.GetDB().WriteStatus(sample.ID, string(StatusStopped), sample.Tool)
@@ -75,8 +83,9 @@ func TestDaemonPreservesStopCommittedDuringProbe(t *testing.T) {
 		sample.Status = StatusError
 		sample.statusSampledLive = true
 		sample.mu.Unlock()
-		probeDone <- stopErr
-		return stopErr
+		committed, probeErr := sample.UpdateStatusObserved(ctx, observed, incarnation)
+		probeDone <- errors.Join(stopErr, probeErr)
+		return committed, errors.Join(stopErr, probeErr)
 	}))
 	d := NewTransitionDaemon()
 	t.Cleanup(d.Flush)
@@ -85,7 +94,7 @@ func TestDaemonPreservesStopCommittedDuringProbe(t *testing.T) {
 	d.syncProfile(profile)
 	select {
 	case err := <-probeDone:
-		require.NoError(t, err)
+		require.ErrorIs(t, err, statedb.ErrStatusRevisionConflict)
 	case <-time.After(5 * time.Second):
 		t.Fatal("daemon probe did not finish")
 	}

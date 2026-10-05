@@ -98,22 +98,22 @@ func TestIssue666_ResolveNewSessionGroup_CursorOnGroup_PreservesIt(t *testing.T)
 
 // TestIssue666_GlobalSearchImport_EndToEnd_PreservesGroupAcrossReload is
 // the full integration test that the user asked for: it simulates the
-// exact call chain at home.go:4762 (Window cursor → resolveNewSessionGroup
-// → NewInstanceWithGroupAndTool) and then persists through the storage
-// layer + reloads to prove the GroupPath survives the round-trip.
+// production creation path (Window cursor → resolveNewSessionGroup →
+// NewInstanceWithGroupAndTool → explicit insert) and then reloads to prove
+// the GroupPath survives the round-trip.
 //
 // The test runs against the REAL SQLite storage path the TUI uses, not
-// a stub — same SaveWithGroups / LoadWithGroups / extractGroupPath
+// a stub — the same explicit insert / LoadWithGroups / extractGroupPath
 // fallback code that hits in production.
 //
 // Three-config behavior (what to expect under the revert dance the user
 // prescribed):
 //
 //  1. Both fixes present (current branch): reload GroupPath == "agent-deck". GREEN.
-//  2. Only storage.go:280 belt-and-braces (4762 reverted): inst.GroupPath="" at save
+//  2. Only the storage belt-and-braces fix: inst.GroupPath="" at insertion
 //     → belt-and-braces normalizes to DefaultGroupPath → reload GroupPath ==
 //     "my-sessions", not "agent-deck". RED (asserting == "agent-deck").
-//  3. Both fixes reverted (v1.7.24 baseline): save persists ” → reload re-derives
+//  3. Both fixes reverted (v1.7.24 baseline): insertion persists "" → reload re-derives
 //     via extractGroupPath(ProjectPath) → for /tmp/claude-proj, GroupPath == "claude-proj"
 //     (some path-derived name). RED.
 func TestIssue666_GlobalSearchImport_EndToEnd_PreservesGroupAcrossReload(t *testing.T) {
@@ -160,10 +160,10 @@ func TestIssue666_GlobalSearchImport_EndToEnd_PreservesGroupAcrossReload(t *test
 	inst.ClaudeSessionID = "test-global-search-session-id"
 	inst.CreatedAt = time.Now()
 
-	// --- Save (identical to forceSaveInstances flow)
+	// --- Explicitly insert (the production creation boundary)
 	tree := session.NewGroupTree([]*session.Instance{inst})
-	if err := storage.SaveWithGroups([]*session.Instance{inst}, tree); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, tree); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	// --- Reload

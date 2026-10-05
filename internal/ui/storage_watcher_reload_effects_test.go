@@ -71,7 +71,10 @@ func TestStorageWatcherReloadFailedSaveRetainsPendingTitle(t *testing.T) {
 
 func TestStorageWatcherNegativeThenExplicitPositive(t *testing.T) {
 	h, storage, inst := newWatcherEffectsHome(t)
-	_, _ = h.Update(openCodeDetectionCompleteMsg{instanceID: inst.ID, sessionID: "explicit-later-session"})
+	_, _ = h.Update(openCodeDetectionCompleteMsg{
+		instanceID: inst.ID, sessionID: "explicit-later-session",
+		observed: inst.CaptureRuntimeBindingObservation("opencode"), detectedAt: time.Now(),
+	})
 	row, err := storage.GetDB().LoadInstanceByID(inst.ID)
 	require.NoError(t, err)
 	require.Contains(t, string(row.ToolData), "explicit-later-session")

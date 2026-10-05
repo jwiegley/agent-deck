@@ -7,30 +7,52 @@ import (
 )
 
 // A restart mints a new tmux session name and that name is the only handle
-// anything has on the live process. WriteRestartOutcome is the targeted write
-// that records it, together with the status the restart ended in (#1870).
+// anything has on the live process. The authoritative runtime transition
+// commits the name and status together; WriteRestartOutcome verifies that
+// exact tuple, acknowledges it, and emits the peer-reload stamp (#1870).
 
 func restartOutcomeRow(id string) *InstanceRow {
 	return &InstanceRow{
-		ID:          id,
-		Title:       "target",
-		ProjectPath: "/tmp/proj",
-		GroupPath:   "Ungrouped",
-		Command:     "claude",
-		Tool:        "claude",
-		Status:      "error",
-		TmuxSession: "agentdeck_target_deadbeef",
-		CreatedAt:   time.Now(),
+		ID:             id,
+		Incarnation:    id + "-incarnation",
+		Title:          "target",
+		ProjectPath:    "/tmp/proj",
+		GroupPath:      "Ungrouped",
+		Command:        "claude",
+		Tool:           "claude",
+		Status:         "error",
+		TmuxSession:    "agentdeck_target_deadbeef",
+		TmuxSocketName: "old-socket",
+		CreatedAt:      time.Now(),
 	}
+}
+
+func committedRestartOutcome(t *testing.T, db *StateDB, id string) (RuntimeState, string) {
+	t.Helper()
+	row := restartOutcomeRow(id)
+	seed, inserted, err := db.InsertInstanceIfAbsent(row)
+	if err != nil || !inserted {
+		t.Fatalf("InsertInstanceIfAbsent: inserted=%v err=%v", inserted, err)
+	}
+	next := RuntimeState{
+		InstanceID: id, Generation: seed.Runtime.Generation + 1,
+		TmuxSession: "agentdeck_target_f00dcafe", TmuxSocketName: "restart-socket",
+		Status: "waiting", LastStartedAt: time.Now().UTC(),
+	}
+	if err := db.CommitRuntimeTransition(seed.Runtime.Generation, row.Incarnation, next); err != nil {
+		t.Fatalf("CommitRuntimeTransition: %v", err)
+	}
+	return next, row.Incarnation
 }
 
 func TestWriteRestartOutcome_UpdatesOnlyItsOwnColumns(t *testing.T) {
 	db := newTestDB(t)
-	if err := db.SaveInstances([]*InstanceRow{restartOutcomeRow("restart-target")}); err != nil {
-		t.Fatalf("SaveInstances: %v", err)
-	}
+	expected, incarnation := committedRestartOutcome(t, db, "restart-target")
 
-	if _, err := db.WriteRestartOutcome("restart-target", "agentdeck_target_f00dcafe", "waiting", "claude"); err != nil {
+	if _, err := db.db.Exec(`UPDATE instances SET tool = 'codex' WHERE id = ?`, expected.InstanceID); err != nil {
+		t.Fatalf("concurrent tool update: %v", err)
+	}
+	if _, err := db.WriteRestartOutcome(expected, incarnation); err != nil {
 		t.Fatalf("WriteRestartOutcome: %v", err)
 	}
 
@@ -50,6 +72,9 @@ func TestWriteRestartOutcome_UpdatesOnlyItsOwnColumns(t *testing.T) {
 		t.Errorf("status = %q, want waiting: a row naming a live pane but still marked error "+
 			"misreports the session just as badly as one naming a dead pane", got.Status)
 	}
+	if got.Tool != "codex" {
+		t.Errorf("tool = %q, want concurrent metadata value codex", got.Tool)
+	}
 	// The point of a targeted write is that it leaves everything else alone. A
 	// whole-row save from a stale snapshot is what this exists to avoid.
 	if got.Title != "target" || got.ProjectPath != "/tmp/proj" || got.GroupPath != "Ungrouped" {
@@ -64,15 +89,13 @@ func TestWriteRestartOutcome_UpdatesOnlyItsOwnColumns(t *testing.T) {
 // abandons the save that would have persisted the rest of the restart.
 func TestWriteRestartOutcome_StampsIdentifyOurOwnBump(t *testing.T) {
 	db := newTestDB(t)
-	if err := db.SaveInstances([]*InstanceRow{restartOutcomeRow("stamped")}); err != nil {
-		t.Fatalf("SaveInstances: %v", err)
-	}
+	expected, incarnation := committedRestartOutcome(t, db, "stamped")
 	loadedAt, err := db.LastModified()
 	if err != nil {
 		t.Fatalf("LastModified: %v", err)
 	}
 
-	stamps, err := db.WriteRestartOutcome("stamped", "agentdeck_target_f00dcafe", "waiting", "claude")
+	stamps, err := db.WriteRestartOutcome(expected, incarnation)
 	if err != nil {
 		t.Fatalf("WriteRestartOutcome: %v", err)
 	}
@@ -126,7 +149,11 @@ func TestWriteStamps_SoleWriterSince_RejectsAPriorExternalChange(t *testing.T) {
 func TestWriteRestartOutcome_UnknownInstanceIsNotSilentlyDropped(t *testing.T) {
 	db := newTestDB(t)
 
-	_, err := db.WriteRestartOutcome("never-stored", "agentdeck_ghost_f00dcafe", "waiting", "claude")
+	_, err := db.WriteRestartOutcome(RuntimeState{
+		InstanceID: "never-stored", Generation: 1,
+		TmuxSession: "agentdeck_ghost_f00dcafe", TmuxSocketName: "ghost-socket",
+		LastStartedAt: time.Now().UTC(),
+	}, "missing-incarnation")
 	if err == nil {
 		t.Fatal("WriteRestartOutcome succeeded for an instance with no row: SQLite reports a " +
 			"zero-row UPDATE as success, so the caller would announce a durable write that " +
@@ -134,5 +161,63 @@ func TestWriteRestartOutcome_UnknownInstanceIsNotSilentlyDropped(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInstanceNotStored) {
 		t.Errorf("error = %v, want ErrInstanceNotStored so callers can tell it apart from an I/O failure", err)
+	}
+}
+
+func TestWriteRestartOutcome_RejectsStalePhysicalRuntime(t *testing.T) {
+	db := newTestDB(t)
+	stale, incarnation := committedRestartOutcome(t, db, "stale-restart")
+	winner := stale
+	winner.Generation++
+	winner.TmuxSession = "agentdeck_winner_cafebabe"
+	winner.LastStartedAt = winner.LastStartedAt.Add(time.Second)
+	if err := db.CommitRuntimeTransition(stale.Generation, incarnation, winner); err != nil {
+		t.Fatalf("CommitRuntimeTransition winner: %v", err)
+	}
+	before, err := db.LastModified()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.WriteRestartOutcome(stale, incarnation); !errors.Is(err, ErrRuntimeGenerationConflict) {
+		t.Fatalf("WriteRestartOutcome stale error = %v, want ErrRuntimeGenerationConflict", err)
+	}
+	after, err := db.LastModified()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("last_modified changed on rejected stale outcome: before=%d after=%d", before, after)
+	}
+	got, found, err := db.ReadRuntimeState(stale.InstanceID)
+	if err != nil || !found || got != winner {
+		t.Fatalf("winner changed by stale outcome: got=%#v found=%v err=%v want=%#v", got, found, err, winner)
+	}
+}
+
+func TestWriteRestartOutcome_AcknowledgementAndStampAreAtomic(t *testing.T) {
+	db := newTestDB(t)
+	expected, incarnation := committedRestartOutcome(t, db, "atomic-restart")
+	if _, err := db.db.Exec(`UPDATE instance_runtime_state SET status = 'running' WHERE instance_id = ?`, expected.InstanceID); err != nil {
+		t.Fatalf("set authoritative running status: %v", err)
+	}
+	if _, err := db.db.Exec(`UPDATE instances SET status = 'running', acknowledged = 1 WHERE id = ?`, expected.InstanceID); err != nil {
+		t.Fatalf("set acknowledged fixture: %v", err)
+	}
+	if _, err := db.db.Exec(`CREATE TRIGGER fail_restart_stamp BEFORE INSERT ON metadata
+		WHEN NEW.key = 'last_modified'
+		BEGIN SELECT RAISE(ABORT, 'forced restart stamp failure'); END`); err != nil {
+		t.Fatalf("create metadata failure trigger: %v", err)
+	}
+
+	if _, err := db.WriteRestartOutcome(expected, incarnation); err == nil {
+		t.Fatal("WriteRestartOutcome succeeded though the reload stamp was rejected")
+	}
+	statuses, err := db.ReadAllStatuses()
+	if err != nil {
+		t.Fatalf("ReadAllStatuses: %v", err)
+	}
+	if !statuses[expected.InstanceID].Acknowledged {
+		t.Fatal("acknowledgement cleared despite stamp failure: update and signal were not atomic")
 	}
 }

@@ -48,6 +48,8 @@ func handleSession(profile string, args []string) {
 		handleSessionArchive(profile, args[1:])
 	case "unarchive":
 		handleSessionUnarchive(profile, args[1:])
+	case "adopt-runtime":
+		handleSessionAdoptRuntime(profile, args[1:])
 	case "restart":
 		if coreRegistryEnabled() {
 			cliSessionRestart(profile, args[1:])
@@ -157,6 +159,7 @@ func printSessionHelp() {
 	fmt.Println("  cleanup [--days N]      Purge dead sessions idle N+ days (dry-run unless --yes)")
 	fmt.Println("  archive <id|title>      Stop session and hide it from active lists (retained in storage)")
 	fmt.Println("  unarchive <id|title>    Restore an archived session (does not restart it)")
+	fmt.Println("  adopt-runtime <id>      Plan or authorize one migrated generation-0 runtime")
 	fmt.Println("  restart [id] [--all] [--env KEY=VALUE]  Restart session (Claude: reload MCPs)")
 	fmt.Println("  revive [--all|--name]   Rebuild dead control pipes for errored sessions")
 	fmt.Println("  fork <id>               Fork Claude, OpenCode, Pi, Codex, or Oh My Pi session with context")
@@ -231,6 +234,8 @@ func printSessionHelp() {
 	fmt.Println("  agent-deck session recent --json --limit 5           # Same, machine-readable, top 5")
 	fmt.Println("  agent-deck session annotate auth-fix --ticket SB-412 --tag auth  # Durable hints for recall")
 	fmt.Println("  agent-deck session annotate --self --outcome worked  # An agent annotating its own session")
+	fmt.Println("  agent-deck session adopt-runtime my-project           # Dry-run legacy recovery")
+	fmt.Println("  agent-deck session adopt-runtime my-project --yes     # Stamp the exact planned runtime")
 	fmt.Println()
 	fmt.Println("Set command fields:")
 	fmt.Println("  title              Session title")
@@ -669,9 +674,14 @@ func handleSessionFork(profile string, args []string) {
 	}
 
 	// Start the forked session
-	if err := forkedInst.Start(); err != nil {
-		out.Error(fmt.Sprintf("failed to start forked session: %v", err), ErrCodeInvalidOperation)
+	runtime, startErr := forkedInst.StartRuntime()
+	startErr, persistenceWarning := consumeRuntimeResult(forkedInst, runtime, startErr)
+	if startErr != nil {
+		out.Error(fmt.Sprintf("failed to start forked session: %v", startErr), ErrCodeInvalidOperation)
 		exitCLI(1)
+	}
+	if persistenceWarning != "" && !*jsonOutput && !quietMode {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
 	}
 	forkedInst.RecordTelemetryCreate(telemetry.ViaCLIFork)
 
@@ -690,20 +700,24 @@ func handleSessionFork(profile string, args []string) {
 	}
 
 	// Save
-	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
+	if err := storage.InsertSessionAndVerify(forkedInst, groupTree); err != nil {
 		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeInvalidOperation)
 		exitCLI(1)
 	}
 
 	// Output success
+	result := map[string]interface{}{
+		"success":   true,
+		"parent_id": inst.ID,
+		"new_id":    forkedInst.ID,
+		"new_title": forkedInst.Title,
+	}
+	if persistenceWarning != "" {
+		result["warning"] = persistenceWarning
+	}
 	out.Success(
 		fmt.Sprintf("Forked session: %s -> %s (%s)", inst.Title, forkedInst.Title, TruncateID(forkedInst.ID)),
-		map[string]interface{}{
-			"success":   true,
-			"parent_id": inst.ID,
-			"new_id":    forkedInst.ID,
-			"new_title": forkedInst.Title,
-		},
+		result,
 	)
 }
 

@@ -40,8 +40,8 @@ config_dir = "~/.claude-spare"
 		nativeSwitchRunning, nativeSwitchStop, nativeSwitchStart = originalRunning, originalStop, originalStart
 	})
 	nativeSwitchRunning = func(*Instance) bool { return true }
-	nativeSwitchStop = func(*Instance) error { return nil }
-	nativeSwitchStart = func(*Instance) error { return nil }
+	nativeSwitchStop = func(*Instance, *runtimeTransitionAuthority) error { return nil }
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error { return nil }
 
 	storage := newTestStorage(t)
 	inst := &Instance{ID: id, Title: "source", ProjectPath: project, GroupPath: "test", Tool: "claude", Command: "claude", Account: "personal", ClaudeSessionID: sid, Status: StatusWaiting, CreatedAt: time.Now()}
@@ -118,7 +118,7 @@ func TestHarnessSwitch_RollbackRestoresVerdictState(t *testing.T) {
 	intent := inst.IntendedSwitch
 
 	starts := 0
-	nativeSwitchStart = func(*Instance) error {
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error {
 		starts++
 		if starts == 1 {
 			return errors.New("injected target start failure")

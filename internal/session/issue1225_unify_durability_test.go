@@ -41,8 +41,10 @@ func seedParentTwoChildren(t *testing.T) (profile, parentID, child1, child2 stri
 	parent := &Instance{ID: "parent-unify-1225", Title: "conductor-unify", ProjectPath: "/tmp/pu", GroupPath: DefaultGroupPath, Tool: "claude", Status: StatusRunning, CreatedAt: now}
 	c1 := &Instance{ID: "child-interactive-1225", Title: "interactive-worker", ProjectPath: "/tmp/c1", GroupPath: DefaultGroupPath, ParentSessionID: parent.ID, Tool: "claude", Status: StatusWaiting, CreatedAt: now}
 	c2 := &Instance{ID: "child-oneshot-1225", Title: "oneshot-worker", ProjectPath: "/tmp/c2", GroupPath: DefaultGroupPath, ParentSessionID: parent.ID, Tool: "bash", Status: StatusWaiting, CreatedAt: now}
-	if err := storage.SaveWithGroups([]*Instance{parent, c1, c2}, nil); err != nil {
-		t.Fatalf("save: %v", err)
+	for _, inst := range []*Instance{parent, c1, c2} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert %s: %v", inst.ID, err)
+		}
 	}
 	return profile, parent.ID, c1.ID, c2.ID
 }

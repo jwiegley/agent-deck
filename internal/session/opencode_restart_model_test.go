@@ -41,7 +41,7 @@ sleep 30
 	stubPATH := stubDir + string(os.PathListSeparator) + os.Getenv("PATH")
 	t.Setenv("PATH", stubPATH)
 
-	tmuxName := fmt.Sprintf("agentdeck-opencode-model-restart-%d", time.Now().UnixNano())
+	tmuxName := fmt.Sprintf("%sopencode-model-restart-%d", tmux.SessionPrefix, time.Now().UnixNano())
 	start := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", projectDir, "sleep 30")
 	if output, err := start.CombinedOutput(); err != nil {
 		t.Fatalf("start isolated tmux session: %v (%s)", err, strings.TrimSpace(string(output)))
@@ -76,6 +76,23 @@ sleep 30
 		t.Fatalf("unmarshal instance: %v", err)
 	}
 	revived.tmuxSession = tmux.ReconnectSessionLazy(tmuxName, tmuxName, projectDir, "opencode", "waiting")
+	revived.tmuxSession.InstanceID = revived.ID
+	revived.TmuxSocketName = revived.tmuxSession.SocketName
+	revived.Status = StatusWaiting
+	revived.LastStartedAt = time.Now().UTC()
+	runtime := revived.runtimeStateSnapshot()
+	if err := stampRuntimeCandidate(
+		revived.tmuxSession, runtime, "opencode", revived.OpenCodeSessionID,
+	); err != nil {
+		t.Fatalf("stamp live runtime fixture: %v", err)
+	}
+	candidates, err := revived.inventoryRuntimeCandidates(runtime)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("inventory stamped live runtime: candidates=%#v err=%v", candidates, err)
+	}
+	if selected := runtimeCandidateForState(candidates, runtime); selected == nil {
+		t.Fatalf("stamped live runtime did not match instance tuple: runtime=%#v candidates=%#v", runtime, candidates)
+	}
 
 	if err := revived.RestartWithEnv(map[string]string{
 		"OPENCODE_RESTART_LOG":    argvLog,

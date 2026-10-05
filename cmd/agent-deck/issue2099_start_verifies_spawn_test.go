@@ -128,18 +128,31 @@ func seedIssue2099Session(t *testing.T, title string) (string, *session.Instance
 	return home, inst
 }
 
+// issue2099Paths runs each CLI repro through the default registry path and
+// the legacy handlers kept as its rollback.
+var issue2099Paths = []struct {
+	name string
+	env  []string
+}{
+	{"registry", nil},
+	{"legacy", []string{envCoreRegistry + "=0"}},
+}
+
 // runIssue2099CLI re-execs the test binary as `agent-deck session <args>`
-// with the isolated HOME and returns combined output plus the exit code.
-func runIssue2099CLI(t *testing.T, home string, args ...string) (string, int) {
+// with the isolated HOME plus extra env and returns combined output plus the
+// exit code.
+func runIssue2099CLI(t *testing.T, home string, extra []string, args ...string) (string, int) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], append([]string{"-test.run=^TestIssue2099HelperProcess$", "--", "session"}, args...)...)
 	var env []string
 	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, "HOME=") || strings.HasPrefix(e, "XDG_") || strings.HasPrefix(e, "AGENTDECK_PROFILE=") {
+		if strings.HasPrefix(e, "HOME=") || strings.HasPrefix(e, "XDG_") || strings.HasPrefix(e, "AGENTDECK_PROFILE=") ||
+			strings.HasPrefix(e, envCoreRegistry+"=") {
 			continue
 		}
 		env = append(env, e)
 	}
+	env = append(env, extra...)
 	cmd.Env = append(env,
 		issue2099HelperEnv+"=1",
 		// Tells TestMain to keep the inherited sandboxed HOME instead of
@@ -175,34 +188,61 @@ func decodeIssue2099JSON(t *testing.T, out string) map[string]interface{} {
 	return payload
 }
 
+// requireIssue2099StoredError asserts the spawn failure reached the store.
+// Status is runtime-owned, so a snapshot save drops it; only the status CAS
+// can record the error.
+func requireIssue2099StoredError(t *testing.T, id string) {
+	t.Helper()
+	storage, err := session.NewStorageWithProfile(session.DefaultProfile)
+	require.NoError(t, err)
+	defer storage.Close()
+	state, found, err := storage.GetDB().ReadRuntimeState(id)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, string(session.StatusError), state.Status, "stored runtime: %+v", state)
+}
+
 // TestIssue2099_CLIStartDiesBeforePane is the CLI-level repro from the issue:
 // `session start` against a spawn whose pane dies at once must exit non-zero
 // and carry the failure in --json. Pre-fix it printed "Started" and exited 0.
 func TestIssue2099_CLIStartDiesBeforePane(t *testing.T) {
 	skipIfNoTmuxBinaryCLI(t)
-	home, inst := seedIssue2099Session(t, "issue-2099-cli-start")
+	for _, path := range issue2099Paths {
+		t.Run(path.name, func(t *testing.T) {
+			home, inst := seedIssue2099Session(t, "issue-2099-cli-start")
 
-	out, code := runIssue2099CLI(t, home, "start", inst.Title, "--json")
+			out, code := runIssue2099CLI(t, home, path.env, "start", inst.Title, "--json")
 
-	assert.NotEqual(t, 0, code, "session start must exit non-zero when no pane survives; output:\n%s", out)
-	assert.NotContains(t, out, "Started session", "no false success line")
-	payload := decodeIssue2099JSON(t, out)
-	assert.Equal(t, false, payload["success"])
-	assert.Contains(t, payload["error"], "failed to start session")
-	assert.Equal(t, "spawn_died_fast", payload["reason"])
-	assert.Equal(t, inst.ID, payload["id"])
-	sf, ok := payload["spawn_failure"].(map[string]interface{})
-	require.True(t, ok, "spawn_failure must be present in --json; payload: %v", payload)
-	assert.Equal(t, "spawn_died_fast", sf["reason"])
+			assert.NotEqual(t, 0, code, "session start must exit non-zero when no pane survives; output:\n%s", out)
+			assert.NotContains(t, out, "Started session", "no false success line")
+			payload := decodeIssue2099JSON(t, out)
+			assert.Equal(t, false, payload["success"])
+			assert.Contains(t, payload["error"], "failed to start session")
+			assert.Equal(t, "spawn_died_fast", payload["reason"])
+			assert.Equal(t, inst.ID, payload["id"])
+			sf, ok := payload["spawn_failure"].(map[string]interface{})
+			require.True(t, ok, "spawn_failure must be present in --json; payload: %v", payload)
+			assert.Equal(t, "spawn_died_fast", sf["reason"])
+			requireIssue2099StoredError(t, inst.ID)
+		})
+	}
 }
 
 // TestIssue2099_CLIRestartDiesBeforePane covers the restart path the issue
 // reports as equally silent.
 func TestIssue2099_CLIRestartDiesBeforePane(t *testing.T) {
 	skipIfNoTmuxBinaryCLI(t)
+	for _, path := range issue2099Paths {
+		t.Run(path.name, func(t *testing.T) {
+			testIssue2099CLIRestartDiesBeforePane(t, path.env)
+		})
+	}
+}
+
+func testIssue2099CLIRestartDiesBeforePane(t *testing.T, extra []string) {
 	home, inst := seedIssue2099Session(t, "issue-2099-cli-restart")
 
-	out, code := runIssue2099CLI(t, home, "restart", inst.Title, "--json")
+	out, code := runIssue2099CLI(t, home, extra, "restart", inst.Title, "--json")
 
 	assert.NotEqual(t, 0, code, "session restart must exit non-zero when no pane survives; output:\n%s", out)
 	assert.NotContains(t, out, "Restarted session", "no false success line")
@@ -219,4 +259,5 @@ func TestIssue2099_CLIRestartDiesBeforePane(t *testing.T) {
 		_, ok := payload["spawn_failure"].(map[string]interface{})
 		assert.True(t, ok, "spawn_failure must accompany a recorded reason; payload: %v", payload)
 	}
+	requireIssue2099StoredError(t, inst.ID)
 }

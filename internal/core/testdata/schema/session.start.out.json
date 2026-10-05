@@ -19,8 +19,12 @@
       "type": "integer"
     },
     "message": {
-      "description": "Initial message that was sent",
+      "description": "Initial message requested for the session",
       "type": "string"
+    },
+    "message_pending": {
+      "description": "The initial message was not delivered; the session is live without it",
+      "type": "boolean"
     },
     "status": {
       "description": "started or queued",
@@ -36,6 +40,10 @@
     "unarchived": {
       "description": "The session was archived and the start unarchived it",
       "type": "boolean"
+    },
+    "warning": {
+      "description": "Runtime durability warning of a start that completed",
+      "type": "string"
     },
     "warning": {
       "description": "Recovery was not sent or submission is uncertain",
