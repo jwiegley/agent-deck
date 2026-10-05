@@ -93,8 +93,17 @@ make goldens-update
 or directly:
 
 ```
-AGENTDECK_UPDATE_GOLDENS=1 go test ./cmd/agent-deck/ -run 'TestCLIGoldens$|TestStorageBytesGoldens$' -v
+bash scripts/test.sh -count=1 -v -run 'TestCLIGoldens$|TestStorageBytesGoldens$' ./cmd/agent-deck/ -args -update-goldens
 ```
+
+This fork runs every test through `scripts/test.sh`, which starts `go test`
+under `env -i` with a fixed environment allowlist so no test sees the real
+user's state. `AGENTDECK_UPDATE_GOLDENS=1` is not on that list and never
+reaches the test binary, so under the runner only the `-update-goldens`
+test flag regenerates (upstream's
+`AGENTDECK_UPDATE_GOLDENS=1 go test ./cmd/agent-deck/ ...` bypasses the
+runner). Pass it after `-args`, as above; `make goldens-update` does the
+same.
 
 Then `git diff` the changed `.golden` files and get a reviewer's PASS before
 committing.

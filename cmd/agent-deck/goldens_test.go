@@ -8,8 +8,12 @@
 // goldens byte for byte; a diff is a behaviour change and needs a reviewer's
 // PASS (see testdata/goldens/README.md).
 //
-// Regenerate with: AGENTDECK_UPDATE_GOLDENS=1 go test ./cmd/agent-deck/ -run TestCLIGoldens
-// (or `make goldens-update`).
+// Regenerate with `make goldens-update`, which runs:
+//
+//	bash scripts/test.sh -count=1 -v -run 'TestCLIGoldens$|TestStorageBytesGoldens$' ./cmd/agent-deck/ -args -update-goldens
+//
+// scripts/test.sh starts go test under env -i with a fixed allowlist, so
+// AGENTDECK_UPDATE_GOLDENS=1 regenerates only in a plain `go test` outside it.
 package main
 
 import (
@@ -26,8 +30,9 @@ import (
 
 // updateGoldensFlag is a `go test`-recognized flag alternative to the
 // AGENTDECK_UPDATE_GOLDENS env var: some CI/sandbox runners invoke `go test`
-// with a fixed argument list but no ability to set extra env vars, so both
-// triggers are honored (see shouldUpdateGoldens).
+// with no ability to set extra env vars (this fork's scripts/test.sh runs it
+// under env -i with a fixed allowlist), so both triggers are honored (see
+// shouldUpdateGoldens).
 var updateGoldensFlag = flag.Bool("update-goldens", false, "regenerate CLI/storage-bytes goldens instead of asserting them")
 
 func shouldUpdateGoldens() bool {
@@ -542,7 +547,7 @@ func assertGoldenWithScrub(t *testing.T, name, scrubbed string) {
 
 	want, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("reading golden %s: %v (run with AGENTDECK_UPDATE_GOLDENS=1 to create it)", path, err)
+		t.Fatalf("reading golden %s: %v (run `make goldens-update`, or pass -update-goldens after -args to scripts/test.sh, to create it)", path, err)
 	}
 	if scrubbed != string(want) {
 		t.Errorf("golden %s mismatch (scrubbed):\n--- want ---\n%s\n--- got ---\n%s", name, string(want), scrubbed)
