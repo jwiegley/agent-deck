@@ -130,6 +130,11 @@ func TestIssue666_SaveWithGroups_NormalizesEmptyGroupPath(t *testing.T) {
 			CreatedAt:   time.Now(),
 		},
 	}
+	instances[0].GroupPath = DefaultGroupPath
+	if err := s.InsertSessionAndVerify(instances[0], nil); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
+	}
+	instances[0].GroupPath = ""
 
 	if err := s.SaveWithGroups(instances, nil); err != nil {
 		t.Fatalf("SaveWithGroups: %v", err)

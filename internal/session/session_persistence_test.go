@@ -675,6 +675,9 @@ func TestPersistence_RestartResumesConversation(t *testing.T) {
 	home := isolatedHomeDir(t)
 	argvLog := setupStubClaudeOnPATH(t, home)
 	inst := newClaudeInstanceForDispatch(t, home)
+	// The fixture replaces Instance.ID after construction; keep the physical
+	// session owner identical so exact-candidate respawn authority remains valid.
+	inst.tmuxSession.InstanceID = inst.ID
 
 	// First bring the tmux session up so Restart()'s respawn-pane branch
 	// (instance.go:3788 — requires tmuxSession.Exists()) is taken.

@@ -919,13 +919,7 @@ func handleSessionSend(profile string, args []string) {
 		// session). First try tmux env (fast), then fall back to reloading
 		// from DB.
 		if session.IsClaudeCompatible(inst.Tool) {
-			if freshID := inst.GetSessionIDFromTmux(); freshID != "" {
-				inst.ClaudeSessionID = freshID
-				// #1815: own pane env — weak vouch (see
-				// NoteClaudeSessionIDFromOwnPane).
-				session.NoteClaudeSessionIDFromOwnPane(inst)
-				inst.ClaudeDetectedAt = time.Now()
-			}
+			inst.RefreshLiveSessionIDs()
 		}
 		// Pre-#2043 contract for non-Claude tools, whose output adapters do
 		// not expose transcript UUIDs, and for slash commands, which Claude
@@ -1879,12 +1873,7 @@ func streamSessionSend(inst *session.Instance, sessionRef, profile string, turnI
 	// first assistant chunk, so we poll briefly for its existence.
 	resolvedInst := inst
 	if session.IsClaudeCompatible(inst.Tool) {
-		if fresh := inst.GetSessionIDFromTmux(); fresh != "" {
-			inst.ClaudeSessionID = fresh
-			// #1815: own pane env — weak vouch.
-			session.NoteClaudeSessionIDFromOwnPane(inst)
-			inst.ClaudeDetectedAt = time.Now()
-		}
+		inst.RefreshLiveSessionIDs()
 	}
 
 	// A remote session's transcript is on the remote host, so the poll below can

@@ -538,15 +538,17 @@ func (h *Home) detectOpenCodeSessionCmd(inst *session.Instance) tea.Cmd {
 	}
 
 	instanceID := inst.ID
+	observed := inst.CaptureRuntimeBindingObservation("opencode")
 
 	return func() tea.Msg {
-		// Run detection (this blocks until complete or timeout)
-		inst.DetectOpenCodeSession()
-
-		// Return message to trigger save
+		// Query only. The event-loop handler publishes through the tokenized
+		// runtime-binding authority on the current canonical instance.
+		sessionID := inst.QueryOpenCodeSessionCandidate()
 		return openCodeDetectionCompleteMsg{
 			instanceID: instanceID,
-			sessionID:  inst.OpenCodeSessionID,
+			sessionID:  sessionID,
+			observed:   observed,
+			detectedAt: time.Now(),
 		}
 	}
 }

@@ -48,7 +48,7 @@ func TestStorageWatcherMaterialChangesIgnoreTimestamp(t *testing.T) {
 			requireWatcherAppliedRow(t, w, db, "a", "one")
 			w.checkAndNotify()
 			requireNoWatcherSignal(t, w)
-			require.NoError(t, db.SaveInstance(&statedb.InstanceRow{ID: "a", Title: "one", Status: "running"}))
+			require.NoError(t, db.WriteStatus("a", "running", ""))
 			w.checkAndNotify()
 			requireWatcherSignal(t, w)
 			row, err := db.LoadInstanceByID("a")

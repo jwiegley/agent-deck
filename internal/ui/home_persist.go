@@ -40,6 +40,7 @@ func (h *Home) loadSessions() tea.Msg {
 // sessionLoadCmd issues ordering without database I/O. The returned command
 // probes and reads the captured storage asynchronously, including initial loads.
 func (h *Home) sessionLoadCmd(restore *reloadState, initializePool bool) tea.Cmd {
+	reloadVersion := h.beginReload()
 	h.sessionLoadSequence++
 	sequence := h.sessionLoadSequence
 	storage, watcher := h.storage, h.storageWatcher
@@ -49,8 +50,12 @@ func (h *Home) sessionLoadCmd(restore *reloadState, initializePool bool) tea.Cmd
 	}
 	return func() tea.Msg {
 		ticket := issuedTicket
-		msg := loadSessionsMsg{loadSequence: sequence, loadWatcher: watcher, restoreState: restore}
+		msg := loadSessionsMsg{
+			loadSequence: sequence, loadWatcher: watcher, restoreState: restore,
+			reloadVersion: reloadVersion,
+		}
 		if storage == nil {
+			msg.instances = []*session.Instance{}
 			msg.err = fmt.Errorf("storage not initialized")
 			return msg
 		}
@@ -64,6 +69,7 @@ func (h *Home) sessionLoadCmd(restore *reloadState, initializePool bool) tea.Cmd
 			}
 		}
 		msg.loadMtime, _ = storage.GetFileMtime()
+		msg.deleteSeqCeiling = h.captureDurableDeleteSeq()
 		msg.instances, msg.groups, msg.persistedSnapshot, msg.err = storage.LoadWithGroupsSnapshot()
 		if watcher != nil {
 			finished, err := watcher.endLoad(ticket)
@@ -71,6 +77,9 @@ func (h *Home) sessionLoadCmd(restore *reloadState, initializePool bool) tea.Cmd
 			if msg.err == nil {
 				msg.err = err
 			}
+		}
+		if msg.err == nil {
+			msg.reconcileWarnings = h.reconcileStartupInstances(msg.instances)
 		}
 		if initializePool {
 			userConfig, configErr := session.LoadUserConfig()
@@ -98,6 +107,84 @@ func (h *Home) SetHeadless(v bool) { h.headless = v }
 // IsHeadless reports whether this Home backs a headless web server.
 func (h *Home) IsHeadless() bool { return h.headless }
 
+type durableDeleteTombstone struct {
+	sequence    uint64
+	incarnation string
+}
+
+func (t durableDeleteTombstone) matches(inst *session.Instance) bool {
+	if inst == nil {
+		return false
+	}
+	if t.incarnation == "" {
+		return inst.PersistenceIncarnation() == ""
+	}
+	return inst.MatchesPersistenceIncarnation(t.incarnation)
+}
+
+// saveWithGroups excludes live web deletes while holding their ordering lock
+// through the durable write. Holding the lock through SaveWithGroups matters:
+// a snapshot taken before a delete must either save first or observe the
+// tombstone, never write the stale row after the delete commits.
+func (h *Home) saveWithGroups(storage *session.Storage, instances []*session.Instance, groups *session.GroupTree) error {
+	h.durableDeleteMu.Lock()
+	defer h.durableDeleteMu.Unlock()
+
+	if len(h.durableDeleteTombstones) == 0 {
+		return storage.SaveWithGroups(instances, groups)
+	}
+	filtered := make([]*session.Instance, 0, len(instances))
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		if deleted, ok := h.durableDeleteTombstones[inst.ID]; ok && deleted.matches(inst) {
+			continue
+		}
+		filtered = append(filtered, inst)
+	}
+	return storage.SaveWithGroups(filtered, groups)
+}
+
+// captureDurableDeleteSeq establishes which delete tokens existed before a
+// database snapshot. A reload may clear only those tokens: a newer delete can
+// commit after this capture but before publication, and an older absence
+// snapshot must never clear that newer tombstone.
+func (h *Home) captureDurableDeleteSeq() uint64 {
+	h.durableDeleteMu.Lock()
+	defer h.durableDeleteMu.Unlock()
+	return h.durableDeleteSeq
+}
+
+// beginDurableDeleteReload filters stale deleted rows and holds the delete
+// ordering lock until the caller has published the filtered instance slice.
+// Tombstones survive reloads that still contain the row and are cleared once a
+// successful reload observes its durable absence.
+func (h *Home) beginDurableDeleteReload(instances []*session.Instance, seqCeiling uint64) ([]*session.Instance, func()) {
+	h.durableDeleteMu.Lock()
+	if len(h.durableDeleteTombstones) == 0 {
+		return instances, h.durableDeleteMu.Unlock
+	}
+
+	seenDeleted := make(map[string]struct{}, len(h.durableDeleteTombstones))
+	filtered := make([]*session.Instance, 0, len(instances))
+	for _, inst := range instances {
+		if inst != nil {
+			if deleted, ok := h.durableDeleteTombstones[inst.ID]; ok && deleted.matches(inst) {
+				seenDeleted[inst.ID] = struct{}{}
+				continue
+			}
+		}
+		filtered = append(filtered, inst)
+	}
+	for id, token := range h.durableDeleteTombstones {
+		if _, stale := seenDeleted[id]; !stale && token.sequence <= seqCeiling {
+			delete(h.durableDeleteTombstones, id)
+		}
+	}
+	return filtered, h.durableDeleteMu.Unlock
+}
+
 // HydrateInstancesFromStorage reloads the in-memory instances, instanceByID
 // map, and groupTree from storage. It is the headless-mode equivalent of the
 // loadSessions/loadSessionsMsg cycle that the bubbletea loop runs in TUI mode:
@@ -117,6 +204,7 @@ func (h *Home) HydrateInstancesFromStorage() error {
 	if err != nil {
 		return fmt.Errorf("hydrate instances from storage: %w", err)
 	}
+	_ = h.reconcileStartupInstances(instances) // warnings are logged with every candidate identity
 
 	h.instancesMu.Lock()
 	h.instances = instances
@@ -167,8 +255,8 @@ func (h *Home) saveInstancesWithForce(force bool) {
 	// This catches external changes (e.g., from CLI) even when fsnotify fails
 	// (common on 9p/NFS filesystems in WSL2).
 	// #1550: force saves no longer skip this check. They still persist (they
-	// carry critical mutations like create/fork/delete, and the save is now
-	// upsert-only so it cannot delete another process's rows), but a detected
+	// carry critical mutations, and the save is now update-only so it cannot
+	// insert or delete another process's rows), but a detected
 	// external change schedules a reload after the save so this TUI stops
 	// holding a stale snapshot.
 	externalChange := false
@@ -260,7 +348,7 @@ func (h *Home) saveInstancesWithForce(force bool) {
 		}
 
 		// Save both instances and groups (including empty ones)
-		if err := h.storage.SaveWithGroups(instancesCopy, groupTreeCopy); err != nil {
+		if err := h.saveWithGroups(h.storage, instancesCopy, groupTreeCopy); err != nil {
 			h.setError(fmt.Errorf("failed to save: %w", err))
 		} else {
 			// CRITICAL FIX: Update lastLoadMtime after successful save.
@@ -286,7 +374,7 @@ func (h *Home) saveInstancesWithForce(force bool) {
 			// mirroring pendingTitleChanges.
 			h.pendingGroupOps = nil
 			// #1550: a force save raced an external change. Our rows are now
-			// persisted (upsert-only, nothing deleted); reload to pick up what
+			// persisted (update-only, nothing inserted or deleted); reload to pick up what
 			// the other process wrote while we were stale.
 			if externalChange && h.storageWatcher != nil {
 				h.storageWatcher.TriggerReload()
@@ -295,8 +383,8 @@ func (h *Home) saveInstancesWithForce(force bool) {
 	}
 }
 
-// adoptRestartRecord accounts for the targeted write Instance.restart makes when
-// it records what a restart produced.
+// adoptRestartRecord accounts for the targeted acknowledgement write
+// Instance.restart makes after committing what a restart produced.
 //
 // That write moves the state DB's last_modified. This TUI's freshness marker
 // does not move with it, so the save that follows a restart would read the
@@ -547,20 +635,47 @@ func (h *Home) applyUIState(state uiState) {
 
 // importSessions imports existing tmux sessions
 func (h *Home) importSessions() tea.Msg {
-	discovered, err := session.DiscoverExistingTmuxSessions(h.instances)
+	reloadVersion := h.beginReload()
+	discover := session.DiscoverExistingTmuxSessions
+	if h.discoverTmuxSessionsFn != nil {
+		discover = h.discoverTmuxSessionsFn
+	}
+	discovered, err := discover(h.instances)
 	if err != nil {
-		return loadSessionsMsg{err: err}
+		return loadSessionsMsg{err: err, reloadVersion: reloadVersion}
+	}
+
+	// beginReload intentionally suppresses routine saves. Imported sessions are
+	// explicit creations. Publish each one only after its parent/runtime insert
+	// commits, so a later insertion failure cannot leave a nondurable suffix in
+	// Home memory that update-only routine saves can never repair.
+	for _, inst := range discovered {
+		if err := h.storage.InsertSessionAndVerify(inst, nil); err != nil {
+			return loadSessionsMsg{
+				err:           fmt.Errorf("persist imported session %s: %w", inst.ID, err),
+				reloadVersion: reloadVersion,
+			}
+		}
+		h.instancesMu.Lock()
+		h.instances = append(h.instances, inst)
+		h.instancesMu.Unlock()
+		if h.groupTree != nil {
+			h.groupTree.AddSession(inst)
+		}
 	}
 
 	h.instancesMu.Lock()
-	h.instances = append(h.instances, discovered...)
+	instancesCopy := make([]*session.Instance, len(h.instances))
+	copy(instancesCopy, h.instances)
 	h.instancesMu.Unlock()
-
-	// Add discovered sessions to group tree before saving
-	for _, inst := range discovered {
-		h.groupTree.AddSession(inst)
+	if h.groupTree != nil {
+		if err := h.storage.SaveGroupsOnly(h.groupTree.ShallowCopyForSave()); err != nil {
+			return loadSessionsMsg{
+				err:           fmt.Errorf("persist imported groups: %w", err),
+				reloadVersion: reloadVersion,
+			}
+		}
 	}
-	// Save both instances AND groups (critical fix: was losing groups!)
-	h.saveInstances()
-	return importReloadMsg{}
+	state := h.preserveState()
+	return loadSessionsMsg{instances: instancesCopy, restoreState: &state, reloadVersion: reloadVersion}
 }

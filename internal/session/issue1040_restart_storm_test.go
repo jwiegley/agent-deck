@@ -1,12 +1,173 @@
 package session
 
 import (
+	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+const instanceSpawnLockCrashHelperEnv = "AGENTDECK_INSTANCE_SPAWN_LOCK_CRASH_HELPER"
+
+const instanceSpawnLockCrashReadyFD = 3
+
+func TestRuntimeLifecycle_InstanceSpawnTryLockUsesStableFlock(t *testing.T) {
+	withTempLockDir(t)
+
+	release, acquired, err := defaultTryAcquireInstanceSpawnLock("target")
+	if err != nil || !acquired {
+		t.Fatalf("first try acquire: acquired=%v err=%v", acquired, err)
+	}
+	path, err := instanceSpawnLockPath("target")
+	if err != nil {
+		release()
+		t.Fatal(err)
+	}
+	if contenderRelease, contenderAcquired, err := defaultTryAcquireInstanceSpawnLock("target"); err != nil {
+		release()
+		t.Fatal(err)
+	} else if contenderAcquired {
+		contenderRelease()
+		release()
+		t.Fatal("nonblocking contender acquired a held flock")
+	}
+
+	release()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("stable lockfile disappeared on release: %v", err)
+	}
+	reacquiredRelease, reacquired, err := defaultTryAcquireInstanceSpawnLock("target")
+	if err != nil || !reacquired {
+		t.Fatalf("try acquire after release: acquired=%v err=%v", reacquired, err)
+	}
+	reacquiredRelease()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("stable lockfile disappeared after second release: %v", err)
+	}
+}
+
+func TestRuntimeLifecycle_InstanceSpawnLockMarkerIsDiagnosticOnly(t *testing.T) {
+	withTempLockDir(t)
+	path, err := instanceSpawnLockPath("diagnostic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("stale malformed marker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	release, acquired, err := defaultTryAcquireInstanceSpawnLock("diagnostic")
+	if err != nil || !acquired {
+		t.Fatalf("stale marker blocked free flock: acquired=%v err=%v", acquired, err)
+	}
+	marker, err := os.ReadFile(path)
+	if err != nil {
+		release()
+		t.Fatal(err)
+	}
+	if string(marker) != strconv.Itoa(os.Getpid()) {
+		release()
+		t.Fatalf("diagnostic marker = %q, want current PID", marker)
+	}
+	// Marker contents do not participate in ownership; changing them cannot
+	// make a second contender acquire the held flock.
+	if err := os.WriteFile(path, []byte("externally changed"), 0o600); err != nil {
+		release()
+		t.Fatal(err)
+	}
+	if contenderRelease, contenderAcquired, err := defaultTryAcquireInstanceSpawnLock("diagnostic"); err != nil {
+		release()
+		t.Fatal(err)
+	} else if contenderAcquired {
+		contenderRelease()
+		release()
+		t.Fatal("marker replacement bypassed held flock")
+	}
+	release()
+}
+
+func TestRuntimeLifecycle_InstanceSpawnLockCrashReleasesFlock(t *testing.T) {
+	if os.Getenv(instanceSpawnLockCrashHelperEnv) == "1" {
+		agentDeckDirOverride = os.Getenv("AGENTDECK_INSTANCE_SPAWN_LOCK_ROOT")
+		if _, err := defaultAcquireInstanceSpawnLock("crash-release"); err != nil {
+			t.Fatal(err)
+		}
+		ready := os.NewFile(instanceSpawnLockCrashReadyFD, "spawn-lock-ready")
+		if ready == nil {
+			t.Fatal("spawn-lock readiness descriptor is unavailable")
+		}
+		if _, err := ready.Write([]byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		_ = ready.Close()
+		select {}
+	}
+
+	withTempLockDir(t)
+	readyRead, readyWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = readyRead.Close() })
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRuntimeLifecycle_InstanceSpawnLockCrashReleasesFlock$")
+	cmd.ExtraFiles = []*os.File{readyWrite}
+	cmd.Env = append(os.Environ(),
+		instanceSpawnLockCrashHelperEnv+"=1",
+		"AGENTDECK_INSTANCE_SPAWN_LOCK_ROOT="+agentDeckDirOverride,
+		"AGENTDECK_RUNTIME_LIFECYCLE_ONLY=1",
+	)
+	if err := cmd.Start(); err != nil {
+		_ = readyWrite.Close()
+		t.Fatal(err)
+	}
+	_ = readyWrite.Close()
+	waited := false
+	t.Cleanup(func() {
+		if !waited {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+	path, err := instanceSpawnLockPath("crash-release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := readyRead.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(readyRead, []byte{0}); err != nil {
+		t.Fatalf("crash helper did not acquire flock: %v", err)
+	}
+	marker, err := os.ReadFile(path)
+	if err != nil || string(marker) != strconv.Itoa(cmd.Process.Pid) {
+		t.Fatalf("crash helper marker=%q err=%v, want PID %d", marker, err, cmd.Process.Pid)
+	}
+	if contenderRelease, acquired, err := defaultTryAcquireInstanceSpawnLock("crash-release"); err != nil {
+		t.Fatal(err)
+	} else if acquired {
+		contenderRelease()
+		t.Fatal("parent acquired flock while child held it")
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+	waited = true
+
+	release, acquired, err := defaultTryAcquireInstanceSpawnLock("crash-release")
+	if err != nil || !acquired {
+		t.Fatalf("try acquire after owner crash: acquired=%v err=%v", acquired, err)
+	}
+	release()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("stable lockfile disappeared after crash recovery: %v", err)
+	}
+}
 
 // Issue #1040 regression suite — concurrent restart-storm prevention.
 //
@@ -20,10 +181,11 @@ import (
 // so every spawn killed the previous one and the last writer wins on DB
 // state — leaving a short-lived (8–15s) session as the "tracked" one.
 //
-// Fix shape: a per-instance file lock at ~/.agent-deck/locks/instance-
+// Fix shape: a per-instance advisory flock at ~/.agent-deck/locks/instance-
 // spawn-<id>.lock serializing the spawn critical section, plus a sibling
 // "already alive" gate inside the lock so the second waiter exits without
-// re-spawning. Mirrors the established acquirePluginLock pattern (#735).
+// re-spawning. The stable lockfile remains after release; flock state alone
+// determines ownership.
 //
 // These tests exercise the lock primitive + the SpawnAttempt wrapper used
 // by Restart() / Start(). They MUST fail on current main (functions do not

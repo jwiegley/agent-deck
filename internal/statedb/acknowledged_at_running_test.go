@@ -23,10 +23,34 @@ func TestRunningWrite_ClearsAcknowledgedAt(t *testing.T) {
 			return err
 		},
 		"PersistInstanceStatusesTx": func(db *StateDB, id string) error {
-			return db.PersistInstanceStatusesTx([]InstanceStatusUpdate{{ID: id, Status: "running"}})
+			incarnation := runtimeTestIncarnation(t, db, id)
+			return db.PersistInstanceStatusesTx([]InstanceStatusUpdate{{ID: id, Incarnation: incarnation, Status: "running"}})
 		},
+		// This fork's restart outcome acknowledges a committed runtime tuple
+		// whose status is the runtime's own. Commit a running generation,
+		// mark the row seen again after that commit (which clears the mark
+		// itself), then acknowledge the tuple.
 		"WriteRestartOutcome": func(db *StateDB, id string) error {
-			_, err := db.WriteRestartOutcome(id, "agentdeck_target_deadbeef", "running", "claude")
+			incarnation := runtimeTestIncarnation(t, db, id)
+			current, found, err := db.ReadRuntimeState(id)
+			if err != nil || !found {
+				t.Fatalf("ReadRuntimeState: found=%v err=%v", found, err)
+			}
+			next := RuntimeState{
+				InstanceID: id, Generation: current.Generation + 1,
+				TmuxSession: "agentdeck_target_f00dcafe", TmuxSocketName: current.TmuxSocketName,
+				Status: "running", LastStartedAt: time.Now().UTC(),
+			}
+			if err := db.CommitRuntimeTransition(current.Generation, incarnation, next); err != nil {
+				t.Fatalf("CommitRuntimeTransition: %v", err)
+			}
+			if err := db.SetAcknowledged(id, true); err != nil {
+				t.Fatalf("SetAcknowledged after the commit: %v", err)
+			}
+			if ack, at := rawAckAt(t, db, id); ack != 1 || at == 0 {
+				t.Fatalf("precondition: acknowledged=%d acknowledged_at=%d after SetAcknowledged", ack, at)
+			}
+			_, err = db.WriteRestartOutcome(next, incarnation)
 			return err
 		},
 	}

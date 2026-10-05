@@ -5,6 +5,7 @@
 package session
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -42,4 +43,42 @@ func TestInstanceServiceUnitOwnership_CarriesSessionAndSocket(t *testing.T) {
 	own := inst.ServiceUnitOwnership()
 	assert.Equal(t, sess.Name, own.SessionName)
 	assert.Equal(t, "ad-test-1721", own.SocketName)
+}
+
+func TestRuntimeLifecycle_ParentDeleteRetiresServiceOnlyAfterSuccess(t *testing.T) {
+	originalCapture := captureParentDeleteServiceOwnershipFn
+	originalRetire := retireParentDeleteServiceUnitFn
+	t.Cleanup(func() {
+		captureParentDeleteServiceOwnershipFn = originalCapture
+		retireParentDeleteServiceUnitFn = originalRetire
+	})
+
+	var events []string
+	captureParentDeleteServiceOwnershipFn = func(*Instance, RuntimeSelection) tmux.ServiceUnitOwnership {
+		events = append(events, "capture")
+		return tmux.ServiceUnitOwnership{SessionName: "selected"}
+	}
+	retireParentDeleteServiceUnitFn = func(_ *Instance, ownership tmux.ServiceUnitOwnership) {
+		events = append(events, "retire:"+ownership.SessionName)
+	}
+
+	inst := &Instance{ID: "selected"}
+	selection := RuntimeSelection{}
+	wantErr := errors.New("delete rejected")
+	if err := inst.deleteCapturedAndRetireService(selection, func() error {
+		events = append(events, "delete-failed")
+		return wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("failed deletion error = %v, want %v", err, wantErr)
+	}
+	require.Equal(t, []string{"capture", "delete-failed"}, events)
+
+	events = nil
+	if err := inst.deleteCapturedAndRetireService(selection, func() error {
+		events = append(events, "delete-succeeded")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, []string{"capture", "delete-succeeded", "retire:selected"}, events)
 }

@@ -22,13 +22,14 @@ type SessionStartOut struct {
 	ID    string `json:"id"`
 	Title string `json:"title"`
 	// Status is "started", or "queued" when the group is at its concurrency cap.
-	Status          string `json:"status" doc:"started or queued"`
-	Group           string `json:"group" doc:"Group path of the session"`
-	MaxConcurrent   int    `json:"max_concurrent,omitempty" doc:"Group cap that queued the session"`
-	Tmux            string `json:"tmux,omitempty" doc:"tmux session name"`
-	ClaudeSessionID string `json:"claude_session_id,omitempty"`
-	Message         string `json:"message,omitempty" doc:"Initial message that was sent"`
-	Warning         string `json:"warning,omitempty" doc:"Recovery was not sent or submission is uncertain"`
+	Status          StartStatus `json:"status" doc:"started or queued"`
+	Group           string      `json:"group" doc:"Group path of the session"`
+	MaxConcurrent   int         `json:"max_concurrent,omitempty" doc:"Group cap that queued the session"`
+	Tmux            string      `json:"tmux,omitempty" doc:"tmux session name"`
+	ClaudeSessionID string      `json:"claude_session_id,omitempty"`
+	Message         string      `json:"message,omitempty" doc:"Initial message requested for the session"`
+	Warning         string      `json:"warning,omitempty" doc:"Runtime durability or recovery warning of a start that completed"`
+	MessagePending  bool        `json:"message_pending,omitempty" doc:"The initial message was not delivered; the session is live without it"`
 	// Unarchived reports that the session was archived and this start
 	// unarchived it (durably) before starting or queueing it.
 	Unarchived bool `json:"unarchived,omitempty" doc:"The session was archived and the start unarchived it"`
@@ -37,10 +38,15 @@ type SessionStartOut struct {
 	Instance *session.Instance `json:"-"`
 }
 
+// StartStatus is a session start's verdict. It is a type of its own, not an
+// untyped string, so a start verdict cannot be assigned to an Instance's
+// runtime-owned session.Status.
+type StartStatus string
+
 // Session start statuses.
 const (
-	StartStatusStarted = "started"
-	StartStatusQueued  = "queued"
+	StartStatusStarted StartStatus = "started"
+	StartStatusQueued  StartStatus = "queued"
 )
 
 func (deps Deps) sessionStart(ctx context.Context, in SessionStartIn) (SessionStartOut, error) {
@@ -68,11 +74,21 @@ func (deps Deps) sessionStart(ctx context.Context, in SessionStartIn) (SessionSt
 	tree := session.NewGroupTreeWithGroups(d.instances, d.groups)
 	max := session.GroupMaxConcurrent(tree, inst.GroupPath)
 	if session.ShouldQueue(d.instances, inst.GroupPath, max) {
-		// A queued session is on its way to running: it leaves the archive
-		// now, or the drain that starts it later would start it hidden.
-		inst.MarkQueued(in.Message)
+		// The save persists the yolo override and the -m message the queued
+		// start delivers (MarkQueued's QueuedMessage); the runtime-owned
+		// queued status goes through the status CAS, which a snapshot save
+		// cannot. A queued session is on its way to running: it leaves the
+		// archive now, or the drain that starts it later would start it
+		// hidden.
+		inst.QueuedMessage = in.Message
 		unarchived, err := session.UnarchiveAround(inst, "start", d.storage.PersistArchived, func() error {
-			return d.saveOr("failed to save queued state")
+			if err := d.saveOr("failed to save queued state"); err != nil {
+				return err
+			}
+			if err := session.PersistSelectedStatus(d.storage, inst, session.StatusQueued); err != nil {
+				return &Error{Code: CodeInvalid, Message: fmt.Sprintf("failed to save queued state: %v", err), Cause: err}
+			}
+			return nil
 		})
 		if err != nil {
 			var ce *Error
@@ -88,15 +104,16 @@ func (deps Deps) sessionStart(ctx context.Context, in SessionStartIn) (SessionSt
 	}
 
 	// Starting an archived session unarchives it durably first; a failed
-	// start (or spawn verification) restores the exact archive timestamp.
+	// start (or spawn verification) restores the exact archive timestamp. A
+	// partial success (the pane is live but its runtime record is not
+	// durable) is a start with a warning.
 	var spawnErr error
+	messageUndelivered := false
+	warning := ""
 	out.Unarchived, err = session.UnarchiveAround(inst, "start", d.storage.PersistArchived, func() error {
-		var startErr error
-		if in.Message != "" {
-			startErr = inst.StartWithMessage(in.Message)
-		} else {
-			startErr = inst.Start()
-		}
+		runtime, startErr := startRuntime(inst, in.Message)
+		messageUndelivered = session.InitialMessageUndelivered(startErr)
+		startErr, warning = consumeRuntime(inst, runtime, startErr)
 		if startErr != nil {
 			return startErr
 		}
@@ -104,8 +121,12 @@ func (deps Deps) sessionStart(ctx context.Context, in SessionStartIn) (SessionSt
 		spawnErr = inst.VerifySpawned(SpawnVerifyWait)
 		return spawnErr
 	})
+	if warning != "" {
+		Warn(ctx, warning)
+		Emit(ctx, Event{Kind: EventRuntimeWarning, ID: inst.ID, Title: inst.Title, Message: warning})
+	}
 	if spawnErr != nil {
-		return SessionStartOut{}, d.failSpawn("start", inst, spawnErr)
+		return SessionStartOut{}, d.failSpawn(ctx, "start", inst, spawnErr)
 	}
 	if err != nil {
 		return SessionStartOut{}, &Error{Code: CodeInvalid, Message: fmt.Sprintf("failed to start session: %v", err), Cause: err}
@@ -117,9 +138,9 @@ func (deps Deps) sessionStart(ctx context.Context, in SessionStartIn) (SessionSt
 		return SessionStartOut{}, err
 	}
 
-	out.Warning = inst.ConductorRecoveryWarning()
-	if out.Warning != "" {
-		Warn(ctx, out.Warning)
+	recoveryWarning := inst.ConductorRecoveryWarning()
+	if recoveryWarning != "" {
+		Warn(ctx, recoveryWarning)
 	}
 	out.Status = StartStatusStarted
 	if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
@@ -127,5 +148,7 @@ func (deps Deps) sessionStart(ctx context.Context, in SessionStartIn) (SessionSt
 	}
 	out.ClaudeSessionID = inst.ClaudeSessionID
 	out.Message = in.Message
+	out.MessagePending = messageUndelivered
+	out.Warning = session.MergeRestartWarnings(warning, recoveryWarning)
 	return out, nil
 }

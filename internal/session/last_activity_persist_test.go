@@ -102,9 +102,7 @@ func TestLastActivityAt_SQLiteRoundTrip(t *testing.T) {
 	inst.lastActivityAt = at
 
 	groupTree := NewGroupTreeWithGroups([]*Instance{inst}, nil)
-	if err := storage.SaveWithGroups([]*Instance{inst}, groupTree); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, groupTree)
 
 	loaded, _, err := storage.LoadWithGroups()
 	if err != nil {
@@ -121,9 +119,7 @@ func TestLastActivityAt_SQLiteRoundTrip(t *testing.T) {
 	fresh := NewInstance("never-active-roundtrip", "/tmp")
 	fresh.Tool = "shell"
 	groupTree2 := NewGroupTreeWithGroups([]*Instance{fresh}, nil)
-	if err := storage.SaveWithGroups([]*Instance{fresh}, groupTree2); err != nil {
-		t.Fatalf("SaveWithGroups (never-active): %v", err)
-	}
+	insertTestInstances(t, storage, []*Instance{fresh}, groupTree2)
 	loaded2, _, err := storage.LoadWithGroups()
 	if err != nil {
 		t.Fatalf("LoadWithGroups (never-active): %v", err)

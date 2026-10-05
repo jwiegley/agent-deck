@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -90,7 +91,10 @@ type SpawnFailure struct {
 	Record *session.SpawnFailureRecord `json:"spawn_failure,omitempty"`
 	// Verb is "start" or "restart".
 	Verb string `json:"-"`
-	// SaveErr is set when persisting the error status also failed.
+	// StatusErr is set when durably marking the failed generation errored
+	// also failed (a concurrent replacement wins that CAS).
+	StatusErr error `json:"-"`
+	// SaveErr is set when persisting the session state also failed.
 	SaveErr error `json:"-"`
 }
 
@@ -115,10 +119,20 @@ func spawnFailureMessage(verb string, err error) string {
 	return fmt.Sprintf("failed to %s session: %v", verb, err)
 }
 
-// failSpawn marks inst errored, persists it, and returns the spawn failure.
-func (d *sessionData) failSpawn(verb string, inst *session.Instance, err error) error {
-	inst.Status = session.StatusError
+// failSpawn marks the failed runtime errored through the status CAS (a
+// snapshot save drops the runtime-owned status), persists the rest of the
+// session state, and returns the spawn failure. An error verdict or session
+// state that could not be saved is also a Result warning, so envelope and
+// daemon clients learn it as the legacy CLI shape does.
+func (d *sessionData) failSpawn(ctx context.Context, verb string, inst *session.Instance, err error) error {
 	sf := newSpawnFailure(verb, inst, err)
+	sf.StatusErr = session.PersistSpawnFailureStatus(d.storage, inst)
+	if sf.StatusErr != nil {
+		Warn(ctx, fmt.Sprintf("failed to save session error status: %v", sf.StatusErr))
+	}
 	sf.SaveErr = d.save()
+	if sf.SaveErr != nil {
+		Warn(ctx, fmt.Sprintf("failed to save session state: %v", sf.SaveErr))
+	}
 	return &Error{Code: CodeSpawnFailed, Message: spawnFailureMessage(verb, err), Data: sf, Cause: err}
 }

@@ -16,8 +16,10 @@ import (
 // lists without the process the move promised. verb names op in the error of
 // a failed unarchive ("start", "restart").
 //
-// unarchived reports whether inst was archived and op succeeded. A session
-// that is not archived runs op unchanged and never calls persist.
+// unarchived reports whether inst was archived and op succeeded, or left
+// the session live with a partial success (IsRestartPartialSuccess), which
+// it returns with unarchived true. A session that is not archived runs op
+// unchanged and never calls persist.
 func UnarchiveAround(inst *Instance, verb string, persist func(*Instance) error, op func() error) (unarchived bool, err error) {
 	if !inst.IsArchived() {
 		return false, op()
@@ -31,6 +33,11 @@ func UnarchiveAround(inst *Instance, verb string, persist func(*Instance) error,
 	}
 
 	if err := op(); err != nil {
+		// A partial success left the replacement live (only its runtime
+		// record is not durable): the session stays out of the archive.
+		if IsRestartPartialSuccess(err) {
+			return true, err
+		}
 		inst.SetArchivedAtThreadSafe(archivedAt)
 		if rollbackErr := persist(inst); rollbackErr != nil {
 			return false, fmt.Errorf("%s failed: %w; restoring archive state failed: %v", verb, err, rollbackErr)

@@ -170,7 +170,9 @@ func TestQueryOpenCodeSession_SnapshotsBindingWhileHTTPIsInFlight(t *testing.T) 
 	case <-time.After(3 * time.Second):
 		t.Fatal("HTTP query did not start")
 	}
-	inst.setOpenCodeSession("ses_NEW")
+	inst.mu.Lock()
+	inst.OpenCodeSessionID = "ses_NEW"
+	inst.mu.Unlock()
 	close(releaseResponse)
 
 	if got := <-result; got != "ses_OLD" {

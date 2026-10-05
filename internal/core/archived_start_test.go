@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -28,13 +27,6 @@ func archivedStartHome(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
 	quiesceBackgroundWriters(t)
-}
-
-func requireTmux(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
 }
 
 // newArchivedShell is an archived shell session (Command "" runs the shell).

@@ -64,6 +64,9 @@ func TestStatusFileWatcher_ProcessFile(t *testing.T) {
 		hs.CodexStartedSessionID != "thread" || hs.CodexCompletedSessionID != "thread" {
 		t.Fatalf("Codex evidence not propagated: %#v", hs)
 	}
+	if want := hookStatusSourceFingerprint(data); hs.Fingerprint != want {
+		t.Errorf("Fingerprint = %x, want %x", hs.Fingerprint, want)
+	}
 }
 
 func TestStatusFileWatcher_LoadExisting(t *testing.T) {

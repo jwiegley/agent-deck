@@ -213,7 +213,7 @@ func handleSessionCommand(profile string, args []string) {
 	if run.OK && cmd.Kind == slashcmd.KindExit && !*dryRun {
 		// Claude exited; finish with the same stop path as `session stop`
 		// so agent-deck records the session as stopped. Only this instance.
-		if _, err := stopInstanceAndSave(storage, inst, instances, groups); err != nil {
+		if _, _, err := stopInstanceAndSave(storage, inst, inst.CaptureRuntimeSelection(), instances, groups); err != nil {
 			run.OK, run.Code, run.Error = false, "stop_failed", "Claude exited but agent-deck could not record the stop: "+err.Error()
 		} else {
 			run.After = "stopped"

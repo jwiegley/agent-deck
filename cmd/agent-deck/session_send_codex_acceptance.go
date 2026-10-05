@@ -118,8 +118,12 @@ func hydrateLegacyCodexIdentity(
 		return nil
 	}
 	stored := strings.TrimSpace(inst.CodexSessionID)
-	live := inst.LiveCodexUserThreadID()
-	if stored != "" && (live == "" || live == stored) {
+	// Capture the runtime before reading the pane so a replaced generation
+	// cannot acquire a binding from its predecessor's observation.
+	observation := inst.CaptureRuntimeBindingObservation("codex")
+	candidate, processOwned := legacyCodexPaneIdentityFn(inst)
+	if stored != "" && (!processOwned || candidate == stored) {
+		_ = inst.RecordRecallLink("codex")
 		return nil
 	}
 
@@ -129,19 +133,17 @@ func hydrateLegacyCodexIdentity(
 		inst.CodexDetectedAt = previousDetectedAt
 	}
 
-	candidate, processOwned := live, live != ""
-	if !processOwned {
-		// Panes from earlier builds can carry a disk-scan guess (#2394), so
-		// the pane environment only ever fills an empty identity.
-		candidate = liveCodexSessionID(inst)
-	}
 	if candidate == "" {
 		return errCodexIdentityUnavailable
 	}
-	if _, _, err := session.SetField(inst, session.FieldCodexSessionID, candidate, nil); err != nil {
-		restore()
+	// Vet the candidate on the in-memory projection only. SetField would
+	// publish the binding durably before returning, where a refusal below
+	// could not take it back; it is published once every check has passed.
+	candidate, err := session.NormalizeCodexSessionID(candidate)
+	if err != nil {
 		return fmt.Errorf("invalid live Codex session identity: %w", err)
 	}
+	inst.CodexSessionID = candidate
 
 	for _, peer := range peers {
 		if peer == nil || peer.ID == inst.ID || !session.IsCodexCompatible(peer.Tool) ||
@@ -167,8 +169,19 @@ func hydrateLegacyCodexIdentity(
 		restore()
 		return fmt.Errorf("cannot persist live Codex session identity")
 	}
-	if err := storage.GetDB().WriteCodexSessionBinding(inst.ID, inst.CodexSessionID, inst.CodexDetectedAt); err != nil {
-		restore()
+	// Clear the vetted projection first: with no codex binding at this
+	// generation the publisher compares against CodexSessionID, and an
+	// unchanged value would take its repeated-observation path, which finds
+	// no durable binding and refuses it as a binding-revision conflict
+	// instead of writing one.
+	restore()
+	if err := inst.PublishRuntimeBindingObservation(observation, candidate, time.Now()); err != nil {
+		return fmt.Errorf("persist live Codex session identity: %w", err)
+	}
+	// The binding and its tool_data projection are durable and adopted in
+	// memory now; this adds its recall link, so a failure here must not roll
+	// the adopted identity back. The next hydration retries the link.
+	if err := inst.RecordRecallLink("codex"); err != nil {
 		return fmt.Errorf("persist live Codex session identity: %w", err)
 	}
 	if processOwned {
@@ -215,6 +228,18 @@ func codexAcceptanceRefusalData(err error) map[string]interface{} {
 		"delivery":               deliveryAcceptanceRefused,
 		"acceptance_unavailable": codexIdentityProvablyUnavailable(err),
 	}
+}
+
+// Tests replace this query to move the runtime between observation and publish.
+var legacyCodexPaneIdentityFn = legacyCodexPaneIdentity
+
+func legacyCodexPaneIdentity(inst *session.Instance) (candidate string, processOwned bool) {
+	if live := inst.LiveCodexUserThreadID(); live != "" {
+		return live, true
+	}
+	// A pane environment can fill an unbound identity, but cannot rebind a
+	// previously bound session without a uniquely owned live user thread.
+	return liveCodexSessionID(inst), false
 }
 
 // liveCodexSessionID reads only the authoritative Codex identity from a live

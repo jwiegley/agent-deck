@@ -50,6 +50,11 @@ show-environment)
  *_unbound_*) exit 0 ;;
  esac
  printf 'CODEX_SESSION_ID=id-%s\n' "$3" ;;
+has-session|list-panes)
+ # With CODEX_SCAN_PANE_PID set, every session is live and its pane runs
+ # that process, so a forced process probe answers without error.
+ if [ -z "$CODEX_SCAN_PANE_PID" ]; then exit 1; fi
+ if [ "$1" = list-panes ]; then printf '%s\n' "$CODEX_SCAN_PANE_PID"; fi ;;
 *) exit 1 ;;
 esac
 `
@@ -268,12 +273,15 @@ func TestCodexExclusionAuthoritativeBindingAfterSnapshot(t *testing.T) {
 			t.Setenv("CODEX_SCAN_EMPTY", "1")
 			t.Setenv("CODEX_HOME", t.TempDir())
 			var pass StatusUpdatePass
-			a := &Instance{Tool: "codex", tmuxSession: &tmux.Session{Name: "agentdeck_scan_0"}}
+			a := &Instance{ID: "scan-authoritative", Tool: "codex", tmuxSession: &tmux.Session{Name: "agentdeck_scan_0"}}
 			b := &Instance{Tool: "codex", tmuxSession: &tmux.Session{Name: "agentdeck_scan_1"}}
 			b.codexExclusions(&pass)
 			sid := uniqueSID(t)
 			if source == "hook" {
-				a.bindCodexSessionFromHook(sid, "agent-turn-complete")
+				observation := a.CaptureRuntimeBindingObservation("codex")
+				a.mu.Lock()
+				a.bindCodexSessionFromHook(observation, sid, "hook_payload", "agent-turn-complete", HookStatusFingerprint{})
+				a.mu.Unlock()
 			} else if got := a.resolveCodexDetectionCandidate(sid, nil); got != sid {
 				t.Fatalf("probe candidate=%q", got)
 			}

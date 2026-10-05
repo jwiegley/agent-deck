@@ -46,10 +46,11 @@ func TestStorageSaveLoad(t *testing.T) {
 		NewInstance("session-2", "/tmp/project2"),
 	}
 
-	// Save
-	err := storage.Save(instances)
-	if err != nil {
-		t.Fatalf("Save failed: %v", err)
+	// Insert
+	for _, inst := range instances {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("InsertSessionAndVerify failed: %v", err)
+		}
 	}
 
 	// Verify db file exists
@@ -78,10 +79,11 @@ func TestOpenCodeFieldsSerialization(t *testing.T) {
 
 	instances := []*Instance{inst}
 
-	// Save
-	err := storage.Save(instances)
-	if err != nil {
-		t.Fatalf("Save failed: %v", err)
+	// Insert
+	for _, candidate := range instances {
+		if err := storage.InsertSessionAndVerify(candidate, nil); err != nil {
+			t.Fatalf("InsertSessionAndVerify failed: %v", err)
+		}
 	}
 
 	// Load

@@ -16,6 +16,7 @@ import (
 // first rollout turn must then produce the exact accepted-turn receipt.
 func TestCodexAcceptanceGuardAcceptsFreshComposerThread(t *testing.T) {
 	testutil.RequireTmux(t)
+	isolateCodexIdentityStore(t)
 	root := t.TempDir()
 	home := filepath.Join(root, "codex")
 	t.Setenv("CODEX_HOME", home)

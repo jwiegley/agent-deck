@@ -107,6 +107,7 @@ func TestSessionStartQueuesWhenGroupAtCap(t *testing.T) {
 	waiting.Status = session.StatusStopped
 	waiting.SetTmuxSessionForTest(nil)
 	seedStore(t, profile, []*session.GroupData{{Name: "serial", Path: "serial", MaxConcurrent: 1}}, running, waiting)
+	before := findByTitle(loadStore(t, profile), "next").RuntimeState()
 
 	out, res := Invoke[SessionStartOut](context.Background(), testRegistry(t, Deps{}), IDSessionStart, SessionStartIn{Profile: profile, Session: "next"})
 	if res.Err != nil {
@@ -115,8 +116,14 @@ func TestSessionStartQueuesWhenGroupAtCap(t *testing.T) {
 	if out.Status != StartStatusQueued || out.MaxConcurrent != 1 || out.Group != "serial" || out.Title != "next" || out.ID != waiting.ID {
 		t.Fatalf("out = %+v", out)
 	}
-	if got := findByTitle(loadStore(t, profile), "next"); got == nil || got.Status != session.StatusQueued {
+	got := findByTitle(loadStore(t, profile), "next")
+	if got == nil || got.Status != session.StatusQueued {
 		t.Fatalf("persisted status = %+v, want queued", got)
+	}
+	// Queued is runtime-owned: it lands through the status CAS on the
+	// generation the start decided on, one revision later.
+	if after := got.RuntimeState(); after.Generation != before.Generation || after.StatusRevision != before.StatusRevision+1 {
+		t.Fatalf("persisted runtime = %+v, want generation %d revision %d", after, before.Generation, before.StatusRevision+1)
 	}
 }
 
@@ -371,8 +378,8 @@ func TestDrainGroupQueueWithNothingQueued(t *testing.T) {
 	inst.Status = session.StatusStopped
 	var events []Event
 	ctx := WithObserver(context.Background(), func(ev Event) { events = append(events, ev) })
-	if got := drainGroupQueue(ctx, nil, "g", []*session.Instance{inst}, []*session.GroupData{{Name: "g", Path: "g", MaxConcurrent: 1}}); got != nil {
-		t.Fatalf("drained %v with nothing queued", got.Title)
+	if got, warning := drainGroupQueue(ctx, nil, "g", []*session.Instance{inst}, []*session.GroupData{{Name: "g", Path: "g", MaxConcurrent: 1}}); got != nil || warning != "" {
+		t.Fatalf("drained %v (%q) with nothing queued", got, warning)
 	}
 	if len(events) != 0 {
 		t.Fatalf("events = %+v", events)
@@ -385,9 +392,9 @@ func TestDrainGroupQueueRespectsCap(t *testing.T) {
 	running.Status = session.StatusRunning
 	queued := session.NewInstanceWithGroup("q", dir, "g")
 	queued.Status = session.StatusQueued
-	got := drainGroupQueue(context.Background(), nil, "g", []*session.Instance{running, queued}, []*session.GroupData{{Name: "g", Path: "g", MaxConcurrent: 1}})
-	if got != nil || queued.Status != session.StatusQueued {
-		t.Fatalf("drained at cap: %v, queued status %s", got, queued.Status)
+	got, warning := drainGroupQueue(context.Background(), nil, "g", []*session.Instance{running, queued}, []*session.GroupData{{Name: "g", Path: "g", MaxConcurrent: 1}})
+	if got != nil || warning != "" || queued.Status != session.StatusQueued {
+		t.Fatalf("drained at cap: %v (%q), queued status %s", got, warning, queued.Status)
 	}
 }
 
@@ -461,10 +468,10 @@ func TestQueuedStartKeepsMessageAndDrainDeliversOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer storage.Close()
-	if got := drainGroupQueue(context.Background(), storage, "serial", instances, groups); got != queued {
+	if got, _ := drainGroupQueue(context.Background(), storage, "serial", instances, groups); got != queued {
 		t.Fatalf("drained %v, want next", got)
 	}
-	if got := drainGroupQueue(context.Background(), storage, "serial", instances, groups); got != nil {
+	if got, _ := drainGroupQueue(context.Background(), storage, "serial", instances, groups); got != nil {
 		t.Fatalf("second drain started %v", got.Title)
 	}
 	if len(sent) != 1 || sent[0] != "" || queued.QueuedMessage != "" {

@@ -23,13 +23,13 @@ import (
 //	storage.LoadWithGroups()                     // full read of all instances + groups
 //	session.NewGroupTreeWithGroups(insts, grps)  // rebuild the tree
 //	groupTree.CreateGroup / DeleteGroup          // the mutation
-//	storage.SaveWithGroups(insts, groupTree)     // rewrite the WHOLE instances
-//	                                             // table + groups + Touch() + dedup
+//	storage.SaveWithGroups(insts, groupTree)     // update existing instances,
+//	                                             // groups + Touch() + dedup
 //
 // This is deliberately NOT Storage.SaveGroupsOnly: that is the lightweight
 // expand/collapse visual-state path (its own doc comment says so) and skips
 // both the instances round-trip and Touch(). Group create/delete goes through
-// SaveWithGroups, where the dominant cost is the instances-table read+rewrite
+// SaveWithGroups, where the dominant cost is the instances-table read+update
 // — which is why this test runs against a populated deck (perfGroupPopN
 // instances), not an empty DB.
 //
@@ -107,7 +107,7 @@ func seedDeck(t *testing.T, storage *Storage) {
 			Tool:        "claude",
 			Status:      "idle",
 			CreatedAt:   now,
-			ToolData:    json.RawMessage(`{"claude_session_id":"sess-abcdef"}`),
+			ToolData:    json.RawMessage(fmt.Sprintf(`{"claude_session_id":"sess-%04d"}`, i)),
 		}
 	}
 	if err := storage.db.SaveInstances(rows); err != nil {
@@ -124,7 +124,7 @@ func seedDeck(t *testing.T, storage *Storage) {
 // Creating then deleting the same ephemeral group is net-zero on persisted
 // state, so the deck returns to baseline each iteration and TrimmedMeanWarm (no
 // per-iter fixture rebuild) applies. The dominant measured cost is the two
-// instances-table read+rewrite passes — exactly the regression class Tier 1
+// instances-table read+update passes — exactly the regression class Tier 1
 // gates ("we added N ms of CPU work in the group save path").
 func TestPerf_Group_CreateDelete(t *testing.T) {
 	testutil.SkipIfShort(t)

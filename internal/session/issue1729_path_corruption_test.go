@@ -66,7 +66,7 @@ func TestSyncInstanceCwd_RefusesRewriteFromHookCwd(t *testing.T) {
 		Status:      StatusRunning,
 		CreatedAt:   time.Now(),
 	}
-	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -114,7 +114,7 @@ func TestSyncInstanceCwd_ForeignTmpdirCannotRewritePath(t *testing.T) {
 		Status:      StatusRunning,
 		CreatedAt:   time.Now(),
 	}
-	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -159,7 +159,7 @@ func TestSyncInstanceCwd_AllowsDeclaredMultiRepoSwap(t *testing.T) {
 		Status:          StatusRunning,
 		CreatedAt:       time.Now(),
 	}
-	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -187,6 +187,52 @@ func TestSyncInstanceCwd_AllowsDeclaredMultiRepoSwap(t *testing.T) {
 		if !swappedBack {
 			t.Fatalf("multi-repo swap lost original primary %q from additional_paths: %v", dirA, in.AdditionalPaths)
 		}
+	}
+}
+
+func TestRuntimeLifecycle_SyncInstanceCwdDoesNotResurrectConcurrentDelete(t *testing.T) {
+	const profile = "_test_issue1729_delete_race"
+	_, storage := bootstrapDaemonProfile(t, profile)
+	deleteStorage, err := NewStorageWithProfile(profile)
+	if err != nil {
+		t.Fatalf("open delete storage: %v", err)
+	}
+	t.Cleanup(func() { _ = deleteStorage.Close() })
+
+	dirA := filepath.Join(os.Getenv("HOME"), "race-repo-a")
+	dirB := filepath.Join(os.Getenv("HOME"), "race-repo-b")
+	for _, dir := range []string{dirA, dirB} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	inst := &Instance{
+		ID: "inst-1729-delete-race", Title: "delete-race", ProjectPath: dirA,
+		AdditionalPaths: []string{dirB}, GroupPath: DefaultGroupPath,
+		Tool: "claude", Status: StatusRunning, CreatedAt: time.Now(),
+	}
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	barrierCalled := false
+	storage.testAfterSyncInstanceCwdLoad = func() {
+		barrierCalled = true
+		if err := deleteStorage.DeleteInstance(inst.ID); err != nil {
+			t.Fatalf("concurrent delete: %v", err)
+		}
+	}
+	found, err := storage.SyncInstanceCwd(inst.ID, dirB)
+	storage.testAfterSyncInstanceCwdLoad = nil
+	if err != nil || !found || !barrierCalled {
+		t.Fatalf("SyncInstanceCwd found=%v barrier=%v err=%v", found, barrierCalled, err)
+	}
+	row, err := storage.GetDB().LoadInstanceByID(inst.ID)
+	if err != nil || row != nil {
+		t.Fatalf("cwd sync resurrected deleted parent: row=%#v err=%v", row, err)
+	}
+	if runtime, found, err := storage.GetDB().ReadRuntimeState(inst.ID); err != nil || found {
+		t.Fatalf("cwd sync recreated runtime=%#v found=%v err=%v", runtime, found, err)
 	}
 }
 

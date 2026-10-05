@@ -183,10 +183,16 @@ func handleSessionMove(profile string, args []string) {
 	}
 
 	restarted := false
+	persistenceWarning := ""
 	if !*noRestart && inst.Exists() {
-		if err := inst.Restart(); err != nil {
-			out.Error(fmt.Sprintf("session moved, but restart failed: %v", err), ErrCodeInvalidOperation)
+		runtime, restartErr := inst.RestartRuntime()
+		restartErr, persistenceWarning = consumeRuntimeResult(inst, runtime, restartErr)
+		if restartErr != nil {
+			out.Error(fmt.Sprintf("session moved, but restart failed: %v", restartErr), ErrCodeInvalidOperation)
 			exitCLI(1)
+		}
+		if persistenceWarning != "" && !*quiet {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
 		}
 		if session.IsClaudeCompatible(inst.Tool) && inst.ClaudeSessionID == "" {
 			inst.PostStartSync(3 * time.Second)
@@ -205,7 +211,8 @@ func handleSessionMove(profile string, args []string) {
 			message = fmt.Sprintf("%s [%s → %s]", message, srcConfigDir, dstConfigDir)
 		}
 	}
-	out.Success(message, map[string]interface{}{
+
+	result := map[string]interface{}{
 		"success":                  true,
 		"id":                       inst.ID,
 		"title":                    inst.Title,
@@ -218,7 +225,12 @@ func handleSessionMove(profile string, args []string) {
 		"history_files_moved":      historyFilesMoved,
 		"source_claude_config_dir": srcConfigDir,
 		"target_claude_config_dir": dstConfigDir,
-	})
+	}
+	if persistenceWarning != "" {
+		result["warning"] = persistenceWarning
+	}
+
+	out.Success(message, result)
 }
 
 // handleSessionMoveToProfile implements `session move <id> --to-profile <name>`

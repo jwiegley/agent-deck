@@ -199,7 +199,11 @@ func discoverTalkbackTargets(remote string) ([]remoteTalkbackTarget, error) {
 		rc = cfg.Remotes[remote]
 	}
 	var out []remoteTalkbackTarget
-	for _, profile := range profilesForTransitionDaemon() {
+	profiles, err := profilesForTransitionDaemon()
+	if err != nil {
+		return nil, err
+	}
+	for _, profile := range profiles {
 		if !talkbackProfileAllowed(rc, profile) {
 			continue
 		}
