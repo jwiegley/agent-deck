@@ -19,10 +19,27 @@ import (
 // `FAIL .../internal/session 60x.xxxs` even though nothing is broken. CI
 // never sees this because go-test.yml passes -timeout 20m; these entry points
 // must do the same.
+//
+// In this fork, `make test` and lefthook.yml's pre-push test run the suite
+// through the hermetic runner scripts/test.sh, so the runner's default
+// arguments are checked in lefthook.yml's place (see runnerDefaultArgs).
 var localWholeSuiteEntryPoints = []string{
 	"Makefile",
-	"lefthook.yml",
+	"scripts/test.sh",
 	"skills/agent-deck/scripts/contributing/self-check.sh",
+}
+
+// runnerDefaultArgs matches the `set -- ARGS` line that gives scripts/test.sh
+// the go test arguments it uses when called without any.
+var runnerDefaultArgs = regexp.MustCompile(`(?m)^\s*set -- ([^\n]*)$`)
+
+// entryPointCommands returns an entry point's text with the runner's default
+// arguments spelled as the `go test` they become.
+func entryPointCommands(name, contents string) string {
+	if name != "scripts/test.sh" {
+		return contents
+	}
+	return runnerDefaultArgs.ReplaceAllString(contents, "go test $1")
 }
 
 var (
@@ -130,11 +147,47 @@ func TestLocalWholeSuiteGoTestSetsCITimeout(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
-		if !goTestInvocation.Match(raw) {
+		contents := entryPointCommands(name, string(raw))
+		if !goTestInvocation.MatchString(contents) {
 			t.Errorf("%s no longer runs go test; drop it from localWholeSuiteEntryPoints", name)
 		}
-		for _, p := range goTestTimeoutProblems(name, string(raw), want) {
+		for _, p := range goTestTimeoutProblems(name, contents, want) {
 			t.Error(p)
+		}
+	}
+	if !runnerDefaultArgs.MatchString(mustRead(t, filepath.Join(repoRoot, "scripts/test.sh"))) {
+		t.Error("scripts/test.sh has no `set -- ARGS` default for this guard to check")
+	}
+	hook := mustRead(t, filepath.Join(repoRoot, "lefthook.yml"))
+	if !strings.Contains(hook, "bash scripts/test.sh") && !goTestInvocation.MatchString(hook) {
+		t.Error("lefthook.yml runs neither scripts/test.sh nor go test; update localWholeSuiteEntryPoints")
+	}
+	for _, p := range goTestTimeoutProblems("lefthook.yml", hook, want) {
+		t.Error(p)
+	}
+}
+
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(raw)
+}
+
+func TestEntryPointCommandsReadsRunnerDefault(t *testing.T) {
+	const want = 20 * time.Minute
+	for _, tc := range []struct {
+		in      string
+		problem bool
+	}{
+		{"if [[ $# -eq 0 ]]; then\n    set -- -race -count=1 -timeout 20m ./...\nfi\n", false},
+		{"if [[ $# -eq 0 ]]; then\n    set -- -race -count=1 ./...\nfi\n", true},
+	} {
+		got := goTestTimeoutProblems("scripts/test.sh", entryPointCommands("scripts/test.sh", tc.in), want)
+		if (len(got) > 0) != tc.problem {
+			t.Fatalf("%q: problems = %q, want problem=%v", tc.in, got, tc.problem)
 		}
 	}
 }
