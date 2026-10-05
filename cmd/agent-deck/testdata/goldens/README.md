@@ -143,3 +143,10 @@ it, and nothing else was.
    substate `unknown-exit`). `golden-sess-6` is therefore `queued` in
    `list --json`, is not counted as `error` by `status --json` or
    `group list --json`, and is not running (skipped) in `fleet status`.
+3. **Queued sessions have their own count.** Because of item 2, a queued
+   session is in none of upstream's buckets, so `status --json` and each
+   group's `status` object in `group list --json` gain an additive `queued`
+   count and their buckets again add up to `total` and `session_count`.
+   `status -v` lists a `QUEUED` section for the same reason. The human
+   `status` and `group list` summaries print only live counts (waiting,
+   running, idle) and are unchanged.

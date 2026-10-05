@@ -183,10 +183,16 @@ var equivalenceScript = [][]string{
 	{"list", "--json"}, {"group", "list", "--json"},
 	// v1.9.1 group cap: q2 queues behind q1 and stopping q1 drains it. Parity
 	// alone cannot catch a bug both paths share, so mustSucceed pins what
-	// these must say. The drain runs in a later process, so it also proves
-	// the queued status reached the store.
+	// these must say and expectStoredStep what reached the store. The list
+	// reads between queueing and draining commit what their status probes
+	// observe, and queued is operator intent that must survive them: q2 has
+	// no tmux session until the drain starts it. After the drain, q2 holds
+	// the starting status its start committed; nothing polls it until the
+	// next list.
 	{"session", "start", "q1"}, {markRunningStep, "q1"}, {"session", "start", "q2", "--json"},
-	{"session", "stop", "q1", "--json"}, {"list", "--json"}, {"session", "stop", "q2", "-q"},
+	{"list", "--json"}, {"group", "list", "--json"}, {expectStoredStep, "q2", "queued"},
+	{"session", "stop", "q1", "--json"}, {expectStoredStep, "q2", "starting"},
+	{"list", "--json"}, {"session", "stop", "q2", "-q"},
 }
 
 // markRunningStep is a script step, not a command: it records the named
@@ -195,9 +201,36 @@ var equivalenceScript = [][]string{
 // never reports running on its own.
 const markRunningStep = "#mark-running"
 
+// expectStoredStep is a script step, not a command: it asserts the named
+// session's durable runtime status in both sandboxes.
+const expectStoredStep = "#expect-stored"
+
 // markSessionRunning publishes a running observation for title through the
 // same status CAS the poller uses.
 func markSessionRunning(t *testing.T, home, title string) {
+	t.Helper()
+	withRuntimeByTitle(t, home, title, func(db *statedb.StateDB, row *statedb.InstanceRow, state statedb.RuntimeState) {
+		applied, err := db.WriteStatusIfVersion(row.ID, row.Incarnation, state.Generation, state.StatusRevision, string(session.StatusRunning))
+		if err != nil || !applied {
+			t.Fatalf("mark %s running: applied=%v err=%v", title, applied, err)
+		}
+	})
+}
+
+// expectStoredStatus asserts title's durable runtime status in home's store.
+func expectStoredStatus(t *testing.T, home, title, want string) {
+	t.Helper()
+	withRuntimeByTitle(t, home, title, func(_ *statedb.StateDB, _ *statedb.InstanceRow, state statedb.RuntimeState) {
+		if state.Status != want {
+			t.Errorf("%s: stored status of %s = %q (generation %d, revision %d), want %q",
+				home, title, state.Status, state.Generation, state.StatusRevision, want)
+		}
+	})
+}
+
+// withRuntimeByTitle calls fn with the store, row and durable runtime state
+// of the session titled title in home.
+func withRuntimeByTitle(t *testing.T, home, title string, fn func(*statedb.StateDB, *statedb.InstanceRow, statedb.RuntimeState)) {
 	t.Helper()
 	db, err := statedb.Open(stateDBPath(t, home))
 	if err != nil {
@@ -216,10 +249,7 @@ func markSessionRunning(t *testing.T, home, title string) {
 		if err != nil || !found {
 			t.Fatalf("runtime of %s: found=%v err=%v", title, found, err)
 		}
-		applied, err := db.WriteStatusIfVersion(row.ID, row.Incarnation, state.Generation, state.StatusRevision, string(session.StatusRunning))
-		if err != nil || !applied {
-			t.Fatalf("mark %s running: applied=%v err=%v", title, applied, err)
-		}
+		fn(db, row, state)
 		return
 	}
 	t.Fatalf("no session titled %s in %s", title, home)
@@ -301,17 +331,25 @@ func TestCoreRegistryMatchesLegacyHandlers(t *testing.T) {
 
 	// The first successful start and a forced restart --json must really
 	// succeed, so the comparison can't pass because both paths failed alike.
-	// The queue cases must durably queue q2 and drain it on the next stop.
+	// The queue cases must durably queue q2, list it as queued (it is the only
+	// queued session then), and drain it on the next stop.
 	mustSucceed := []equivalenceExpectation{
 		{"session start alpha", "Started session: alpha"},
 		{"session restart alpha --force --json", `"success": true`},
 		{"session start q2 --json", `"status": "queued"`},
+		{"list --json", `"status": "queued"`},
+		{"group list --json", `"queued": 1`},
 		{"session stop q1 --json", `"drained_title": "q2"`},
 	}
 	for _, args := range equivalenceScript {
-		if args[0] == markRunningStep {
+		switch args[0] {
+		case markRunningStep:
 			markSessionRunning(t, legacy.home, args[1])
 			markSessionRunning(t, registry.home, args[1])
+			continue
+		case expectStoredStep:
+			expectStoredStatus(t, legacy.home, args[1], args[2])
+			expectStoredStatus(t, registry.home, args[1], args[2])
 			continue
 		}
 		// Stored paths point into the seed dir, identical in both clones.

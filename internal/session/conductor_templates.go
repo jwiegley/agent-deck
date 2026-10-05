@@ -2,15 +2,26 @@ package session
 
 import "strings"
 
-// previousConductorInstructionsTemplate reconstructs the immediately previous
-// generated template. Installers compare its fully rendered form byte-for-byte
-// before migrating, so any user customization is preserved.
-func previousConductorInstructionsTemplate(template string) string {
-	template = preBackgroundWorkConductorInstructionsTemplate(template)
+// queuedCountStatusRow and preQueuedCountStatusRow are the shared template's
+// `status --json` row with and without the fork's additive `queued` count.
+const (
+	queuedCountStatusRow    = `| ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` | **Always triage with this compact count summary first:** ` + "`" + `{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "queued": N, "total": N}` + "`" + ` |`
+	preQueuedCountStatusRow = `| ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` | **Always triage with this compact count summary first:** ` + "`" + `{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}` + "`" + ` |`
+)
+
+// preQueuedCountConductorInstructionsTemplate removes the fork's queued count
+// from the shared status row. Per-name templates never documented counts.
+func preQueuedCountConductorInstructionsTemplate(template string) string {
+	return strings.Replace(template, queuedCountStatusRow, preQueuedCountStatusRow, 1)
+}
+
+// preCommsRedesignConductorInstructionsTemplate restores the heartbeat wording
+// shipped before the #2469 prompt-time drain and record tiers.
+func preCommsRedesignConductorInstructionsTemplate(template string) string {
 	// Issue #2469 (comms redesign): the heartbeat section gained the
 	// prompt-time drain wording and the record tiers paragraph. Revert them so
 	// a conductor written by v1.16.23 and earlier is recognised as generated.
-	template = strings.Replace(template,
+	return strings.Replace(template,
 		`Your hooks drain the same queue
 automatically when your agent supports hooks (Claude Code): at the start of every turn
 (records appear in your context under `+"`"+`[agent-deck inbox]`+"`"+`) and at each turn boundary
@@ -25,9 +36,16 @@ record you already have unless the text is clipped and you need the rest.`,
 		`Your Stop hook drains the same queue
 automatically at each turn boundary, so this heartbeat drain is the idle-conductor
 fallback — together they guarantee no completion is missed whether you are busy or idle.`, 1)
+}
+
+// previousConductorInstructionsTemplate reconstructs the v1.11.0-v1.16.10
+// generated template. Installers compare it byte-for-byte, preserving edits.
+func previousConductorInstructionsTemplate(template string) string {
+	template = preQueuedCountConductorInstructionsTemplate(template)
+	template = preBackgroundWorkConductorInstructionsTemplate(template)
+	template = preCommsRedesignConductorInstructionsTemplate(template)
 	template = preHumanTierConductorInstructionsTemplate(template)
-	template = strings.Replace(template,
-		`| `+"`"+`agent-deck -p <PROFILE> status --json`+"`"+` | **Always triage with this compact count summary first:** `+"`"+`{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}`+"`"+` |`,
+	template = strings.Replace(template, preQueuedCountStatusRow,
 		`| `+"`"+`agent-deck -p <PROFILE> status --json`+"`"+` | Get counts: `+"`"+`{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}`+"`"+` |`, 1)
 	template = strings.Replace(template,
 		`| `+"`"+`agent-deck -p <PROFILE> list --json`+"`"+` | Expensive full inventory; use only when the user explicitly needs details for every profile session, never for status triage or polling |`,
@@ -110,29 +128,36 @@ const (
 //
 // Verified against fixtures rendered from the actual shipped source
 // (testdata/conductor_templates_shipped.tsv): this reconstructs the
-// v1.16.24 generation (only the heartbeat reply format differs), the
-// v1.11.0-v1.16.10 generation and the v1.10.9-v1.10.11 generation. It does
+// v1.16.24, v1.16.11-v1.16.17, v1.11.0-v1.16.10, and v1.10.9-v1.10.11
+// generations. It does
 // NOT reconstruct v1.9.73 or v1.9.70, which shipped further template
 // changes (Codex `session approve` docs, the local-first rewrite) that are
 // not reverted here; a conductor instructions file last written by one of
 // those releases is treated as user-edited and left alone.
 func conductorInstructionsGenerations(template string) []string {
 	var gens []string
-	// Chain: current -> minus the #2473 background-work sentence (unreleased
-	// main builds) -> minus the strict urgent rule (unreleased main builds)
-	// -> exactly what v1.16.24 shipped. The intermediate "new sentence with the
-	// old reply format" was never released, so it is not a generation.
 	base := template
-	if noBG := preBackgroundWorkConductorInstructionsTemplate(template); noBG != template {
+	if noQueued := preQueuedCountConductorInstructionsTemplate(base); noQueued != base {
+		gens = append(gens, noQueued)
+		base = noQueued
+	}
+	if noBG := preBackgroundWorkConductorInstructionsTemplate(base); noBG != base {
 		gens = append(gens, noBG)
 		base = noBG
 	}
+	beforeUrgentRule := base
 	prevRule := preStrictUrgentRuleConductorInstructionsTemplate(base)
 	if prevRule != base {
 		gens = append(gens, prevRule)
+		base = prevRule
 	}
-	if v11624 := preHumanTierConductorInstructionsTemplate(prevRule); v11624 != prevRule {
+	if v11624 := preHumanTierConductorInstructionsTemplate(base); v11624 != base {
 		gens = append(gens, v11624)
+	}
+	// Releases before #2469 need the old heartbeat paragraph as well as the
+	// old reply format; apply it before the urgent-rule wording changes.
+	if preComms := preCommsRedesignConductorInstructionsTemplate(beforeUrgentRule); preComms != beforeUrgentRule {
+		gens = append(gens, preHumanTierConductorInstructionsTemplate(preComms))
 	}
 	previous := previousConductorInstructionsTemplate(template)
 	gens = append(gens, previous)
@@ -157,7 +182,7 @@ Each conductor has its own identity in its subdirectory and its own policy in PO
 ### Status & Listing
 | Command | Description |
 |---------|-------------|
-| ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` | **Always triage with this compact count summary first:** ` + "`" + `{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "total": N}` + "`" + ` |
+| ` + "`" + `agent-deck -p <PROFILE> status --json` + "`" + ` | **Always triage with this compact count summary first:** ` + "`" + `{"waiting": N, "running": N, "idle": N, "error": N, "stopped": N, "queued": N, "total": N}` + "`" + ` |
 | ` + "`" + `agent-deck -p <PROFILE> list --json` + "`" + ` | Expensive full inventory; use only when the user explicitly needs details for every profile session, never for status triage or polling |
 | ` + "`" + `agent-deck -p <PROFILE> session children --follow --until-done` + "`" + ` | Block in one shell call while children run; emits every waiting/error transition and exits when all children are terminal |
 | ` + "`" + `agent-deck -p <PROFILE> session show --json <id_or_title>` + "`" + ` | Full details for one session |

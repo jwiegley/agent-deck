@@ -46,6 +46,7 @@ type RemoteFleetCounts struct {
 	Idle           int `json:"idle"`
 	Error          int `json:"error"`
 	Stopped        int `json:"stopped"`
+	Queued         int `json:"queued"`
 }
 
 type remoteFleetRunner interface {
@@ -315,6 +316,11 @@ func countRemoteFleet(remotes []RemoteFleetRemote) RemoteFleetCounts {
 				counts.Error++
 			case "stopped":
 				counts.Stopped++
+			case "queued":
+				// A remote on this fork keeps a queued session queued rather
+				// than reporting its absent pane as error, so it needs its
+				// own bucket for the buckets to add up to Sessions.
+				counts.Queued++
 			}
 		}
 	}
