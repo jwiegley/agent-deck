@@ -1,10 +1,13 @@
 package session
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -52,6 +55,30 @@ func TestApplyTerminatedPaneStatus_StoppedGuard(t *testing.T) {
 
 	if got != StatusStopped {
 		t.Errorf("Status = %q, want %q (stopped-state guard must hold)", got, StatusStopped)
+	}
+}
+
+func TestProbeTerminatedPaneStatus_StoppedGuard(t *testing.T) {
+	i := &Instance{
+		ID:          "stopped",
+		Tool:        "claude",
+		Status:      StatusStopped,
+		tmuxSession: &tmux.Session{Name: "missing"},
+		paneDeadExitStatusForTest: func() (int, bool) {
+			return 1, true
+		},
+	}
+	observed := i.runtimeStateSnapshot()
+
+	i.mu.Lock()
+	got, err := i.probeTerminatedPaneStatus(context.Background(), observed, i.Status)
+	i.mu.Unlock()
+
+	if err != nil {
+		t.Fatalf("probeTerminatedPaneStatus: %v", err)
+	}
+	if got != StatusStopped {
+		t.Fatalf("status = %q, want %q", got, StatusStopped)
 	}
 }
 
@@ -134,10 +161,10 @@ func TestUpdateStatus_DropsLockDuringSlowPaneStatusProbe(t *testing.T) {
 	}
 
 	release()
-	if err := <-updateDone; err != nil {
-		t.Fatalf("UpdateStatus() error = %v", err)
+	if err := <-updateDone; !errors.Is(err, statedb.ErrStatusRevisionConflict) {
+		t.Fatalf("UpdateStatus() error = %v, want status revision conflict", err)
 	}
-	if got := i.GetStatusThreadSafe(); got != StatusStopped {
-		t.Fatalf("Status = %q, want %q", got, StatusStopped)
+	if got := i.GetStatusThreadSafe(); got != StatusWaiting {
+		t.Fatalf("Status = %q, want concurrent winner %q", got, StatusWaiting)
 	}
 }

@@ -14,6 +14,7 @@ import (
 // send guard must accept that thread with an empty prior generation, and the
 // first rollout turn must then produce the exact accepted-turn receipt.
 func TestCodexAcceptanceGuardAcceptsFreshComposerThread(t *testing.T) {
+	isolateCodexIdentityStore(t)
 	root := t.TempDir()
 	home := filepath.Join(root, "codex")
 	t.Setenv("CODEX_HOME", home)

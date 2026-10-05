@@ -1,6 +1,7 @@
 package tmux
 
 import (
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
@@ -52,5 +53,43 @@ func TestDiscoverAllTmuxSessions_WorkDirWithColonSurvives(t *testing.T) {
 	}
 	if found.Created.IsZero() {
 		t.Fatalf("Created = zero, want a real creation time")
+	}
+}
+
+// Every wrapper DiscoverAllTmuxSessions returns names the socket it listed.
+// It listed DefaultSocketName() but left SocketName unset, so with a
+// configured socket each wrapper addressed the native default server: an
+// imported instance stored and probed the wrong server, and a stop that found
+// nothing there recorded stopped over a live process.
+func TestDiscoverAllTmuxSessions_WrappersNameTheSocketTheyWereListedOn(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	socketName := fmt.Sprintf("adtest-discover-socket-%d", time.Now().UnixNano())
+	t.Cleanup(func() { _ = exec.Command("tmux", "-L", socketName, "kill-server").Run() })
+	oldDefault := DefaultSocketName()
+	SetDefaultSocketName(socketName)
+	t.Cleanup(func() { SetDefaultSocketName(oldDefault) })
+	const name = "discovered-on-socket"
+	if out, err := exec.Command("tmux", "-L", socketName, "new-session", "-d", "-s", name, "sleep 300").CombinedOutput(); err != nil {
+		t.Fatalf("tmux new-session: %v (%s)", err, out)
+	}
+
+	sessions, err := DiscoverAllTmuxSessions()
+	if err != nil {
+		t.Fatalf("DiscoverAllTmuxSessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].Name != name {
+		t.Fatalf("discovered %+v, want only %q", sessions, name)
+	}
+	found := sessions[0]
+	if found.SocketName != socketName {
+		t.Fatalf("discovered wrapper socket = %q, want the socket it was listed on %q", found.SocketName, socketName)
+	}
+	// The wrapper's own commands reach that server.
+	if err := found.SetEnvironment("AGENTDECK_DISCOVERY_PROBE", "reached"); err != nil {
+		t.Fatalf("set environment through the discovered wrapper: %v", err)
+	}
+	out, err := exec.Command("tmux", "-L", socketName, "show-environment", "-t", "="+name, "AGENTDECK_DISCOVERY_PROBE").Output()
+	if err != nil || string(out) != "AGENTDECK_DISCOVERY_PROBE=reached\n" {
+		t.Fatalf("environment on the listed server = %q err=%v, want the wrapper's write", out, err)
 	}
 }

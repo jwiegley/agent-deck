@@ -41,19 +41,19 @@ func TestIssue1396_FinishLastWorktreeDoesNotTripEmptySweepGuard(t *testing.T) {
 		WorktreePath:     "/tmp/issue1396-repo/.worktrees/feat1",
 		WorktreeBranch:   "feature/feat1",
 	}
-	require.NoError(t, seed.SaveWithGroups([]*Instance{only}, NewGroupTree([]*Instance{only})))
+	require.NoError(t, seed.InsertSessionAndVerify(only, NewGroupTree([]*Instance{only})))
 	require.True(t, only.IsWorktree(), "seed instance must be a worktree session")
 
 	// Sanity: the OLD persistence path cannot remove the last session. At #1396
 	// time SaveWithGroups([]) tripped the S1 empty-sweep guard
-	// (ErrRefusingEmptySweep); since #1550 SaveWithGroups is upsert-only, so an
+	// (ErrRefusingEmptySweep); now SaveWithGroups is update-only, so an
 	// empty save is a benign no-op that deletes nothing. Either way the row
 	// survives — locking in WHY removal needs the targeted path.
 	t.Run("SaveWithGroups path cannot remove the last session", func(t *testing.T) {
 		s := rmTestStorage(t, dbPath)
 		var remaining []*Instance // empty: the finished session was the only one
 		err := s.SaveWithGroups(remaining, NewGroupTreeWithGroups(remaining, nil))
-		require.NoError(t, err, "upsert-only SaveWithGroups([]) must be a benign no-op (#1550)")
+		require.NoError(t, err, "update-only SaveWithGroups([]) must be a benign no-op (#1550)")
 
 		// The row is still present — an empty save must never wipe the table.
 		exists, exErr := s.InstanceExists(only.ID)

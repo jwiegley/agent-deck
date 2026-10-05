@@ -51,7 +51,7 @@ const (
 // replaces them.
 var (
 	ownershipProber   procowner.Prober   = procowner.NewProber()
-	ownershipSignaler procowner.Signaler = procowner.OSSignaler{}
+	ownershipSignaler procowner.Signaler = pinnedOwnershipSignaler{procowner.OSSignaler{}}
 )
 
 // ownershipStores caches one Store per directory.
@@ -867,6 +867,18 @@ func (i *Instance) OwnershipStatus() OwnershipStatus { return i.ownershipStatus(
 // a result of an operator asking for it rather than as part of a teardown, and
 // it still refuses to touch anything whose identity does not match.
 func (i *Instance) ReconcileOwnership() (procowner.ReapReport, error) {
+	selection := i.CaptureRuntimeSelection()
+	release, err := acquireInstanceSpawnLock(i.ID)
+	if err != nil {
+		return procowner.ReapReport{}, err
+	}
+	defer release()
+	i.mu.RLock()
+	durable := i.owningDB != nil || selection.State.Generation != 0
+	i.mu.RUnlock()
+	if err := i.validateRuntimeSelection(i.restartPersistenceDB(), selection, durable); err != nil {
+		return procowner.ReapReport{}, err
+	}
 	store := ownershipStore()
 	receipt, err := store.Load(i.ID)
 	if err != nil {

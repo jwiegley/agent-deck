@@ -214,6 +214,41 @@ func recordFields(r *sendqueue.Record) map[string]interface{} {
 	return m
 }
 
+// spawnSendWorker starts a detached worker for the target. A second worker
+// for the same target exits at once on the target lock. sessionID comes from
+// storage or an on-disk queue record, so it is checked against the same
+// instance-id guard the hook handler uses before it reaches argv.
+func spawnSendWorker(profile, sessionID string) error {
+	if !validInstanceID.MatchString(sessionID) || strings.Contains(sessionID, "..") {
+		return fmt.Errorf("invalid session id %q", sessionID)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	// #nosec G702 -- exe is this binary (os.Executable) and every argument,
+	// including the resolved session id, is passed as argv, never to a shell.
+	cmd := exec.Command(exe, profileArgs(profile, "session", "send-worker", "--target", sessionID)...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
+}
+
+// kickPendingSendWorkers starts a worker for every target in the queue
+// directory dir (or only sessionID) that still has an unfinished queued
+// send, e.g. after a reboot killed the old workers. A live worker keeps its
+// target lock, so the extra one exits at once.
+func kickPendingSendWorkers(profile, dir, sessionID string) {
+	for _, target := range sendqueue.PendingTargets(dir) {
+		if sessionID == "" || target == sessionID {
+			_ = spawnSendWorker(profile, target)
+		}
+	}
+}
+
 // handleSessionSendStatus implements `agent-deck session send-status <send-id> --json`.
 func handleSessionSendStatus(profile string, args []string) {
 	fs := flag.NewFlagSet("session send-status", flag.ContinueOnError)

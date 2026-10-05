@@ -1,0 +1,648 @@
+package session
+
+import (
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
+)
+
+func TestRuntimeLifecycle_PublicPhysicalEntrypointsAdoptOneFakeSpawn(t *testing.T) {
+	entrypoints := []struct {
+		name string
+		call func(*Instance) (statedb.RuntimeState, error)
+	}{
+		{"Start", (*Instance).StartRuntime},
+		{"StartWithMessage", func(inst *Instance) (statedb.RuntimeState, error) {
+			return inst.StartWithMessageRuntime("hello")
+		}},
+		{"restart/fallback", (*Instance).RestartRuntime},
+		{"restart with environment", func(inst *Instance) (statedb.RuntimeState, error) {
+			return inst.RestartWithEnvRuntime(map[string]string{"MATRIX": "1"})
+		}},
+		{"fresh recovery", (*Instance).RestartFreshRuntime},
+	}
+
+	for _, entrypoint := range entrypoints {
+		t.Run(entrypoint.name, func(t *testing.T) {
+			installRuntimeLifecycleTestSeams(t)
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			db, inst := runtimeLifecycleTestDB(t, "pi", nil)
+			initial, found, err := db.ReadRuntimeState(inst.ID)
+			if err != nil || !found {
+				t.Fatalf("initial runtime: found=%v err=%v", found, err)
+			}
+
+			want := initial
+			want.Generation++
+			want.StatusRevision = 0
+			want.TmuxSession = "runtime-g1"
+			want.Status = string(StatusStarting)
+			want.LastStartedAt = time.Unix(200, 123).UTC()
+			fakeSpawns := 0
+			var fakeSpawnErr error
+			runtimeTransitionObservedFn = func() {
+				fakeSpawns++
+				fakeSpawnErr = db.CommitRuntimeTransition(initial.Generation, inst.PersistenceIncarnation(), want)
+			}
+
+			got, err := entrypoint.call(inst)
+			if fakeSpawnErr != nil {
+				t.Fatalf("fake backend spawn: %v", fakeSpawnErr)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fakeSpawns != 1 {
+				t.Fatalf("fake backend spawns = %d, want 1", fakeSpawns)
+			}
+			if got != want {
+				t.Fatalf("returned runtime = %+v, want %+v", got, want)
+			}
+			durable, found, err := db.ReadRuntimeState(inst.ID)
+			if err != nil || !found || durable != want {
+				t.Fatalf("durable runtime = %+v, found=%v err=%v; want %+v", durable, found, err, want)
+			}
+		})
+	}
+}
+
+func TestRuntimeLifecycle_StaleDestructiveAndTerminalResultsCannotTouchNextGeneration(t *testing.T) {
+	destructive := []struct {
+		name string
+		call func(*Instance, RuntimeSelection) error
+	}{
+		{"stop", (*Instance).KillCaptured},
+		{"close", (*Instance).KillAndWaitCaptured},
+		{"delete", (*Instance).DeleteCaptured},
+		{"delete and wait", (*Instance).DeleteAndWaitCaptured},
+		{"remove", (*Instance).RemoveCaptured},
+	}
+
+	for _, operation := range destructive {
+		t.Run(operation.name, func(t *testing.T) {
+			inst, db, current := newRuntimeDeleteTestInstance(t)
+			terminated := 0
+			stubRuntimeDeletionPhysicalWork(t, current, func(tmux.RuntimeGenerationCandidate, bool) error {
+				terminated++
+				return nil
+			})
+			selection := inst.CaptureRuntimeSelection()
+			next := current
+			next.Generation++
+			next.StatusRevision = 0
+			next.TmuxSession = "runtime-g2"
+			next.LastStartedAt = current.LastStartedAt.Add(time.Second)
+			if err := db.CommitRuntimeTransition(current.Generation, selection.Incarnation, next); err != nil {
+				t.Fatal(err)
+			}
+			inst.ApplyRuntimeState(next)
+
+			if err := operation.call(inst, selection); !errors.Is(err, statedb.ErrRuntimeGenerationConflict) {
+				t.Fatalf("stale %s error = %v, want generation conflict", operation.name, err)
+			}
+			if terminated != 0 {
+				t.Fatalf("stale %s terminated %d runtimes", operation.name, terminated)
+			}
+			got, found, err := db.ReadRuntimeState(inst.ID)
+			if err != nil || !found || got != next {
+				t.Fatalf("runtime after stale %s = %+v, found=%v err=%v; want %+v", operation.name, got, found, err, next)
+			}
+		})
+	}
+
+	t.Run("terminal status", func(t *testing.T) {
+		inst, db, current := newRuntimeDeleteTestInstance(t)
+		incarnation := inst.PersistenceIncarnation()
+		next := current
+		next.Generation++
+		next.StatusRevision = 0
+		next.TmuxSession = "runtime-g2"
+		if err := db.CommitRuntimeTransition(current.Generation, incarnation, next); err != nil {
+			t.Fatal(err)
+		}
+		applied, err := db.WriteStatusIfVersion(inst.ID, incarnation, current.Generation, current.StatusRevision, string(StatusStopped))
+		if err != nil || applied {
+			t.Fatalf("stale terminal status applied=%v err=%v", applied, err)
+		}
+		got, found, err := db.ReadRuntimeState(inst.ID)
+		if err != nil || !found || got != next {
+			t.Fatalf("runtime after stale terminal status = %+v, found=%v err=%v; want %+v", got, found, err, next)
+		}
+	})
+}
+
+func TestRuntimeLifecycle_PhysicalEntrypointRoutingContract(t *testing.T) {
+	contracts := []struct {
+		surface, path, function string
+		calls                   []string
+	}{
+		{"Start result", "internal/session/restart_result.go", "StartRuntime", []string{"start"}},
+		{"StartWithMessage result", "internal/session/restart_result.go", "StartWithMessageRuntime", []string{"startWithMessage"}},
+		{"restart result", "internal/session/restart_result.go", "RestartRuntime", []string{"restartRecorded"}},
+		{"restart-with-env result", "internal/session/restart_result.go", "RestartWithEnvRuntime", []string{"restartWithEnv"}},
+		{"restart-with-env adapter", "internal/session/instance.go", "restartWithEnv", []string{"restartRecorded"}},
+		{"recorded restart", "internal/session/instance.go", "restartRecorded", []string{"restart", "RecordTelemetryEnd"}},
+		{"fresh-recovery result", "internal/session/restart_result.go", "RestartFreshRuntime", []string{"restartFresh"}},
+		{"Start core", "internal/session/instance.go", "start", []string{"beginRuntimeTransition", "commitPhysicalRuntime"}},
+		{"StartWithMessage core", "internal/session/instance.go", "startWithMessage", []string{"beginRuntimeTransition", "commitPhysicalRuntime"}},
+		{"fallback authority", "internal/session/instance.go", "restart", []string{"beginRuntimeTransition", "restartWithTransition"}},
+		{"fallback core", "internal/session/instance.go", "restartWithTransition", []string{"commitPhysicalRuntime", "adoptCodexSessionForRestart"}},
+		{"restart Codex fallback", "internal/session/instance.go", "adoptCodexSessionForRestart", []string{"queryCodexSessionCandidateForPass", "recordCodexOwnership", "release"}},
+		{"CLI start", "cmd/agent-deck/session_cmd.go", "handleSessionStart", []string{"StartRuntime", "StartWithMessageRuntime", "InitialMessageUndelivered", "consumeRuntimeResult", "PersistSelectedStatus", "renderStartSuccess"}},
+		{"core CLI start", "cmd/agent-deck/core_cli_session.go", "cliSessionStart", []string{"renderStartSuccess"}},
+		{"CLI launch entry", "cmd/agent-deck/launch_cmd.go", "handleLaunch", []string{"handleLaunchCommand"}},
+		{"CLI launch", "cmd/agent-deck/launch_cmd.go", "handleLaunchCommand", []string{"StartRuntime", "StartWithMessageRuntime", "InitialMessageUndelivered", "consumeRuntimeResult", "renderStartSuccess"}},
+		{"CLI restart", "cmd/agent-deck/session_cmd.go", "handleSessionRestart", []string{"RestartWithEnvRuntime", "consumeRuntimeResult"}},
+		{"CLI spawn failure", "cmd/agent-deck/session_cmd.go", "failSpawnVerification", []string{"PersistSpawnFailureStatus"}},
+		{"spawn failure verdict", "internal/session/status_authority.go", "PersistSpawnFailureStatus", []string{"ReconcileRuntime", "PersistSelectedStatus"}},
+		{"CLI queued recovery", "cmd/agent-deck/session_cmd.go", "drainGroupQueue", []string{"StartRuntime", "consumeRuntimeResult", "PersistSelectedStatus"}},
+		{"core start seam", "internal/core/runtime_authority.go", "startRuntime", []string{"StartRuntime", "StartWithMessageRuntime"}},
+		{"core restart seam", "internal/core/runtime_authority.go", "restartRuntime", []string{"RestartWithEnvRuntime"}},
+		{"core runtime consumer", "internal/core/runtime_authority.go", "consumeRuntime", []string{"ConsumePhysicalRuntimeResult"}},
+		{"core start", "internal/core/session_start.go", "sessionStart", []string{"startRuntime", "InitialMessageUndelivered", "consumeRuntime", "PersistSelectedStatus"}},
+		{"core restart", "internal/core/session_restart.go", "sessionRestart", []string{"restartRuntime", "consumeRuntime"}},
+		{"core restart all", "internal/core/session_restart.go", "restartAll", []string{"restartRuntime", "consumeRuntime"}},
+		{"core queued recovery", "internal/core/session_stop.go", "drainGroupQueue", []string{"startRuntime", "consumeRuntime", "PersistSelectedStatus"}},
+		{"core spawn failure", "internal/core/session_common.go", "failSpawn", []string{"PersistSpawnFailureStatus"}},
+		{"CLI fork", "cmd/agent-deck/session_cmd.go", "handleSessionFork", []string{"StartRuntime", "consumeRuntimeResult"}},
+		{"CLI plugin mutation", "cmd/agent-deck/plugin_cmd.go", "pluginAttachOrDetach", []string{"RestartRuntime", "consumeRuntimeResult"}},
+		{"CLI skill mutation", "cmd/agent-deck/skill_cmd.go", "restartProjectSkillsSession", []string{"RestartRuntime", "consumeRuntimeResult"}},
+		{"CLI move", "cmd/agent-deck/session_move.go", "handleSessionMove", []string{"RestartRuntime", "consumeRuntimeResult"}},
+		{"CLI try", "cmd/agent-deck/try_cmd.go", "handleTry", []string{"StartRuntime", "consumeRuntimeResult"}},
+		{"CLI add entry", "cmd/agent-deck/main.go", "handleAdd", []string{"handleAddCommand"}},
+		{"CLI add attach", "cmd/agent-deck/main.go", "handleAddCommand", []string{"StartRuntime", "consumeRuntimeResult"}},
+		{"CLI switch account", "cmd/agent-deck/session_switch_account.go", "handleSessionSwitchAccount", []string{"SwitchAccount"}},
+		{"account switch adapter", "internal/session/account_switch.go", "SwitchAccount", []string{"ExecuteHarnessSwitch"}},
+		{"native harness switch", "internal/session/harness_switch.go", "ExecuteHarnessSwitch", []string{"beginRuntimeTransition", "executeNativeClaudeSwitch", "executeNativeCodexSwitch", "ConsumePhysicalRuntimeResult"}},
+		{"cross harness start", "internal/session/cross_harness_switch.go", "StartTarget", []string{"StartWithMessageRuntime", "ConsumePhysicalRuntimeResult"}},
+		{"MCP attach", "cmd/agent-deck/mcp_cmd.go", "handleMCPAttach", []string{"RestartRuntime", "consumeRuntimeResult"}},
+		{"MCP detach", "cmd/agent-deck/mcp_cmd.go", "handleMCPDetach", []string{"RestartRuntime", "consumeRuntimeResult"}},
+		{"web start seam", "internal/ui/web_mutator.go", "startRuntime", []string{"StartRuntime"}},
+		{"web restart seam", "internal/ui/web_mutator.go", "restartRuntime", []string{"RestartRuntime"}},
+		{"web create consumer", "internal/ui/web_mutator.go", "CreateSession", []string{"startRuntime", "consumeRuntime"}},
+		{"web start consumer", "internal/ui/web_mutator.go", "StartSession", []string{"startRuntime", "consumeRuntime"}},
+		{"web restart consumer", "internal/ui/web_mutator.go", "RestartSession", []string{"restartRuntime", "consumeRuntime"}},
+		{"web recovery consumer", "internal/ui/web_mutator.go", "UndoDelete", []string{"restartRuntime", "consumeRuntime"}},
+		{"web fork consumer", "internal/ui/web_mutator.go", "ForkSession", []string{"startRuntime", "consumeRuntime"}},
+		{"TUI start seam", "internal/ui/home.go", "startRuntime", []string{"StartRuntime"}},
+		{"TUI restart seam", "internal/ui/home.go", "restartRuntime", []string{"RestartRuntime"}},
+		{"TUI fresh seam", "internal/ui/home.go", "restartFreshRuntime", []string{"RestartFreshRuntime"}},
+		{"TUI imported-session consumer", "internal/ui/home.go", "createSessionFromGlobalSearch", []string{"startRuntime", "consumePhysicalRuntimeResult"}},
+		{"TUI create consumer", "internal/ui/home.go", "createSessionInGroupWithWorktreeAndOptions", []string{"startRuntime", "consumePhysicalRuntimeResult"}},
+		{"TUI fork consumer", "internal/ui/home.go", "completeForkRuntime", []string{"startRuntime", "consumeResult"}},
+		{"TUI restart consumer", "internal/ui/home.go", "restartSession", []string{"restartRuntime", "consumePhysicalRuntimeResult"}},
+		{"TUI fresh-recovery consumer", "internal/ui/home.go", "restartSessionFreshRuntimeWith", []string{"restartFresh", "consumePhysicalRuntimeResult"}},
+		{"fleet seam", "internal/fleet/recover.go", "NewRecoverer", []string{"RestartRuntime"}},
+		{"fleet consumer", "internal/fleet/recover.go", "Recover", []string{"restart", "consumeRestartRuntime"}},
+	}
+
+	for _, contract := range contracts {
+		t.Run(contract.surface, func(t *testing.T) {
+			calls := runtimeLifecycleFunctionCalls(t, contract.path, contract.function)
+			for _, want := range contract.calls {
+				if calls[want] == 0 {
+					t.Fatalf("%s.%s does not call %s", contract.path, contract.function, want)
+				}
+			}
+		})
+	}
+}
+
+// The core registry is the default path for session start/stop/restart and
+// is also served by `agent-deck daemon serve`. Its command bodies must reach
+// the runtime only through the seams above: an error-only lifecycle call drops
+// the exact transition tuple and turns a partial success into a retryable
+// failure, an uncaptured kill can take out a replacement adopted mid-command,
+// and a write to a runtime-owned field (Status, LastStartedAt, the generation
+// or status revision), whether assigned, set through an in-memory setter or
+// keyed in an Instance literal, is dropped by the snapshot save.
+func TestRuntimeLifecycle_CoreRegistryBypassesNoRuntimeAuthority(t *testing.T) {
+	root := runtimeLifecycleSourceRoot(t)
+	dir := filepath.Join(root, "internal", "core")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forbiddenCalls := map[string]bool{
+		"Start": true, "StartWithMessage": true, "Restart": true, "RestartWithEnv": true,
+		"Kill": true, "KillAndWait": true,
+	}
+	parsed, startStatuses := 0, 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || filepath.Ext(name) != ".go" || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed++
+		where := func(pos token.Pos) string {
+			return fmt.Sprintf("internal/core/%s:%d", name, fset.Position(pos).Line)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			if call, ok := node.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && forbiddenCalls[sel.Sel.Name] {
+					t.Errorf("%s: calls error-only lifecycle method %s", where(call.Pos()), sel.Sel.Name)
+				}
+			}
+			if field, ok := runtimeOwnedWrite(node); ok {
+				t.Errorf("%s: writes runtime-owned field %s", where(node.Pos()), field)
+			}
+			// The Status exemption for StartStatus* values is sound only
+			// while they cannot be assigned to a session.Status.
+			if spec, ok := node.(*ast.TypeSpec); ok && spec.Name.Name == "StartStatus" && spec.Assign.IsValid() {
+				t.Errorf("%s: StartStatus must be a defined type, not an alias", where(spec.Pos()))
+			}
+			if spec, ok := node.(*ast.ValueSpec); ok {
+				for _, ident := range spec.Names {
+					if !strings.HasPrefix(ident.Name, "StartStatus") {
+						continue
+					}
+					startStatuses++
+					if typ, ok := spec.Type.(*ast.Ident); !ok || typ.Name != "StartStatus" {
+						t.Errorf("%s: %s must be declared as a StartStatus", where(ident.Pos()), ident.Name)
+					}
+				}
+			}
+			for _, ident := range untypedStartStatusNames(node) {
+				t.Errorf("%s: %s must be declared as a StartStatus, not by := or as a parameter", where(ident.Pos()), ident.Name)
+			}
+			return true
+		})
+	}
+	if parsed == 0 {
+		t.Fatalf("no internal/core sources found under %s", dir)
+	}
+	if startStatuses == 0 {
+		t.Fatal("no StartStatus* declarations found in internal/core: update provablyNotSessionStatus")
+	}
+}
+
+// runtimeOwnedFields are the Instance fields only runtime authority writes; a
+// snapshot save drops an in-memory write to any of them. No internal/core type
+// declares these names, so any write to such a selector is a bypass.
+var runtimeOwnedFields = map[string]bool{"LastStartedAt": true, "RuntimeGeneration": true, "StatusRevision": true}
+
+// runtimeOwnedSetters are the Instance methods that write a runtime-owned
+// field in memory only; the snapshot save drops that write too.
+// ApplyStatusIfRuntimeVersion and AcceptStatusRevision are the in-memory
+// halves of a status CAS some other writer already committed, and
+// SeedLiveStatusPrior carries one long-lived pass's verdict to the next.
+var runtimeOwnedSetters = map[string]string{
+	"SetStatusThreadSafe":         "Status",
+	"SeedLiveStatusPrior":         "Status",
+	"ApplyStatusIfRuntimeVersion": "Status",
+	"AcceptStatusRevision":        "StatusRevision",
+}
+
+// runtimeOwnedWrite reports the runtime-owned field that node writes in
+// memory, whatever the written value. Status is also a field of core's own
+// output types, so a Status write passes only when its value provably is not
+// a session.Status: a StartStatus* constant (SessionStartOut's vocabulary,
+// declared as the StartStatus type, which the guard above keeps true) or an
+// address (GroupNode.Status is a *string; Instance.Status never is).
+func runtimeOwnedWrite(node ast.Node) (string, bool) {
+	switch n := node.(type) {
+	case *ast.CallExpr:
+		if sel, ok := n.Fun.(*ast.SelectorExpr); ok {
+			if field, ok := runtimeOwnedSetters[sel.Sel.Name]; ok {
+				return field, true
+			}
+		}
+	case *ast.CompositeLit:
+		return runtimeOwnedInstanceKey(n)
+	case *ast.IncDecStmt:
+		if sel, ok := n.X.(*ast.SelectorExpr); ok && (runtimeOwnedFields[sel.Sel.Name] || sel.Sel.Name == "Status") {
+			return sel.Sel.Name, true
+		}
+	case *ast.AssignStmt:
+		for idx, lhs := range n.Lhs {
+			sel, ok := lhs.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			if runtimeOwnedFields[sel.Sel.Name] {
+				return sel.Sel.Name, true
+			}
+			if sel.Sel.Name == "Status" && (len(n.Rhs) != len(n.Lhs) || !provablyNotSessionStatus(n.Rhs[idx])) {
+				return sel.Sel.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
+func provablyNotSessionStatus(value ast.Expr) bool {
+	switch v := value.(type) {
+	case *ast.Ident:
+		return strings.HasPrefix(v.Name, "StartStatus")
+	case *ast.UnaryExpr:
+		return v.Op == token.AND
+	}
+	return false
+}
+
+// untypedStartStatusNames reports the StartStatus* identifiers node declares
+// without a type the guard can see: by := (including a type switch's or a
+// select case's), in a range clause, or as a parameter, result or receiver.
+// provablyNotSessionStatus exempts StartStatus* by name, which holds only
+// while every such name is a var or const the ValueSpec check keeps typed
+// StartStatus; `StartStatusX := session.StatusError` or a parameter named
+// StartStatusX would otherwise make `inst.Status = StartStatusX` pass.
+func untypedStartStatusNames(node ast.Node) []*ast.Ident {
+	var names []*ast.Ident
+	add := func(exprs ...ast.Expr) {
+		for _, expr := range exprs {
+			if ident, ok := expr.(*ast.Ident); ok && strings.HasPrefix(ident.Name, "StartStatus") {
+				names = append(names, ident)
+			}
+		}
+	}
+	addFields := func(fields *ast.FieldList) {
+		if fields == nil {
+			return
+		}
+		for _, field := range fields.List {
+			for _, name := range field.Names {
+				add(name)
+			}
+		}
+	}
+	switch n := node.(type) {
+	case *ast.AssignStmt:
+		if n.Tok == token.DEFINE {
+			add(n.Lhs...)
+		}
+	case *ast.RangeStmt:
+		if n.Tok == token.DEFINE {
+			add(n.Key, n.Value)
+		}
+	case *ast.FuncType:
+		addFields(n.Params)
+		addFields(n.Results)
+	case *ast.FuncDecl:
+		addFields(n.Recv)
+	}
+	return names
+}
+
+// runtimeOwnedInstanceKey reports a runtime-owned key in a session.Instance
+// literal, or in an element literal whose Instance type a slice, array or map
+// literal elides. Any Status key counts: no StartStatus value or address is
+// assignable to an Instance's Status.
+func runtimeOwnedInstanceKey(lit *ast.CompositeLit) (string, bool) {
+	var literals []*ast.CompositeLit
+	if isSessionInstanceType(lit.Type) {
+		literals = append(literals, lit)
+	}
+	var elem ast.Expr
+	switch t := lit.Type.(type) {
+	case *ast.ArrayType:
+		elem = t.Elt
+	case *ast.MapType:
+		elem = t.Value
+	}
+	if elem != nil && isSessionInstanceType(elem) {
+		for _, e := range lit.Elts {
+			if kv, ok := e.(*ast.KeyValueExpr); ok {
+				e = kv.Value
+			}
+			if inner, ok := e.(*ast.CompositeLit); ok && inner.Type == nil {
+				literals = append(literals, inner)
+			}
+		}
+	}
+	for _, l := range literals {
+		for _, elt := range l.Elts {
+			kv, ok := elt.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			if key, ok := kv.Key.(*ast.Ident); ok && (runtimeOwnedFields[key.Name] || key.Name == "Status") {
+				return key.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
+// isSessionInstanceType reports whether expr names session.Instance or a
+// pointer to it.
+func isSessionInstanceType(expr ast.Expr) bool {
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "Instance" {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	return ok && pkg.Name == "session"
+}
+
+// The negative guard above is only as strong as runtimeOwnedWrite: pin every
+// write shape a snapshot save drops, and the core output writes it must pass.
+func TestRuntimeLifecycle_CoreRuntimeOwnedWriteClassifier(t *testing.T) {
+	cases := []struct{ stmt, want string }{
+		{"inst.Status = session.StatusError", "Status"},
+		{"inst.Status = st", "Status"},
+		{"inst.Status = session.Status(value)", "Status"},
+		{"inst.Status, ok = next()", "Status"},
+		{"inst.LastStartedAt = time.Now()", "LastStartedAt"},
+		{"inst.LastStartedAt = now", "LastStartedAt"},
+		{"inst.LastStartedAt = time.Now().UTC()", "LastStartedAt"},
+		{"inst.LastStartedAt, err = parse(raw)", "LastStartedAt"},
+		{"inst.RuntimeGeneration = 0", "RuntimeGeneration"},
+		{"inst.StatusRevision++", "StatusRevision"},
+		{"inst.SetStatusThreadSafe(session.StatusError)", "Status"},
+		{"inst.SeedLiveStatusPrior(session.StatusRunning, false)", "Status"},
+		{"inst.ApplyStatusIfRuntimeVersion(generation, revision, session.StatusError)", "Status"},
+		{"inst.AcceptStatusRevision(generation, revision)", "StatusRevision"},
+		{"inst = &session.Instance{ID: id, Status: session.StatusRunning}", "Status"},
+		{"return session.Instance{LastStartedAt: now}", "LastStartedAt"},
+		{"use(session.Instance{RuntimeGeneration: 1})", "RuntimeGeneration"},
+		{"rows := []*session.Instance{{ID: id}, {StatusRevision: 2}}", "StatusRevision"},
+		{"byID := map[string]session.Instance{id: {Status: st}}", "Status"},
+		{"out.Status = StartStatusQueued", ""},
+		{"out := SessionStartOut{ID: id, Status: StartStatusStarted}", ""},
+		{"node.Status = &status", ""},
+		{"inst.Title = title", ""},
+		{"inst := &session.Instance{ID: id, Title: title}", ""},
+		{"rows := []*session.Instance{{ID: id}}", ""},
+		{"status := inst.GetStatusThreadSafe()", ""},
+	}
+	for _, c := range cases {
+		src := "package p\nfunc f() {\n" + c.stmt + "\n}\n"
+		file, err := parser.ParseFile(token.NewFileSet(), "case.go", src, 0)
+		if err != nil {
+			t.Fatalf("%s: %v", c.stmt, err)
+		}
+		// The guard inspects every node, so a write nested in the statement
+		// (a literal or a setter call) counts as the statement's.
+		var field string
+		var ok bool
+		ast.Inspect(file.Decls[0].(*ast.FuncDecl).Body.List[0], func(node ast.Node) bool {
+			if !ok && node != nil {
+				field, ok = runtimeOwnedWrite(node)
+			}
+			return !ok
+		})
+		if ok != (c.want != "") || field != c.want {
+			t.Errorf("runtimeOwnedWrite(%s) = %q, %v; want %q", c.stmt, field, ok, c.want)
+		}
+	}
+}
+
+// The StartStatus* exemption is sound only if the guard sees every
+// declaration of such a name: pin each declaration form that carries no
+// visible StartStatus type, and the forms that must pass.
+func TestRuntimeLifecycle_CoreUntypedStartStatusNameClassifier(t *testing.T) {
+	cases := []struct {
+		decl string
+		want []string
+	}{
+		{"func f() { StartStatusX := session.StatusError; use(StartStatusX) }", []string{"StartStatusX"}},
+		{"func f() { status, StartStatusX := next(); use(status, StartStatusX) }", []string{"StartStatusX"}},
+		{"func f(values []session.Status) { for _, StartStatusX := range values { use(StartStatusX) } }", []string{"StartStatusX"}},
+		{"func f(v any) { switch StartStatusX := v.(type) { default: use(StartStatusX) } }", []string{"StartStatusX"}},
+		{"func f(ch chan session.Status) { select { case StartStatusX := <-ch: use(StartStatusX) } }", []string{"StartStatusX"}},
+		{"func f(StartStatusX session.Status) {}", []string{"StartStatusX"}},
+		{"func f() (StartStatusX session.Status) { return }", []string{"StartStatusX"}},
+		{"func f() { use(func(StartStatusX session.Status) {}) }", []string{"StartStatusX"}},
+		{"func (StartStatusX T) f() {}", []string{"StartStatusX"}},
+		{"func f() { status := StartStatusQueued; use(status) }", nil},
+		{"func f() { var StartStatusX StartStatus = StartStatusQueued; use(StartStatusX) }", nil},
+		{"func f(status session.Status) { out.Status = StartStatusStarted }", nil},
+		{"func f() { for i := range 3 { use(i) } }", nil},
+	}
+	for _, c := range cases {
+		file, err := parser.ParseFile(token.NewFileSet(), "case.go", "package p\n"+c.decl+"\n", 0)
+		if err != nil {
+			t.Fatalf("%s: %v", c.decl, err)
+		}
+		var got []string
+		ast.Inspect(file, func(node ast.Node) bool {
+			for _, ident := range untypedStartStatusNames(node) {
+				got = append(got, ident.Name)
+			}
+			return true
+		})
+		if strings.Join(got, ",") != strings.Join(c.want, ",") {
+			t.Errorf("untypedStartStatusNames(%s) = %v, want %v", c.decl, got, c.want)
+		}
+	}
+}
+
+// F6: the outcome of a start's initial message is rendered in one place,
+// renderStartSuccess. A start surface that wrote message_pending itself could
+// report a message the start left undelivered as sent.
+func TestRuntimeLifecycle_StartMessageOutcomeHasOneRenderer(t *testing.T) {
+	dir := filepath.Join(runtimeLifecycleSourceRoot(t), "cmd", "agent-deck")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || filepath.Ext(name) != ".go" || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, declaration := range file.Decls {
+			decl, ok := declaration.(*ast.FuncDecl)
+			if !ok || decl.Body == nil {
+				continue
+			}
+			ast.Inspect(decl.Body, func(node ast.Node) bool {
+				lit, ok := node.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING || lit.Value != strconv.Quote("message_pending") {
+					return true
+				}
+				if decl.Name.Name == "renderStartSuccess" {
+					rendered++
+				} else {
+					t.Errorf("cmd/agent-deck/%s:%d: %s writes message_pending outside renderStartSuccess",
+						name, fset.Position(lit.Pos()).Line, decl.Name.Name)
+				}
+				return true
+			})
+		}
+	}
+	if rendered == 0 {
+		t.Fatal("renderStartSuccess no longer renders message_pending")
+	}
+}
+
+func runtimeLifecycleFunctionCalls(t *testing.T, path, function string) map[string]int {
+	t.Helper()
+	root := runtimeLifecycleSourceRoot(t)
+	parsed, err := parser.ParseFile(token.NewFileSet(), filepath.Join(root, path), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body *ast.BlockStmt
+	for _, declaration := range parsed.Decls {
+		decl, ok := declaration.(*ast.FuncDecl)
+		if ok && decl.Name.Name == function {
+			body = decl.Body
+			break
+		}
+	}
+	if body == nil {
+		t.Fatalf("function %s not found in %s", function, path)
+	}
+	calls := make(map[string]int)
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch target := call.Fun.(type) {
+		case *ast.Ident:
+			calls[target.Name]++
+		case *ast.SelectorExpr:
+			calls[target.Sel.Name]++
+		}
+		return true
+	})
+	return calls
+}
+
+func runtimeLifecycleSourceRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		info, statErr := os.Stat(filepath.Join(dir, "go.mod"))
+		if statErr == nil && !info.IsDir() {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("cannot find go.mod above %s", dir)
+		}
+		dir = parent
+	}
+}

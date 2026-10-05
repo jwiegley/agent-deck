@@ -8,9 +8,9 @@ import (
 )
 
 // Recall phase 1: the Claude adoption arbitration is the writer of harness
-// session links. A cold-start bind writes the authoritative row via
-// WriteClaudeSessionBinding, a live hook confirming a minted id writes it via
-// confirmClaudeSessionLink; a rejected candidate that was bound earlier has
+// session links. A cold-start bind and a live hook confirming a minted id
+// both write the authoritative row via confirmHookSessionLink once the
+// binding is published; a rejected candidate that was bound earlier has
 // its row retracted, so the recall index can never bind that transcript to
 // this instance again.
 func TestUpdateHookStatus_SessionLinkWrittenOnBindRetractedOnReject(t *testing.T) {

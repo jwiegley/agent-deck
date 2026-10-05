@@ -90,7 +90,6 @@ func handleSessionSwitchAccount(profile string, args []string) {
 		exitCLI(1)
 		return // unreachable, satisfies staticcheck SA5011
 	}
-
 	result, switchErr := session.SwitchAccount(userConfig, inst, account, session.AccountSwitchOptions{
 		NoRestart:          *noRestart,
 		Storage:            storage,

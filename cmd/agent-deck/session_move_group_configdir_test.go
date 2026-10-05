@@ -85,8 +85,10 @@ func TestSessionMove_MigratesClaudeProjectDir_GroupConfigDirBoundary(t *testing.
 	}
 
 	var resp struct {
-		Success           bool `json:"success"`
-		HistoryFilesMoved int  `json:"history_files_moved"`
+		Success           bool   `json:"success"`
+		HistoryFilesMoved int    `json:"history_files_moved"`
+		SourceConfigDir   string `json:"source_claude_config_dir"`
+		TargetConfigDir   string `json:"target_claude_config_dir"`
 	}
 	if err := json.Unmarshal([]byte(stdout), &resp); err != nil {
 		t.Fatalf("parse move response: %v\nstdout: %s", err, stdout)
@@ -96,6 +98,10 @@ func TestSessionMove_MigratesClaudeProjectDir_GroupConfigDirBoundary(t *testing.
 	}
 	if resp.HistoryFilesMoved != 2 {
 		t.Errorf("expected history_files_moved=2, got %d; response: %s", resp.HistoryFilesMoved, stdout)
+	}
+	if resp.SourceConfigDir != sourceDir || resp.TargetConfigDir != targetDir {
+		t.Errorf("expected config dirs %s -> %s, got %q -> %q; response: %s",
+			sourceDir, targetDir, resp.SourceConfigDir, resp.TargetConfigDir, stdout)
 	}
 }
 

@@ -132,12 +132,19 @@ func (p *StatusUpdatePass) codexOwnership(socket string) codexOwnershipSnapshot 
 	return snapshot
 }
 
+// codexExclusions lists the Codex session IDs other tmux sessions on this
+// instance's socket own. The caller must not hold i.mu: the wrapper is read
+// under it, because a storage reload replaces the wrapper under i.mu without
+// the spawn lock Codex detection holds.
 func (i *Instance) codexExclusions(p *StatusUpdatePass) map[string]bool {
 	socket := tmux.DefaultSocketName()
 	ownName := ""
-	if i.tmuxSession != nil {
-		socket = i.tmuxSession.SocketName
-		ownName = i.tmuxSession.Name
+	i.mu.RLock()
+	tmuxSession := i.tmuxSession
+	i.mu.RUnlock()
+	if tmuxSession != nil {
+		socket = tmuxSession.SocketName
+		ownName = tmuxSession.Name
 	}
 	snapshot := p.codexOwnership(socket)
 	snapshot.claims.Lock()
@@ -156,22 +163,38 @@ func (i *Instance) codexExclusions(p *StatusUpdatePass) map[string]bool {
 	return exclude
 }
 
+// recordCodexOwnership publishes id as the claim of this instance's tmux
+// session to in-process peers. The caller must not hold i.mu; the wrapper is
+// read under it, as in codexExclusions. A caller that holds i.mu uses
+// recordCodexOwnershipLocked.
 func (i *Instance) recordCodexOwnership(id string) {
-	if i.tmuxSession == nil || id == "" {
+	i.mu.RLock()
+	tmuxSession := i.tmuxSession
+	i.mu.RUnlock()
+	recordCodexOwnershipFor(tmuxSession, id)
+}
+
+// recordCodexOwnershipLocked is recordCodexOwnership for a caller holding i.mu.
+func (i *Instance) recordCodexOwnershipLocked(id string) {
+	recordCodexOwnershipFor(i.tmuxSession, id)
+}
+
+func recordCodexOwnershipFor(tmuxSession *tmux.Session, id string) {
+	if tmuxSession == nil || id == "" {
 		return
 	}
 	codexOwnershipCache.Lock()
 	defer codexOwnershipCache.Unlock()
-	claims := codexOwnershipCache.bySocket[i.tmuxSession.SocketName].claims
+	claims := codexOwnershipCache.bySocket[tmuxSession.SocketName].claims
 	if claims == nil {
 		return // Refresh registers claims before starting any subprocess reads.
 	}
 	claims.Lock()
 	defer claims.Unlock()
 	if claims.updates != nil {
-		claims.updates[i.tmuxSession.Name] = id
+		claims.updates[tmuxSession.Name] = id
 	}
 	if claims.bySession != nil {
-		claims.bySession[i.tmuxSession.Name] = id
+		claims.bySession[tmuxSession.Name] = id
 	}
 }

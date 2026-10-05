@@ -77,3 +77,34 @@ func TestCodexHookStatusOwnership(t *testing.T) {
 		}
 	}
 }
+
+// The cached-evidence recheck must not discard the pane's own turn-end: the
+// bound thread is never foreign, even when no rollout for it is found under
+// this Codex home.
+func TestCodexHookStatusKeepsBoundThreadTurnEnd(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	inst, _ := newCodexGateInstance(t)
+	bound := uniqueSID(t)
+	inst.CodexSessionID = bound
+	inst.Status = StatusRunning
+	if err := inst.tmuxSession.Start("sleep 300"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inst.tmuxSession.Kill() })
+	inst.tmuxSession.Command = "codex"
+	if err := inst.tmuxSession.SetEnvironment("CODEX_SESSION_ID", bound); err != nil {
+		t.Fatal(err)
+	}
+	inst.hookStatus, inst.hookEvent = "waiting", "agent-turn-complete"
+	inst.hookLastUpdate, inst.hookSessionID = time.Now(), bound
+	if err := inst.UpdateStatus(); err != nil {
+		t.Fatal(err)
+	}
+	if inst.CodexSessionID != bound || inst.hookSessionID != bound {
+		t.Fatalf("bound thread's turn-end was discarded: binding=%q cached=%q, want %q",
+			inst.CodexSessionID, inst.hookSessionID, bound)
+	}
+	if got := inst.GetStatusThreadSafe(); got != StatusWaiting {
+		t.Fatalf("status = %q, want %q from the bound thread's turn-end", got, StatusWaiting)
+	}
+}

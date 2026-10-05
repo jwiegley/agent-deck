@@ -52,9 +52,7 @@ func TestCodexBootstrapWalkDoesNotHoldStatusLock(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				inst.mu.Lock()
-				defer inst.mu.Unlock()
-				inst.updateCodexSessionForPass(map[string]bool{}, false, &StatusUpdatePass{}, true)
+				inst.updateCodexSessionForPass(map[string]bool{}, false, &StatusUpdatePass{})
 			}()
 			released := false
 			t.Cleanup(func() {

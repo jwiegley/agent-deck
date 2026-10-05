@@ -68,8 +68,8 @@ func TestIssue1576_WorktreeFinishSweepsNotifierState(t *testing.T) {
 		t.Fatalf("NewStorageWithProfile: %v", err)
 	}
 	instances := []*session.Instance{inst}
-	if err := storage.SaveWithGroups(instances, session.NewGroupTreeWithGroups(instances, nil)); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, session.NewGroupTreeWithGroups(instances, nil)); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 	if err := storage.Close(); err != nil {
 		t.Fatalf("close storage: %v", err)

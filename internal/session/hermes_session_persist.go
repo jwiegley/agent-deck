@@ -71,7 +71,8 @@ func ReadHermesSessionIDFromToolData(td json.RawMessage) string {
 // so a web mutator's short-lived Storage never drops the write and an
 // unrelated profile's global database is never written.
 func (i *Instance) persistHermesSessionBinding(sessionID string) {
-	db := i.restartDB.Load()
+	// Called with i.mu held; owningDB belongs to the selected profile.
+	db := i.owningDB
 	if db == nil {
 		db = statedb.GetGlobal()
 	}
@@ -219,10 +220,7 @@ func (i *Instance) prepareHermesResume() {
 // (true) when the database cannot be read, since a wrong guess resumes
 // another entry's conversation.
 func (i *Instance) hermesWorkspaceShared(workspace string) bool {
-	db := i.restartDB.Load()
-	if db == nil {
-		db = statedb.GetGlobal()
-	}
+	db := i.restartPersistenceDB()
 	if db == nil {
 		return true
 	}

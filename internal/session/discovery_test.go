@@ -22,6 +22,35 @@ func TestDiscoverExistingTmuxSessions(t *testing.T) {
 	_ = discovered
 }
 
+// DiscoverAllTmuxSessions returns bare wrappers, so discovery configures each
+// imported one the way storage load does, before EnableMouseMode touches the
+// live session. Without that the imported instance ignored every per-session
+// setting and [tmux].options, and its wrapper lost the "recovered" group path.
+func TestDiscoverExistingTmuxSessionsConfiguresImportedWrappers(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	configureNonDefaultTmuxWrapperSettings(t)
+	name := fmt.Sprintf("%sdiscovered_%08x", tmux.SessionPrefix, time.Now().UnixNano()&0xffffffff)
+	if out, err := exec.Command("tmux", "new-session", "-d", "-s", name, "sleep 300").CombinedOutput(); err != nil {
+		t.Fatalf("start session to discover: %v: %s", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", "="+name).Run() })
+
+	discovered, err := DiscoverExistingTmuxSessions(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inst := range discovered {
+		if sess := inst.GetTmuxSession(); sess != nil && sess.Name == name {
+			if inst.GroupPath != "recovered" {
+				t.Fatalf("discovered group = %q, want recovered", inst.GroupPath)
+			}
+			assertTmuxWrapperConfigured(t, inst, sess, true)
+			return
+		}
+	}
+	t.Fatalf("%s was not discovered among %d sessions", name, len(discovered))
+}
+
 func TestDiscoverSkipsAgentDeckSessions(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not available")

@@ -349,6 +349,11 @@ func TestIssue1753_VisibleRowRefreshIsBudgeted(t *testing.T) {
 	}
 	h := newTestHomeWithItems(200, 50, nil)
 	h.instances = instances
+	for _, inst := range instances {
+		if err := h.storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("seed visible session runtime: %v", err)
+		}
+	}
 
 	req := statusUpdateRequest{viewOffset: 0, visibleHeight: fleet, flatItemIDs: ids}
 	h.processStatusUpdate(req)

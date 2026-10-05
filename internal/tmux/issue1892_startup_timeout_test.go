@@ -99,12 +99,19 @@ func TestIssue1892_RespawnCannotCrossTimeoutGenerationClaim(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Kill() })
 
-	oldPID, _ := s.getPaneProcessTree()
+	oldPID, _, err := s.paneProcessTree()
+	if err != nil {
+		t.Fatal(err)
+	}
 	s.mu.Lock() // models expireStartupHandover's claimed generation
 	done := make(chan error, 1)
 	go func() { done <- s.RespawnPane("sleep 300") }()
 	time.Sleep(150 * time.Millisecond)
-	newPID, _ := s.getPaneProcessTree()
+	newPID, _, err := s.paneProcessTree()
+	if err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
 	if newPID != oldPID {
 		s.mu.Unlock()
 		<-done

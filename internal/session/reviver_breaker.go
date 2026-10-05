@@ -37,6 +37,7 @@ type ReviveBreaker struct {
 }
 
 type breakerEntry struct {
+	generation    uint64
 	futileCount   int
 	pendingVerify bool // a revive ran last sweep; next ClassErrored ⇒ futile
 	circuitOpen   bool
@@ -90,13 +91,23 @@ func NewReviveBreaker(log *slog.Logger) *ReviveBreaker {
 //     circuit is open and still cooling down, returns false (skip); otherwise
 //     returns true (attempt, including the single probe at cooldown expiry).
 func (b *ReviveBreaker) OnClassify(id, title string, class RevivalClass) bool {
+	return b.OnClassifyVersion(id, title, 0, class)
+}
+
+// OnClassifyVersion is OnClassify scoped to one physical runtime generation.
+// A replacement runtime starts with an empty circuit even when its predecessor
+// was wedged: breaker evidence never transfers across generation ownership.
+func (b *ReviveBreaker) OnClassifyVersion(id, title string, generation uint64, class RevivalClass) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	now := b.now()
 	e := b.entries[id]
-	if e == nil {
-		e = &breakerEntry{}
+	if e != nil && e.generation > generation {
+		return false
+	}
+	if e == nil || e.generation < generation {
+		e = &breakerEntry{generation: generation}
 		b.entries[id] = e
 	}
 	e.lastSeen = now
@@ -137,12 +148,22 @@ func (b *ReviveBreaker) OnClassify(id, title string, class RevivalClass) bool {
 // immediately futile; a nil error arms pendingVerify so the next OnClassify can
 // judge whether the session actually stabilized.
 func (b *ReviveBreaker) AfterRevive(id, title string, actionErr error) {
+	b.AfterReviveVersion(id, title, 0, actionErr)
+}
+
+// AfterReviveVersion records an attempt only for the runtime that was
+// classified. If a replacement committed meanwhile, the old attempt is
+// discarded instead of arming the replacement's breaker.
+func (b *ReviveBreaker) AfterReviveVersion(id, title string, generation uint64, actionErr error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	e := b.entries[id]
-	if e == nil {
-		e = &breakerEntry{}
+	if e != nil && e.generation > generation {
+		return
+	}
+	if e == nil || e.generation < generation {
+		e = &breakerEntry{generation: generation}
 		b.entries[id] = e
 	}
 	e.lastSeen = b.now()

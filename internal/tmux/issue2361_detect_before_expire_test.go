@@ -49,6 +49,16 @@ func startPaneWithContent(t *testing.T, name, content, tool, readyMarker string)
 	}
 }
 
+// issue2361PanePID reads the pane's initial process id; a respawn replaces it.
+func issue2361PanePID(t *testing.T, s *Session) int {
+	t.Helper()
+	pid, err := s.PanePID()
+	if err != nil {
+		t.Fatalf("pane pid: %v", err)
+	}
+	return pid
+}
+
 // TestIssue2361_PromptOverdueResolvesWithoutRespawn is the "Prompt, overdue"
 // case: a pane rendering a prompt hasPromptIndicator accepts for tool
 // "claude" (realisticClaudeDoneContent, reused from status_fixes_test.go's
@@ -58,7 +68,7 @@ func startPaneWithContent(t *testing.T, name, content, tool, readyMarker string)
 func TestIssue2361_PromptOverdueResolvesWithoutRespawn(t *testing.T) {
 	s := startPaneWithContent(t, "issue2361-prompt-overdue", realisticClaudeDoneContent, "claude", "Cooked for 32s")
 
-	oldPID, _ := s.getPaneProcessTree()
+	oldPID := issue2361PanePID(t, s)
 
 	s.mu.Lock()
 	s.startupAt = time.Now().Add(-startupStateWindow - time.Second)
@@ -73,7 +83,7 @@ func TestIssue2361_PromptOverdueResolvesWithoutRespawn(t *testing.T) {
 		t.Fatal("overdue prompt pane was expired into the timeout hold")
 	}
 
-	newPID, _ := s.getPaneProcessTree()
+	newPID := issue2361PanePID(t, s)
 	if newPID != oldPID {
 		t.Fatalf("pane was respawned though its prompt should have resolved the overdue startup: pid %d -> %d", oldPID, newPID)
 	}
@@ -95,7 +105,7 @@ func TestIssue2361_BusyOverdueResolvesWithoutRespawn(t *testing.T) {
 	const busyFixture = "Working on task...\nctrl+c to interrupt\n"
 	s := startPaneWithContent(t, "issue2361-busy-overdue", busyFixture, "claude", "ctrl+c to interrupt")
 
-	oldPID, _ := s.getPaneProcessTree()
+	oldPID := issue2361PanePID(t, s)
 
 	s.mu.Lock()
 	s.startupAt = time.Now().Add(-startupStateWindow - time.Second)
@@ -110,7 +120,7 @@ func TestIssue2361_BusyOverdueResolvesWithoutRespawn(t *testing.T) {
 		t.Fatal("overdue busy pane was expired into the timeout hold")
 	}
 
-	newPID, _ := s.getPaneProcessTree()
+	newPID := issue2361PanePID(t, s)
 	if newPID != oldPID {
 		t.Fatalf("pane was respawned though its busy signal should have resolved the overdue startup: pid %d -> %d", oldPID, newPID)
 	}
@@ -137,7 +147,7 @@ func TestIssue2361_RosterUnderFooterOverdueResolvesWithoutRespawn(t *testing.T) 
 	}
 	s := startPaneWithContent(t, "issue2361-roster-overdue", string(frame), "claude", "Task 12: review slice 12")
 
-	oldPID, _ := s.getPaneProcessTree()
+	oldPID := issue2361PanePID(t, s)
 
 	s.mu.Lock()
 	s.startupAt = time.Now().Add(-startupStateWindow - time.Second)
@@ -152,7 +162,7 @@ func TestIssue2361_RosterUnderFooterOverdueResolvesWithoutRespawn(t *testing.T) 
 		t.Fatal("overdue idle pane with a roster under the footer was expired into the timeout hold")
 	}
 
-	newPID, _ := s.getPaneProcessTree()
+	newPID := issue2361PanePID(t, s)
 	if newPID != oldPID {
 		t.Fatalf("pane was respawned though its prompt should have resolved the overdue startup: pid %d -> %d", oldPID, newPID)
 	}

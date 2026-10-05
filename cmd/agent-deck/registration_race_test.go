@@ -82,8 +82,8 @@ func registerConcurrently(t *testing.T, profile string, n int, title string, loc
 				inst.ProjectPath = controllerCWD
 			}
 			instances = append(instances, inst)
-			if err := storage.SaveWithGroups(instances, session.NewGroupTreeWithGroups(instances, groups)); err != nil {
-				t.Errorf("save: %v", err)
+			if err := storage.InsertSessionAndVerify(inst, session.NewGroupTreeWithGroups(instances, groups)); err != nil {
+				t.Errorf("insert: %v", err)
 				return
 			}
 
@@ -226,8 +226,8 @@ func TestConcurrentAdd_DifferentRemoteLocationsDoNotBlockEachOther(t *testing.T)
 			inst.SSHHost = loc.Host
 			inst.SSHRemotePath = loc.Path
 			instances = append(instances, inst)
-			if err := storage.SaveWithGroups(instances, session.NewGroupTreeWithGroups(instances, groups)); err != nil {
-				t.Errorf("save: %v", err)
+			if err := storage.InsertSessionAndVerify(inst, session.NewGroupTreeWithGroups(instances, groups)); err != nil {
+				t.Errorf("insert: %v", err)
 				return
 			}
 			mu.Lock()
@@ -262,8 +262,11 @@ func TestConcurrentTitleRename_OnlyOneWins(t *testing.T) {
 		session.NewInstance("beta", dir),
 		session.NewInstance("gamma", dir),
 	}
-	if err := storage.SaveWithGroups(seed, session.NewGroupTreeWithGroups(seed, nil)); err != nil {
-		t.Fatalf("seed: %v", err)
+	seedTree := session.NewGroupTreeWithGroups(seed, nil)
+	for _, inst := range seed {
+		if err := storage.InsertSessionAndVerify(inst, seedTree); err != nil {
+			t.Fatalf("seed %s: %v", inst.ID, err)
+		}
 	}
 	renameTargets := []string{seed[1].ID, seed[2].ID}
 	_ = storage.Close()
@@ -483,9 +486,10 @@ func TestConcurrentAdd_FailedReloadNeverCreatesADuplicate(t *testing.T) {
 			if d.Duplicate != nil {
 				return
 			}
-			instances = append(instances, session.NewInstance(d.Title, loc.Path))
-			if err := storage.SaveWithGroups(instances, session.NewGroupTreeWithGroups(instances, groups)); err != nil {
-				t.Errorf("save: %v", err)
+			inst := session.NewInstance(d.Title, loc.Path)
+			instances = append(instances, inst)
+			if err := storage.InsertSessionAndVerify(inst, session.NewGroupTreeWithGroups(instances, groups)); err != nil {
+				t.Errorf("insert: %v", err)
 				return
 			}
 			mu.Lock()

@@ -185,7 +185,11 @@ func (s *remoteTalkbackScheduler) finish(name string, rc RemoteConfig, targets [
 // from it.
 func discoverTalkbackTargets(remote string) ([]remoteTalkbackTarget, error) {
 	var out []remoteTalkbackTarget
-	for _, profile := range profilesForTransitionDaemon() {
+	profiles, err := profilesForTransitionDaemon()
+	if err != nil {
+		return nil, err
+	}
+	for _, profile := range profiles {
 		storage, err := NewStorageWithProfile(profile)
 		if err != nil {
 			return nil, err

@@ -63,8 +63,8 @@ config_dir = "~/.claude-work"
 
 	originalRunning, originalStop, originalStart := nativeSwitchRunning, nativeSwitchStop, nativeSwitchStart
 	nativeSwitchRunning = func(*Instance) bool { return false }
-	nativeSwitchStop = func(*Instance) error { return nil }
-	nativeSwitchStart = func(*Instance) error { return nil }
+	nativeSwitchStop = func(*Instance, *runtimeTransitionAuthority) error { return nil }
+	nativeSwitchStart = func(*Instance, *runtimeTransitionAuthority) error { return nil }
 	f := &switchKeysFixture{cfg: cfg, home: home, typedProject: typedProject, realProject: realProject,
 		keys: claudeProjectKeyCandidates(typedProject),
 		restoreLifecycle: func() {
