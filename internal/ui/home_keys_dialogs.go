@@ -460,6 +460,25 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case ConfirmQuitWithWorktreeFinish:
+		switch msg.String() {
+		case "y", "Y":
+			h.confirmDialog.Hide()
+			return h.tryQuitWithPool()
+		case "enter":
+			// Activate focused button: 0=quit anyway, 1=cancel
+			quit := h.confirmDialog.GetFocusedButton() == 0
+			h.confirmDialog.Hide()
+			if quit {
+				return h.tryQuitWithPool()
+			}
+			return h, nil
+		case "n", "N", "esc":
+			h.confirmDialog.Hide()
+			return h, nil
+		}
+		return h, nil
+
 	case ConfirmCreateDirectory:
 		switch msg.String() {
 		case "y", "Y":
@@ -1723,6 +1742,12 @@ func (h *Home) handleWorktreeFinishDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd
 
 	switch action {
 	case "close":
+		return h, nil
+
+	case "background":
+		// The finish keeps running; worktreeFinishResultMsg reports its outcome
+		// through the status line now that the dialog is hidden.
+		h.setError(fmt.Errorf("finishing worktree '%s' in the background", h.worktreeFinishDialog.sessionTitle))
 		return h, nil
 
 	case "confirm":
