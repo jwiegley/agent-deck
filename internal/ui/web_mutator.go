@@ -110,6 +110,33 @@ func (m *WebMutator) clearDeleteTokenAndReload(id string, token uint64) {
 	m.requestReload()
 }
 
+// tombstoned reports whether a live web delete already removed inst's row and
+// only a reload has yet to evict it from h.instances (see DeleteSession).
+func (m *WebMutator) tombstoned(inst *session.Instance) bool {
+	m.h.durableDeleteMu.Lock()
+	defer m.h.durableDeleteMu.Unlock()
+	deleted, ok := m.h.durableDeleteTombstones[inst.ID]
+	return ok && deleted.matches(inst)
+}
+
+// saveStorage returns the Storage a web mutation saves the Home's instances
+// through, and a release the caller must defer. SaveWithGroups binds every
+// saved instance to its Storage's database handle, so saving the Tea-owned
+// instances through a transient Storage closed on return would leave their
+// runtime-authority writes (status CAS, captured kill/delete, binding
+// publishes) failing with "sql: database is closed" until the next reload.
+// A transient Storage is opened only for a Home that has none.
+func (m *WebMutator) saveStorage() (*session.Storage, func(), error) {
+	if m.h.storage != nil {
+		return m.h.storage, func() {}, nil
+	}
+	storage, err := session.NewStorageWithProfile(m.h.profile)
+	if err != nil {
+		return nil, nil, err
+	}
+	return storage, func() { _ = storage.Close() }, nil
+}
+
 // WithUndoWindow overrides the undo grace period (useful for tests that
 // need to force expiry without sleeping).
 func (m *WebMutator) WithUndoWindow(d time.Duration) *WebMutator {
@@ -814,31 +841,47 @@ func (m *WebMutator) MoveSessionToGroup(id, groupPath string) (string, bool, err
 	}
 	defer unlock()
 
-	m.h.instancesMu.Lock()
+	m.h.instancesMu.RLock()
 	inst := m.h.instanceByID[id]
-	if inst == nil {
-		m.h.instancesMu.Unlock()
+	m.h.instancesMu.RUnlock()
+	// The tombstone-aware save would silently skip a live-deleted instance, so
+	// a stale tab moving it must get a 404, not a group nothing stored.
+	if inst == nil || m.tombstoned(inst) {
 		return "", false, web.ErrSessionNotFound
 	}
+
+	m.h.instancesMu.Lock()
+	// Resolve the tree once: the save and any rollback must see the tree the
+	// move was applied to.
+	tree := m.h.groupTree
 	// Seed the new-group default in case the target must be auto-created.
 	if cfg, _ := session.LoadUserConfig(); cfg != nil {
-		m.h.groupTree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
+		tree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
 	}
-	target := m.h.groupTree.ResolveMoveTargetGroup(groupPath)
+	restore := tree.CaptureSessionPlacement(inst)
+	target := tree.ResolveMoveTargetGroup(groupPath)
 	restartRequired := session.IsClaudeCompatible(inst.Tool) &&
 		session.GetClaudeConfigDirForInstanceInGroup(inst, target) != session.GetClaudeConfigDirForInstance(inst)
-	m.h.groupTree.MoveSessionToGroup(inst, target)
+	tree.MoveSessionToGroup(inst, target)
 	instances := make([]*session.Instance, len(m.h.instances))
 	copy(instances, m.h.instances)
 	m.h.instancesMu.Unlock()
 
-	storage, err := session.NewStorageWithProfile(m.h.profile)
-	if err != nil {
-		return "", false, fmt.Errorf("open storage: %w", err)
+	fail := func(err error) (string, bool, error) {
+		// The handler answers 500 and the client reverts; retract the move
+		// too, or the TUI's next save would persist it.
+		m.h.instancesMu.Lock()
+		restore()
+		m.h.instancesMu.Unlock()
+		return "", false, err
 	}
-	defer storage.Close()
-	if err := storage.SaveWithGroups(instances, m.h.groupTree); err != nil {
-		return "", false, fmt.Errorf("save session: %w", err)
+	storage, release, err := m.saveStorage()
+	if err != nil {
+		return fail(fmt.Errorf("open storage: %w", err))
+	}
+	defer release()
+	if err := m.h.saveWithGroups(storage, instances, tree); err != nil {
+		return fail(fmt.Errorf("save session: %w", err))
 	}
 	return target, restartRequired, nil
 }
