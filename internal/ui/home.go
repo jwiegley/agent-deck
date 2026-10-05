@@ -9825,12 +9825,16 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case worktreeFinishResultMsg:
+		// Every result ends the finish, so a quit confirmation opened over it
+		// must stop saying it is still running.
+		h.confirmDialog.NoteWorktreeFinishEnded(msg.sessionID, msg.err)
 		if msg.err != nil {
 			// Show error in dialog (user can go back or cancel)
 			if h.worktreeFinishDialog.IsVisible() {
 				h.worktreeFinishDialog.SetError(msg.err.Error())
 			} else {
 				h.setError(msg.err)
+				h.worktreeFinishDialog.Hide() // Ends a finish dismissed into the background.
 			}
 			return h, nil
 		}
@@ -12381,6 +12385,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					h.setError(fmt.Errorf("session '%s' is not a worktree", inst.Title))
 					return h, nil
 				}
+				// The dialog owns one finish at a time: reopening it over a
+				// finish dismissed into the background would let that result
+				// land on, or hide, another finish's dialog.
+				if h.worktreeFinishDialog.IsExecuting() {
+					h.setError(fmt.Errorf("still finishing worktree '%s'", h.worktreeFinishDialog.sessionTitle))
+					return h, nil
+				}
 				// Determine default target branch
 				defaultBranch := "main"
 				if detected, err := git.GetDefaultBranch(inst.WorktreeRepoRoot); err == nil {
@@ -13472,6 +13483,25 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case ConfirmQuitWithWorktreeFinish:
+		switch msg.String() {
+		case "y", "Y":
+			h.confirmDialog.Hide()
+			return h.tryQuitWithPool()
+		case "enter":
+			// Activate focused button: 0=quit anyway, 1=cancel
+			quit := h.confirmDialog.GetFocusedButton() == 0
+			h.confirmDialog.Hide()
+			if quit {
+				return h.tryQuitWithPool()
+			}
+			return h, nil
+		case "n", "N", "esc":
+			h.confirmDialog.Hide()
+			return h, nil
+		}
+		return h, nil
+
 	case ConfirmCreateDirectory:
 		switch msg.String() {
 		case "y", "Y":
@@ -13893,12 +13923,30 @@ func (h *Home) declineInstallHermesHooks() tea.Cmd {
 	return nil
 }
 
-// tryQuit checks if MCP pool is running and shows confirmation dialog, or quits directly
+// tryQuit asks before abandoning a background worktree finish, then checks if
+// MCP pool is running and shows confirmation dialog, or quits directly
 func (h *Home) tryQuit() (tea.Model, tea.Cmd) {
+	// A worktree finish dismissed into the background (Esc) is still merging,
+	// deleting its session, or removing its worktree, and quitting would stop
+	// it partway. Ask rather than refuse: a hung finish must not make the TUI
+	// impossible to quit.
+	if h.worktreeFinishDialog.IsExecuting() {
+		h.confirmDialog.ShowQuitWithWorktreeFinish(h.worktreeFinishDialog.GetSessionID(), h.worktreeFinishDialog.sessionTitle)
+		return h, nil
+	}
+	return h.tryQuitWithPool()
+}
+
+// mcpPoolRunningCount is session.GetGlobalPoolRunningCount, a seam for tests
+// that need a running pool without starting MCP servers.
+var mcpPoolRunningCount = session.GetGlobalPoolRunningCount
+
+// tryQuitWithPool quits, first offering to keep a running MCP pool alive.
+func (h *Home) tryQuitWithPool() (tea.Model, tea.Cmd) {
 	// Check if pool is enabled and has running MCPs
 	userConfig, _ := session.LoadUserConfig()
 	if userConfig != nil && userConfig.MCPPool.Enabled {
-		runningCount := session.GetGlobalPoolRunningCount()
+		runningCount := mcpPoolRunningCount()
 		if runningCount > 0 {
 			// Show quit confirmation dialog
 			h.confirmDialog.ShowQuitWithPool(runningCount)
@@ -26249,6 +26297,12 @@ func (h *Home) handleWorktreeFinishDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd
 
 	switch action {
 	case "close":
+		return h, nil
+
+	case "background":
+		// The finish keeps running; worktreeFinishResultMsg reports its outcome
+		// through the status line now that the dialog is hidden.
+		h.setError(fmt.Errorf("finishing worktree '%s' in the background", h.worktreeFinishDialog.sessionTitle))
 		return h, nil
 
 	case "confirm":
