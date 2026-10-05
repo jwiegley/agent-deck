@@ -17,6 +17,19 @@ func TestRedactNormalizesClaudeProjectKey(t *testing.T) {
 	}
 }
 
+// Claude Code's project key replaces every character that is not a letter or
+// a digit, not only separators, so a temporary parent with a dot, an
+// underscore or a space in it (scripts/test.sh runs under
+// /tmp/agent-deck-tests.XXXXXX) must still redact to the placeholder.
+func TestRedactNormalizesClaudeProjectKeyOfAnyTemporaryParent(t *testing.T) {
+	root := "/private/tmp/agent-deck-tests.Ab_1 x/tmp/ctxfix9/rrr"
+	got := Redact("path "+root+"/project key -private-tmp-agent-deck-tests-Ab-1-x-tmp-ctxfix9-rrr-project", root)
+	want := "path <FIXTURE_ROOT>/project key <FIXTURE_ROOT_KEY>-project"
+	if got != want {
+		t.Fatalf("Redact() = %q, want %q", got, want)
+	}
+}
+
 // TestMain isolates the package from the developer's real home directory.
 //
 // Nothing here reads $HOME, but the isolation is unconditional: this repository
