@@ -1002,6 +1002,8 @@ func StatusSymbol(status session.Status) string {
 		return "✕"
 	case session.StatusStopped:
 		return "■"
+	case session.StatusQueued:
+		return "○"
 	default:
 		return "?"
 	}

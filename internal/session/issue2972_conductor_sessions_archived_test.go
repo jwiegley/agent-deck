@@ -37,25 +37,40 @@ func TestConductorSharedTemplate_SessionsSkipsArchivedRows(t *testing.T) {
 			}
 
 			// The shared file the previous release wrote is recognised as
-			// generated and migrated, not left behind as user-edited.
-			before := strings.Replace(current, row, conductorSessionsRowBefore2972, 1)
+			// generated and migrated, not left behind as user-edited. This
+			// fork lists every generation first as upstream wrote it (without
+			// the fork's queued count), newest first, then as a fork build
+			// wrote it (conductorInstructionsGenerations), so the newest is
+			// upstream's pre-#2972 file and the fork's own is listed too.
+			upstreamCurrent := renderConductorInstructionsTemplate(preQueuedCountConductorInstructionsTemplate(conductorSharedClaudeMDTemplate), "", DefaultProfile, spec)
+			upstreamBefore := strings.Replace(upstreamCurrent, row, conductorSessionsRowBefore2972, 1)
+			forkBefore := strings.Replace(current, row, conductorSessionsRowBefore2972, 1)
 			gens := renderConductorInstructionsGenerations(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
-			if len(gens) == 0 || gens[0] != before {
-				t.Fatal("the pre-#2972 shared file is not the newest reconstructed generation")
+			if len(gens) == 0 || gens[0] != upstreamBefore {
+				t.Fatal("upstream's pre-#2972 shared file is not the newest reconstructed generation")
 			}
-			path := filepath.Join(t.TempDir(), spec.InstructionsFileName)
-			if err := os.WriteFile(path, []byte(before), 0o644); err != nil {
-				t.Fatal(err)
+			forkListed := false
+			for _, gen := range gens {
+				forkListed = forkListed || gen == forkBefore
 			}
-			if err := writeGeneratedFileOrMigrate(path, gens, current, 0o644); err != nil {
-				t.Fatal(err)
+			if !forkListed {
+				t.Fatal("the fork's pre-#2972 shared file is not a reconstructed generation")
 			}
-			got, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !matchesTemplateContent(string(got), current) {
-				t.Fatal("a pre-#2972 shared file was not migrated")
+			for _, before := range []string{upstreamBefore, forkBefore} {
+				path := filepath.Join(t.TempDir(), spec.InstructionsFileName)
+				if err := os.WriteFile(path, []byte(before), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := writeGeneratedFileOrMigrate(path, gens, current, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				got, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !matchesTemplateContent(string(got), current) {
+					t.Fatal("a pre-#2972 shared file was not migrated")
+				}
 			}
 		})
 	}
