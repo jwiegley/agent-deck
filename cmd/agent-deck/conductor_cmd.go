@@ -762,6 +762,22 @@ func applyConductorRuntimeAction(target conductorRuntimeTarget, selection sessio
 	return target.KillAndWaitCaptured(selection)
 }
 
+// conductorTeardownAbort is a conductor that teardown skipped, and why. Any
+// incomplete teardown fails the command, because a zero exit tells the caller
+// every target was fully torn down.
+//
+// Separately, some skipped conductors still have the heartbeat on: a skip
+// before the runtime action is confirmed leaves it as it was, while a later
+// skip has already turned it off. Heartbeat is its state after the skip,
+// under the `conductor status` key; the human summary marks it "(heartbeat
+// still on)".
+type conductorTeardownAbort struct {
+	Name      string `json:"name"`
+	Profile   string `json:"profile"`
+	Heartbeat bool   `json:"heartbeat"`
+	Reason    string `json:"reason"`
+}
+
 // handleConductorTeardown stops conductors and optionally removes directories
 func handleConductorTeardown(_ string, args []string) {
 	fs := flag.NewFlagSet("conductor teardown", flag.ExitOnError)
@@ -857,7 +873,25 @@ func handleConductorTeardown(_ string, args []string) {
 	}
 
 	// Step 2: Stop and optionally remove each conductor
-	var removed []string
+	removed := make([]string, 0, len(targets))
+	var aborted []conductorTeardownAbort
+	abort := func(meta session.ConductorMeta, reason string) {
+		aborted = append(aborted, conductorTeardownAbort{
+			Name: meta.Name, Profile: meta.Profile, Heartbeat: meta.HeartbeatEnabled, Reason: reason,
+		})
+		if !*jsonOutput {
+			fmt.Fprintf(os.Stderr, "  Warning: %s\n", reason)
+		}
+	}
+	// disableHeartbeat also clears the loop's copy of the meta, so a later
+	// abort reports the heartbeat as off.
+	disableHeartbeat := func(conductor *session.ConductorMeta) {
+		if err := session.UninstallHeartbeatDaemon(conductor.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "Error disabling heartbeat for %s: %v\n", conductor.Name, err)
+			os.Exit(1)
+		}
+		conductor.HeartbeatEnabled = false
+	}
 conductorLoop:
 	for _, meta := range targets {
 		sessionTitle := session.ConductorSessionTitle(meta.Name)
@@ -867,19 +901,23 @@ conductorLoop:
 
 		// Resolve and mutate every matching runtime before touching its heartbeat
 		// or directory. Each action captures and revalidates its physical identity.
+		//
+		// Upstream disabled the heartbeat even when the profile could not be
+		// opened or loaded. Here the heartbeat stays on: the conductor was neither
+		// observed nor stopped and may still be running, possibly under a
+		// generation this process cannot see, and the heartbeat only nudges a
+		// session it reads as idle or waiting from that same store. The failed
+		// exit tells the caller, and a rerun once the store opens performs the
+		// whole ordered teardown.
 		storage, err := session.NewStorageWithProfile(meta.Profile)
 		if err != nil {
-			if !*jsonOutput {
-				fmt.Fprintf(os.Stderr, "  Warning: failed to open profile %s: %v\n", meta.Profile, err)
-			}
+			abort(meta, fmt.Sprintf("failed to open profile %s: %v", meta.Profile, err))
 			continue
 		}
 		instances, groups, loadErr := storage.LoadWithGroups()
 		if loadErr != nil {
 			_ = storage.Close()
-			if !*jsonOutput {
-				fmt.Fprintf(os.Stderr, "  Warning: failed to load profile %s: %v\n", meta.Profile, loadErr)
-			}
+			abort(meta, fmt.Sprintf("failed to load profile %s: %v", meta.Profile, loadErr))
 			continue
 		}
 
@@ -896,9 +934,7 @@ conductorLoop:
 		for idx, inst := range matching {
 			if actionErr := applyConductorRuntimeAction(inst, selections[idx], *removeAll); actionErr != nil {
 				_ = storage.Close()
-				if !*jsonOutput {
-					fmt.Fprintf(os.Stderr, "  Warning: runtime action aborted for %s: %v\n", sessionTitle, actionErr)
-				}
+				abort(meta, fmt.Sprintf("runtime action aborted for %s: %v", sessionTitle, actionErr))
 				continue conductorLoop
 			}
 		}
@@ -918,22 +954,28 @@ conductorLoop:
 				}
 			}
 			groupTree := session.NewGroupTreeWithGroups(filtered, groups)
-			if saveErr := storage.SaveGroupsOnly(groupTree); saveErr != nil {
-				_ = storage.Close()
-				if !*jsonOutput {
-					fmt.Fprintf(os.Stderr, "  Warning: failed to save groups in %s: %v\n", meta.Profile, saveErr)
-				}
-				continue
-			}
+			saveErr := storage.SaveGroupsOnly(groupTree)
 			for id := range removedIDs {
 				exists, existsErr := storage.InstanceExists(id)
 				if existsErr != nil || exists {
 					_ = storage.Close()
-					if !*jsonOutput {
-						fmt.Fprintf(os.Stderr, "  Warning: failed to verify conditional removal %s: exists=%v err=%v\n", id, exists, existsErr)
+					reason := fmt.Sprintf("failed to verify conditional removal %s: exists=%v err=%v", id, exists, existsErr)
+					if saveErr != nil {
+						reason += fmt.Sprintf("; group save also failed: %v", saveErr)
 					}
+					abort(meta, reason)
 					continue conductorLoop
 				}
+			}
+			if saveErr != nil {
+				_ = storage.Close()
+				// The conditional delete of every matching runtime committed and
+				// verified, so the stale-generation fence no longer applies:
+				// disable the heartbeat as a completed removal would, but keep the
+				// directory so a rerun can finish the teardown.
+				disableHeartbeat(&meta)
+				abort(meta, fmt.Sprintf("failed to save groups in %s: %v", meta.Profile, saveErr))
+				continue
 			}
 			if !*jsonOutput {
 				fmt.Printf("  [ok] Removed session '%s' from %s\n", sessionTitle, meta.Profile)
@@ -943,15 +985,10 @@ conductorLoop:
 
 		// Heartbeat and directory teardown are downstream of the conditional
 		// runtime action, so a stale generation cannot remove either one.
-		if err := session.UninstallHeartbeatDaemon(meta.Name); err != nil {
-			fmt.Fprintf(os.Stderr, "Error disabling heartbeat for %s: %v\n", meta.Name, err)
-			os.Exit(1)
-		}
+		disableHeartbeat(&meta)
 		if *removeAll {
 			if err := session.TeardownConductor(meta.Name); err != nil {
-				if !*jsonOutput {
-					fmt.Fprintf(os.Stderr, "  Warning: failed to remove dir for %s: %v\n", meta.Name, err)
-				}
+				abort(meta, fmt.Sprintf("failed to remove dir for %s: %v", meta.Name, err))
 				continue
 			}
 			if !*jsonOutput {
@@ -977,13 +1014,33 @@ conductorLoop:
 	}
 
 	if *jsonOutput {
-		output, _ := json.MarshalIndent(map[string]any{
-			"success":  true,
+		result := map[string]any{
+			"success":  len(aborted) == 0,
 			"removed":  *removeAll,
 			"teardown": removed,
-		}, "", "  ")
+		}
+		if len(aborted) > 0 {
+			result["aborted"] = aborted
+		}
+		output, _ := json.MarshalIndent(result, "", "  ")
 		fmt.Println(string(output))
+		if len(aborted) > 0 {
+			os.Exit(1)
+		}
 		return
+	}
+
+	if len(aborted) > 0 {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintf(os.Stderr, "Teardown incomplete: %d of %d conductor(s) not torn down:\n", len(aborted), len(targets))
+		for _, skipped := range aborted {
+			heartbeat := ""
+			if skipped.Heartbeat {
+				heartbeat = " (heartbeat still on)"
+			}
+			fmt.Fprintf(os.Stderr, "  %s (profile: %s): %s%s\n", skipped.Name, skipped.Profile, skipped.Reason, heartbeat)
+		}
+		os.Exit(1)
 	}
 
 	fmt.Println()
