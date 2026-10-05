@@ -66,7 +66,7 @@ func TestDrainSpawnFailureHoldsQueuedMessage(t *testing.T) {
 
 	rs := &runState{}
 	ctx := withRunState(context.Background(), rs)
-	if got := drainGroupQueue(ctx, storage, "serial", instances, groups); got != nil {
+	if got, _ := drainGroupQueue(ctx, storage, "serial", instances, groups); got != nil {
 		t.Fatalf("drained %s although its spawn failed", got.Title)
 	}
 	next := findByTitle(instances, "next")
@@ -98,7 +98,7 @@ func TestDrainUnqueueableMessageWarnsNotDelivered(t *testing.T) {
 	}))
 
 	rs := &runState{}
-	if got := drainGroupQueue(withRunState(context.Background(), rs), storage, "serial", instances, groups); got == nil {
+	if got, _ := drainGroupQueue(withRunState(context.Background(), rs), storage, "serial", instances, groups); got == nil {
 		t.Fatal("drained nothing")
 	}
 	if w := strings.Join(rs.warnings, "\n"); !strings.Contains(w, "queued -m message NOT delivered for next") || !strings.Contains(w, `"brief line one"`) {
@@ -133,10 +133,10 @@ func TestDrainClaimLoserStartsTheNextQueued(t *testing.T) {
 		return nil
 	}))
 
-	if got := drainGroupQueue(context.Background(), a, "serial", first, groups); got == nil || got.Title != "older" {
+	if got, _ := drainGroupQueue(context.Background(), a, "serial", first, groups); got == nil || got.Title != "older" {
 		t.Fatalf("first drainer started %v, want older", got)
 	}
-	if got := drainGroupQueue(context.Background(), b, "serial", second, groups); got == nil || got.Title != "newer" {
+	if got, _ := drainGroupQueue(context.Background(), b, "serial", second, groups); got == nil || got.Title != "newer" {
 		t.Fatalf("second drainer started %v, want newer", got)
 	}
 }
@@ -201,10 +201,10 @@ func TestDrainClaimLoserRespectsTheCap(t *testing.T) {
 		return nil
 	}))
 
-	if got := drainGroupQueue(context.Background(), a, "serial", first, groups); got == nil || got.Title != "older" {
+	if got, _ := drainGroupQueue(context.Background(), a, "serial", first, groups); got == nil || got.Title != "older" {
 		t.Fatalf("first drainer started %v, want older", got)
 	}
-	if got := drainGroupQueue(context.Background(), b, "serial", second, groups); got != nil {
+	if got, _ := drainGroupQueue(context.Background(), b, "serial", second, groups); got != nil {
 		t.Fatalf("second drainer started %s past the cap of 1", got.Title)
 	}
 	if n := findByTitle(loadStore(t, profile), "newer"); n == nil || n.Status != session.StatusQueued {
@@ -239,7 +239,7 @@ func TestFailedDirectStartThenDrainQueuesTheBriefOnce(t *testing.T) {
 	}))
 	storage := openStorage(t, profile)
 	defer storage.Close()
-	if got := drainGroupQueue(context.Background(), storage, "serial", loadStore(t, profile), groups); got == nil {
+	if got, _ := drainGroupQueue(context.Background(), storage, "serial", loadStore(t, profile), groups); got == nil {
 		t.Fatal("drain started nothing")
 	}
 	if recs := queuedSends(t, profile, next.ID); len(recs) != 1 || recs[0].Message != "brief" {
@@ -309,7 +309,7 @@ func TestDrainDoesNotStartARowThatLeftTheQueue(t *testing.T) {
 		i.Status = session.StatusStarting
 		return nil
 	}))
-	if got := drainGroupQueue(context.Background(), storage, "serial", stale, groups); got != nil || spawns != 0 {
+	if got, _ := drainGroupQueue(context.Background(), storage, "serial", stale, groups); got != nil || spawns != 0 {
 		t.Fatalf("drained %v (%d spawns) from a stale queued copy of a started row", got, spawns)
 	}
 }
@@ -334,7 +334,7 @@ func TestDrainDeliversTheRowsMessageNotAStaleCopy(t *testing.T) {
 		i.Status = session.StatusStarting
 		return nil
 	}))
-	if got := drainGroupQueue(context.Background(), storage, "serial", stale, groups); got == nil {
+	if got, _ := drainGroupQueue(context.Background(), storage, "serial", stale, groups); got == nil {
 		t.Fatal("drained nothing")
 	}
 	if recs := queuedSends(t, profile, n.ID); len(recs) != 1 || recs[0].Message != "new brief" {

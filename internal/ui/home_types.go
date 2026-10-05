@@ -15,9 +15,8 @@ import (
 
 // deletedSessionEntry holds a deleted session for undo restore
 type deletedSessionEntry struct {
-	instance    *session.Instance
-	deletedAt   time.Time
-	cleanupDone <-chan struct{}
+	instance  *session.Instance
+	deletedAt time.Time
 }
 
 // Messages
@@ -33,10 +32,20 @@ type loadSessionsMsg struct {
 	poolProxies       int          // Number of socket proxies started
 	poolError         error        // Pool initialization error
 	loadMtime         time.Time    // File mtime at load time (for external change detection)
+	reloadVersion     uint64       // request token; stale completions are ignored
+	deleteSeqCeiling  uint64       // newest live-delete token that existed before this DB snapshot
+	reconcileWarnings []string
 }
 
 type sessionCreatedMsg struct {
 	instance     *session.Instance
+	sessionID    string
+	token        uint64
+	runtime      statedb.RuntimeState
+	warning      string
+	seeded       bool
+	seed         statedb.InstanceSeedToken
+	rolledBack   bool
 	err          error
 	tempID       string // matches creatingSessions key for placeholder removal
 	setupWarning string // non-fatal worktree setup-script failure, shown after a successful create
@@ -44,6 +53,13 @@ type sessionCreatedMsg struct {
 
 type sessionForkedMsg struct {
 	instance     *session.Instance
+	sessionID    string
+	token        uint64
+	runtime      statedb.RuntimeState
+	warning      string
+	seeded       bool
+	seed         statedb.InstanceSeedToken
+	rolledBack   bool
 	sourceID     string // ID of the source session that was forked (for cleanup)
 	notice       string // non-fatal degradation notice shown after a successful fork
 	err          error
@@ -67,6 +83,8 @@ type storageChangedMsg struct{}
 type openCodeDetectionCompleteMsg struct {
 	instanceID string
 	sessionID  string // The detected session ID (may be empty if detection failed)
+	observed   session.RuntimeBindingObservation
+	detectedAt time.Time
 }
 
 type updateCheckMsg struct {

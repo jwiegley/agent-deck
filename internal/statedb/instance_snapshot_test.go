@@ -13,7 +13,7 @@ func TestInstanceSnapshotsPreserveEveryPersistedColumn(t *testing.T) {
 	rowType := reflect.TypeOf(InstanceRow{})
 	for field := 0; field < rowType.NumField(); field++ {
 		name := rowType.Field(field).Name
-		if name == "ID" || name == "ToolData" {
+		if name == "ID" || name == "ToolData" || runtimeOwnedInstanceField(name) {
 			continue
 		}
 		t.Run(name, func(t *testing.T) {
@@ -39,7 +39,7 @@ func TestInstanceSnapshotsPreserveEveryPersistedColumn(t *testing.T) {
 			_, err = db.MergeInstanceSnapshots([]InstanceSnapshot{{Original: base, Stored: base, Desired: other}}, nil)
 			require.NoError(t, err)
 			if name == "Title" {
-				desired.Status = "running"
+				desired.Account = "alice"
 			} else {
 				desired.Title = "alice"
 			}

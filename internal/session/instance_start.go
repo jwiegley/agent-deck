@@ -341,23 +341,25 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 // The capture-resume pattern sets CLAUDE_SESSION_ID in tmux env, so we poll for that.
 // Returns the detected session ID or empty string after timeout.
 func (i *Instance) WaitForClaudeSession(maxWait time.Duration) string {
-	if !IsClaudeCompatible(i.Tool) {
-		return ""
-	}
-
 	// Poll every 200ms for up to maxWait
 	interval := 200 * time.Millisecond
 	deadline := time.Now().Add(maxWait)
 
 	for time.Now().Before(deadline) {
 		// Check tmux environment (set by capture-resume pattern)
+		observation := i.CaptureRuntimeBindingObservation("claude")
+		i.mu.RLock()
+		isClaude := IsClaudeCompatible(i.Tool)
+		i.mu.RUnlock()
+		if !isClaude {
+			return ""
+		}
 		if sessionID := i.GetSessionIDFromTmux(); sessionID != "" {
-			i.ClaudeSessionID = sessionID
-			// #1815: own pane env is a WEAK vouch — see
-			// noteClaudeSessionIDFromOwnPane.
-			i.noteClaudeSessionIDFromOwnPane()
-			i.ClaudeDetectedAt = time.Now()
-			return sessionID
+			if err := i.PublishRuntimeBindingObservation(observation, sessionID, time.Now()); err == nil {
+				// #1815: own pane env is a weak vouch, after durable acceptance.
+				i.noteClaudeSessionIDFromOwnPane()
+				return sessionID
+			}
 		}
 		time.Sleep(interval)
 	}
@@ -390,17 +392,25 @@ func (i *Instance) PostStartSync(maxWait time.Duration) {
 	case i.Tool == "copilot":
 		// Copilot uses async detection via detectCopilotSessionAsync().
 		// If the session was not yet detected, attempt a quick sync check.
-		if i.CopilotSessionID == "" {
-			cwd := i.EffectiveWorkingDir()
+		observation := i.CaptureRuntimeBindingObservation("copilot")
+		i.mu.RLock()
+		isCopilot := i.Tool == "copilot"
+		startedAt := i.CopilotStartedAt
+		cwd := i.EffectiveWorkingDir()
+		i.mu.RUnlock()
+		if isCopilot && observation.value == "" {
 			startedAfter := time.Now().Add(-30 * time.Second)
-			if i.CopilotStartedAt > 0 {
-				startedAfter = time.UnixMilli(i.CopilotStartedAt).Add(-2 * time.Second)
+			if startedAt > 0 {
+				startedAfter = time.UnixMilli(startedAt).Add(-2 * time.Second)
 			}
 			if sid := detectCopilotSessionFromDisk(cwd, startedAfter); sid != "" {
-				i.CopilotSessionID = sid
-				i.CopilotDetectedAt = time.Now()
-				if i.tmuxSession != nil {
-					_ = i.tmuxSession.SetEnvironment("COPILOT_SESSION_ID", sid)
+				if err := i.PublishRuntimeBindingObservation(observation, sid, time.Now()); err == nil {
+					i.mu.RLock()
+					tmuxSession := i.tmuxSession
+					i.mu.RUnlock()
+					if tmuxSession != nil {
+						_ = tmuxSession.SetEnvironment("COPILOT_SESSION_ID", sid)
+					}
 				}
 			}
 		}

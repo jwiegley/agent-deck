@@ -23,6 +23,7 @@ type SessionStopOut struct {
 	Title        string `json:"title"`
 	Drained      string `json:"drained,omitempty" doc:"Id of the queued session started in the freed slot"`
 	DrainedTitle string `json:"drained_title,omitempty"`
+	Warning      string `json:"warning,omitempty" doc:"Runtime durability warning of the drained session's start"`
 }
 
 func (deps Deps) sessionStop(ctx context.Context, in SessionStopIn) (SessionStopOut, error) {
@@ -34,6 +35,10 @@ func (deps Deps) sessionStop(ctx context.Context, in SessionStopIn) (SessionStop
 	if err != nil {
 		return SessionStopOut{}, err
 	}
+	// Freeze the runtime the caller resolved before any probe: syncing ids
+	// publishes bindings and can adopt a newer durable generation, which this
+	// stop must never kill.
+	selection := inst.CaptureRuntimeSelection()
 	if !inst.Exists() {
 		return SessionStopOut{}, Errorf(CodeNotRunning, "session '%s' is not running", inst.Title)
 	}
@@ -41,21 +46,31 @@ func (deps Deps) sessionStop(ctx context.Context, in SessionStopIn) (SessionStop
 	// Capture tool conversation ids before Kill: show-environment fails on
 	// a dead tmux session.
 	inst.SyncSessionIDsFromTmux()
-	loaded := session.BeforeStopKill(d.storage, inst.ID)
-	if err := inst.Kill(); err != nil {
+	// A Codex thread the pane's process took after launch stopped waiting
+	// for it is in no pane variable, and Kill destroys the only evidence of
+	// it (#2400), so bind it from the live process as the legacy stop does.
+	if _, err := inst.BindLiveCodexThread(0); err != nil {
+		Warn(ctx, fmt.Sprintf("could not persist Codex session identity: %v", err))
+	}
+	// KillCaptured reserves the selected runtime before the kill and commits
+	// stopped through the status authority, so another process's error
+	// sample of this kill cannot win (defect 317).
+	if err := inst.KillCaptured(selection); err != nil {
 		return SessionStopOut{}, &Error{Code: CodeInvalid, Message: fmt.Sprintf("failed to stop session: %v", err), Cause: err}
 	}
-	// Defect 317: write stopped now, so another process's error sample of
-	// this kill cannot refuse the save below.
-	session.WriteStoppedAfterKill(d.storage, inst, loaded)
+	inst.RecordTelemetryEnd(telemetry.EndStop)
 	// Saved before the drain: a drained start waits for its agent to be ready.
 	if err := d.saveOr("failed to save session state"); err != nil {
 		return SessionStopOut{}, err
 	}
 
-	drained := drainGroupQueue(ctx, d.storage, inst.GroupPath, d.instances, d.groups)
+	drained, warning := drainGroupQueue(ctx, d.storage, inst.GroupPath, d.instances, d.groups)
+	if warning != "" {
+		Warn(ctx, warning)
+		Emit(ctx, Event{Kind: EventRuntimeWarning, ID: drained.ID, Title: drained.Title, Message: warning})
+	}
 
-	out := SessionStopOut{ID: inst.ID, Title: inst.Title}
+	out := SessionStopOut{ID: inst.ID, Title: inst.Title, Warning: warning}
 	if drained != nil {
 		out.Drained = drained.ID
 		out.DrainedTitle = drained.Title
@@ -73,13 +88,14 @@ func (deps Deps) sessionStop(ctx context.Context, in SessionStopIn) (SessionStop
 }
 
 // drainGroupQueue starts the oldest queued instance in groupPath when a slot
-// is free and returns it. It persists only that instance's row
-// (session.Storage.StartQueued), which also puts its queued message on the
-// send queue. Best-effort: a failed start is reported through
-// EventQueueDrainFailed and marks that instance errored. A session another
-// drainer claimed first is left to it, and the next queued one is tried
-// while the group is below its cap.
-func drainGroupQueue(ctx context.Context, storage *session.Storage, groupPath string, instances []*session.Instance, groups []*session.GroupData) *session.Instance {
+// is free and returns it with the start's runtime durability warning. It
+// persists only that instance's row (session.Storage.StartQueued), which also
+// puts its queued message on the send queue. Best-effort: a failed start is
+// reported through EventQueueDrainFailed and durably marks that instance
+// errored, so later stops do not retry it ahead of the rest of the queue. A
+// session another drainer claimed first is left to it, and the next queued
+// one is tried while the group is below its cap.
+func drainGroupQueue(ctx context.Context, storage *session.Storage, groupPath string, instances []*session.Instance, groups []*session.GroupData) (*session.Instance, string) {
 	tree := session.NewGroupTreeWithGroups(instances, groups)
 	max := session.GroupMaxConcurrent(tree, groupPath)
 	// The cap is checked on every pass, counting starting sessions too: a
@@ -88,7 +104,7 @@ func drainGroupQueue(ctx context.Context, storage *session.Storage, groupPath st
 	for !session.IsAtCap(session.CountOccupiedInGroup(instances, groupPath), max) {
 		next := session.FindNextQueued(instances, groupPath)
 		if next == nil {
-			return nil
+			return nil, ""
 		}
 		started, err := storage.StartQueued(next)
 		if started.Warning != "" {
@@ -96,15 +112,15 @@ func drainGroupQueue(ctx context.Context, storage *session.Storage, groupPath st
 		}
 		if err != nil {
 			Emit(ctx, Event{Kind: EventQueueDrainFailed, ID: next.ID, Title: next.Title, Err: err})
-			return nil
+			return nil, ""
 		}
 		if started.Started {
-			return next
+			return next, ""
 		}
 		// Claimed by another drainer: this copy is stale.
 		next.Status = session.StatusStarting
 	}
-	return nil
+	return nil, ""
 }
 
 func init() { session.SetQueuedMessageSink(EnqueueQueuedStartMessage, sendqueue.DefaultRetryBudget) }

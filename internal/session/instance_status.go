@@ -1,10 +1,12 @@
 package session
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -86,23 +88,6 @@ func (i *Instance) shellForegroundRunning() bool {
 		return false
 	}
 	return true
-}
-
-// neverStarted reports whether this session was added but never started, so an
-// absent tmux session is expected rather than a fault. Two conditions must both
-// hold (caller holds i.mu):
-//
-//  1. The instance was added in THIS process (addedThisProcess), not reloaded
-//     from storage. A reloaded session whose tmux later dies is a genuine error
-//     (instance_cli_parity_test.go TestUpdateStatus_CLIvsTUIParity_Error builds
-//     a reloaded struct literal, so addedThisProcess is false there).
-//  2. Start() was never called (lastStartTime is zero). A started-then-killed
-//     session has a non-zero lastStartTime and must surface as error
-//     (lifecycle_regression_test.go phase5).
-//  3. The status is still the pristine post-add state (idle or starting).
-func (i *Instance) neverStarted() bool {
-	return i.addedThisProcess && i.lastStartTime.IsZero() &&
-		(i.Status == StatusIdle || i.Status == StatusStarting)
 }
 
 // UpdateStatus updates the session status by checking tmux.
@@ -417,26 +402,64 @@ func classifyTerminatedPane(exitCode int, haveExitCode bool, tool string, hookSt
 	return StatusError, SubstateNone
 }
 
+// probeTerminatedPaneStatus returns a private candidate. The caller holds i.mu
+// on entry and return; a runtime replacement or cancellation while the tmux
+// query is in flight discards the result.
+func (i *Instance) probeTerminatedPaneStatus(ctx context.Context, observed statedb.RuntimeState, current Status) (Status, error) {
+	tmuxSession := i.tmuxSession
+	tool := i.Tool
+	hookStatus := i.hookStatus
+	paneDeadExitStatus := i.paneDeadExitStatusForTest
+
+	i.mu.Unlock()
+	exitCode, haveExitCode := 0, false
+	if tmuxSession != nil {
+		if paneDeadExitStatus == nil {
+			paneDeadExitStatus = tmuxSession.PaneDeadExitStatus
+		}
+		exitCode, haveExitCode = paneDeadExitStatus()
+	}
+	candidate, substate := classifyTerminatedPane(exitCode, haveExitCode, tool, hookStatus)
+	i.mu.Lock()
+	if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
+		return current, err
+	}
+	if i.Status == StatusStopped {
+		return StatusStopped, nil
+	}
+	i.terminatedPaneSubstate = substate
+	return candidate, nil
+}
+
 func (i *Instance) UpdateStatus() error {
 	return i.updateStatus(nil, true)
 }
 
 // probeTmuxExists is called with i.mu held and returns with it held. tmux can
 // wait for a busy server, so status readers must not wait behind this probe.
-// With a pass, the pass's listing of the session's socket can prove the
-// session absent without a has-session per row (listedAbsent).
+// A runtime replacement or cancellation while the query is in flight discards
+// the result, as in probeTerminatedPaneStatus.
 //
-// Start() keeps the same tmux.Session and stopRevision, so its lastStartTime
-// is part of 'current' too: a probe that answered from before Start's
-// new-session (a listing, or a has-session) must not overwrite 'starting'.
-func (i *Instance) probeTmuxExists(pass *StatusUpdatePass) (exists, listedAbsent, current bool) {
+// With a pass, the pass's listing of the session's socket can prove the
+// session absent without a has-session per row, but only for a row already
+// recorded dead (listingAloneProvesDead): a row observed in any other status
+// asks tmux itself.
+func (i *Instance) probeTmuxExists(ctx context.Context, observed statedb.RuntimeState) (bool, error) {
 	s := i.tmuxSession
-	stopRevision := i.stopRevision
-	started := i.lastStartTime
+	pass := statusProbePass(ctx)
+	useListing := pass != nil && i.listingAloneProvesDead(Status(observed.Status))
 	i.mu.Unlock()
-	exists, listedAbsent = s.ExistsListed(func() map[string]struct{} { return pass.listedSessions(s.SocketName) })
+	var exists bool
+	if useListing {
+		exists, _ = s.ExistsListed(func() map[string]struct{} { return pass.listedSessions(s.SocketName) })
+	} else {
+		exists = s.Exists()
+	}
 	i.mu.Lock()
-	return exists, listedAbsent, i.tmuxSession == s && i.stopRevision == stopRevision && i.lastStartTime.Equal(started)
+	if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // listingAloneProvesDead reports whether a pass listing's absence may stand
@@ -445,8 +468,8 @@ func (i *Instance) probeTmuxExists(pass *StatusUpdatePass) (exists, listedAbsent
 // passSessionListMaxAge old, and a row last seen in any other status (running,
 // waiting, idle, starting, queued) written error from it would page its
 // parent if another process had just (re)created the session.
-func (i *Instance) listingAloneProvesDead() bool {
-	return i.Status == StatusError || i.Status == StatusStopped || i.neverStarted()
+func (i *Instance) listingAloneProvesDead(status Status) bool {
+	return status == StatusError || status == StatusStopped || i.neverStarted()
 }
 
 // passSessionListMaxAge bounds how long a pass trusts one listing of a socket.
@@ -456,9 +479,9 @@ func (i *Instance) listingAloneProvesDead() bool {
 // created after it reads as absent until the listing ages out, where a
 // per-row has-session would have seen it. So only a row already recorded dead
 // takes the listing's word (listingAloneProvesDead); a row last seen live
-// confirms with its own has-session, and a Start() during the probe makes it
-// stale (probeTmuxExists). For a dead row the window is this age, under the
-// 1.5 s start grace.
+// confirms with its own has-session, and a runtime replacement during the
+// probe makes it stale (probeTmuxExists). For a dead row the window is this
+// age, under the 1.5 s start grace.
 // A long pass pays one more list-sessions per socket per age, not per row.
 const passSessionListMaxAge = 250 * time.Millisecond
 

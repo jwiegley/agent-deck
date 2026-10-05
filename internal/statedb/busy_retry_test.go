@@ -77,6 +77,39 @@ func TestWithBusyRetry_ExhaustsRetries(t *testing.T) {
 	}
 }
 
+func TestMigrate_ConcurrentCallersRetryWholeTransaction(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	const callers = 8
+	dbs := make([]*StateDB, callers)
+	for i := range dbs {
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("Open caller %d: %v", i, err)
+		}
+		db.db.SetMaxOpenConns(1)
+		if _, err := db.db.Exec("PRAGMA busy_timeout=0"); err != nil {
+			t.Fatalf("set busy_timeout caller %d: %v", i, err)
+		}
+		dbs[i] = db
+		t.Cleanup(func() { _ = db.Close() })
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	for _, db := range dbs {
+		go func() {
+			<-start
+			errs <- db.Migrate()
+		}()
+	}
+	close(start)
+	for range callers {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent Migrate: %v", err)
+		}
+	}
+}
+
 // openSingleConnDB opens a StateDB configured with a single connection and
 // busy_timeout=0 so SQLITE_BUSY surfaces immediately when another connection
 // holds a write lock. This makes app-level retry behavior deterministic.

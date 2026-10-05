@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"al.essio.dev/pkg/shellescape"
@@ -105,8 +104,16 @@ func handleSessionStart(profile string, args []string) {
 	tree := session.NewGroupTreeWithGroups(instances, groups)
 	max := session.GroupMaxConcurrent(tree, inst.GroupPath)
 	if session.ShouldQueue(instances, inst.GroupPath, max) {
-		inst.MarkQueued(initialMessage)
+		// The save persists the yolo override and the -m message the queued
+		// start delivers (MarkQueued's QueuedMessage); the runtime-owned
+		// queued status goes through the status CAS, which a snapshot save
+		// cannot.
+		inst.QueuedMessage = initialMessage
 		if err := saveSessionData(storage, instances, groups); err != nil {
+			out.Error(fmt.Sprintf("failed to save queued state: %v", err), ErrCodeInvalidOperation)
+			exitCLI(1)
+		}
+		if err := session.PersistSelectedStatus(storage, inst, session.StatusQueued); err != nil {
 			out.Error(fmt.Sprintf("failed to save queued state: %v", err), ErrCodeInvalidOperation)
 			exitCLI(1)
 		}
@@ -125,16 +132,26 @@ func handleSessionStart(profile string, args []string) {
 	}
 
 	// Start the session (with or without initial message).
+	persistenceWarning := ""
+	messageUndelivered := false
 	if initialMessage != "" {
-		if err := inst.StartWithMessage(initialMessage); err != nil {
-			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
+		runtime, startErr := inst.StartWithMessageRuntime(initialMessage)
+		messageUndelivered = session.InitialMessageUndelivered(startErr)
+		startErr, persistenceWarning = consumeRuntimeResult(inst, runtime, startErr)
+		if startErr != nil {
+			out.Error(fmt.Sprintf("failed to start session: %v", startErr), ErrCodeInvalidOperation)
 			exitCLI(1)
 		}
 	} else {
-		if err := inst.Start(); err != nil {
-			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
+		runtime, startErr := inst.StartRuntime()
+		startErr, persistenceWarning = consumeRuntimeResult(inst, runtime, startErr)
+		if startErr != nil {
+			out.Error(fmt.Sprintf("failed to start session: %v", startErr), ErrCodeInvalidOperation)
 			exitCLI(1)
 		}
+	}
+	if persistenceWarning != "" && !*jsonOutput && !quietMode {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", persistenceWarning)
 	}
 
 	// #2099: Start() returning nil only means tmux accepted the spawn. Read
@@ -160,8 +177,9 @@ func handleSessionStart(profile string, args []string) {
 		exitCLI(1)
 	}
 
-	if warning := inst.ConductorRecoveryWarning(); warning != "" && !*jsonOutput {
-		fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
+	recoveryWarning := inst.ConductorRecoveryWarning()
+	if recoveryWarning != "" && !*jsonOutput {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", recoveryWarning)
 	}
 
 	// --attach: drop the user into the freshly started session's pane. This
@@ -186,27 +204,18 @@ func handleSessionStart(profile string, args []string) {
 	}
 
 	// Output success
-	jsonData := map[string]interface{}{
-		"success": true,
-		"id":      inst.ID,
-		"title":   inst.Title,
-	}
-	if warning := inst.ConductorRecoveryWarning(); warning != "" {
-		jsonData["warning"] = warning
-	}
+	tmuxName := ""
 	if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
-		jsonData["tmux"] = tmuxSess.Name
+		tmuxName = tmuxSess.Name
 	}
-	if inst.ClaudeSessionID != "" {
-		jsonData["claude_session_id"] = inst.ClaudeSessionID
-	}
-	if initialMessage != "" {
-		jsonData["message"] = initialMessage
-		jsonData["message_pending"] = false
-		out.Success(fmt.Sprintf("Started session: %s (message sent)", inst.Title), jsonData)
-	} else {
-		out.Success(fmt.Sprintf("Started session: %s", inst.Title), jsonData)
-	}
+	jsonData := map[string]interface{}{}
+	line := renderStartSuccess(startSuccess{
+		verb: "Started", id: inst.ID, title: inst.Title,
+		warning: session.MergeRestartWarnings(persistenceWarning, recoveryWarning),
+		tmux:    tmuxName, claudeSessionID: inst.ClaudeSessionID,
+		message: initialMessage, messageUndelivered: messageUndelivered,
+	}, jsonData)
+	out.Success(line, jsonData)
 }
 
 // spawnFailureJSON is the one --json shape for a spawn-failure record, shared
@@ -245,10 +254,14 @@ func spawnFailureOutput(verb string, inst *session.Instance, err error) (string,
 	return fmt.Sprintf("failed to %s session: %v", verb, err), data
 }
 
-// failSpawnVerification persists whatever Start()/Restart() changed on the
-// instance (tmux name, timestamps), reports the spawn failure and exits 1.
+// failSpawnVerification marks only the runtime that failed verification
+// errored (a concurrent replacement wins rather than inheriting the error),
+// persists whatever Start()/Restart() changed on the instance (tmux name,
+// timestamps), reports the spawn failure and exits 1.
 func failSpawnVerification(out *CLIOutput, verb string, storage *session.Storage, instances []*session.Instance, groups []*session.GroupData, inst *session.Instance, err error) {
-	inst.Status = session.StatusError
+	if statusErr := session.PersistSpawnFailureStatus(storage, inst); statusErr != nil && !out.jsonMode {
+		fmt.Fprintf(os.Stderr, "Warning: failed to save session error status: %v\n", statusErr)
+	}
 	if saveErr := saveSessionData(storage, instances, groups); saveErr != nil && !out.jsonMode {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save session state: %v\n", saveErr)
 	}
@@ -298,6 +311,7 @@ func handleSessionStop(profile string, args []string) {
 		exitCLI(1)
 		return // unreachable, satisfies staticcheck SA5011
 	}
+	selection := inst.CaptureRuntimeSelection()
 
 	// Check if not running
 	if !inst.Exists() {
@@ -305,10 +319,13 @@ func handleSessionStop(profile string, args []string) {
 		exitCLI(1)
 	}
 
-	drained, err := stopInstanceAndSave(storage, inst, instances, groups)
+	drained, drainWarning, err := stopInstanceAndSave(storage, inst, selection, instances, groups)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeInvalidOperation)
 		exitCLI(1)
+	}
+	if drainWarning != "" && !*jsonOutput && !quietMode {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", drainWarning)
 	}
 
 	// Output success
@@ -321,6 +338,9 @@ func handleSessionStop(profile string, args []string) {
 		result["drained"] = drained.ID
 		result["drained_title"] = drained.Title
 	}
+	if drainWarning != "" {
+		result["warning"] = drainWarning
+	}
 	out.Success(fmt.Sprintf("Stopped session: %s", inst.Title), result)
 
 	// Journaled after the verdict, not before it: RecordSessionEvent writes
@@ -331,35 +351,39 @@ func handleSessionStop(profile string, args []string) {
 }
 
 // stopInstanceAndSave is the stop path shared by `session stop` and
-// `session command <id> /exit`: it kills only this instance's tmux session,
-// drains one queued sibling and persists the state.
-func stopInstanceAndSave(storage *session.Storage, inst *session.Instance, instances []*session.Instance, groups []*session.GroupData) (*session.Instance, error) {
+// `session command`. It stops exactly selection, the runtime the caller
+// resolved before any probe, saves, and drains the group queue. It returns
+// the queued session the freed slot started, if any, and that start's
+// runtime durability warning.
+func stopInstanceAndSave(storage *session.Storage, inst *session.Instance, selection session.RuntimeSelection, instances []*session.Instance, groups []*session.GroupData) (*session.Instance, string, error) {
 	// Capture tool conversation IDs from tmux env before killing the session.
 	// This ensures IDs are saved to storage even if PostStartSync timed out
 	// during start (e.g., tool started late on slow WSL2 machines).
 	// Must happen before Kill() because tmux show-environment fails on dead sessions.
 	inst.SyncSessionIDsFromTmux()
 	adoptLiveCodexIdentity(storage, inst)
-	loaded := session.BeforeStopKill(storage, inst.ID)
 
-	// Stop the session by killing the tmux session
-	if err := inst.Kill(); err != nil {
-		return nil, fmt.Errorf("failed to stop session: %w", err)
+	// Stop the session by killing the tmux session. KillCaptured reserves the
+	// selected runtime before the kill and commits stopped through the status
+	// authority, so another process's error sample of this kill cannot win
+	// (defect 317).
+	if err := inst.KillCaptured(selection); err != nil {
+		return nil, "", fmt.Errorf("failed to stop session: %w", err)
 	}
-	session.WriteStoppedAfterKill(storage, inst, loaded) // defect 317
 	inst.RecordTelemetryEnd(telemetry.EndStop)
 
 	// Save updated state before the drain: a drained start waits for its
 	// agent to be ready, and this full-list save must not run after that wait.
 	if err := saveSessionData(storage, instances, groups); err != nil {
-		return nil, fmt.Errorf("failed to save session state: %w", err)
+		return nil, "", fmt.Errorf("failed to save session state: %w", err)
 	}
 
 	// v1.9.1 queue drain: a slot freed up. If the group has a cap and a
 	// queued sibling is waiting, start the oldest one. Only one drain per
 	// stop: if max_concurrent>=2 and multiple slots are now free, the next
 	// stop drains the next entry. The drain persists only its own row.
-	return drainGroupQueue(storage, inst.GroupPath, instances, groups), nil
+	drained, warning := drainGroupQueue(storage, inst.GroupPath, instances, groups)
+	return drained, warning, nil
 }
 
 // handleSessionArchive stops a session and marks it archived so it is hidden
@@ -417,6 +441,7 @@ func handleSessionArchive(profile string, args []string) {
 		exitCLI(1)
 		return // unreachable, satisfies staticcheck SA5011
 	}
+	selection := inst.CaptureRuntimeSelection()
 
 	if inst.IsArchived() {
 		out.Error(fmt.Sprintf("session '%s' is already archived", inst.Title), ErrCodeInvalidOperation)
@@ -454,11 +479,6 @@ func handleSessionArchive(profile string, args []string) {
 		}
 	}
 
-	// Only kill a live tmux session. Killing an already-dead session returns a
-	// fatal error that would abort the archive (see idempotent-Kill history),
-	// so gate on Exists() the way handleSessionStop does. Kill() sets
-	// Status=stopped in memory only; persistArchivedCLI persists it below.
-	//
 	// Unlike handleSessionStop we deliberately do NOT SyncSessionIDsFromTmux()
 	// here: archive persists via a targeted UPDATE (to survive concurrent TUI
 	// writers), which cannot carry the whole-row tool-id fields the sync
@@ -467,20 +487,20 @@ func handleSessionArchive(profile string, args []string) {
 	// session's normal lifecycle already persists its tool ids.
 	//
 	// Codex is the exception: launch left its identity unpersisted, and the
-	// live process is the only evidence of it, so bind it with the targeted
-	// Codex write before the kill destroys that evidence (#2400).
-	killed := false
+	// live process is the only evidence of it, so publish its runtime binding
+	// before the kill destroys that evidence (#2400). A dead pane has none.
 	if inst.Exists() {
 		adoptLiveCodexIdentity(storage, inst)
-		if err := inst.Kill(); err != nil {
-			out.Error(fmt.Sprintf("failed to stop session: %v", err), ErrCodeInvalidOperation)
-			exitCLI(1)
-		}
-		killed = true
+	}
+	runtime, err := inst.KillCapturedRuntime(selection)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to stop selected runtime: %v", err), ErrCodeInvalidOperation)
+		exitCLI(1)
 	}
 
 	inst.SetArchivedAtThreadSafe(time.Now().UTC())
-	if err := persistArchivedCLI(storage, inst, killed); err != nil {
+	if err := persistArchivedCLI(storage, inst, runtime, selection.Incarnation); err != nil {
+		inst.SetArchivedAtThreadSafe(time.Time{})
 		out.Error(fmt.Sprintf("failed to persist archive: %v", err), ErrCodeInvalidOperation)
 		exitCLI(1)
 	}
@@ -599,9 +619,12 @@ func handleSessionUnarchive(profile string, args []string) {
 		exitCLI(1)
 	}
 
-	// unarchive never kills tmux, so there is no post-kill status to persist.
+	// Unarchive never kills tmux, so fence the metadata mutation with the
+	// selected logical parent's incarnation rather than a post-kill runtime.
+	archivedAt := inst.ArchivedAtThreadSafe()
 	inst.SetArchivedAtThreadSafe(time.Time{})
-	if err := persistArchivedCLI(storage, inst, false); err != nil {
+	if err := persistArchivedCLI(storage, inst, statedb.RuntimeState{}, inst.PersistenceIncarnation()); err != nil {
+		inst.SetArchivedAtThreadSafe(archivedAt)
 		out.Error(fmt.Sprintf("failed to persist unarchive: %v", err), ErrCodeInvalidOperation)
 		exitCLI(1)
 	}
@@ -614,39 +637,131 @@ func handleSessionUnarchive(profile string, args []string) {
 	})
 }
 
-// persistArchivedCLI writes the archive timestamp (and, when persistStatus is
-// set, the post-kill Status) via targeted UPDATEs. It deliberately avoids
+// handleSessionAdoptRuntime is the explicit recovery bridge for live sessions
+// migrated from a pre-generation Agent Deck database. Planning is the default;
+// --yes is required before any tmux stamp is written.
+func handleSessionAdoptRuntime(profile string, args []string) {
+	fs := flag.NewFlagSet("session adopt-runtime", flag.ExitOnError)
+	yes := fs.Bool("yes", false, "Stamp the uniquely proved migrated runtime (default is dry-run)")
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck session adopt-runtime <id|title> [--yes] [options]")
+		fmt.Println()
+		fmt.Println("Plan recovery of one live runtime migrated as generation 0.")
+		fmt.Println("The default is read-only; --yes authorizes the exact tmux stamp.")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		exitCLI(1)
+	}
+
+	identifier := fs.Arg(0)
+	quietMode := *quiet || *quietShort
+	out := NewCLIOutput(*jsonOutput, quietMode)
+	if identifier == "" {
+		out.Error("session <id|title> required", ErrCodeInvalidOperation)
+		if !*jsonOutput {
+			fs.Usage()
+		}
+		exitCLI(1)
+	}
+	_, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		out.Error(err.Error(), ErrCodeNotFound)
+		exitCLI(1)
+	}
+	inst, errMsg, errCode := ResolveSession(identifier, instances)
+	if inst == nil {
+		out.Error(errMsg, errCode)
+		if errCode == ErrCodeNotFound {
+			os.Exit(2)
+		}
+		exitCLI(1)
+		return
+	}
+
+	if !*yes {
+		plan, err := inst.PlanLegacyRuntimeAdoption()
+		if err != nil {
+			out.Error(fmt.Sprintf("cannot adopt migrated runtime: %v", err), ErrCodeInvalidOperation)
+			exitCLI(1)
+		}
+		data := map[string]interface{}{
+			"success":          true,
+			"id":               inst.ID,
+			"title":            inst.Title,
+			"dry_run":          true,
+			"generation":       plan.State.Generation,
+			"tmux_session":     plan.Candidate.SessionName,
+			"tmux_socket_name": plan.Candidate.SocketName,
+			"tmux_session_id":  plan.Candidate.SessionID,
+			"tmux_pane_id":     plan.Candidate.PaneID,
+			"tmux_pane_pid":    plan.Candidate.PanePID,
+			"already_stamped":  plan.AlreadyStamped,
+		}
+		out.Success(
+			fmt.Sprintf("Would adopt migrated runtime for %s; re-run with --yes to apply", inst.Title),
+			data,
+		)
+		return
+	}
+	result, err := inst.AdoptLegacyRuntime()
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to adopt migrated runtime: %v", err), ErrCodeInvalidOperation)
+		exitCLI(1)
+	}
+	if len(result.Candidates) != 1 {
+		out.Error("failed to adopt migrated runtime: exact adopted tmux identity unavailable", ErrCodeInvalidOperation)
+		exitCLI(1)
+	}
+	candidate := result.Candidates[0]
+	data := map[string]interface{}{
+		"success":          true,
+		"id":               inst.ID,
+		"title":            inst.Title,
+		"dry_run":          false,
+		"generation":       result.State.Generation,
+		"tmux_session":     candidate.SessionName,
+		"tmux_socket_name": candidate.SocketName,
+		"tmux_session_id":  candidate.SessionID,
+		"tmux_pane_id":     candidate.PaneID,
+		"tmux_pane_pid":    candidate.PanePID,
+		"already_stamped":  true,
+	}
+	out.Success(fmt.Sprintf("Adopted migrated runtime: %s", inst.Title), data)
+}
+
+// persistArchivedCLI writes the archive timestamp via a targeted update. It deliberately avoids
 // saveSessionData: the full-save path has an external-change guard that aborts
 // and reloads under concurrent writers (a running TUI), which would silently
 // revert the archive. This mirrors home.go's persistArchived.
 //
-// persistStatus is true only when archive killed a live session: Kill() sets
-// Status=stopped in memory but writes nothing to the DB, so without this the
-// row keeps its pre-kill running/idle status and a later load misclassifies the
-// stopped session. PersistInstanceStatusesTx is the same targeted, abort-safe
-// primitive revive uses (single status column, no whole-row clobber).
-func persistArchivedCLI(storage *session.Storage, inst *session.Instance, persistStatus bool) error {
+// Archive passes the exact post-kill tuple so a concurrent replacement cannot
+// be hidden. Unarchive passes a zero tuple plus the selected incarnation because
+// it performs no runtime kill but must still reject a delete/reinsert ABA.
+func persistArchivedCLI(storage *session.Storage, inst *session.Instance, expected statedb.RuntimeState, incarnation string) error {
 	db := storage.GetDB()
 	if db == nil {
 		return fmt.Errorf("state database unavailable")
 	}
-	if persistStatus {
-		if err := db.PersistInstanceStatusesTx([]statedb.InstanceStatusUpdate{
-			{ID: inst.ID, Status: string(inst.Status)},
-		}); err != nil {
-			return err
-		}
+	if expected.InstanceID != "" {
+		return db.SetArchivedIfRuntime(expected, incarnation, inst.ArchivedAtThreadSafe())
 	}
-	return db.SetArchived(inst.ID, inst.ArchivedAtThreadSafe())
+	return db.SetArchivedIfIncarnation(inst.ID, incarnation, inst.ArchivedAtThreadSafe())
 }
 
 // drainGroupQueue starts the oldest queued instance in groupPath when a slot
 // is available. Returns the drained instance (or nil if nothing to drain).
 // It persists only the drained instance's row (session.Storage.StartQueued),
 // which also puts its queued message on the send queue without waiting for
-// the agent. A session another drainer claimed first is left to it, and the
-// next queued one is tried while the group is below its cap.
-func drainGroupQueue(storage *session.Storage, groupPath string, instances []*session.Instance, groups []*session.GroupData) *session.Instance {
+// the agent, and returns that start's runtime durability warning. A session
+// another drainer claimed first is left to it, and the next queued one is
+// tried while the group is below its cap.
+func drainGroupQueue(storage *session.Storage, groupPath string, instances []*session.Instance, groups []*session.GroupData) (*session.Instance, string) {
 	tree := session.NewGroupTreeWithGroups(instances, groups)
 	max := session.GroupMaxConcurrent(tree, groupPath)
 	// The cap is checked on every pass, counting starting sessions too: a
@@ -655,7 +770,7 @@ func drainGroupQueue(storage *session.Storage, groupPath string, instances []*se
 	for !session.IsAtCap(session.CountOccupiedInGroup(instances, groupPath), max) {
 		next := session.FindNextQueued(instances, groupPath)
 		if next == nil {
-			return nil
+			return nil, ""
 		}
 		started, err := storage.StartQueued(next)
 		if started.Warning != "" {
@@ -665,15 +780,15 @@ func drainGroupQueue(storage *session.Storage, groupPath string, instances []*se
 			// Drain is best-effort. StartQueued persisted the outcome; log it
 			// and don't fail the stop.
 			fmt.Fprintf(os.Stderr, "queue drain failed to start %s: %v\n", next.Title, err)
-			return nil
+			return nil, ""
 		}
 		if started.Started {
-			return next
+			return next, ""
 		}
 		// Claimed by another drainer: this copy is stale.
 		next.Status = session.StatusStarting
 	}
-	return nil
+	return nil, ""
 }
 
 // handleSessionRestart restarts a session (or all active sessions with --all)
@@ -806,18 +921,20 @@ func handleSessionRestart(profile string, args []string) {
 	}
 
 	// Restart the session
-	if err := inst.RestartWithEnv(envFlags.Map()); err != nil {
-		out.Error(fmt.Sprintf("failed to restart session: %v", err), ErrCodeInvalidOperation)
+	runtime, restartErr := inst.RestartWithEnvRuntime(envFlags.Map())
+	restartErr, persistenceWarning := consumeRuntimeResult(inst, runtime, restartErr)
+	if restartErr != nil {
+		out.Error(fmt.Sprintf("failed to restart session: %v", restartErr), ErrCodeInvalidOperation)
 		exitCLI(1)
 	}
 	// #2099: confirm the new pane is actually there before reporting success.
 	if err := inst.VerifySpawned(spawnVerifyWait); err != nil {
 		failSpawnVerification(out, "restart", storage, instances, groups, inst, err)
 	}
-	// Stamp the persisted freshness marker so subsequent watchdog ticks see
-	// this session as "just started" and skip (issue #30).
-	inst.LastStartedAt = time.Now()
-	warning := strings.TrimSpace(inst.ConsumeCodexRestartWarning() + "\n" + inst.ConductorRecoveryWarning())
+	warning := session.MergeRestartWarnings(
+		session.MergeRestartWarnings(inst.ConsumeCodexRestartWarning(), persistenceWarning),
+		inst.ConductorRecoveryWarning(),
+	)
 	if warning != "" && !*jsonOutput {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
 	}
@@ -890,14 +1007,16 @@ func restartAllSessions(profile string, out *CLIOutput, storage *session.Storage
 			fmt.Printf("Restarting %s...\n", inst.Title)
 		}
 
-		if err := inst.RestartWithEnv(env); err != nil {
-			errMsg := fmt.Sprintf("failed to restart session '%s': %v", inst.Title, err)
+		runtime, restartErr := inst.RestartWithEnvRuntime(env)
+		restartErr, persistenceWarning := consumeRuntimeResult(inst, runtime, restartErr)
+		if restartErr != nil {
+			errMsg := fmt.Sprintf("failed to restart session '%s': %v", inst.Title, restartErr)
 			if !out.jsonMode {
 				fmt.Fprintf(os.Stderr, "  Error: %s\n", errMsg)
 			}
 			result["success"] = false
 			result["error"] = errMsg
-			return err
+			return restartErr
 		}
 		// #2099: a restart whose pane is already gone is a failure, not a boot.
 		if err := inst.VerifySpawned(spawnVerifyWait); err != nil {
@@ -912,10 +1031,12 @@ func restartAllSessions(profile string, out *CLIOutput, storage *session.Storage
 			}
 			return err
 		}
-		inst.LastStartedAt = time.Now()
 		restarted = append(restarted, inst.ID)
 
-		warning := strings.TrimSpace(inst.ConsumeCodexRestartWarning() + "\n" + inst.ConductorRecoveryWarning())
+		warning := session.MergeRestartWarnings(
+			session.MergeRestartWarnings(inst.ConsumeCodexRestartWarning(), persistenceWarning),
+			inst.ConductorRecoveryWarning(),
+		)
 		if warning != "" && !out.jsonMode {
 			fmt.Fprintf(os.Stderr, "  Warning: %s\n", warning)
 		}

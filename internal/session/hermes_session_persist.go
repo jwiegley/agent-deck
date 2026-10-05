@@ -90,8 +90,9 @@ func ReadHermesSessionIDFromToolData(td json.RawMessage) string {
 // so a web mutator's short-lived Storage never drops the write and an
 // unrelated profile's global database is never written.
 func (i *Instance) persistHermesSessionBinding(sessionID string) {
+	// Called with i.mu held; owningDB belongs to the selected profile.
 	now := time.Now()
-	err := i.withOwningStateDB(func(db *statedb.StateDB) error {
+	err := i.withOwningStateDBLocked(func(db *statedb.StateDB) error {
 		return db.WriteHermesSessionBinding(i.ID, sessionID, now)
 	})
 	if errors.Is(err, errNoStateDB) {
@@ -535,10 +536,7 @@ func (i *Instance) clearHermesOwnedSessionID() {
 // (true) when the database cannot be read, since a wrong guess resumes
 // another entry's conversation.
 func (i *Instance) hermesWorkspaceShared(workspace string) bool {
-	db := i.restartDB.Load()
-	if db == nil {
-		db = statedb.GetGlobal()
-	}
+	db := i.restartPersistenceDB()
 	if db == nil {
 		return true
 	}

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -12,9 +13,9 @@ import (
 // stale concurrent deletion and the undone session was never written back.
 func TestWebUndoReSavesTheDeletedInstance(t *testing.T) {
 	m, _ := newUndoSweepWebMutator(t, "_test_web_undo_resave")
-	prev := restartForUndo
-	restartForUndo = func(*session.Instance) error { return nil }
-	t.Cleanup(func() { restartForUndo = prev })
+	m.restartRuntimeFn = func(inst *session.Instance) (statedb.RuntimeState, error) {
+		return m.h.storage.GetDB().EnsureRuntimeState(inst.RuntimeState(), inst.PersistenceIncarnation())
+	}
 
 	require.NoError(t, m.DeleteSession("web-final-001"))
 	id, err := m.UndoDelete()

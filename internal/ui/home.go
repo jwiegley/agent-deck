@@ -261,6 +261,13 @@ type Home struct {
 	// bubbletea loop owns this state.
 	headless bool
 
+	// durableDeleteMu orders live web deletes against saves and reload swaps.
+	// A successful delete stays tombstoned until a reload observes the row's
+	// absence, preventing a stale Tea snapshot from upserting it back first.
+	durableDeleteMu         sync.Mutex
+	durableDeleteSeq        uint64
+	durableDeleteTombstones map[string]durableDeleteTombstone
+
 	// Components
 	search               *Search
 	globalSearch         *GlobalSearch // Recall search over recall.db (the G key)
@@ -397,7 +404,20 @@ type Home struct {
 	sessionRef sessionRefState
 
 	// Earliest eligible membership expiry; ordinary ticks only compare clocks.
-	nextTimeFilterExpiry time.Time
+	nextTimeFilterExpiry   time.Time
+	transitionMu           sync.Mutex
+	transitionSeq          uint64
+	transitionTokens       map[string]uint64
+	transitionFloors       map[string]uint64
+	transitionPending      map[string]*session.Instance
+	transitionDeferred     map[string]*session.Instance
+	startRuntimeFn         func(*session.Instance) (statedb.RuntimeState, error)
+	restartRuntimeFn       func(*session.Instance) (statedb.RuntimeState, error)
+	restartFreshRuntimeFn  func(*session.Instance) (statedb.RuntimeState, error)
+	reconcileRestartFn     func(*session.Instance, error) error
+	reconcileRuntimeFn     func(*session.Instance) (session.RuntimeReconciliationResult, error)
+	discoverTmuxSessionsFn func([]*session.Instance) ([]*session.Instance, error)
+	startupReconcileOnce   sync.Once
 
 	// Preview cache (async fetching - View() must be pure, no blocking I/O)
 	previewCache      map[string]string    // previewKey -> cached preview content
@@ -451,11 +471,10 @@ type Home struct {
 	statusTrigger       chan statusUpdateRequest // Triggers background status update
 	statusWorkerDone    chan struct{}            // Signals worker has stopped
 	lastFullStatusSweep atomic.Int64             // UnixNano timestamp of last periodic status batch (legacy field name)
-	lastPersistedStatus map[string]string        // instanceID -> last status written to SQLite
+	lastPersistedStatus map[string]string        // legacy claim memo; status publication is owned by session.UpdateStatus
 	// lastPersistedAutoNameDesc tracks the last auto-name description written to
 	// SQLite per instance, so the background loop only issues a targeted write
-	// when the live Claude task description actually changes (mirrors
-	// lastPersistedStatus). Keyed by instance ID.
+	// when the live Claude task description actually changes. Keyed by instance ID.
 	lastPersistedAutoNameDesc map[string]string
 
 	// Issue #1143: auto-stop dormant child sessions via central poll.
@@ -1934,18 +1953,15 @@ func (h *Home) backgroundStatusUpdate() {
 				// from the shared row. Gated on isPolledByMe, not isOwned:
 				// an orphan we just polled above must keep its fresh
 				// UpdateStatus result — applying the older DB row here would
-				// clobber it, the WriteStatus loop below would persist the
-				// stale value, and the lastPersistedStatus dedup would then
-				// freeze it. Tool is NOT imported from the shared row: it's
+				// clobber it. Tool is NOT imported from the shared row: it's
 				// hydrated once from the instances table and effectively
 				// immutable mid-session, and render paths read inst.Tool
 				// lock-free, so writing it here from a background goroutine
 				// would be a data race.
 				if h.claimPolling && !h.isPolledByMe(inst.ID) && s.Status != "" {
-					if session.Status(s.Status) != inst.GetStatusThreadSafe() {
+					if applySharedStatusRow(inst, s, db.ReadRuntimeState) {
 						statusChanged.Store(true)
 					}
-					inst.SetStatusThreadSafe(session.Status(s.Status))
 				}
 			}
 		}
@@ -1958,8 +1974,8 @@ func (h *Home) backgroundStatusUpdate() {
 	}
 	h.refreshSessionRenderSnapshot(instances)
 
-	// SQLite writes: dead-instance cleanup, status writes (enables
-	// multi-instance coordination). The heartbeat runs at the top of the sweep.
+	// SQLite writes: dead-instance cleanup and metadata (status publication
+	// belongs to UpdateStatus). The heartbeat runs at the top of the sweep.
 	if db := statedb.GetGlobal(); db != nil {
 		// Clean dead instances every ~20s (not every tick)
 		if time.Since(h.lastDeadInstanceCleanup) > 20*time.Second {
@@ -1970,23 +1986,16 @@ func (h *Home) backgroundStatusUpdate() {
 			h.lastDeadInstanceCleanup = time.Now()
 		}
 
-		// Write statuses only when changed to reduce SQLite write pressure.
-		// Sessions neither owned nor orphan-polled this sweep are not written:
-		// the owning instance (or, for orphans, this primary's orphan sweep)
-		// is the source of truth for that session's status row. Orphans MUST
-		// be written here — that's the entire point of polling them above.
-		currentIDs := h.persistPolledStatuses(db, instances)
-		for id := range h.lastPersistedStatus {
-			if _, ok := currentIDs[id]; !ok {
-				delete(h.lastPersistedStatus, id)
-			}
+		currentIDs := make(map[string]struct{}, len(instances))
+		for _, inst := range instances {
+			currentIDs[inst.ID] = struct{}{}
 		}
 
 		// Persist the live Claude task description for auto-named sessions so the
 		// meaningful name survives an app reopen (it would otherwise live only in
 		// the in-memory render snapshot). The snapshot was refreshed just above,
 		// so getSessionRenderState returns the freshly-cleaned pane title. Only
-		// write on change (mirrors the status loop) and only when non-empty — an
+		// write on change and only when non-empty — an
 		// empty/idle pane must not clobber a previously captured description.
 		for _, inst := range instances {
 			desc, write := shouldPersistAutoNameDesc(
@@ -2132,13 +2141,6 @@ func (h *Home) refreshAttachedSessionStatus(sessionID string) {
 	if newStatus != oldStatus {
 		h.cachedStatusCounts.valid.Store(false)
 		h.publishCurrentSessionStates()
-		if db := statedb.GetGlobal(); db != nil {
-			committed, applied := writeStatusIfCurrent(db, inst.ID, string(oldStatus), string(newStatus), inst.GetToolThreadSafe())
-			if !applied && committed != "" && committed != string(newStatus) {
-				inst.SetStatusThreadSafe(session.Status(committed))
-				h.publishCurrentSessionStates()
-			}
-		}
 	}
 	h.refreshSessionRenderSnapshot(nil)
 }
@@ -2436,6 +2438,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Clear loading indicators and store file mtime for external change detection
 		h.reloadMu.Lock()
+		if msg.reloadVersion != h.reloadVersion {
+			h.reloadMu.Unlock()
+			return h, nil
+		}
 		h.isReloading = false
 		if msg.err == nil && !msg.loadMtime.IsZero() {
 			h.lastLoadMtime = msg.loadMtime
@@ -2486,6 +2492,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			h.setError(msg.err)
 		} else {
+			if len(msg.reconcileWarnings) > 0 {
+				h.setError(fmt.Errorf("%s", strings.Join(msg.reconcileWarnings, "; ")))
+			}
 			// Fix stale state: re-capture current cursor AND expanded groups.
 			// Between storageChangedMsg (which saved restoreState) and now,
 			// the user may have navigated or toggled groups.
@@ -2524,8 +2533,13 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+			var finishDeleteReload func()
+			msg.instances, finishDeleteReload = h.beginDurableDeleteReload(msg.instances, msg.deleteSeqCeiling)
 			h.instancesMu.Lock()
 			oldCount := len(h.instances)
+			for idx, loaded := range msg.instances {
+				msg.instances[idx] = h.mergeReloadedInstance(loaded, h.instanceByID[loaded.ID])
+			}
 			h.instances = msg.instances
 			newCount := len(msg.instances)
 			uiLog.Debug("reload_load_sessions", slog.Int("old_count", oldCount), slog.Int("new_count", newCount), slog.String("profile", h.profile))
@@ -2546,6 +2560,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			h.instancesMu.Unlock()
+			finishDeleteReload()
 			if firstLoad {
 				// Seed the MRU ring from persisted last_accessed (#2058) once,
 				// on the process's first load — a later reload (ctrl+r) or
@@ -2720,6 +2735,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case sessionCreatedMsg:
+		if !h.transitionCurrent(msg.sessionID, msg.token) {
+			if msg.rolledBack && msg.sessionID != "" {
+				h.removeRolledBackSeededInstance(msg.sessionID, msg.seed)
+			}
+			return h, nil
+		}
 		uiLog.Info("session_created_msg",
 			slog.Bool("has_err", msg.err != nil),
 			slog.String("temp_id", msg.tempID),
@@ -2734,7 +2755,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.reloadMu.Lock()
 		reloading := h.isReloading
 		h.reloadMu.Unlock()
-		if reloading && msg.err == nil && msg.instance != nil {
+		if reloading && msg.token == 0 && msg.err == nil && msg.instance != nil {
 			// CRITICAL: Save the new session to JSON immediately to prevent orphaning
 			// Skip in-memory state update (reload will handle that), but persist to disk
 			uiLog.Debug("reload_save_session_created", slog.String("id", msg.instance.ID), slog.String("title", msg.instance.Title))
@@ -2755,37 +2776,43 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return h, nil
 		}
 		if msg.err != nil {
+			if msg.rolledBack && msg.sessionID != "" {
+				h.removeRolledBackSeededInstance(msg.sessionID, msg.seed)
+			}
+			if h.finishSessionTransition(msg.sessionID, msg.token) {
+				h.resyncDeferredTransitionViews()
+			}
 			h.setError(msg.err)
 			if msg.tempID != "" {
 				h.rebuildFlatItems() // Remove placeholder from list
 			}
 		} else {
-			h.instancesMu.Lock()
-			h.instances = append(h.instances, msg.instance)
-			h.instanceByID[msg.instance.ID] = msg.instance
-			// Run dedup to ensure the new session doesn't have a duplicate ID
-			session.UpdateClaudeSessionsWithDedup(h.instances)
-			h.instancesMu.Unlock()
+			canonical, added := h.publishCompletedInstance(msg.instance, msg.runtime)
+			if h.finishSessionTransition(msg.sessionID, msg.token) {
+				h.resyncDeferredTransitionViews()
+			}
 			// Invalidate status counts cache
 			h.cachedStatusCounts.valid.Store(false)
 
 			// Track as launching for animation
-			h.launchingSessions[msg.instance.ID] = time.Now()
+			h.launchingSessions[canonical.ID] = time.Now()
 
 			// Expand the group so the session is visible
-			if msg.instance.GroupPath != "" {
-				h.groupTree.ExpandGroupWithParents(msg.instance.GroupPath)
+			if canonical.GroupPath != "" {
+				h.groupTree.ExpandGroupWithParents(canonical.GroupPath)
 			}
 			h.revealParentFold(msg.instance)
 
 			// Add to existing group tree instead of rebuilding
-			h.groupTree.AddSession(msg.instance)
+			if added {
+				h.groupTree.AddSession(canonical)
+			}
 			h.rebuildFlatItems()
 			h.search.SetItems(h.instances)
 
 			// Auto-select the new session
 			for i, item := range h.flatItems {
-				if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == msg.instance.ID {
+				if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == canonical.ID {
 					h.cursor = i
 					h.syncViewport()
 					break
@@ -2801,6 +2828,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.setupWarning != "" {
 				h.setError(noticeError(h.err, msg.setupWarning))
 			}
+			if msg.warning != "" {
+				h.setError(noticeError(h.err, msg.warning))
+			}
 
 			// Auto-attach to the new session when [ui].attach_on_create is set,
 			// so creating a session "instantly opens" it instead of only moving
@@ -2812,17 +2842,23 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Skip auto-attach when a setup warning is pending: attaching would
 			// hide the footer before the user can read it.
 			if h.attachOnCreate && msg.setupWarning == "" {
-				if attachTo := h.attachSession(msg.instance); attachTo != nil {
-					return h, tea.Batch(h.fetchPreview(msg.instance, msg.instance.ID, -1), attachTo)
+				if attachTo := h.attachSession(canonical); attachTo != nil {
+					return h, tea.Batch(h.fetchPreview(canonical, canonical.ID, -1), attachTo)
 				}
 			}
 
 			// Start fetching preview for the new session
-			return h, h.fetchPreview(msg.instance, msg.instance.ID, -1)
+			return h, h.fetchPreview(canonical, canonical.ID, -1)
 		}
 		return h, nil
 
 	case sessionForkedMsg:
+		if !h.transitionCurrent(msg.sessionID, msg.token) {
+			if msg.rolledBack && msg.sessionID != "" {
+				h.removeRolledBackSeededInstance(msg.sessionID, msg.seed)
+			}
+			return h, nil
+		}
 		// Clean up forking state for source session
 		if msg.sourceID != "" {
 			delete(h.forkingSessions, msg.sourceID)
@@ -2832,7 +2868,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.reloadMu.Lock()
 		reloading := h.isReloading
 		h.reloadMu.Unlock()
-		if reloading && msg.err == nil && msg.instance != nil {
+		if reloading && msg.token == 0 && msg.err == nil && msg.instance != nil {
 			// CRITICAL: Save the forked session to JSON immediately to prevent orphaning
 			uiLog.Debug("reload_save_session_forked", slog.String("id", msg.instance.ID), slog.String("title", msg.instance.Title))
 			h.instancesMu.Lock()
@@ -2851,35 +2887,40 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if msg.err != nil {
+			if msg.rolledBack && msg.sessionID != "" {
+				h.removeRolledBackSeededInstance(msg.sessionID, msg.seed)
+			}
+			if h.finishSessionTransition(msg.sessionID, msg.token) {
+				h.resyncDeferredTransitionViews()
+			}
 			h.setError(msg.err)
 		} else {
-			h.instancesMu.Lock()
-			h.instances = append(h.instances, msg.instance)
-			h.instanceByID[msg.instance.ID] = msg.instance
-			// Run dedup to ensure the forked session doesn't have a duplicate ID
-			// This is critical: fork detection may have picked up wrong session
-			session.UpdateClaudeSessionsWithDedup(h.instances)
-			h.instancesMu.Unlock()
+			canonical, added := h.publishCompletedInstance(msg.instance, msg.runtime)
+			if h.finishSessionTransition(msg.sessionID, msg.token) {
+				h.resyncDeferredTransitionViews()
+			}
 			// Invalidate status counts cache
 			h.cachedStatusCounts.valid.Store(false)
 
 			// Track as launching for animation
-			h.launchingSessions[msg.instance.ID] = time.Now()
+			h.launchingSessions[canonical.ID] = time.Now()
 
 			// Expand the group so the session is visible
-			if msg.instance.GroupPath != "" {
-				h.groupTree.ExpandGroupWithParents(msg.instance.GroupPath)
+			if canonical.GroupPath != "" {
+				h.groupTree.ExpandGroupWithParents(canonical.GroupPath)
 			}
 			h.revealParentFold(msg.instance)
 
 			// Add to existing group tree instead of rebuilding
-			h.groupTree.AddSession(msg.instance)
+			if added {
+				h.groupTree.AddSession(canonical)
+			}
 			h.rebuildFlatItems()
 			h.search.SetItems(h.instances)
 
 			// Auto-select the forked session
 			for i, item := range h.flatItems {
-				if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == msg.instance.ID {
+				if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == canonical.ID {
 					h.cursor = i
 					h.syncViewport()
 					break
@@ -2901,9 +2942,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.setupWarning != "" {
 				h.setError(noticeError(h.err, msg.setupWarning))
 			}
+			if msg.warning != "" {
+				h.setError(noticeError(h.err, msg.warning))
+			}
 
 			// Start fetching preview for the forked session
-			return h, h.fetchPreview(msg.instance, msg.instance.ID, -1)
+			return h, h.fetchPreview(canonical, canonical.ID, -1)
 		}
 		return h, nil
 
@@ -2917,37 +2961,50 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return h, nil
 		}
 
-		// Report kill error if any (session may still be running in tmux)
+		// A stale or failed destructive selection has no deletion authority.
 		if msg.killErr != nil {
-			h.setError(fmt.Errorf("warning: tmux session may still be running: %w", msg.killErr))
+			h.setError(fmt.Errorf("session deletion aborted: %w", msg.killErr))
+			return h, nil
 		}
 
 		// Find and remove from list
 		var deletedInstance *session.Instance
+		matchesDeletedIncarnation := func(inst *session.Instance) bool {
+			if inst == nil || inst.ID != msg.deletedID {
+				return false
+			}
+			if msg.incarnation == "" {
+				return inst.PersistenceIncarnation() == ""
+			}
+			return inst.MatchesPersistenceIncarnation(msg.incarnation)
+		}
 		h.instancesMu.Lock()
 		for i, s := range h.instances {
-			if s.ID == msg.deletedID {
+			if matchesDeletedIncarnation(s) {
 				deletedInstance = s
 				h.instances = append(h.instances[:i], h.instances[i+1:]...)
 				break
 			}
 		}
-		delete(h.instanceByID, msg.deletedID)
+		if mapped := h.instanceByID[msg.deletedID]; matchesDeletedIncarnation(mapped) {
+			if deletedInstance == nil {
+				deletedInstance = mapped
+			}
+			delete(h.instanceByID, msg.deletedID)
+		}
 		h.instancesMu.Unlock()
+		if deletedInstance == nil {
+			// The delete completed for an older incarnation, but a same-ID
+			// replacement is already canonical. Do not remove, save, cache-purge,
+			// or add that replacement to the old incarnation's undo history.
+			return h, nil
+		}
 
 		// Push to undo stack before removing from group tree
-		var cleanupDone chan struct{}
-		var evictSweep tea.Cmd
-		if deletedInstance != nil {
-			evictSweep = h.pushUndoStack(deletedInstance)
-			cleanupDone = make(chan struct{})
-			h.undoMu.Lock()
-			h.undoStack[len(h.undoStack)-1].cleanupDone = cleanupDone
-			h.undoMu.Unlock()
-			// Save to recent sessions for quick re-creation
-			if err := h.storage.SaveRecentSession(deletedInstance); err != nil {
-				uiLog.Warn("save_recent_session_err", slog.String("id", msg.deletedID), slog.String("err", err.Error()))
-			}
+		evictSweep := h.pushUndoStack(deletedInstance)
+		// Save to recent sessions for quick re-creation
+		if err := h.storage.SaveRecentSession(deletedInstance); err != nil {
+			uiLog.Warn("save_recent_session_err", slog.String("id", msg.deletedID), slog.String("err", err.Error()))
 		}
 
 		// Invalidate status counts cache
@@ -2971,27 +3028,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.rebuildFlatItems()
 		// Update search items
 		h.search.SetItems(h.instances)
-		// Undoable: record the pending sweep before the row goes, so a crash
-		// after the delete still leaves it for the startup reconcile.
-		if deletedInstance != nil {
-			if err := h.storage.MarkPendingDeleteSweep(msg.deletedID); err != nil {
-				uiLog.Warn("mark_pending_sweep_err", slog.String("id", msg.deletedID), slog.String("err", err.Error()))
-			}
-		}
-		// Explicitly delete from database to prevent resurrection on reload
-		cleanup, err := h.storage.DeleteInstanceDeferredCleanup(msg.deletedID)
-		if err != nil {
-			uiLog.Warn("delete_instance_db_err", slog.String("id", msg.deletedID), slog.String("err", err.Error()))
-		} else if deletedInstance != nil {
-			// Undoable (ctrl+z): announce it now; the inbox and notify-state
-			// sweep (#910) waits until the delete is final (the entry leaves
-			// the undo stack, see pushUndoStack), so an undo keeps the
-			// session's pending inbox events.
-			session.PublishSessionClosed(h.profile, msg.deletedID, session.SessionClosedRemoved)
-		} else {
-			// Nothing to undo: final now, same cleanup as `agent-deck rm`.
-			logRemovedSessionCleanup("delete", msg.deletedID, session.CleanupRemovedSession(h.profile, msg.deletedID))
-		}
+		// The captured delete already removed the row and pruned its hook
+		// artifacts. Undoable (ctrl+z): announce it now; the inbox and
+		// notify-state sweep (#910) waits until the delete is final (the
+		// entry leaves the undo stack, see pushUndoStack), so an undo keeps
+		// the session's pending inbox events.
+		session.PublishSessionClosed(h.profile, msg.deletedID, session.SessionClosedRemoved)
 		// Save both instances AND groups (critical fix: was losing groups!)
 		// Use forceSave to bypass the external-change abort - delete MUST persist
 		h.forceSaveInstances()
@@ -3004,7 +3046,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.setError(fmt.Errorf("deleted '%s'", deletedInstance.Title))
 			}
 		}
-		return h, tea.Batch(hookCleanupCmd(cleanup, cleanupDone), evictSweep)
+		return h, evictSweep
 
 	case sessionClosedMsg:
 		// Keep session metadata, just reflect runtime termination state.
@@ -3034,41 +3076,60 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.setError(fmt.Errorf("failed to archive: %w", msg.killErr))
 			return h, nil
 		}
-		h.cachedStatusCounts.valid.Store(false)
-		h.invalidatePreviewCache(msg.sessionID)
-		h.rebuildFlatItems()
 		if inst := h.getInstanceByID(msg.sessionID); inst != nil {
-			// Persist via a targeted UPDATE, not saveInstances(): under concurrent
-			// writers the full-table save aborts on external-change and reloads,
-			// silently discarding the archive (archived_at reverts to 0).
-			if err := h.persistArchived(inst); err != nil {
+			// The asynchronous completion belongs to the exact persisted
+			// incarnation captured before stopping the runtime. A same-ID row
+			// inserted in the meantime is a different session and must not be
+			// archived in memory or storage.
+			if inst.PersistenceIncarnation() != msg.incarnation {
+				return h, nil
+			}
+			if err := h.persistArchivedIfRuntime(msg.runtime, msg.incarnation, msg.archivedAt); err != nil {
 				h.setError(fmt.Errorf("failed to persist archive: %w", err))
 				return h, nil
 			}
+			inst.SetArchivedAtThreadSafe(msg.archivedAt)
+			h.cachedStatusCounts.valid.Store(false)
+			h.invalidatePreviewCache(msg.sessionID)
+			h.rebuildFlatItems()
 			h.setError(fmt.Errorf("archived '%s' (^ to view)", inst.Title))
 		}
 		return h, nil
 
 	case sessionUnarchivedMsg:
-		h.rebuildFlatItems()
-		if inst := h.getInstanceByID(msg.sessionID); inst != nil {
-			if err := h.persistArchived(inst); err != nil {
-				h.setError(fmt.Errorf("failed to persist unarchive: %w", err))
-				return h, nil
-			}
+		if err := h.persistArchivedIncarnation(msg.sessionID, msg.incarnation, time.Time{}); err != nil {
+			h.setError(fmt.Errorf("failed to persist unarchive: %w", err))
+			return h, nil
+		}
+		if inst := h.getInstanceByID(msg.sessionID); inst != nil && inst.MatchesPersistenceIncarnation(msg.incarnation) {
+			inst.SetArchivedAtThreadSafe(time.Time{})
+			h.rebuildFlatItems()
 			h.setError(fmt.Errorf("unarchived '%s'", inst.Title))
 		}
 		return h, nil
 
 	case sessionRestoredMsg:
+		if !h.transitionCurrent(msg.sessionID, msg.token) {
+			if msg.rolledBack && msg.sessionID != "" {
+				h.removeRolledBackSeededInstance(msg.sessionID, msg.seed)
+			}
+			return h, nil
+		}
+		msg.err, msg.warning = normalizeRestartResult(msg.err, msg.warning)
 		h.reloadMu.Lock()
 		reloading := h.isReloading
 		h.reloadMu.Unlock()
-		if reloading {
+		if reloading && msg.token == 0 {
 			uiLog.Debug("reload_skip_session_restored")
 			return h, nil
 		}
 		if msg.err != nil {
+			if msg.rolledBack && msg.sessionID != "" {
+				h.removeRolledBackSeededInstance(msg.sessionID, msg.seed)
+			}
+			if h.finishSessionTransition(msg.sessionID, msg.token) {
+				h.resyncDeferredTransitionViews()
+			}
 			// The entry is off the undo stack and the session did not come
 			// back: the delete is final, so its deferred sweep runs now.
 			h.setError(fmt.Errorf("failed to restore session: %w", msg.err))
@@ -3079,30 +3140,31 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Re-add to instances (mirrors sessionCreatedMsg pattern)
-		h.instancesMu.Lock()
-		h.instances = append(h.instances, msg.instance)
-		h.instanceByID[msg.instance.ID] = msg.instance
-		session.UpdateClaudeSessionsWithDedup(h.instances)
-		h.instancesMu.Unlock()
+		canonical, added := h.publishCompletedInstance(msg.instance, msg.runtime)
+		if h.finishSessionTransition(msg.sessionID, msg.token) {
+			h.resyncDeferredTransitionViews()
+		}
 		h.cachedStatusCounts.valid.Store(false)
 
 		// Track as launching for animation
-		h.launchingSessions[msg.instance.ID] = time.Now()
+		h.launchingSessions[canonical.ID] = time.Now()
 
 		// Expand the group so the restored session is visible
-		if msg.instance.GroupPath != "" {
-			h.groupTree.ExpandGroupWithParents(msg.instance.GroupPath)
+		if canonical.GroupPath != "" {
+			h.groupTree.ExpandGroupWithParents(canonical.GroupPath)
 		}
 		h.revealParentFold(msg.instance)
 
 		// Add to group tree and rebuild
-		h.groupTree.AddSession(msg.instance)
+		if added {
+			h.groupTree.AddSession(canonical)
+		}
 		h.rebuildFlatItems()
 		h.search.SetItems(h.instances)
 
 		// Move cursor to restored session
 		for i, item := range h.flatItems {
-			if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == msg.instance.ID {
+			if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.ID == canonical.ID {
 				h.cursor = i
 				h.syncViewport()
 				break
@@ -3112,13 +3174,13 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Use forceSave to bypass the external-change abort - restore MUST persist
 		h.forceSaveInstances()
 		if msg.warning != "" {
-			h.setError(fmt.Errorf("restored '%s' (%s)", msg.instance.Title, msg.warning))
+			h.setError(fmt.Errorf("restored '%s' (%s)", canonical.Title, msg.warning))
 		} else {
-			h.setError(fmt.Errorf("restored '%s'", msg.instance.Title))
+			h.setError(fmt.Errorf("restored '%s'", canonical.Title))
 		}
 		// The row is back: the delete has nothing left to sweep, so its
 		// pending record goes (off the Update loop).
-		return h, tea.Batch(h.fetchPreview(msg.instance, msg.instance.ID, -1), h.clearPendingSweepCmd(msg.instance.ID))
+		return h, tea.Batch(h.fetchPreview(canonical, canonical.ID, -1), h.clearPendingSweepCmd(canonical.ID))
 
 	case openCodeDetectionCompleteMsg:
 		if msg.sessionID == "" {
@@ -3131,27 +3193,21 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The original pointer may have been replaced by storage watcher reload
 		if msg.sessionID != "" {
 			uiLog.Debug("opencode_detection_complete", slog.String("instance_id", msg.instanceID), slog.String("session_id", msg.sessionID))
-			// Update the CURRENT instance (not the original pointer which may be stale)
 			if inst := h.getInstanceByID(msg.instanceID); inst != nil {
-				inst.OpenCodeSessionID = msg.sessionID
-				inst.OpenCodeDetectedAt = time.Now()
-				uiLog.Debug("opencode_instance_updated", slog.String("instance_id", msg.instanceID), slog.String("session_id", msg.sessionID))
+				if err := inst.PublishRuntimeBindingObservation(msg.observed, msg.sessionID, msg.detectedAt); err != nil {
+					uiLog.Warn("opencode_binding_rejected", slog.String("instance_id", msg.instanceID), slog.String("error", err.Error()))
+				} else {
+					if tmuxSession := inst.GetTmuxSession(); tmuxSession != nil {
+						_ = tmuxSession.SetEnvironment("OPENCODE_SESSION_ID", msg.sessionID)
+					}
+					uiLog.Debug("opencode_instance_updated", slog.String("instance_id", msg.instanceID), slog.String("session_id", msg.sessionID))
+				}
 			} else {
 				uiLog.Warn("opencode_instance_not_found", slog.String("instance_id", msg.instanceID))
 			}
 		} else {
 			uiLog.Debug("opencode_detection_no_session", slog.String("instance_id", msg.instanceID))
-			// Mark detection as completed even when no session found
-			// This allows UI to show "No session found" instead of "Detecting..."
-			if inst := h.getInstanceByID(msg.instanceID); inst != nil {
-				inst.OpenCodeDetectedAt = time.Now()
-				uiLog.Debug("opencode_marked_complete", slog.String("instance_id", msg.instanceID))
-			}
 		}
-		// CRITICAL: Force save to persist the detected session ID to storage
-		// This uses forceSaveInstances() to bypass isReloading check, preventing
-		// the race condition where detection completes during a storage watcher reload
-		h.forceSaveInstances()
 		return h, nil
 
 	case accountSwitchedMsg:
@@ -3284,8 +3340,15 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case sessionRestartedMsg:
+		if !h.transitionCurrent(msg.sessionID, msg.token) {
+			return h, nil
+		}
+		msg.err, msg.warning = normalizeRestartResult(msg.err, msg.warning)
 		if msg.err != nil {
 			// Restart failed - clear resuming animation immediately so user can retry.
+			if h.finishSessionTransition(msg.sessionID, msg.token) {
+				h.resyncDeferredTransitionViews()
+			}
 			delete(h.resumingSessions, msg.sessionID)
 			if msg.fresh {
 				h.setError(fmt.Errorf("failed to restart session fresh: %w", msg.err))
@@ -3293,8 +3356,23 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.setError(fmt.Errorf("failed to restart session: %w", msg.err))
 			}
 		} else {
-			// Find the instance and refresh its MCP state (O(1) lookup)
+			// Publish the physical result before draining any metadata snapshot
+			// deferred during the transition. The drain must precede the save so
+			// the external metadata edit is not overwritten by stale memory.
 			if inst := h.getInstanceByID(msg.sessionID); inst != nil {
+				if msg.runtime.InstanceID != "" {
+					inst.ApplyRuntimeState(msg.runtime)
+				}
+			}
+			if h.finishSessionTransition(msg.sessionID, msg.token) {
+				h.resyncDeferredTransitionViews()
+			}
+			// Find the canonical instance again after the deferred merge and
+			// refresh transition-produced metadata before persistence.
+			if inst := h.getInstanceByID(msg.sessionID); inst != nil {
+				if msg.unarchived {
+					inst.SetArchivedAtThreadSafe(time.Time{})
+				}
 				// Refresh the loaded MCPs to match the new config
 				inst.CaptureLoadedMCPs()
 			}
@@ -3307,10 +3385,11 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.cachedStatusCounts.valid.Store(false)
 				h.rebuildFlatItems()
 			}
-			// The name and status this restart produced are already durable:
-			// Instance.restart records them with a targeted two-column write at
-			// the moment it mints them (#1870). This save is for the rest of the
-			// restart's in-memory state, and it stays a ROUTINE save on purpose.
+			// The name and status this restart produced are already durable in
+			// the authoritative runtime-generation commit. Instance.restart then
+			// acknowledges that exact tuple and emits the targeted reload stamp
+			// consumed below (#1870). This save is for the rest of the restart's
+			// in-memory state, and it stays a ROUTINE save on purpose.
 			//
 			// The first shape of this fix force-saved here, to stop the
 			// external-change abort from discarding the new tmux name. That cured
@@ -3338,6 +3417,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case mcpRestartedMsg:
+		if session.IsRestartPartialSuccess(msg.err) {
+			h.setError(fmt.Errorf("%s", msg.err))
+			msg.err = nil
+		}
 		if msg.err != nil {
 			h.setError(fmt.Errorf("failed to restart session for MCP changes: %w", msg.err))
 			return h, nil
@@ -3909,12 +3992,17 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		inst := h.instanceByID[msg.instanceID]
 		h.instancesMu.RUnlock()
 		if inst != nil {
-			if err := inst.SetGeminiModel(msg.model); err != nil {
-				h.err = fmt.Errorf("failed to set model: %w", err)
-				h.errTime = time.Now()
-			}
-			// Force save to persist the model change
+			inst.GeminiModel = msg.model
 			h.forceSaveInstances()
+			if inst.Exists() {
+				token := h.beginSessionTransitionFor(inst)
+				h.resumingSessions[inst.ID] = time.Now()
+				return h, func() tea.Msg {
+					runtime, err := h.restartRuntime(inst)
+					runtime, err, warning := h.consumePhysicalRuntimeResult(inst, runtime, err)
+					return sessionRestartedMsg{sessionID: inst.ID, token: token, runtime: runtime, err: err, warning: warning}
+				}
+			}
 		}
 		return h, nil
 
@@ -3986,12 +4074,6 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case storageChangedMsg:
 		uiLog.Debug("reload_storage_changed", slog.String("profile", h.profile), slog.Int("instances", len(h.instances)))
-
-		// Show reload indicator and increment version to invalidate in-flight background saves
-		h.reloadMu.Lock()
-		h.isReloading = true
-		h.reloadVersion++
-		h.reloadMu.Unlock()
 
 		// Preserve UI state before reload
 		state := h.preserveState()
@@ -4473,11 +4555,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.rebuildFlatItems()
 		h.search.SetItems(h.instances)
 
-		// Delete from database and save
-		cleanup, err := h.storage.DeleteInstanceDeferredCleanup(msg.sessionID)
-		if err != nil {
-			uiLog.Warn("worktree_finish_delete_err", slog.String("id", msg.sessionID), slog.String("err", err.Error()))
-		}
+		// The asynchronous finish command already performed the conditional
+		// runtime-row delete before touching the worktree.
 		h.forceSaveInstances()
 
 		// Issue #1576: sweep transition-notifier state (inbox JSONL lines +
@@ -4492,7 +4571,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			successMsg += fmt.Sprintf(", merged into %s", msg.targetBranch)
 		}
 		h.setError(fmt.Errorf("%s", successMsg))
-		return h, hookCleanupCmd(cleanup, nil)
+		return h, nil
 
 	case copyResultMsg:
 		if msg.err != nil {
@@ -5129,13 +5208,20 @@ func (h *Home) createSessionFromGlobalSearch(result *GlobalSearchResult) tea.Cmd
 		// Persist options so restarts use per-session settings
 		_ = inst.SetClaudeOptions(opts)
 
-		// Start the session
-		if err := inst.Start(); err != nil {
-			return sessionCreatedMsg{err: fmt.Errorf("failed to start session: %w", err)}
+		token := h.beginSessionTransitionFor(inst)
+		seed, seeded, err := h.seedPhysicalInstance(inst)
+		if err != nil {
+			return sessionCreatedMsg{sessionID: inst.ID, token: token, err: fmt.Errorf("seed session: %w", err)}
+		}
+		runtime, startErr := h.startRuntime(inst)
+		runtime, startErr, warning := h.consumePhysicalRuntimeResult(inst, runtime, startErr)
+		if startErr != nil {
+			rolledBack, rollbackErr := h.rollbackPhysicalSeed(inst, seed, seeded, fmt.Errorf("failed to start session: %w", startErr))
+			return sessionCreatedMsg{sessionID: inst.ID, token: token, seeded: seeded, seed: seed, rolledBack: rolledBack, err: rollbackErr}
 		}
 		inst.RecordTelemetryCreate(telemetry.ViaTUINew)
 
-		return sessionCreatedMsg{instance: inst}
+		return sessionCreatedMsg{instance: inst, sessionID: inst.ID, token: token, runtime: runtime, warning: warning, seeded: seeded, seed: seed}
 	}
 }
 
@@ -6495,12 +6581,11 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					//
 					// Adopt the write: it moves last_modified, and without that
 					// the save below reads this TUI's OWN bump as an external
-					// change, aborts, and reloads instead. The reload rebuilds
-					// acknowledged from the stored status -- still "idle",
-					// precisely because the save that would have written
-					// "waiting" was the one that aborted -- so the row went
-					// straight back to gray and the key looked like it did
-					// nothing. Same self-inflicted false positive as #1868.
+					// change, aborts, discards its snapshot, and schedules a
+					// reload for a change this TUI made. Same self-inflicted
+					// false positive as #1868. The status itself is
+					// runtime-owned: UpdateStatus below commits it through the
+					// status CAS, and the save does not carry it.
 					if db := statedb.GetGlobal(); db != nil {
 						if stamps, err := db.SetAcknowledgedStamped(item.Session.ID, false); err == nil {
 							h.adoptOwnWrite(stamps, "mark_unread")
@@ -6850,17 +6935,34 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.undoStack = h.undoStack[:len(h.undoStack)-1]
 		h.undoMu.Unlock()
 		inst := entry.instance
+		token := h.beginSessionTransitionFor(inst)
 		return h, func() tea.Msg {
-			// Restart reuses the ID and can write anchors before the registry row
-			// is restored. Finish deleting old artifacts before creating new ones.
-			if entry.cleanupDone != nil {
-				<-entry.cleanupDone
+			// Hook cleanup completed under lifecycle authority before deletion
+			// was reported, so reinsertion cannot race old artifact pruning.
+			var seed statedb.InstanceSeedToken
+			seeded := false
+			if h.storage != nil {
+				var err error
+				seed, err = h.storage.ReinsertDeletedSession(inst)
+				if err != nil {
+					return sessionRestoredMsg{instance: inst, sessionID: inst.ID, token: token, err: fmt.Errorf("seed session: %w", err)}
+				}
+				seeded = true
 			}
-			err := inst.Restart()
+			runtime, restartErr := h.restartRuntime(inst)
+			runtime, restartErr, warning := h.consumePhysicalRuntimeResult(inst, runtime, restartErr)
+			rolledBack := false
+			if restartErr != nil && seeded {
+				if rollbackErr := h.storage.RollbackSessionSeed(seed); rollbackErr != nil {
+					restartErr = errors.Join(restartErr, fmt.Errorf("rollback session seed: %w", rollbackErr))
+				} else {
+					rolledBack = true
+				}
+			}
 			return sessionRestoredMsg{
-				instance: inst,
-				err:      err,
-				warning:  inst.ConsumeCodexRestartWarning(),
+				instance: inst, sessionID: inst.ID, token: token, runtime: runtime,
+				seeded: seeded, seed: seed, rolledBack: rolledBack, err: restartErr,
+				warning: joinForkNotices(warning, inst.ConsumeCodexRestartWarning()),
 			}
 		}
 
@@ -7524,12 +7626,22 @@ func (h *Home) forkSessionCmdWithOptions(
 			}
 		}
 
-		inst, err := completeFork(source, title, groupPath, toggles, opts, parentSessionID, parentProjectPath, withStateWorktreeCreated, defaultForkInstanceDeps())
+		completed, err := completeForkRuntime(source, title, groupPath, toggles, opts, parentSessionID, parentProjectPath, withStateWorktreeCreated, h.forkInstanceDeps())
 		if err != nil {
-			return sessionForkedMsg{err: err, sourceID: sourceID}
+			failed := sessionForkedMsg{err: err, sourceID: sourceID}
+			if completed.instance != nil {
+				failed.instance, failed.sessionID, failed.token = completed.instance, completed.instance.ID, completed.token
+				failed.runtime, failed.seeded = completed.runtime, completed.seeded
+				failed.seed, failed.rolledBack = completed.seed, completed.rolledBack
+			}
+			return failed
 		}
 
-		return sessionForkedMsg{instance: inst, sourceID: sourceID, notice: forkNotice, setupWarning: setupWarning}
+		return sessionForkedMsg{
+			instance: completed.instance, sessionID: completed.instance.ID, token: completed.token,
+			runtime: completed.runtime, warning: completed.warning, seeded: completed.seeded, seed: completed.seed,
+			sourceID: sourceID, notice: forkNotice, setupWarning: setupWarning,
+		}
 	}
 }
 

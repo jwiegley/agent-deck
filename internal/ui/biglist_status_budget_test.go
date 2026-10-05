@@ -10,6 +10,7 @@ import (
 )
 
 func TestBigListBackgroundStatusWorkIsBounded(t *testing.T) {
+	isolateStatusFleetDB(t)
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)

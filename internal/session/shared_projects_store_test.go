@@ -260,7 +260,7 @@ func TestSwitchSharedProjectsStoreRechecksAfterStop(t *testing.T) {
 			running := true
 			nativeSwitchRunning = func(*Instance) bool { return running }
 			var stops, starts int
-			nativeSwitchStop = func(*Instance) error {
+			nativeSwitchStop = func(*Instance, *runtimeTransitionAuthority) error {
 				stops++
 				running = false
 				if mode == "flush" {
@@ -284,7 +284,7 @@ func TestSwitchSharedProjectsStoreRechecksAfterStop(t *testing.T) {
 				}
 				return nil
 			}
-			nativeSwitchStart = func(got *Instance) error {
+			nativeSwitchStart = func(got *Instance, _ *runtimeTransitionAuthority) error {
 				starts++
 				require.Equal(t, "personal", got.Account, "refusal restores the source account")
 				running = true

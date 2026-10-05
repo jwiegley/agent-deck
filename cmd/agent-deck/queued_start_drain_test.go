@@ -46,10 +46,10 @@ func TestDrainGroupQueue_SeedsTrustAndDeliversQueuedMessageOnce(t *testing.T) {
 	}
 	var workers []string
 	t.Cleanup(core.SetSendWorkerSpawnForTest(func(_, id string) error { workers = append(workers, id); return nil }))
-	if got := drainGroupQueue(storage, "workers", instances, groups); got != queued {
+	if got, _ := drainGroupQueue(storage, "workers", instances, groups); got != queued {
 		t.Fatalf("drained %v, want the queued worker", got)
 	}
-	if got := drainGroupQueue(storage, "workers", instances, groups); got != nil {
+	if got, _ := drainGroupQueue(storage, "workers", instances, groups); got != nil {
 		t.Fatalf("second drain started %v", got.Title)
 	}
 	if len(sent) != 1 || sent[0] != "" || queued.QueuedMessage != "" {
@@ -119,7 +119,7 @@ func TestStopInstanceAndSave_DrainKeepsConcurrentRestart(t *testing.T) {
 
 	t.Cleanup(core.SetSendWorkerSpawnForTest(func(string, string) error { return nil }))
 
-	drained, err := stopInstanceAndSave(storage, busy, instances, groups)
+	drained, _, err := stopInstanceAndSave(storage, busy, busy.CaptureRuntimeSelection(), instances, groups)
 	if err != nil || drained != next {
 		t.Fatalf("stop: drained %v, err %v", drained, err)
 	}
@@ -163,7 +163,7 @@ func TestDrainGroupQueue_ClaimLoserStartsTheNextQueued(t *testing.T) {
 		i.Status = session.StatusStarting
 		return nil
 	}))
-	if got := drainGroupQueue(storage, "workers", instances, groups); got != newer {
+	if got, _ := drainGroupQueue(storage, "workers", instances, groups); got != newer {
 		t.Fatalf("drained %v, want newer", got)
 	}
 }
@@ -194,7 +194,7 @@ func TestDrainGroupQueue_ClaimLoserRespectsTheCap(t *testing.T) {
 		i.Status = session.StatusStarting
 		return nil
 	}))
-	if got := drainGroupQueue(storage, "workers", instances, groups); got != nil {
+	if got, _ := drainGroupQueue(storage, "workers", instances, groups); got != nil {
 		t.Fatalf("drained %s past the cap of 1", got.Title)
 	}
 }

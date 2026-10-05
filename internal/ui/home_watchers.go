@@ -234,7 +234,6 @@ func (h *Home) propagateThemeToSessions() {
 	instances := make([]*session.Instance, len(h.instances))
 	copy(instances, h.instances)
 	h.instancesMu.RUnlock()
-
 	safego.Go(uiLog, "apply_theme_to_sessions", func() {
 		for _, inst := range instances {
 			// ExistsCached() (cache/pipe only): iterating every instance with

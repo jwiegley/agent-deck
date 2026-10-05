@@ -53,6 +53,9 @@ func TestSaveWithGroupsPreservesEmptyGroupAcrossStaleSave(t *testing.T) {
 		{Name: "alpha", Path: "alpha", Expanded: true},
 		{Name: "empties", Path: "empties", Expanded: true},
 	})
+	if err := s.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("insert fixture: %v", err)
+	}
 	if err := s.SaveWithGroups(instances, full); err != nil {
 		t.Fatalf("authoritative SaveWithGroups: %v", err)
 	}

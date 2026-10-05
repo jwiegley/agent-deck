@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/logging"
-	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // Issue #2683: pressing ← in Claude Code's agent view moves the conversation
@@ -41,6 +40,7 @@ func (i *Instance) followClaudeContinuedIn() {
 	if i == nil || !i.TranscriptIsResolvableLocally() {
 		return
 	}
+	observation := i.CaptureRuntimeBindingObservation("claude")
 	i.mu.RLock()
 	start := i.ClaudeSessionID
 	i.mu.RUnlock()
@@ -80,12 +80,17 @@ func (i *Instance) followClaudeContinuedIn() {
 		return
 	}
 
-	// buildClaudeResumeCommand runs without i.mu, while UpdateStatus reads
-	// claudeSupersededIDs and ClaudeSessionID under it: take the lock for the
-	// rebind itself. The tmux and SQLite writes below stay outside it.
+	// Publish against the runtime observed before the transcript walk. A
+	// replaced generation or another binding winner makes this stale.
+	if err := i.PublishRuntimeBindingObservation(observation, cur, time.Now()); err != nil {
+		sessionLog.Warn("claude_continued_in_persist_failed",
+			slog.String("instance_id", logging.SanitizeValue(i.ID)),
+			slog.String("new_id", logging.SanitizeValue(cur)),
+			slog.String("error", logging.SanitizeValue(err.Error())))
+		return
+	}
 	i.mu.Lock()
-	if i.ClaudeSessionID != start {
-		// Something else rebound the session while the chain was walked.
+	if i.ClaudeSessionID != cur {
 		i.mu.Unlock()
 		return
 	}
@@ -98,13 +103,13 @@ func (i *Instance) followClaudeContinuedIn() {
 		}
 	}
 	delete(i.claudeSupersededIDs, cur)
-	i.ClaudeSessionID = cur
 	i.markClaudeSessionIDVerified()
-	i.ClaudeDetectedAt = time.Now()
-	detectedAt := i.ClaudeDetectedAt
 	i.mu.Unlock()
 
-	i.publishClaudeContinuedInRebind(cur, detectedAt)
+	if tmuxSession := i.GetTmuxSession(); tmuxSession != nil && tmuxSession.Exists() {
+		_ = tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", cur)
+	}
+	_ = i.RecordRecallLink("claude")
 	_ = WriteSessionIDLifecycleEvent(SessionIDLifecycleEvent{
 		InstanceID: i.ID,
 		Tool:       "claude",
@@ -169,35 +174,6 @@ func (i *Instance) claudeIDSuperseded(id string) bool {
 	}
 	_, ok := i.claudeSupersededIDs[id]
 	return ok
-}
-
-// publishClaudeContinuedInRebind makes a continued-in rebind durable and
-// visible, the same way bindClaudeSessionFromHook does for a hook rebind.
-//
-// The Restart path that reuses the existing pane (RespawnPane) never re-runs
-// the start-time SetEnvironment, so without this the pane env keeps the old
-// id: the respawned claude inherits it, and RefreshLiveSessionIDs later reads
-// it back and reverts ClaudeSessionID to the stalled predecessor. The SQLite
-// write keeps a fresh load (another process, the next CLI call, a reboot)
-// from resurrecting the old id too.
-func (i *Instance) publishClaudeContinuedInRebind(sessionID string, detectedAt time.Time) {
-	if i.tmuxSession != nil && i.tmuxSession.Exists() {
-		_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", sessionID)
-	}
-	db := statedb.GetGlobal()
-	if db == nil {
-		return
-	}
-	if err := db.WriteClaudeSessionBinding(i.ID, sessionID, detectedAt); err != nil {
-		sessionLog.Warn("claude_continued_in_persist_failed",
-			slog.String("instance_id", logging.SanitizeValue(i.ID)),
-			slog.String("new_id", logging.SanitizeValue(sessionID)),
-			slog.String("error", logging.SanitizeValue(err.Error())))
-		return
-	}
-	i.mu.Lock()
-	i.linkedClaudeSessionID = sessionID
-	i.mu.Unlock()
 }
 
 // continuedInSuccessor returns the continuedInSessionId of the transcript's

@@ -1,10 +1,12 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -248,6 +250,11 @@ type Instance struct {
 	// and skip the teardown. Zero value means "unknown" (old record or
 	// never started) and callers MUST NOT treat zero as "just now".
 	LastStartedAt time.Time `json:"last_started_at,omitempty"`
+	// RuntimeGeneration and StatusRevision are monotonic ownership tokens from
+	// instance_runtime_state. Wall-clock time is diagnostic only.
+	RuntimeGeneration uint64                            `json:"runtime_generation,omitempty"`
+	StatusRevision    uint64                            `json:"status_revision,omitempty"`
+	RuntimeBindings   map[string]statedb.RuntimeBinding `json:"-"`
 
 	// GenericSessionID is the conversation id for a custom [tools.*] tool
 	// that declares resume_flag. Persisted in tool_data so Restart can rebuild
@@ -443,8 +450,9 @@ type Instance struct {
 	// after a grace period) each PID so children aren't reparented to
 	// PID 1 and leaked. Mutated only via RegisterMCPChild /
 	// UnregisterMCPChild to keep concurrent access safe.
-	TrackedMCPPIDs []int `json:"tracked_mcp_pids,omitempty"`
-	mcpPIDsMu      sync.Mutex
+	TrackedMCPPIDs            []int `json:"tracked_mcp_pids,omitempty"`
+	trackedMCPChildIdentities map[int]tmux.ProcessIdentity
+	mcpPIDsMu                 sync.Mutex
 
 	// Channels are Claude Code plugin-channel ids (e.g. "plugin:telegram@user/repo").
 	// When non-empty on a claude session, buildClaudeExtraFlags emits
@@ -625,9 +633,23 @@ type Instance struct {
 
 	tmuxSession              *tmux.Session // Internal tmux session
 	conductorRecoveryWarning string        // protected by mu; latest spawn only
-	// Database that last loaded or saved this instance. Restart bookkeeping must
-	// return to that profile instead of whichever database is process-global.
-	restartDB atomic.Pointer[statedb.StateDB]
+	// owningDB is the profile database that loaded or saved this instance.
+	// Restart durability must not depend on the process-global DB: CLI/MCP/plugin
+	// paths can restart immediately after a profile load, before main installs it.
+	// Guarded by mu after the Instance becomes shared.
+	owningDB *statedb.StateDB
+	// persistenceIncarnation identifies the exact insertion of ID represented
+	// by this object. New instances pre-mint it before a physical runtime can be
+	// published; loaded instances adopt the token stored beside their parent
+	// row. Routine writes compare it in SQLite so a stale object cannot update a
+	// byte-identical delete/recreate winner.
+	persistenceIncarnation string
+	// importOwnershipPending marks an instance DiscoverExistingTmuxSessions
+	// built around a live tmux session. InsertSessionAndVerify consumes it
+	// once the instance's row commits and only then applies the import's
+	// ownership grant (runtime_import.go), so no stamp ever names an instance
+	// that was never persisted. Not persisted; guarded by mu.
+	importOwnershipPending bool
 
 	paneDeadExitStatusForTest func() (int, bool) // nil uses tmuxSession.PaneDeadExitStatus
 
@@ -651,7 +673,6 @@ type Instance struct {
 	// carrying one must not revert ClaudeSessionID to the stalled copy.
 	claudeSupersededIDs         map[string]struct{}
 	hookLastUpdate              time.Time // When hook status was last received
-	linkedClaudeSessionID       string    // Last Claude id confirmClaudeSessionLink wrote a session_links row for
 	skipRecoveryTurn            bool      // SkipConductorRecoveryTurn: the next spawn sends no recovery turn
 	restartReason               string    // SetRestartReason: why the next restart happens, for its resume note
 	codexStartedGeneration      string
@@ -659,6 +680,11 @@ type Instance struct {
 	codexStartedSessionID       string
 	codexCompletedSessionID     string
 	codexInvalidatingGeneration string
+
+	// Per runtime binding kind, the last binding version (id, generation and
+	// revision) recordRecallLinkLocked confirmed an authoritative
+	// session_links row for.
+	linkedBindings recallLinkMarks
 
 	// Durable last-activity record (issue #1846). Unlike hookLastUpdate this
 	// survives ClearHookStatus and, via tool_data.last_activity_at, TUI
@@ -670,7 +696,7 @@ type Instance struct {
 	lastActivityPersisted time.Time
 	lastActivityPersistMu sync.Mutex
 
-	// restartTmuxRecordErr holds why the last restart could not record the
+	// restartTmuxRecordErr holds why the last restart could not acknowledge the
 	// tmux session name it minted, or nil once one did. Callers that have no
 	// other save on their path (the CLI --restart commands) read it through
 	// RestartTmuxNameRecorded so they can report a live-but-unrecorded restart
@@ -680,6 +706,11 @@ type Instance struct {
 	restartTmuxRecordMu     sync.Mutex
 	restartTmuxRecordErr    error
 	restartTmuxRecordStamps statedb.WriteStamps
+	hookFingerprint         HookStatusFingerprint // Exact hook file contents last received
+	// validatedHookBindings suppresses repeated publication of the same cached
+	// hook file. Entries are versioned with the authoritative runtime binding,
+	// so a new hook event or binding transition still takes the durable CAS path.
+	validatedHookBindings map[string]validatedHookRuntimeBinding
 
 	// SSE-based status detection for OpenCode (set by OpenCodeSSEWatcher,
 	// issue #1614). Not persisted; rebuilt from the live event stream.
@@ -690,11 +721,14 @@ type Instance struct {
 	// Use GetStatus()/SetStatus() and GetTool()/SetTool() for thread-safe access.
 	// UpdateStatus() acquires the write lock internally.
 	mu sync.RWMutex
-
-	// archiveMu guards ArchivedAt alone (IsArchived, SetArchivedAtThreadSafe).
-	// It is not mu: UpdateStatus holds mu across tool detection and metadata
-	// I/O, and the TUI checks the archive state of every row it renders.
+	// Archive state is read by the TUI while status probes may hold mu.
 	archiveMu sync.RWMutex
+
+	// statusProbeGate permits one status observation per logical instance. It is
+	// initialized under mu and acquired with the caller's context, so ordinary
+	// callers serialize while a bounded daemon poll can cancel without leaving a
+	// waiter behind a stuck probe.
+	statusProbeGate chan struct{}
 
 	// spawnGen supersedes stale fast-death watchers; spawnWatchers lets teardown
 	// and tests join them before restoring process-global filesystem environment.
@@ -729,8 +763,14 @@ type Instance struct {
 
 	// lastErrorCheck tracks when we last confirmed the session doesn't exist
 	// Used to skip expensive Exists() checks for ghost sessions (sessions in JSON but not in tmux)
-	// Not serialized - resets on load, but that's fine since we'll recheck on first poll
+	// Not serialized; long-lived pollers that reload instances must carry it in
+	// process so the recheck interval survives the reload.
 	lastErrorCheck time.Time
+	// lastErrorCheckGeneration is the runtime generation lastErrorCheck
+	// confirmed absent. The throttle covers only that runtime: a newer
+	// generation, such as one another process started and this one adopted,
+	// names another tmux session and is probed at once.
+	lastErrorCheckGeneration uint64
 
 	// Tiered polling: skip expensive checks for idle sessions with no activity
 	lastIdleCheck     time.Time // When we last did a full check for an idle session
@@ -740,9 +780,6 @@ type Instance struct {
 	// Used to provide grace period for tmux session creation (prevents error flash)
 	// Not serialized - only relevant for current TUI session
 	lastStartTime time.Time
-
-	// stopRevision is guarded by mu and invalidates unlocked liveness probes.
-	stopRevision uint64
 
 	// tmuxFlipFromRunningPending debounces a purely tmux-inferred flip AWAY from
 	// running (→ waiting/error). A long single tool-call (past the hook freshness
@@ -829,6 +866,213 @@ type Instance struct {
 	// Gateway health cache for Hermes sessions (volatile, not persisted).
 	hermesGatewayCheckedAt time.Time
 	hermesGatewayOK        bool
+}
+
+// instancePollingState is process-local status machinery that must survive a
+// long-lived poller's storage reload. It deliberately excludes durable session
+// data: SQLite remains authoritative for that on every pass.
+type instancePollingIdentity struct {
+	tool          string
+	createdAt     time.Time
+	lastStartedAt time.Time
+
+	claudeSessionID   string
+	geminiSessionID   string
+	openCodeSessionID string
+	codexSessionID    string
+	copilotSessionID  string
+}
+
+func (identity instancePollingIdentity) equal(other instancePollingIdentity) bool {
+	return identity.tool == other.tool &&
+		identity.createdAt.Equal(other.createdAt) &&
+		identity.lastStartedAt.Equal(other.lastStartedAt) &&
+		identity.claudeSessionID == other.claudeSessionID &&
+		identity.geminiSessionID == other.geminiSessionID &&
+		identity.openCodeSessionID == other.openCodeSessionID &&
+		identity.codexSessionID == other.codexSessionID &&
+		identity.copilotSessionID == other.copilotSessionID
+}
+
+// instancePollingState carries caches and throttles across the notify
+// daemon's per-pass reload. The running-flip debounce state
+// (statusSampledLive, tmuxFlipFromRunningPending) is deliberately absent: the
+// daemon's livePrior is its only carrier, because it is dropped while a TUI
+// owns status and reseeded only while the durable status still equals the
+// carried verdict. Carrying it here as well would restore a pending flip
+// frozen across a whole TUI lifetime, or a verdict another writer has
+// superseded.
+type instancePollingState struct {
+	identity instancePollingIdentity
+
+	tmuxSession *tmux.Session
+
+	lastOpenCodeScanAt time.Time
+	lastCodexScanAt    time.Time
+	lastCodexProbeAt   time.Time
+	lastPromptModTime  time.Time
+	lastJSONLSize      int64
+	lastJSONLPath      string
+	cachedPrompt       string
+
+	lastErrorCheck           time.Time
+	lastErrorCheckGeneration uint64
+	lastIdleCheck            time.Time
+	lastKnownActivity        int64
+	lastSessionMetaSync      time.Time
+	validatedHookBindings    map[string]validatedHookRuntimeBinding
+
+	hermesGatewayCheckedAt time.Time
+	hermesGatewayOK        bool
+}
+
+func (i *Instance) pollingIdentity() instancePollingIdentity {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.pollingIdentityLocked()
+}
+
+func (i *Instance) setOwningDB(db *statedb.StateDB) {
+	i.mu.Lock()
+	i.owningDB = db
+	i.mu.Unlock()
+}
+
+func newPersistenceIncarnation() string {
+	// Match SQLite's lower(hex(randomblob(16))) fallback used when importing
+	// legacy metadata that never had a pre-minted lifecycle identity.
+	return randomString(32)
+}
+
+func (i *Instance) persistenceIncarnationSnapshot() string {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.persistenceIncarnation
+}
+
+// PersistenceIncarnation returns the durable insertion identity represented by
+// this Instance. The value is opaque and must only be compared for equality.
+func (i *Instance) PersistenceIncarnation() string {
+	return i.persistenceIncarnationSnapshot()
+}
+
+// MatchesPersistenceIncarnation reports whether this object still represents
+// the exact durable parent insertion identified by incarnation.
+func (i *Instance) MatchesPersistenceIncarnation(incarnation string) bool {
+	return incarnation != "" && i.persistenceIncarnationSnapshot() == incarnation
+}
+
+func (i *Instance) adoptPersistenceIncarnation(incarnation string) {
+	i.mu.Lock()
+	i.persistenceIncarnation = incarnation
+	i.mu.Unlock()
+}
+
+func (i *Instance) restartPersistenceDB() *statedb.StateDB {
+	i.mu.RLock()
+	db := i.owningDB
+	i.mu.RUnlock()
+	if db != nil {
+		return db
+	}
+	return statedb.GetGlobal()
+}
+
+func (i *Instance) pollingIdentityLocked() instancePollingIdentity {
+	return instancePollingIdentity{
+		tool:              i.Tool,
+		createdAt:         i.CreatedAt,
+		lastStartedAt:     i.LastStartedAt,
+		claudeSessionID:   i.ClaudeSessionID,
+		geminiSessionID:   i.GeminiSessionID,
+		openCodeSessionID: i.OpenCodeSessionID,
+		codexSessionID:    i.CodexSessionID,
+		copilotSessionID:  i.CopilotSessionID,
+	}
+}
+
+func (i *Instance) pollingStateForIdentity(identity instancePollingIdentity) instancePollingState {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return instancePollingState{
+		identity:                 identity,
+		tmuxSession:              i.tmuxSession,
+		lastOpenCodeScanAt:       i.lastOpenCodeScanAt,
+		lastCodexScanAt:          i.lastCodexScanAt,
+		lastCodexProbeAt:         i.lastCodexProbeAt,
+		lastPromptModTime:        i.lastPromptModTime,
+		lastJSONLSize:            i.lastJSONLSize,
+		lastJSONLPath:            i.lastJSONLPath,
+		cachedPrompt:             i.cachedPrompt,
+		lastErrorCheck:           i.lastErrorCheck,
+		lastErrorCheckGeneration: i.lastErrorCheckGeneration,
+		lastIdleCheck:            i.lastIdleCheck,
+		lastKnownActivity:        i.lastKnownActivity,
+		lastSessionMetaSync:      i.lastSessionMetaSync,
+		validatedHookBindings:    maps.Clone(i.validatedHookBindings),
+		hermesGatewayCheckedAt:   i.hermesGatewayCheckedAt,
+		hermesGatewayOK:          i.hermesGatewayOK,
+	}
+}
+
+func (i *Instance) restorePollingState(state instancePollingState) bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	// A replaced row that reuses an ID is a new runtime identity. Let it start
+	// cold rather than inheriting another tool/session's throttle decisions.
+	// A restart or durable tool-session rebind is also a new runtime: cached tmux
+	// environment, status trackers, and probe backoffs all describe the old pane.
+	if !state.identity.equal(i.pollingIdentityLocked()) {
+		return false
+	}
+
+	if (i.tmuxSession == nil) != (state.tmuxSession == nil) {
+		return false
+	}
+	if i.tmuxSession != nil {
+		if !tmuxRuntimeCompatible(i.tmuxSession, state.tmuxSession) {
+			return false
+		}
+		// ReconnectSessionLazy creates a fresh wrapper on every DB load. Reusing
+		// the compatible prior wrapper preserves its env cache, pane cache, and
+		// status tracker, which otherwise restart cold and shell out every poll.
+		i.tmuxSession = state.tmuxSession
+	}
+
+	i.lastOpenCodeScanAt = state.lastOpenCodeScanAt
+	i.lastCodexScanAt = state.lastCodexScanAt
+	i.lastCodexProbeAt = state.lastCodexProbeAt
+	i.lastPromptModTime = state.lastPromptModTime
+	i.lastJSONLSize = state.lastJSONLSize
+	i.lastJSONLPath = state.lastJSONLPath
+	i.cachedPrompt = state.cachedPrompt
+	i.lastErrorCheck = state.lastErrorCheck
+	i.lastErrorCheckGeneration = state.lastErrorCheckGeneration
+	i.lastIdleCheck = state.lastIdleCheck
+	i.lastKnownActivity = state.lastKnownActivity
+	i.lastSessionMetaSync = state.lastSessionMetaSync
+	i.validatedHookBindings = maps.Clone(state.validatedHookBindings)
+	i.hermesGatewayCheckedAt = state.hermesGatewayCheckedAt
+	i.hermesGatewayOK = state.hermesGatewayOK
+	return true
+}
+
+func tmuxRuntimeCompatible(current, previous *tmux.Session) bool {
+	if current == nil || previous == nil {
+		return false
+	}
+	return current.Name == previous.Name &&
+		current.DisplayName == previous.DisplayName &&
+		current.WorkDir == previous.WorkDir &&
+		current.Command == previous.Command &&
+		current.InstanceID == previous.InstanceID &&
+		current.SocketName == previous.SocketName &&
+		maps.Equal(current.OptionOverrides, previous.OptionOverrides) &&
+		current.RunCommandAsInitialProcess == previous.RunCommandAsInitialProcess &&
+		current.VimMode == previous.VimMode &&
+		current.LaunchInUserScope == previous.LaunchInUserScope &&
+		current.LaunchAs == previous.LaunchAs
 }
 
 // newSpawnGenWatch bumps the generation and hands back both the new generation
@@ -1297,24 +1541,21 @@ func NewInstance(title, projectPath string) *Instance {
 	tmuxSess := tmux.NewSession(title, projectPath)
 	tmuxSess.SocketName = socket
 	tmuxSess.InstanceID = id // Pass instance ID for activity hooks
-	tmuxSess.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
-	tmuxSess.SetMouse(GetTmuxSettings().GetMouse())
-	tmuxSess.SetIndicZeroWidthMarks(GetTmuxSettings().IndicZeroWidthMarks)
-	tmuxSess.SetClearOnRestart(GetTmuxSettings().ClearOnRestart)
-	tmuxSess.SetTerminalChromeEnabled(GetTerminalSettings().GetITermBadge())
+	applyTmuxSessionSettings(tmuxSess)
 
 	inst := &Instance{
-		ID:               id,
-		Account:          strings.TrimSpace(os.Getenv("AGENTDECK_ACCOUNT")),
-		Title:            title,
-		ProjectPath:      projectPath,
-		GroupPath:        extractGroupPath(projectPath), // Auto-assign group from path
-		Tool:             "shell",
-		Status:           StatusIdle,
-		CreatedAt:        time.Now(),
-		TmuxSocketName:   socket,
-		tmuxSession:      tmuxSess,
-		addedThisProcess: true,
+		ID:                     id,
+		persistenceIncarnation: newPersistenceIncarnation(),
+		Account:                strings.TrimSpace(os.Getenv("AGENTDECK_ACCOUNT")),
+		Title:                  title,
+		ProjectPath:            projectPath,
+		GroupPath:              extractGroupPath(projectPath), // Auto-assign group from path
+		Tool:                   "shell",
+		Status:                 StatusIdle,
+		CreatedAt:              time.Now(),
+		TmuxSocketName:         socket,
+		tmuxSession:            tmuxSess,
+		addedThisProcess:       true,
 	}
 	tmuxSess.GroupPath = inst.GroupPath
 	logSessionCreated(inst)
@@ -1388,24 +1629,21 @@ func NewInstanceWithTool(title, projectPath, tool string) *Instance {
 	tmuxSess := tmux.NewSession(title, projectPath)
 	tmuxSess.SocketName = socket
 	tmuxSess.InstanceID = id // Pass instance ID for activity hooks
-	tmuxSess.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
-	tmuxSess.SetMouse(GetTmuxSettings().GetMouse())
-	tmuxSess.SetIndicZeroWidthMarks(GetTmuxSettings().IndicZeroWidthMarks)
-	tmuxSess.SetClearOnRestart(GetTmuxSettings().ClearOnRestart)
-	tmuxSess.SetTerminalChromeEnabled(GetTerminalSettings().GetITermBadge())
+	applyTmuxSessionSettings(tmuxSess)
 
 	inst := &Instance{
-		ID:               id,
-		Account:          strings.TrimSpace(os.Getenv("AGENTDECK_ACCOUNT")),
-		Title:            title,
-		ProjectPath:      projectPath,
-		GroupPath:        extractGroupPath(projectPath),
-		Tool:             tool,
-		Status:           StatusIdle,
-		CreatedAt:        time.Now(),
-		TmuxSocketName:   socket,
-		tmuxSession:      tmuxSess,
-		addedThisProcess: true,
+		ID:                     id,
+		persistenceIncarnation: newPersistenceIncarnation(),
+		Account:                strings.TrimSpace(os.Getenv("AGENTDECK_ACCOUNT")),
+		Title:                  title,
+		ProjectPath:            projectPath,
+		GroupPath:              extractGroupPath(projectPath),
+		Tool:                   tool,
+		Status:                 StatusIdle,
+		CreatedAt:              time.Now(),
+		TmuxSocketName:         socket,
+		tmuxSession:            tmuxSess,
+		addedThisProcess:       true,
 	}
 	tmuxSess.GroupPath = inst.GroupPath
 
@@ -1463,15 +1701,15 @@ func extractGroupPath(projectPath string) string {
 
 // Start starts the session in tmux.
 //
-// Issue #1040: gated by acquireInstanceSpawnLock plus a "spawned-while-
-// we-waited" stamp so concurrent `agent-deck session start <id>`
-// invocations after a Claude exit don't each fall through the "tmux
-// session does not exist" gate and spawn parallel sessions. The lock
-// and gate are inlined here (rather than wrapping the whole body in a
-// SpawnAttempt helper) to preserve the structural-grep contract that
-// checks Start()'s body for the #745 IsForkAwaitingStart guard.
-func (i *Instance) Start() (startErr error) {
-	defer func() { i.recordTelemetryStartError(startErr) }()
+// Physical transition authority serializes concurrent starts and makes a lock
+// loser adopt the committed generation. The private start implementation keeps
+// the command-dispatch contract around the #745 fork-start guard.
+func (i *Instance) Start() (err error) {
+	defer func() { i.recordTelemetryStartError(err) }()
+	return i.start(nil)
+}
+
+func (i *Instance) start(result *statedb.RuntimeState) (startErr error) {
 	if i.leftQueue() {
 		defer func() {
 			if startErr == nil {
@@ -1482,18 +1720,24 @@ func (i *Instance) Start() (startErr error) {
 	if err := i.ValidateAccount(); err != nil {
 		return err
 	}
-	beforeLock := spawnGenerationSnapshot(i.ID)
-	release, lockErr := acquireInstanceSpawnLock(i.ID)
-	if lockErr != nil {
-		return lockErr
-	}
-	defer release()
-	if spawnedSince(i.ID, beforeLock) {
-		return nil
-	}
 	if i.tmuxSession == nil {
 		return fmt.Errorf("tmux session not initialized")
 	}
+	if reconciled, err := i.ReconcileRuntime(); err != nil {
+		return err
+	} else if reconciled.Live {
+		captureRuntimeResult(result, reconciled.State)
+		return nil
+	}
+	transition, winner, transitionErr := i.beginRuntimeTransition(false)
+	if transitionErr != nil {
+		return transitionErr
+	}
+	if winner != nil {
+		captureRuntimeResult(result, *winner)
+		return nil
+	}
+	defer transition.close()
 	var validatedDeepSeekCommand string
 	if i.Tool == "deepseek" {
 		var err error
@@ -1502,18 +1746,9 @@ func (i *Instance) Start() (startErr error) {
 			return err
 		}
 	}
-
-	// #1873: refuse to spawn while this instance still owns a process tree from
-	// an earlier spawn. Runs before anything is mutated or launched, so a
-	// refusal leaves the session exactly as it was and signals nothing — and
-	// before recordInstanceSpawn is deferred, so a refusal does not stamp a
-	// spawn that never happened. That stamp is what a concurrent caller reads
-	// to decide it can return "already started"; a refusal must not hand it
-	// that answer.
 	if err := i.guardOwnedProcessesBeforeSpawn("start"); err != nil {
 		return err
 	}
-	defer recordInstanceSpawn(i.ID)
 
 	// #1580 diagnosability: clear any stale spawn-failure sidecar and drop a
 	// spawn_attempt trace so a spawn that dies before anything else runs still
@@ -1689,7 +1924,7 @@ func (i *Instance) Start() (startErr error) {
 	}
 
 	// Load custom patterns for status detection
-	i.loadCustomPatternsFromConfig()
+	i.loadCustomPatternsFromConfig(i.tmuxSession)
 
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
@@ -1781,9 +2016,6 @@ func (i *Instance) Start() (startErr error) {
 	// inside Docker sandbox containers that have no access to the host tmux socket.
 	if i.ClaudeSessionID != "" {
 		_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", i.ClaudeSessionID)
-		// Kill any other agentdeck tmux session with the same Claude session ID
-		// to prevent duplicates running `claude --resume` with the same conversation (#596).
-		tmux.KillSessionsWithEnvValue("CLAUDE_SESSION_ID", i.ClaudeSessionID, i.tmuxSession.Name)
 	}
 	if i.GeminiSessionID != "" {
 		_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", i.GeminiSessionID)
@@ -1827,6 +2059,20 @@ func (i *Instance) Start() (startErr error) {
 		i.Status = StatusIdle
 	}
 	i.mu.Unlock()
+	candidate, plan, committed, err := i.commitPhysicalRuntime(transition)
+	if spawnedRuntimeGone(err) {
+		transition.keepCanonicalRuntime(i)
+		captureRuntimeResult(result, transition.expected)
+		return nil
+	}
+	captureRuntimeResult(result, candidate)
+	if err != nil {
+		return &RestartPartialSuccessError{
+			InstanceID: i.ID, Operation: "start", Runtime: candidate, BindingPlan: plan,
+			NeedsReconciliation: !committed, Err: err,
+		}
+	}
+	runtimeDuplicateSweepFn(i, transition.expected.TmuxSocketName)
 
 	// Start async session ID detection for OpenCode
 	// This runs in background and captures the session ID once OpenCode creates it
@@ -1858,14 +2104,15 @@ func (i *Instance) Start() (startErr error) {
 // Issue #1040: same per-instance spawn lock as Start() — a concurrent
 // `launch -m "..."` racing with a poller-triggered Start() must not
 // produce two parallel tmux sessions.
-func (i *Instance) StartWithMessage(message string) (startErr error) {
-	// Conductor with no explicit message: Start() records its own telemetry
-	// start error, so return before installing the defer below or a failed
-	// start would be recorded twice.
+func (i *Instance) StartWithMessage(message string) (err error) {
 	if message == "" && i.IsConductor {
 		return i.Start()
 	}
-	defer func() { i.recordTelemetryStartError(startErr) }()
+	defer func() { i.recordTelemetryStartError(err) }()
+	return i.startWithMessage(message, nil)
+}
+
+func (i *Instance) startWithMessage(message string, result *statedb.RuntimeState) (startErr error) {
 	if i.leftQueue() {
 		defer func() {
 			if startErr == nil {
@@ -1876,15 +2123,21 @@ func (i *Instance) StartWithMessage(message string) (startErr error) {
 	if err := i.ValidateAccount(); err != nil {
 		return err
 	}
-	beforeLock := spawnGenerationSnapshot(i.ID)
-	release, lockErr := acquireInstanceSpawnLock(i.ID)
-	if lockErr != nil {
-		return lockErr
-	}
-	defer release()
-	if spawnedSince(i.ID, beforeLock) {
+	if reconciled, err := i.ReconcileRuntime(); err != nil {
+		return err
+	} else if reconciled.Live {
+		captureRuntimeResult(result, reconciled.State)
 		return nil
 	}
+	transition, winner, transitionErr := i.beginRuntimeTransition(false)
+	if transitionErr != nil {
+		return transitionErr
+	}
+	if winner != nil {
+		captureRuntimeResult(result, *winner)
+		return nil
+	}
+	defer transition.close()
 	if i.tmuxSession == nil {
 		return fmt.Errorf("tmux session not initialized")
 	}
@@ -1917,7 +2170,6 @@ func (i *Instance) StartWithMessage(message string) (startErr error) {
 	if err := i.guardOwnedProcessesBeforeSpawn("start"); err != nil {
 		return err
 	}
-	defer recordInstanceSpawn(i.ID)
 
 	// #1580 diagnosability: clear any stale spawn-failure sidecar and drop a
 	// spawn_attempt trace (same as Start()).
@@ -2092,7 +2344,7 @@ func (i *Instance) StartWithMessage(message string) (startErr error) {
 	}
 
 	// Load custom patterns for status detection.
-	i.loadCustomPatternsFromConfig()
+	i.loadCustomPatternsFromConfig(i.tmuxSession)
 
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
@@ -2183,11 +2435,37 @@ func (i *Instance) StartWithMessage(message string) (startErr error) {
 	i.CaptureLoadedMCPs()
 
 	// Record start time for grace period (prevents error flash during tmux startup)
+	i.mu.Lock()
 	i.lastStartTime = time.Now()
 	i.markStarted() // persisted stamp (issue #30 — cross-process freshness guard)
 
 	// New sessions start as STARTING
 	i.Status = StatusStarting
+	i.mu.Unlock()
+	candidate, plan, committed, err := i.commitPhysicalRuntime(transition)
+	if spawnedRuntimeGone(err) {
+		transition.keepCanonicalRuntime(i)
+		captureRuntimeResult(result, transition.expected)
+		if message != "" && !promptEmbeddedInCommand {
+			// The message had no live pane to go to; the call must not
+			// report it sent.
+			return &RestartPartialSuccessError{
+				InstanceID: i.ID, Operation: "start", Runtime: transition.expected,
+				MessageUndelivered: true, Err: err,
+			}
+		}
+		return nil
+	}
+	captureRuntimeResult(result, candidate)
+	if err != nil {
+		return &RestartPartialSuccessError{
+			InstanceID: i.ID, Operation: "start", Runtime: candidate, BindingPlan: plan,
+			NeedsReconciliation: !committed,
+			MessageUndelivered:  message != "" && !promptEmbeddedInCommand,
+			Err:                 err,
+		}
+	}
+	runtimeDuplicateSweepFn(i, transition.expected.TmuxSocketName)
 
 	// Start async session ID detection for tools that persist IDs out-of-band.
 	if i.Tool == "opencode" {
@@ -2200,7 +2478,11 @@ func (i *Instance) StartWithMessage(message string) (startErr error) {
 	// Send message synchronously (CLI will wait). Codex may already carry the
 	// prompt as a launch argument, in which case there is nothing to type.
 	if message != "" && !promptEmbeddedInCommand {
-		return i.sendMessageWhenReady(message)
+		if err := i.sendMessageWhenReady(message); err != nil {
+			return &RestartPartialSuccessError{
+				InstanceID: i.ID, Operation: "start", Runtime: candidate, MessageUndelivered: true, Err: err,
+			}
+		}
 	}
 
 	return nil
@@ -2210,13 +2492,62 @@ func (i *Instance) StartWithMessage(message string) (startErr error) {
 // still queued for group capacity keeps StatusQueued until its tmux pane
 // exists; a missing pane is not an error for it (issue #2526).
 func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error {
+	_, err := i.updateStatusWithEvidence(pass, syncMetadata)
+	return err
+}
+
+// updateStatusWithEvidence is updateStatus, also reporting how its probe
+// settled the candidate.
+func (i *Instance) updateStatusWithEvidence(pass *StatusUpdatePass, syncMetadata bool) (*statusProbeEvidence, error) {
 	// #1846: flush any unpersisted last-activity evidence once the lock is
 	// released (declared before Lock so it runs after the Unlock defer).
 	// Cheap no-op unless the cold-load fold below (or an earlier
 	// UpdateHookStatus within the throttle window) left something behind.
 	defer i.persistLastActivity(false)
+	selection := i.CaptureRuntimeSelection()
+	bindingObserved := i.captureActiveRuntimeBindingObservation()
+	ctx, evidence := withStatusProbeEvidence(context.Background())
+	evidence.pass = pass
+	committed, err := i.UpdateStatusObserved(ctx, selection.State, selection.Incarnation)
+	// A pass without a verdict is a no-op, as upstream's early return is.
+	if err == nil && !evidence.noVerdict.Load() {
+		i.refreshStatusMetadataIfCurrent(committed, bindingObserved, evidence.paneSampled.Load(), syncMetadata, pass)
+	}
+	return evidence, err
+}
+
+// graceWindowStatus settles a probe inside the tmux grace window, while the
+// spawn has no session to look at yet. Running, idle and queued are kept, and
+// so is stopped: stopped and queued are operator intent, as they are with no
+// tmux session at all, and a poll must not publish starting over a stop. Any
+// other status reads starting. The window observes nothing, so a status that
+// stays what it was, starting included, forms no verdict: finalizing it would
+// mark the status sampled live and release an auth hold on no evidence. Only a
+// status the window changes to starting is a verdict.
+func graceWindowStatus(ctx context.Context, current Status) Status {
+	candidate := current
+	switch current {
+	case StatusRunning, StatusIdle, StatusQueued, StatusStopped:
+	default:
+		candidate = StatusStarting
+	}
+	if candidate == current {
+		recordStatusNoVerdict(ctx)
+	}
+	return candidate
+}
+
+func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.RuntimeState) (Status, error) {
+	if statusProbeCandidateOverride != nil {
+		return statusProbeCandidateOverride(ctx, i, observed)
+	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
+	if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
+		return Status(observed.Status), err
+	}
+	candidate := Status(observed.Status)
+
 	// Short grace period for tmux initialization (not Claude startup)
 	// Use lastStartTime for accuracy on restarts, fallback to CreatedAt
 	graceTime := i.lastStartTime
@@ -2227,116 +2558,122 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 	// Don't block status detection once tmux session exists
 	var exists bool
 	var checkedExists bool
-	if i.Status == StatusQueued {
+	if candidate == StatusQueued {
 		// Waiting for group capacity is not a missing-pane error. Start may
 		// leave an interactive shell queued until this pass sees its pane.
 		if i.tmuxSession == nil {
-			return nil
+			recordStatusNoVerdict(ctx)
+			return candidate, ctx.Err()
 		}
-		var current bool
-		exists, _, current = i.probeTmuxExists(nil)
-		if !current || !exists {
-			return nil
+		var err error
+		exists, err = i.probeTmuxExists(ctx, observed)
+		if err != nil {
+			return candidate, err
+		}
+		if !exists {
+			recordStatusNoVerdict(ctx)
+			return candidate, ctx.Err()
 		}
 		checkedExists = true
 	}
 	if time.Since(graceTime) < 1500*time.Millisecond {
 		// Only skip if tmux session doesn't exist yet
 		if i.tmuxSession == nil {
-			if i.Status != StatusRunning && i.Status != StatusIdle && i.Status != StatusStopped {
-				i.Status = StatusStarting
-			}
-			return nil
+			return graceWindowStatus(ctx, candidate), ctx.Err()
 		}
-		var current bool
-		exists, _, current = i.probeTmuxExists(nil)
-		if !current {
-			return nil
+		var err error
+		if exists, err = i.probeTmuxExists(ctx, observed); err != nil {
+			return candidate, err
 		}
 		checkedExists = true
 		if !exists {
-			if i.Status != StatusRunning && i.Status != StatusIdle && i.Status != StatusStopped {
-				i.Status = StatusStarting
-			}
-			return nil
+			// An absence inside the window proves nothing yet.
+			return graceWindowStatus(ctx, candidate), ctx.Err()
 		}
 		// Session exists - allow normal status detection below
 	}
 
 	if i.tmuxSession == nil {
-		if i.neverStarted() {
+		if i.addedThisProcess && i.lastStartTime.IsZero() &&
+			(candidate == StatusIdle || candidate == StatusStarting) {
 			// A session that was added but never started has no tmux yet; it is
 			// not an error, just not-yet-running. Keep it idle (✕ → ○).
-			i.Status = StatusIdle
-		} else if i.Status != StatusStopped {
-			i.Status = i.terminatedPaneStatus()
+			candidate = StatusIdle
+		} else if candidate != StatusStopped && candidate != StatusQueued {
+			candidate = i.terminatedPaneStatus()
 			// Was this death a credential failure? If so the status stays error
 			// but the substate now says auth-401, and the automatic boot paths
 			// hold off (see auth_hold.go).
 			i.refreshAuthHoldOnDeathLocked()
+		} else {
+			// Stopped and queued are operator intent, and without a tmux session
+			// there is nothing to observe: keep them, forming no verdict.
+			recordStatusNoVerdict(ctx)
 		}
-		return nil
+		return candidate, ctx.Err()
 	}
 
 	// Optimization: Skip expensive Exists() check for sessions already in error/stopped status
 	// Ghost sessions (in JSON but not in tmux) only get rechecked every 30 seconds
 	// This reduces subprocess spawns from 74/sec to ~5/sec for 28 ghost sessions
-	if (i.Status == StatusError || i.Status == StatusStopped) && !i.lastErrorCheck.IsZero() &&
+	// The skip trusts only the generation that check confirmed absent.
+	if (candidate == StatusError || candidate == StatusStopped || candidate == StatusQueued) && !i.lastErrorCheck.IsZero() &&
+		i.lastErrorCheckGeneration == observed.Generation &&
 		time.Since(i.lastErrorCheck) < errorRecheckInterval {
-		return nil // Skip - still in error/stopped, checked recently
+		recordStatusNoVerdict(ctx)
+		return candidate, ctx.Err() // Skip - still in error/stopped/queued, checked recently
 	}
 	// An error/stopped row whose session this tick's listing shows absent is
 	// answered without forking has-session + list-panes. With ~130 ghosts those
 	// two forks per row per 30s pushed whole status passes past the 250 ms
 	// health budget. A recheck of a confirmed ghost stays dead as is; a first
 	// sighting still runs the terminated-pane classification below.
-	if (i.Status == StatusError || i.Status == StatusStopped) && i.tmuxSession.AbsentFromCache() {
-		if !i.lastErrorCheck.IsZero() {
+	if (candidate == StatusError || candidate == StatusStopped) && i.tmuxSession.AbsentFromCache() {
+		if !i.lastErrorCheck.IsZero() && i.lastErrorCheckGeneration == observed.Generation {
 			i.lastErrorCheck = time.Now()
-			return nil
+			recordStatusNoVerdict(ctx)
+			return candidate, ctx.Err()
 		}
 		exists, checkedExists = false, true
 	}
 
-	// Check if tmux session exists
-	var listedAbsent bool
+	// Check if tmux session exists. A pass's listing settles absence only for
+	// a row already recorded dead (probeTmuxExists).
 	if !checkedExists {
-		var current bool
-		exists, listedAbsent, current = i.probeTmuxExists(pass)
-		if !current {
-			return nil
-		}
-		if listedAbsent && !i.listingAloneProvesDead() {
-			// A row last seen live: confirm with its own has-session before
-			// a terminated status (the listing may predate a restart).
-			exists, _, current = i.probeTmuxExists(nil)
-			if !current {
-				return nil
-			}
-			listedAbsent = !exists
+		var err error
+		if exists, err = i.probeTmuxExists(ctx, observed); err != nil {
+			return candidate, err
 		}
 	}
 	if !exists {
-		if i.tmuxSession.AbsenceIsForeignServer() {
+		foreign, err := i.probeAbsenceIsForeignServer(ctx, observed)
+		if err != nil {
+			return candidate, err
+		}
+		if foreign {
 			// This process runs inside another tmux server and its socket-less
 			// probe followed $TMUX there; the session is alive on the default
 			// server. No verdict: keep the last-known status rather than publish
 			// error for a session this process cannot see (rc 2026-09-23).
-			return nil
+			recordStatusNoVerdict(ctx)
+			return candidate, ctx.Err()
 		}
-		if i.neverStarted() {
+		// Queued is operator intent, like stopped: the session waits for group
+		// capacity and was never started, so an absent tmux session is expected
+		// and no death is classified. Only the queue drain's start replaces it.
+		if i.addedThisProcess && i.lastStartTime.IsZero() &&
+			(candidate == StatusIdle || candidate == StatusStarting) {
 			// Added but never started: no tmux session was ever created, so an
 			// absent tmux is expected — classify as idle, not error (✕ → ○).
-			i.Status = StatusIdle
-		} else {
+			candidate = StatusIdle
+		} else if candidate != StatusQueued {
 			// tmux session is non-nil here, so the exit-status probe can block;
 			// applyTerminatedPaneStatus drops i.mu for the query and keeps the
-			// stopped-state guard on write. A session the pass listing proved
-			// gone has no pane to ask.
-			if listedAbsent {
-				i.applyTerminatedPaneStatusOf(nil)
-			} else {
-				i.applyTerminatedPaneStatus()
+			// stopped-state guard on write.
+			var err error
+			candidate, err = i.probeTerminatedPaneStatus(ctx, observed, candidate)
+			if err != nil {
+				return candidate, err
 			}
 			// Attribute the death to authentication when the pane's last live
 			// sample showed a credential banner: the fleet-death case, which no
@@ -2346,49 +2683,64 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 			i.refreshAuthHoldOnDeathLocked()
 		}
 		i.lastErrorCheck = time.Now() // Record when we confirmed error/stopped
-		return nil
+		i.lastErrorCheckGeneration = observed.Generation
+		return candidate, ctx.Err()
 	}
 
-	// A cached positive tmux hit may outlive Kill(). Confirm a stopped
-	// session directly before treating it as started again.
-	if i.Status == StatusStopped {
+	// Session exists again (user manually started it) - clear stopped status
+	if candidate == StatusStopped {
 		s := i.tmuxSession
-		stopRevision := i.stopRevision
 		i.mu.Unlock()
-		live, err := s.ProbeExists()
+		live, probeErr := s.ProbeExists()
 		i.mu.Lock()
-		if i.tmuxSession != s || i.Status != StatusStopped || i.stopRevision != stopRevision {
-			return nil
+		if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
+			return candidate, err
 		}
-		if err != nil || !live {
+		if probeErr != nil || !live {
 			i.lastErrorCheck = time.Now()
-			return nil
+			recordStatusNoVerdict(ctx)
+			return candidate, ctx.Err()
 		}
-		i.Status = StatusRunning
+		candidate = StatusRunning
 	}
 
 	// Session exists - clear error check timestamp
 	i.lastErrorCheck = time.Time{}
 
 	// Tiered polling: skip expensive checks for idle sessions with no new activity
-	if i.Status == StatusIdle {
+	if candidate == StatusIdle {
 		currentTS := i.tmuxSession.GetCachedWindowActivity()
 		if currentTS == i.lastKnownActivity && !i.lastIdleCheck.IsZero() &&
 			time.Since(i.lastIdleCheck) < 10*time.Second {
-			return nil // No activity detected, skip full check
+			recordStatusNoVerdict(ctx)
+			return candidate, ctx.Err() // No activity detected, skip full check
 		}
 		// Activity detected OR recheck interval passed: do full check
 		i.lastIdleCheck = time.Now()
 		i.lastKnownActivity = currentTS
 	}
 
+	// Discard older cached foreign evidence before calculating or publishing
+	// status: a rollout may acquire its subagent metadata after the hook was
+	// first read, or an older reader may have cached a turn-end from a helper
+	// thread without a rollout. The bound thread's own turn-end is never
+	// foreign (codexHookFromForeignThread).
+	if IsCodexCompatible(i.Tool) && i.hookSessionID != "" &&
+		(i.shouldRejectCodexSubagentRebind(i.hookSessionID) ||
+			(i.hookSessionID != i.CodexSessionID &&
+				i.shouldRejectCodexUnbackedTurnEnd(i.hookSessionID, i.hookEvent))) {
+		i.clearRejectedCodexHookLocked(i.hookSessionID)
+	}
+
 	// COLD LOAD: CLI doesn't run StatusFileWatcher, so hookStatus is always empty.
 	// Read the hook file from disk once to give CLI the same fast path as the TUI.
 	if i.hookStatus == "" && HookStatusTool(i.Tool) {
-		if hs := readHookStatusForPass(i.ID); hs != nil && !i.codexHookFromForeignThread(hs) {
+		if hs := readHookStatusForPass(i.ID); hs != nil && !i.codexHookFromForeignThread(hs) &&
+			(!IsCodexCompatible(i.Tool) || !i.shouldRejectCodexSubagentRebind(hs.SessionID)) {
 			i.hookStatus = hs.Status
 			i.hookEvent = hs.Event
 			i.hookLastUpdate = hs.UpdatedAt
+			i.hookFingerprint = hs.Fingerprint
 			i.hookSessionID = hs.SessionID
 			// #1846: a disk-read hook sample is activity evidence too.
 			// Flushed by this function's persistLastActivity defer.
@@ -2403,16 +2755,6 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 		}
 	}
 
-	// Recheck cached evidence too: a rollout may acquire its subagent metadata
-	// after the hook was first read, or an older reader may have cached a
-	// foreign turn-end from a thread without a rollout.
-	if IsCodexCompatible(i.Tool) && i.hookSessionID != "" &&
-		(i.shouldRejectCodexSubagentRebind(i.hookSessionID) ||
-			i.shouldRejectCodexUnbackedTurnEnd(i.hookSessionID, i.hookEvent)) {
-		i.hookStatus, i.hookEvent, i.hookSessionID = "", "", ""
-		i.hookLastUpdate = time.Time{}
-	}
-
 	// Issue #2853: the pane exists here, so a "dead" hook (SessionEnd) from
 	// before the newest spawn began is the previous process's exit, not this
 	// one's (HookDeadFromEarlierSpawn).
@@ -2420,6 +2762,7 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 	if HookDeadFromEarlierSpawn(i.ID, i.hookStatus, i.hookLastUpdate) {
 		i.hookStatus, i.hookEvent, i.hookSessionID = "", "", ""
 		i.hookLastUpdate = time.Time{}
+		i.hookFingerprint = HookStatusFingerprint{}
 	}
 
 	// HOOK FAST PATH: hook-based status for tools that emit lifecycle events.
@@ -2438,9 +2781,9 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 		}
 		switch i.hookStatus {
 		case "starting":
-			i.Status = StatusStarting
+			candidate = StatusStarting
 		case "running":
-			i.Status = StatusRunning
+			candidate = StatusRunning
 			// Reset acknowledged: new activity means output not yet seen.
 			// Without this, a previously-acknowledged session would go straight
 			// to idle (gray) after Stop, skipping the waiting (orange) state.
@@ -2467,14 +2810,14 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 				i.mu.Unlock()
 				work, holds := i.shellHoldsTurn()
 				i.mu.Lock()
-				if i.Status == StatusStopped {
-					return nil
+				if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
+					return candidate, err
 				}
 				if holds {
 					i.bgWork = work
 					i.bgWorkActive = true
 				} else {
-					i.Status = StatusWaiting
+					candidate = StatusWaiting
 					i.hookLagFlipped = true
 				}
 			}
@@ -2486,7 +2829,7 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 				if i.tmuxSession != nil {
 					i.tmuxSession.ResetAcknowledged()
 				}
-				i.Status = StatusWaiting
+				candidate = StatusWaiting
 			} else {
 				// Claude fires its Stop hook (→ "waiting") when the FOREGROUND turn
 				// ends, including the turn that launched a Workflow, background
@@ -2522,18 +2865,18 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 						work = i.probeBackgroundWork(pane)
 					}
 					i.mu.Lock()
-					if i.Status == StatusStopped {
-						return nil
+					if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
+						return candidate, err
 					}
 				}
 				switch {
 				case foregroundBusy:
 					// Stop can arrive before Claude removes its live spinner.
 					// A fresh waiting hook cannot override that frame (#2502).
-					i.Status = StatusRunning
+					candidate = StatusRunning
 					i.tmuxSession.ResetAcknowledged()
 				case work.Running():
-					i.Status = StatusRunning
+					candidate = StatusRunning
 					i.bgWorkActive = true
 					// Output produced while the work ran is unseen: when it
 					// ends the session is waiting, not idle.
@@ -2543,15 +2886,14 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 					// Acknowledge() is called when user attaches to a session.
 					// ResetAcknowledged() is called by UpdateHookStatus on any new
 					// waiting event, and by the u key / new activity.
-					i.Status = StatusIdle
+					candidate = StatusIdle
 				default:
-					i.Status = StatusWaiting
+					candidate = StatusWaiting
 				}
 			}
 		case "dead":
-			i.Status = StatusError
+			candidate = StatusError
 		}
-		i.applyHookSessionIDLocked()
 		// A1: For Hermes, run the gateway reachability check even on the fast path.
 		// Without this, a dead gateway can still report running/waiting for the full
 		// hook freshness window because the check below is skipped.
@@ -2559,22 +2901,20 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 		// [hermes].gateway_url in config) still gets gateway-health degradation —
 		// reading config.Hermes.GatewayURL directly would skip the discovery path
 		// via ~/.hermes/gateway_state.json.
-		if i.Tool == "hermes" && (i.Status == StatusRunning || i.Status == StatusWaiting) {
+		if i.Tool == "hermes" && (candidate == StatusRunning || candidate == StatusWaiting) {
 			if gatewayURL := GetHermesGatewayURL(); gatewayURL != "" {
 				if time.Since(i.hermesGatewayCheckedAt) > 30*time.Second {
 					i.mu.Unlock()
 					reachable := IsHermesGatewayReachable(gatewayURL)
 					i.mu.Lock()
-					// Mirror the stale-stop guard from the tmux path: a concurrent
-					// Kill() may have published StatusStopped while we were unlocked.
-					if i.Status == StatusStopped {
-						return nil
+					if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
+						return candidate, err
 					}
 					i.hermesGatewayCheckedAt = time.Now()
 					i.hermesGatewayOK = reachable
 				}
 				if !i.hermesGatewayOK {
-					i.Status = StatusError
+					candidate = StatusError
 				}
 			}
 		}
@@ -2582,9 +2922,7 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 		// auth hold. Needed here as well as on the tmux path: a recovered session
 		// reports through the hook fast path and returns before the tmux-derived
 		// reconciliation below would ever run.
-		i.releaseAuthHoldIfHealthyLocked()
-		i.statusSampledLive = true
-		return nil
+		return candidate, ctx.Err()
 	}
 
 	// SSE FAST PATH (issue #1614): OpenCode publishes session.status over its
@@ -2596,23 +2934,19 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 		time.Since(i.sseLastUpdate) < opencodeSSEFreshnessWindow {
 		switch i.sseStatus {
 		case "running":
-			i.Status = StatusRunning
+			candidate = StatusRunning
 			// New activity means output not yet seen (mirrors hook fast path).
 			if i.tmuxSession != nil {
 				i.tmuxSession.ResetAcknowledged()
 			}
-			i.releaseAuthHoldIfHealthyLocked()
-			i.statusSampledLive = true
-			return nil
+			return candidate, ctx.Err()
 		case "waiting":
 			if i.tmuxSession != nil && i.tmuxSession.IsAcknowledged() {
-				i.Status = StatusIdle
+				candidate = StatusIdle
 			} else {
-				i.Status = StatusWaiting
+				candidate = StatusWaiting
 			}
-			i.releaseAuthHoldIfHealthyLocked()
-			i.statusSampledLive = true
-			return nil
+			return candidate, ctx.Err()
 		}
 	}
 
@@ -2620,19 +2954,13 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 	i.mu.Unlock()
 	status, err := i.tmuxSession.GetStatus()
 	i.mu.Lock()
-
-	// Issue #953: a concurrent Kill() may have published StatusStopped
-	// while we were unlocked for the GetStatus call above. Honoring a
-	// stale tmux-derived status now would clobber the user-initiated
-	// stop with idle/running/error and the next render would show the
-	// wrong icon (the original v1.9.20 user-visible symptom).
-	if i.Status == StatusStopped {
-		return nil
+	if currentErr := i.statusProbeCurrentLocked(ctx, observed); currentErr != nil {
+		return candidate, currentErr
 	}
 
 	// Prior status, captured before this tmux-derived sample overwrites it, so the
 	// debounce below can tell a flip AWAY from running from a steady state.
-	prevStatus := i.Status
+	prevStatus := candidate
 	// For the running→waiting/error debounce only a status this process
 	// settled itself counts as prior: a row loaded as "running" is a persisted
 	// guess, not an observation, and holding on it is what kept hook-less codex
@@ -2656,12 +2984,11 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 		// firing a false error. Modeled as a derived error with no tmux raw status.
 		if apply, nextPending, held := debounceFlipFromRunning(prevStatus, StatusError, "", i.hookStatus, i.tmuxFlipFromRunningPending); held {
 			i.tmuxFlipFromRunningPending = nextPending
-			i.Status = apply
-			return nil
+			candidate = apply
+			return candidate, nil
 		}
 		i.tmuxFlipFromRunningPending = false
-		i.Status = StatusError
-		return err
+		return StatusError, err
 	}
 
 	// Map tmux status to instance status
@@ -2671,36 +2998,36 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 	}
 	switch status {
 	case "active":
-		i.Status = StatusRunning
+		candidate = StatusRunning
 	case "waiting":
 		// tmux reports a shell prompt ("waiting"), but a non-interactive foreground
 		// process may still be running (e.g. "yarn dev", "mvn spring-boot:run").
 		// shellForegroundRunning() inspects the cached pane command to tell them apart.
 		if i.Tool == "shell" {
 			if i.shellForegroundRunning() {
-				i.Status = StatusRunning
+				candidate = StatusRunning
 			} else {
-				i.Status = StatusIdle
+				candidate = StatusIdle
 			}
 		} else {
-			i.Status = StatusWaiting
+			candidate = StatusWaiting
 		}
 	case "idle":
 		// Acknowledged shell sessions can still have a foreground process running
 		// even after the user has attached; keep surfacing that as running.
 		if i.Tool == "shell" && i.shellForegroundRunning() {
-			i.Status = StatusRunning
+			candidate = StatusRunning
 		} else {
-			i.Status = StatusIdle
+			candidate = StatusIdle
 		}
 	case "starting":
-		i.Status = StatusStarting
+		candidate = StatusStarting
 	case "error":
 		// Pane shows a tool-rendered error banner (#1400): auth failure
 		// ("API Error: 401" / "Please run /login") or a dead connection
 		// ("socket connection closed"). The process is alive but cannot make
 		// progress without user action — report error, not waiting.
-		i.Status = StatusError
+		candidate = StatusError
 	case "inactive":
 		// Pane is dead/gone. terminatedPaneStatus prefers the real exit code
 		// when remain-on-exit still holds the dead pane — a clean exit 0 reads
@@ -2708,12 +3035,18 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 		// per-tool heuristic (crash → ✕ for hook tools, clean `/exit` → ■ for
 		// OpenCode). #1617, and clean one-shot completions. The probe can block,
 		// so applyTerminatedPaneStatus runs it without holding i.mu.
-		i.applyTerminatedPaneStatus()
+		candidate, err = i.probeTerminatedPaneStatus(ctx, observed, candidate)
+		if err != nil {
+			return candidate, err
+		}
 	default:
-		i.Status = StatusError
+		candidate = StatusError
 	}
-	if i.Status == StatusRunning {
+	if candidate == StatusRunning {
 		i.invalidateCodexCompletionOnRunning()
+		if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
+			return candidate, err
+		}
 	}
 
 	// Issue #2473: merge the transcript into the pane verdict for background
@@ -2736,23 +3069,23 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 			i.mu.Unlock()
 			work := i.probeBackgroundWork(pane)
 			i.mu.Lock()
-			if i.Status == StatusStopped {
-				return nil
+			if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
+				return candidate, err
 			}
 			switch {
 			case work.Running():
 				if status != "active" {
 					i.tmuxSession.ResetAcknowledged()
 				}
-				i.Status = StatusRunning
+				candidate = StatusRunning
 				i.bgWorkActive = true
 			case status == "active":
 				// The only thing keeping the pane green was a workflow row the
 				// transcript proves finished.
 				if i.tmuxSession.IsAcknowledged() {
-					i.Status = StatusIdle
+					candidate = StatusIdle
 				} else {
-					i.Status = StatusWaiting
+					candidate = StatusWaiting
 				}
 			}
 		}
@@ -2778,12 +3111,12 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 	// statusSampledLive): a one-pass process (e.g. `agent-deck list --json`)
 	// cannot take the confirming sample, so holding there is a guess it never
 	// checks.
-	bypassWaitingDebounce := i.shouldBypassCodexWaitingDebounce(i.Status)
+	bypassWaitingDebounce := i.shouldBypassCodexWaitingDebounce(candidate)
 	if shouldDebounceTmuxFlipForTool(i.Tool) && !bypassWaitingDebounce {
-		if apply, nextPending, held := debounceFlipFromRunning(livePrevStatus, i.Status, status, i.hookStatus, i.tmuxFlipFromRunningPending); held {
+		if apply, nextPending, held := debounceFlipFromRunning(livePrevStatus, candidate, status, i.hookStatus, i.tmuxFlipFromRunningPending); held {
 			i.tmuxFlipFromRunningPending = nextPending
-			i.Status = apply
-			return nil
+			candidate = apply
+			return candidate, nil
 		}
 		// Confirmed flip (second consecutive sample) or a non-debounceable outcome:
 		// clear the marker so a later genuine flip starts a fresh debounce.
@@ -2798,7 +3131,7 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 	// loopback probe) gets the same degradation behavior as an explicit config
 	// override — without this, users on the documented-easy setup never see a
 	// dead gateway flip them to StatusError.
-	if i.Tool == "hermes" && i.Status != StatusStopped && i.Status != StatusError {
+	if i.Tool == "hermes" && candidate != StatusStopped && candidate != StatusError {
 		if gatewayURL := GetHermesGatewayURL(); gatewayURL != "" {
 			if time.Since(i.hermesGatewayCheckedAt) > 30*time.Second {
 				// A2: A concurrent Kill() may publish StatusStopped while we are
@@ -2807,77 +3140,101 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 				i.mu.Unlock()
 				reachable := IsHermesGatewayReachable(gatewayURL)
 				i.mu.Lock()
-				if i.Status == StatusStopped {
-					return nil
+				if currentErr := i.statusProbeCurrentLocked(ctx, observed); currentErr != nil {
+					return candidate, currentErr
 				}
 				i.hermesGatewayCheckedAt = time.Now()
 				i.hermesGatewayOK = reachable
 			}
 			if !i.hermesGatewayOK {
-				i.Status = StatusError
+				candidate = StatusError
 			}
 		}
 	}
 
-	// Observed runtime is separate from the configured launch identity. A shell
-	// session that later runs OpenCode in the foreground is observed as opencode
-	// for status patterns and the list icon, but Restart still launches the
-	// configured command. Writing the observation back onto Tool is what made
-	// a screen-text guess sticky and then resumed the wrong agent.
-	if detectedTool := i.tmuxSession.DetectTool(); detectedTool != "" {
+	// Only this settled live pane sample licenses the post-commit tool refresh.
+	recordStatusPaneSample(ctx)
+	return candidate, ctx.Err()
+}
+
+// refreshStatusMetadataIfCurrent preserves the status poller's historical
+// metadata refresh, but only after the observed status has won authority.
+// The bounded daemon calls UpdateStatusObserved directly and therefore cannot
+// publish tool IDs after its context has timed out. Tool detection and session
+// discovery also require a live pane sample (paneSampled): for an absent
+// session DetectTool's pane capture fails and reports "shell", which would
+// rename a stored claude, codex or gemini session. As upstream, only native
+// session-ID discovery is left to the poller (syncMetadata); read-only
+// listings still publish hook bindings and detect the tool. A listing never
+// waits for the instance spawn lock to publish, though: a start or restart can
+// hold it for the lock's whole budget, and a later uncontended pass publishes
+// the binding a contended listing skips.
+func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState, hookObservation RuntimeBindingObservation, paneSampled, syncMetadata bool, pass *StatusUpdatePass) {
+	i.mu.Lock()
+	if !sameStatusRuntime(committed, i.runtimeStateLocked()) {
+		i.mu.Unlock()
+		return
+	}
+	hookSessionID := i.hookSessionID
+	hookFingerprint := i.hookFingerprint
+	i.releaseAuthHoldIfHealthyLocked()
+	tmuxSession := i.tmuxSession
+	i.mu.Unlock()
+
+	if hookSessionID != "" && runtimeBindingKindSupported(hookObservation.kind) {
+		if err := i.publishHookRuntimeBindingObservation(hookObservation, hookSessionID, hookFingerprint, syncMetadata); err != nil {
+			sessionLog.Debug("status_hook_binding_rejected",
+				slog.String("kind", hookObservation.kind), slog.String("session_id", hookSessionID),
+				slog.String("error", err.Error()))
+		} else if hookObservation.kind == "claude" {
+			i.markClaudeSessionIDVerified()
+		}
+	}
+
+	if tmuxSession == nil || !paneSampled {
+		return
+	}
+	detectedTool := tmuxSession.DetectTool()
+	i.mu.Lock()
+	if i.tmuxSession != tmuxSession || !sameStatusRuntime(committed, i.runtimeStateLocked()) {
+		i.mu.Unlock()
+		return
+	}
+	if detectedTool != "" {
 		i.noteObservedRuntimeLocked(detectedTool)
 	}
 
-	// Update session metadata tracking only for active/waiting sessions.
-	// This path can perform filesystem and tmux env reads while i.mu is held, so
-	// rate-limit it to reduce intermittent render/key handling stalls under load.
-	if syncMetadata && (i.Status == StatusRunning || i.Status == StatusWaiting) {
-		interval := 2 * time.Second
-		// Bootstrap unknown IDs faster for newly-started sessions.
-		switch {
-		case IsClaudeCompatible(i.Tool):
-			if i.ClaudeSessionID == "" {
-				interval = 500 * time.Millisecond
-			}
-		case i.Tool == "gemini":
-			if i.GeminiSessionID == "" {
-				interval = 500 * time.Millisecond
-			}
-		case IsCodexCompatible(i.Tool):
-			if i.CodexSessionID == "" {
-				interval = 500 * time.Millisecond
-			}
-		}
-		if i.lastSessionMetaSync.IsZero() || time.Since(i.lastSessionMetaSync) >= interval {
-			i.lastSessionMetaSync = time.Now()
-
-			// Update Claude session tracking (non-blocking, best-effort)
-			i.UpdateClaudeSession(nil)
-
-			// Update Gemini session tracking (non-blocking, best-effort)
-			if i.Tool == "gemini" {
-				i.UpdateGeminiSession(nil)
-			}
-
-			// Update Codex session tracking (non-blocking, best-effort)
-			if IsCodexCompatible(i.Tool) {
-				i.updateCodexSessionForPass(nil, false, pass, true)
-			}
-
-			// Update OpenCode session tracking (non-blocking, best-effort).
-			// The opencode CLI subprocess can take seconds and must not run
-			// under i.mu or it starves render-path RLocks and freezes the TUI.
-			// updateOpenCodeSession manages its own locking internally — we
-			// drop i.mu here and reacquire after it returns.
-			if i.Tool == "opencode" {
-				i.mu.Unlock()
-				i.UpdateOpenCodeSession()
-				i.mu.Lock()
-			}
-		}
+	if !syncMetadata || (i.Status != StatusRunning && i.Status != StatusWaiting) {
+		i.mu.Unlock()
+		return
 	}
+	interval := 2 * time.Second
+	switch {
+	case IsClaudeCompatible(i.Tool) && i.ClaudeSessionID == "":
+		interval = 500 * time.Millisecond
+	case i.Tool == "gemini" && i.GeminiSessionID == "":
+		interval = 500 * time.Millisecond
+	case IsCodexCompatible(i.Tool) && i.CodexSessionID == "":
+		interval = 500 * time.Millisecond
+	}
+	if !i.lastSessionMetaSync.IsZero() && time.Since(i.lastSessionMetaSync) < interval {
+		i.mu.Unlock()
+		return
+	}
+	i.lastSessionMetaSync = time.Now()
+	tool := i.Tool
+	i.mu.Unlock()
 
-	return nil
+	i.UpdateClaudeSession(nil)
+	if tool == "gemini" {
+		i.UpdateGeminiSession(nil)
+	}
+	if IsCodexCompatible(tool) {
+		i.updateCodexSessionForPass(nil, false, pass)
+	}
+	if tool == "opencode" {
+		i.UpdateOpenCodeSession()
+	}
 }
 
 // GetAutoNameDescription returns the last captured Claude task description for

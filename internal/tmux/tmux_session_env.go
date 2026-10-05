@@ -228,6 +228,38 @@ func KillSessionsWithEnvValue(envKey, envValue, excludeName string) {
 	}
 }
 
+// KillLowerGenerationSessions removes only proved older runtimes for one
+// logical Agent Deck instance. Missing, malformed, equal, or newer generation
+// evidence is intentionally left untouched.
+func KillLowerGenerationSessions(socketName, instanceID, excludeName string, generation uint64) error {
+	if instanceID == "" || generation == 0 {
+		return nil
+	}
+	candidates, err := ListRuntimeGenerationCandidates(socketName, instanceID)
+	if err != nil {
+		return err
+	}
+	for _, candidate := range candidates {
+		if candidate.SessionName == excludeName {
+			continue
+		}
+		if !candidate.GenerationKnown {
+			statusLog.Warn("retaining_duplicate_without_generation", slog.String("session", logging.SanitizeValue(candidate.SessionName)))
+			continue
+		}
+		if candidate.Generation >= generation {
+			statusLog.Warn("retaining_nonolder_duplicate",
+				slog.String("session", logging.SanitizeValue(candidate.SessionName)),
+				slog.Uint64("generation", candidate.Generation))
+			continue
+		}
+		if err := KillRuntimeGenerationCandidate(candidate, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SetEnvironment sets an environment variable for this tmux session
 func (s *Session) SetEnvironment(key, value string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

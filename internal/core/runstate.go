@@ -17,7 +17,8 @@ type EventKind string
 
 const (
 	// EventQueueDrainFailed: stopping a session freed a slot but the queued
-	// sibling failed to start. Title/Err name it.
+	// sibling failed to start. Title/Err name it; Message, when set, warns
+	// that its error status could not be saved.
 	EventQueueDrainFailed EventKind = "queue.drain_failed"
 	// EventRestartBegin: restart --all is about to restart Title.
 	EventRestartBegin EventKind = "restart.begin"

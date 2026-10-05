@@ -89,7 +89,13 @@ func (i *Instance) ensureClaudeSessionIDFromDiskForRestart() {
 		slog.String("reason", "jsonl_discovery_restart"))
 }
 
+// clearSessionBindingForFreshStart drops the conversation bindings a fresh
+// restart must not resume. It writes under i.mu, as restoreFresh puts them
+// back: the restart holds the spawn lock, not i.mu, and every status pass
+// observes the active binding under i.mu alone
+// (captureActiveRuntimeBindingObservation).
 func (i *Instance) clearSessionBindingForFreshStart() {
+	i.mu.Lock()
 	if IsClaudeCompatible(i.Tool) {
 		i.ClaudeSessionID = ""
 		i.ClaudeDetectedAt = time.Time{}
@@ -112,9 +118,7 @@ func (i *Instance) clearSessionBindingForFreshStart() {
 		i.CodexDetectedAt = time.Time{}
 		i.CodexStartedAt = 0
 		i.lastCodexScanAt = time.Time{}
-		i.mu.Lock()
 		i.pendingCodexRestartWarning = ""
-		i.mu.Unlock()
 	}
 
 	if i.Tool == "copilot" {
@@ -149,30 +153,36 @@ func (i *Instance) clearSessionBindingForFreshStart() {
 	// fresh start does not re-attach resume after reboot. Flag the clear so
 	// a subsequent SaveWithGroups writes explicit empty (sticky-safe) even
 	// when statedb.GetGlobal() is nil (CLI paths).
-	if i.GenericSessionID != "" || !i.GenericDetectedAt.IsZero() || i.genericSessionIDCleared ||
-		i.GenericSessionTool != "" || i.GenericSessionCommand != "" || i.GenericSessionLocation != "" {
-		cleared := i.GenericSessionID
+	clearGeneric := i.GenericSessionID != "" || !i.GenericDetectedAt.IsZero() || i.genericSessionIDCleared ||
+		i.GenericSessionTool != "" || i.GenericSessionCommand != "" || i.GenericSessionLocation != ""
+	cleared := i.GenericSessionID
+	if clearGeneric {
 		i.GenericSessionID = ""
 		i.GenericDetectedAt = time.Time{}
 		i.GenericSessionTool = ""
 		i.GenericSessionCommand = ""
 		i.GenericSessionLocation = ""
 		i.genericSessionIDCleared = true
-		// The flag above means a later save re-applies this clear, so the
-		// outcome is eventually right either way — but a write that keeps
-		// failing on a data path would otherwise never be visible, and
-		// this one deletes a binding the operator asked to be rid of.
-		if err := i.withOwningStateDB(func(db *statedb.StateDB) error {
-			return db.WriteGenericSessionBinding(i.ID, "", "", "", "", time.Time{})
-		}); !errors.Is(err, errNoStateDB) {
-			i.setGenericSessionPersistError(err)
-			if err != nil {
-				sessionLog.Warn("generic_session_clear_persist_failed",
-					slog.String("instance_id", logging.SanitizeValue(i.ID)),
-					slog.String("tool", logging.SanitizeValue(i.Tool)),
-					slog.String("session_id_fingerprint", fingerprintSessionID(cleared)),
-					slog.String("error", logging.SanitizeValue(err.Error())))
-			}
+	}
+	i.mu.Unlock()
+
+	if !clearGeneric {
+		return
+	}
+	// The flag above means a later save re-applies this clear, so the
+	// outcome is eventually right either way — but a write that keeps
+	// failing on a data path would otherwise never be visible, and
+	// this one deletes a binding the operator asked to be rid of.
+	if err := i.withOwningStateDB(func(db *statedb.StateDB) error {
+		return db.WriteGenericSessionBinding(i.ID, "", "", "", "", time.Time{})
+	}); !errors.Is(err, errNoStateDB) {
+		i.setGenericSessionPersistError(err)
+		if err != nil {
+			sessionLog.Warn("generic_session_clear_persist_failed",
+				slog.String("instance_id", logging.SanitizeValue(i.ID)),
+				slog.String("tool", logging.SanitizeValue(i.Tool)),
+				slog.String("session_id_fingerprint", fingerprintSessionID(cleared)),
+				slog.String("error", logging.SanitizeValue(err.Error())))
 		}
 	}
 }
@@ -190,11 +200,7 @@ func (i *Instance) recreateTmuxSession() {
 	// one.
 	i.tmuxSession.SocketName = i.TmuxSocketName
 	i.tmuxSession.InstanceID = i.ID
-	i.tmuxSession.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
-	i.tmuxSession.SetMouse(GetTmuxSettings().GetMouse())
-	i.tmuxSession.SetIndicZeroWidthMarks(GetTmuxSettings().IndicZeroWidthMarks)
-	i.tmuxSession.SetClearOnRestart(GetTmuxSettings().ClearOnRestart)
-	i.tmuxSession.SetTerminalChromeEnabled(GetTerminalSettings().GetITermBadge())
+	applyTmuxSessionSettings(i.tmuxSession)
 }
 
 func (i *Instance) prepareRestartMCPConfig() {
@@ -242,7 +248,7 @@ func (i *Instance) RetireServiceUnit(own tmux.ServiceUnitOwnership) tmux.Service
 
 // Kill terminates the tmux session and cleans up sandbox container if present.
 func (i *Instance) Kill() error {
-	return i.killInternal(false)
+	return i.KillCaptured(i.CaptureRuntimeSelection())
 }
 
 // KillAndWait is the synchronous companion to Kill. It performs the
@@ -253,10 +259,101 @@ func (i *Instance) Kill() error {
 // variant — see issue #59 (v1.7.68). The TUI and web callers can
 // keep using Kill for the non-blocking path.
 func (i *Instance) KillAndWait() error {
-	return i.killInternal(true)
+	return i.KillAndWaitCaptured(i.CaptureRuntimeSelection())
 }
 
-func (i *Instance) killInternal(sync bool) error {
+var (
+	deleteInstanceIfRuntimeFn = func(db *statedb.StateDB, expected statedb.RuntimeState, incarnation string) error {
+		return db.DeleteInstanceIfRuntime(expected, incarnation)
+	}
+	completeDeletedRuntimeDestructionFn = func(db *statedb.StateDB, expected statedb.RuntimeState, incarnation string) (statedb.RuntimeState, error) {
+		return db.CompleteRuntimeDestruction(expected, incarnation, string(StatusStopped))
+	}
+)
+
+func (i *Instance) killInternal(selection RuntimeSelection, sync, deleteRow, terminate bool, result *statedb.RuntimeState) error {
+	return i.killInternalWithCleanup(selection, sync, deleteRow, terminate, result, nil)
+}
+
+func (i *Instance) killInternalWithCleanup(selection RuntimeSelection, sync, deleteRow, terminate bool, result *statedb.RuntimeState, beforeDelete func()) error {
+	expected := selection.State
+	if expected.InstanceID == "" || expected.InstanceID != i.ID {
+		return statedb.ErrRuntimeGenerationConflict
+	}
+	release, err := acquireInstanceSpawnLock(expected.InstanceID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	err = i.killInternalLocked(selection, sync, deleteRow, terminate, result, beforeDelete)
+	if err == nil && deleteRow {
+		if cleanupErr := pruneHookArtifacts(expected.InstanceID); cleanupErr != nil {
+			sessionLog.Warn("hook_cleanup_failed", slog.String("id", expected.InstanceID), slog.String("error", cleanupErr.Error()))
+		}
+	}
+	return err
+}
+
+// killInternalLocked is killInternal after the per-instance lifecycle lock has
+// been acquired. Composite transitions use it to keep one authority across the
+// stop, their metadata mutation, and the replacement spawn.
+func (i *Instance) killInternalLocked(selection RuntimeSelection, sync, deleteRow, terminate bool, result *statedb.RuntimeState, beforeDelete func()) error {
+	expected := selection.State
+	originalStatus := selection.State.Status
+	db := i.restartPersistenceDB()
+	versioned := false
+	if db != nil {
+		durable, found, readErr := db.ReadRuntimeState(i.ID)
+		if readErr != nil {
+			return readErr
+		}
+		if found && statedb.IsRuntimeDestructionReserved(durable) {
+			// The reservation was published only after the then-current writers
+			// passed the compatibility fence. Recover it before considering a
+			// legacy writer that registered later, or that late writer could strand
+			// the private marker forever.
+			reconciled, reconcileErr := i.reconcileRuntimeLocked(
+				db, durable, selection.Incarnation)
+			if reconcileErr != nil {
+				return reconcileErr
+			}
+			durable = reconciled.State
+		}
+		if err := db.RequireRuntimeWriterCompatibility(); err != nil {
+			return err
+		}
+		if found {
+			if !sameDestructiveRuntime(durable, expected) {
+				return destructiveRuntimeConflict(durable, expected)
+			}
+			versioned = true
+		}
+	}
+	if err := i.validateRuntimeSelection(db, selection, versioned); err != nil {
+		return err
+	}
+	if !terminate {
+		if !deleteRow {
+			return nil
+		}
+		if beforeDelete != nil {
+			beforeDelete()
+		}
+		if versioned {
+			return db.DeleteInstanceIfRuntime(expected, selection.Incarnation)
+		}
+		return nil
+	}
+	operation := destroyForStop
+	if deleteRow {
+		operation = destroyForDelete
+	}
+	candidate, err := i.captureDestructiveRuntimeCandidateLocked(
+		db, operation, expected, selection.Incarnation, versioned)
+	if err != nil {
+		return err
+	}
+
 	// #1580/#1775: supersede any in-flight fast-death watcher BEFORE the tmux
 	// kill (not after). watchForFastDeath only writes a SpawnFailureRecord /
 	// lifecycle event on an iteration whose gen check passes; bumping here
@@ -264,68 +361,71 @@ func (i *Instance) killInternal(sync bool) error {
 	// observed by the watcher as a "fast death" mid-teardown — including the
 	// up-to-3s KillAndWait escalation below, which used to run entirely
 	// inside the stale-gen window.
+	if versioned {
+		claimed, reserveErr := db.ReserveRuntimeDestruction(expected, selection.Incarnation)
+		if reserveErr != nil {
+			return reserveErr
+		}
+		expected = claimed
+		runtimeDestructionReservedFn(claimed)
+	}
+
+	// Recheck at the last possible point before the physical mutation. The
+	// cross-process lock prevents generation replacement until teardown returns;
+	// the captured tuple prevents this delayed caller from substituting whatever
+	// tmux pointer happens to be on i now.
+	currentSelection := selection
+	currentSelection.State = expected
+	if err := i.validateRuntimeSelection(db, currentSelection, versioned); err != nil {
+		if versioned {
+			if restored, restoreErr := db.CompleteRuntimeDestruction(expected, selection.Incarnation, originalStatus); restoreErr == nil {
+				i.adoptRuntimeState(restored)
+			} else {
+				return fmt.Errorf("runtime selection changed: %v; failed to release runtime reservation: %w", err, restoreErr)
+			}
+		}
+		return err
+	}
 	i.bumpSpawnGenAndBarrier()
 
-	// Issue #965 wiring (PR #1000 follow-up): claude/codex/gemini spawn
-	// stdio MCP children when they read .mcp.json — agent-deck never
-	// has a direct exec.Command for them, so spawn-time PID
-	// registration is impossible. Discover descendants from the pane
-	// process tree while the shell+tool are still alive, then SIGTERM
-	// them before tmux teardown. Without this, detached children
-	// (e.g., npx-wrapped MCPs that setsid into their own session)
-	// reparent to PID 1 and accumulate.
-	i.discoverMCPChildrenFromPaneTree()
-
-	// Reap tracked MCP child PIDs first (issue #965). Stdio MCP children
-	// don't die with their parent claude process — they get reparented to
-	// PID 1 and accumulate. SIGTERM with a short grace period, then
-	// SIGKILL anything still alive.
-	i.reapTrackedMCPChildren()
-
-	// Issue #953: kill the tmux session AND publish StatusStopped
-	// atomically under i.mu so concurrent UpdateStatus() callers (most
-	// notably the TUI's backgroundStatusUpdate poller) cannot observe
-	// the intermediate state where the tmux pane is gone but Status
-	// still reflects the pre-kill running/idle value. The pre-existing
-	// !tmuxSession.Exists() branch in UpdateStatus then short-circuits
-	// on `Status == StatusStopped` (lines around 3221/3237) and leaves
-	// the status alone. Setting Status only AFTER the tmux Kill (and
-	// not before) also prevents the symmetric "Status is stopped, tmux
-	// is alive — must be a user-initiated restart, flip to Running"
-	// path at line 3245 from firing during the cleanup window.
-	//
-	// Holding the lock around the kill is safe: tmuxSession.Kill() is
-	// a single tmux command (the process-tree reaping is deferred to a
-	// goroutine via ensureProcessesDead). The KillAndWait variant can
-	// take up to 3s when escalating to SIGKILL — only short-lived CLI
-	// processes (session remove) take that path, and they have no
-	// concurrent TUI render contending for the lock.
+	// Issue #965 wiring (PR #1000 follow-up): discover descendants only after
+	// the final durable check. Keep them local until the atomic stable-identity
+	// kill succeeds; a rejected replacement must not inherit their cleanup.
+	var discoveredChildren []tmux.ProcessIdentity
 	var tmuxErr error
-	i.mu.Lock()
-	if i.tmuxSession != nil {
-		if sync {
-			tmuxErr = i.tmuxSession.KillAndWait()
-		} else {
-			tmuxErr = i.tmuxSession.Kill()
+	if candidate != nil {
+		discoveredChildren, tmuxErr = discoverCapturedRuntimeChildrenFn(i, *candidate)
+		if tmuxErr == nil {
+			tmuxErr = terminateCapturedRuntimeFn(*candidate, sync)
 		}
 	}
-	i.Status = StatusStopped
-	i.stopRevision++
-	// A deliberate stop releases any auth hold: the session's whole runtime state
-	// is being discarded, and the next start is by definition a user act — the
-	// same intent the hold is waiting for. Without this, a session that showed a
-	// 401 and was then stopped by hand would stay held, and the user's own
-	// `session restart` would be refused with only --force as a way through.
-	i.clearAuthHoldLocked()
-	i.mu.Unlock()
-	// (gen already bumped at the top of killInternal, before the tmux kill —
-	// see the comment there for why it must happen first, not here.)
+	if tmuxErr != nil {
+		tmux.CloseProcessIdentities(discoveredChildren)
+		if versioned {
+			if restored, restoreErr := db.CompleteRuntimeDestruction(expected, selection.Incarnation, originalStatus); restoreErr == nil {
+				i.adoptRuntimeState(restored)
+			} else {
+				return fmt.Errorf("failed to kill tmux session: %v; failed to release runtime reservation: %w", tmuxErr, restoreErr)
+			}
+		}
+		return fmt.Errorf("failed to kill tmux session: %w", tmuxErr)
+	}
+	for _, identity := range discoveredChildren {
+		i.RegisterMCPChildIdentity(identity)
+	}
 	if i.GetToolThreadSafe() == "hermes" {
 		i.clearHermesHookArtifacts()
 	}
 
-	// Clean up sandbox container (only if name matches our prefix convention).
-	// Runs regardless of tmux kill result to avoid orphaned containers.
+	// Reap tracked MCP child PIDs after the exact tmux target has been killed.
+	// Stdio MCP children can detach from the tmux process group, so the explicit
+	// reap remains necessary even though the tmux terminator captures its tree.
+	i.reapTrackedMCPChildren()
+	// (gen was already bumped before the tmux kill — see the comment above for
+	// why it must happen first, not here.)
+
+	// Clean up the sandbox container only after the exact runtime kill succeeds
+	// (and only if its name matches our prefix convention).
 	if i.SandboxContainer != "" && docker.IsManagedContainer(i.SandboxContainer) {
 		dockerCfg := GetDockerSettings()
 		if dockerCfg.GetAutoCleanup() {
@@ -382,13 +482,43 @@ func (i *Instance) killInternal(sync bool) error {
 		i.CleanupWorkerScratchConfigDir()
 	}
 
-	// Issue #953: StatusStopped was already written under i.mu at the top
-	// of this function. Re-asserting it here without the lock would
-	// reintroduce the write/write data race with concurrent UpdateStatus.
-
-	if tmuxErr != nil {
-		return fmt.Errorf("failed to kill tmux session: %w", tmuxErr)
+	if deleteRow {
+		if beforeDelete != nil {
+			beforeDelete()
+		}
+		if versioned {
+			if deletionErr := deleteInstanceIfRuntimeFn(db, expected, selection.Incarnation); deletionErr != nil {
+				completed, releaseErr := completeDeletedRuntimeDestructionFn(db, expected, selection.Incarnation)
+				if releaseErr != nil {
+					return errors.Join(deletionErr, fmt.Errorf("failed to release runtime destruction reservation: %w", releaseErr))
+				}
+				i.adoptRuntimeState(completed)
+				return deletionErr
+			}
+		} else if err := i.validateRuntimeSelection(db, currentSelection, false); err != nil {
+			return err
+		}
+		return nil
 	}
+	if versioned {
+		completed, persistErr := db.CompleteRuntimeDestruction(expected, selection.Incarnation, string(StatusStopped))
+		if persistErr != nil {
+			return persistErr
+		}
+		expected = completed
+	} else {
+		expected.Status = string(StatusStopped)
+	}
+	i.mu.Lock()
+	if i.RuntimeGeneration == expected.Generation {
+		i.Status = StatusStopped
+		i.StatusRevision = expected.StatusRevision
+		// A deliberate stop releases an auth hold; the next start is an
+		// explicit user action.
+		i.clearAuthHoldLocked()
+	}
+	i.mu.Unlock()
+	captureRuntimeResult(result, expected)
 	return nil
 }
 
@@ -396,53 +526,52 @@ func (i *Instance) killInternal(sync bool) error {
 // For Claude sessions with known ID: sends Ctrl+C twice and resume command to existing session
 // For dead sessions or unknown ID: recreates the tmux session
 //
-// Issue #1040: gated by acquireInstanceSpawnLock plus a "spawned-while-
-// we-waited" stamp so concurrent callers (TUI poller + RC-exit handler
-// in-process; multiple `agent-deck session start` CLI invocations
-// cross-process) cannot each race to recreate a tmux session for the
-// same instance. A legitimate manual restart still proceeds because the
-// stamp generation from any prior spawn is already in the new caller's
-// pre-lock snapshot.
+// Concurrent callers serialize through physical transition authority. A
+// caller that observed an older generation adopts the durable winner without
+// stamping, spawning, persisting, or sweeping.
 func (i *Instance) Restart() error {
-	return i.restartRecorded(nil, "")
+	return i.restartRecorded(nil, nil, "")
 }
 
-// RestartFrom is Restart with session.end recorded from surface sf ("" =
-// the process surface), for web requests served by a CLI or TUI process.
+// RestartFrom records the restart telemetry from the specified surface.
 func (i *Instance) RestartFrom(sf telemetry.Surface) error {
-	return i.restartRecorded(nil, sf)
+	return i.restartRecorded(nil, nil, sf)
 }
 
 // RestartWithEnv restarts the session with one-shot environment overrides.
 // The values apply to the replacement process only and are not persisted in
 // the Instance or tmux session environment for future restarts.
 func (i *Instance) RestartWithEnv(env map[string]string) error {
+	return i.restartWithEnv(env, nil)
+}
+
+func (i *Instance) restartWithEnv(env map[string]string, result *statedb.RuntimeState) error {
 	for key := range env {
 		if !IsValidEnvKey(key) {
 			return fmt.Errorf("invalid environment variable name (%s, %d bytes)", EnvKeyRejectReason(key), len(key))
 		}
 	}
-	return i.restartRecorded(env, "")
+	return i.restartRecorded(env, result, "")
 }
 
-// restartRecorded restarts and records session.end(restart) from surface sf
-// on success.
-func (i *Instance) restartRecorded(env map[string]string, sf telemetry.Surface) error {
+// restartRecorded restarts and records session.end(restart) once the
+// replacement is live: on success, and on a partial success, which every
+// caller adopts as completed. A lock loser that adopted the winner replaced
+// nothing and records nothing.
+func (i *Instance) restartRecorded(env map[string]string, result *statedb.RuntimeState, sf telemetry.Surface) error {
 	// The old process's exit and the resumed one's boot are not turns: leave
 	// a token first, so the parent gets no false completion (#2792,
 	// restart_resume.go).
 	noteRestartToken(i, time.Now())
 	queued := i.leftQueue()
-	err := i.restart(env)
-	if err != nil {
+	adopted, err := i.restart(env, false, result)
+	live := err == nil || IsRestartPartialSuccess(err)
+	if !live {
 		clearRestartToken(i.ID)
 	} else {
 		markRestartSpawned(i, time.Now())
 	}
-	if err == nil {
-		// LastStartedAt covers restarts too (its contract), so the idle
-		// build refresh sees a TUI restart as already on the new build.
-		i.markStarted()
+	if !adopted && live {
 		i.RecordTelemetryEndFrom(telemetry.EndRestart, sf)
 		// A restart of a queued session takes it off the queue: its brief is
 		// delivered now, not left for a later start to type into a
@@ -454,66 +583,90 @@ func (i *Instance) restartRecorded(env map[string]string, sf telemetry.Surface) 
 	return err
 }
 
-func (i *Instance) restart(env map[string]string) (err error) {
+// restart reports adopted when it returned a concurrent winner's runtime
+// without stopping or spawning anything.
+func (i *Instance) restart(env map[string]string, fresh bool, result *statedb.RuntimeState) (adopted bool, err error) {
+	transition, winner, transitionErr := i.beginRuntimeTransition(fresh)
+	if transitionErr != nil {
+		return false, transitionErr
+	}
+	if winner != nil {
+		captureRuntimeResult(result, *winner)
+		return true, nil
+	}
+	defer transition.close()
+	return false, i.restartWithTransition(transition, env, result)
+}
+
+// restartWithTransition performs the physical replacement after its caller has
+// acquired per-instance transition authority. It never releases that authority.
+func (i *Instance) restartWithTransition(transition *runtimeTransitionAuthority, env map[string]string, result *statedb.RuntimeState) (err error) {
 	if err := i.ValidateAccount(); err != nil {
 		return err
 	}
-	beforeLock := spawnGenerationSnapshot(i.ID)
-	release, lockErr := acquireInstanceSpawnLock(i.ID)
-	if lockErr != nil {
-		return lockErr
-	}
-	defer release()
-	// A one-shot environment request is explicit operator intent. If another
-	// spawn won while this call waited for the lock, restart that fresh process
-	// so the requested environment is not silently discarded.
-	if spawnedSince(i.ID, beforeLock) && len(env) == 0 {
-		return nil
-	}
-	// #1873: the case this issue reports IS a restart — a pane that died during
-	// startup, a wrapped tree that escaped it, and a later legitimate restart
-	// that spawns a second one. The gate runs before the generation bump and
-	// before any tmux work, so a refusal changes nothing at all: no kill, no
-	// respawn, no signal, and the receipt left intact for inspection.
 	if err := i.guardOwnedProcessesBeforeSpawn("restart"); err != nil {
 		return err
 	}
+	ownershipCommand := i.Command
+	// Supersede the previous watcher before fresh bindings are cleared.
+	i.bumpSpawnGenAndBarrier()
+	// A fresh restart rotates the Hermes hook generation before it clears the
+	// recorded id: a late hook from the old process then fails the generation
+	// check instead of writing its id back.
+	hermesSeeded := false
+	if i.Tool == "hermes" && transition.fresh {
+		if _, err := i.seedHermesHookGeneration("starting", false); err != nil {
+			return fmt.Errorf("seed hermes fresh restart generation: %w", err)
+		}
+		hermesSeeded = true
+	}
+	transition.prepareFresh(i)
+	// Every successful branch below represents a new physical runtime. Publish
+	// the complete tuple once, after the branch succeeds and while the
+	// cross-process spawn lock is still held.
+	defer func() {
+		if err != nil {
+			transition.restoreFresh(i)
+			return
+		}
+		// Capture the physical replacement before a failed CAS can adopt a
+		// different durable winner into this Instance.
+		i.commitOwnershipAfterRestart(ownershipCommand)
+		candidate, plan, committed, persistErr := i.commitPhysicalRuntime(transition)
+		if spawnedRuntimeGone(persistErr) {
+			transition.keepCanonicalRuntime(i)
+			captureRuntimeResult(result, transition.expected)
+			return
+		}
+		captureRuntimeResult(result, candidate)
+		if persistErr != nil {
+			err = &RestartPartialSuccessError{
+				InstanceID: i.ID, Operation: "restart", Runtime: candidate, BindingPlan: plan,
+				NeedsReconciliation: !committed, Err: persistErr,
+			}
+			return
+		}
+		// A fallback recreate changes the only durable handle for the live
+		// process. The runtime transition above publishes that handle first;
+		// only then may the compatibility write acknowledge the exact committed
+		// generation and emit the change-detection stamp used by the TUI.
+		if candidate.TmuxSession != transition.expected.TmuxSession ||
+			candidate.TmuxSocketName != transition.expected.TmuxSocketName {
+			i.recordRestartOutcome(candidate, transition.incarnation)
+		}
+		runtimeDuplicateSweepFn(i, transition.expected.TmuxSocketName)
+	}()
+
 	var validatedDeepSeekRestartCommand string
 	if i.Tool == "deepseek" {
-		i.refreshDeepSeekSessionID()
-		var err error
+		if !transition.fresh {
+			i.refreshDeepSeekSessionID()
+		}
 		validatedDeepSeekRestartCommand, err = i.deepSeekRestartCommand()
 		if err != nil {
 			return err
 		}
 	}
-	// Deferred only once the gate has passed: a refused restart started nothing,
-	// so it must not leave a spawn stamp that makes a concurrent caller believe
-	// a replacement is already running.
-	defer recordInstanceSpawn(i.ID)
-	// Cover every successful respawn/recreate branch while holding the spawn
-	// lock. Storm-suppressed calls and failed spawns never send recovery input.
-	defer func() {
-		if err == nil {
-			i.recoverConductorAfterSpawn()
-		}
-	}()
-	// Registered AFTER the gate and BEFORE the tmux work, so it runs on every
-	// exit of this function — including each per-tool respawn-pane fast path —
-	// while the spawn lock is still held (deferred release() was registered
-	// first, so it runs last). A replacement pane that kept the previous
-	// receipt would be an unowned tree.
-	ownershipCommand := i.Command
-	defer func() { i.commitOwnershipAfterRestart(ownershipCommand) }()
-
-	// #1775: supersede the fast-death watcher from the PREVIOUS spawn here, at
-	// the single entry point, rather than deeper down. restart() has several
-	// early-returning fast paths (the claude respawn-pane branch and its
-	// per-tool siblings) that never reach the fallback-recreate block, so a
-	// bump placed there left a restart inside the 15s window watching the
-	// REPLACEMENT pane with the old spawn's command and start time — and
-	// recording a failure against it if that pane died.
-	i.bumpSpawnGenAndBarrier()
 
 	if len(env) > 0 {
 		i.restartEnv = make(map[string]string, len(env))
@@ -525,7 +678,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 	// Generation publication is the restart invalidation boundary. Commit it
 	// before any signal/kill reaches the old Hermes process, so its delayed
 	// hooks cannot overwrite the replacement's starting seed.
-	if i.Tool == "hermes" {
+	if i.Tool == "hermes" && !hermesSeeded {
 		if _, err := i.seedHermesHookGeneration("starting", false); err != nil {
 			return fmt.Errorf("seed hermes restart generation: %w", err)
 		}
@@ -552,6 +705,9 @@ func (i *Instance) restart(env map[string]string) (err error) {
 	// current state. Same call as Start()/recreate paths — idempotent
 	// per (sourceProfileDir, plugins-set) and best-effort on failure.
 	i.prepareWorkerScratchConfigDirForSpawn()
+	if transition.fresh {
+		goto fallbackRecreate
+	}
 
 	// Issue #956: custom-command Claude sessions whose hooks never fired
 	// (or whose wrapper script overrode CLAUDE_CONFIG_DIR) arrive at
@@ -609,7 +765,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 		// Use respawn-pane for atomic restart
 		// This is more reliable than Ctrl+C + wait for shell + send command
 		// respawn-pane -k kills the current process and starts the new command atomically
-		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+		if err := i.respawnRuntimePane(transition, resumeCmd); err != nil {
 			mcpLog.Debug("respawn_pane_claude_failed", slog.String("error", err.Error()))
 			return fmt.Errorf("failed to restart Claude session: %w", err)
 		}
@@ -618,11 +774,6 @@ func (i *Instance) restart(env map[string]string) (err error) {
 
 		// Persist .sid sidecar so hook events after restart can be correlated
 		WriteHookSessionAnchor(i.ID, i.ClaudeSessionID)
-
-		// Issue #666: kill OTHER agentdeck tmux sessions sharing this
-		// Claude session id so two `claude --resume` processes don't
-		// race the same conversation (and stack two telegram pollers).
-		i.sweepDuplicateToolSessions()
 
 		// Re-capture MCPs after restart (they may have changed since session started)
 		i.CaptureLoadedMCPs()
@@ -635,7 +786,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 	// For Gemini: ALWAYS update session to get the most recent one
 	// Krudony fix: don't skip when we already have an ID - the user may have started a NEW session
 	if i.Tool == "gemini" {
-		i.UpdateGeminiSession(nil)
+		i.updateGeminiSessionForTransition()
 	}
 
 	// If Gemini session with known ID AND tmux session exists, use respawn-pane.
@@ -662,7 +813,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 		i.ensureProfileEnv()
 		i.ensureClaudeConfigDirEnv()
 
-		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+		if err := i.respawnRuntimePane(transition, resumeCmd); err != nil {
 			sessionLog.Info("restart_gemini_respawn_failed", slog.String("error", err.Error()))
 			return fmt.Errorf("failed to restart Gemini session: %w", err)
 		}
@@ -672,17 +823,21 @@ func (i *Instance) restart(env map[string]string) (err error) {
 		// Persist .sid sidecar so hook events after restart can be correlated
 		WriteHookSessionAnchor(i.ID, i.GeminiSessionID)
 
-		// Issue #666: sweep cross-tmux duplicates on the respawn path too.
-		i.sweepDuplicateToolSessions()
-
 		i.Status = StatusWaiting
 		return nil
 	}
 
 	// If OpenCode session AND tmux session exists, use respawn-pane
 	if i.Tool == "opencode" && i.tmuxSession != nil && i.tmuxSession.Exists() {
-		// Refresh from OpenCode state before deciding the resume target.
-		i.updateOpenCodeSession(true)
+		// Refresh from OpenCode state while physical transition authority is
+		// already held. The final assignment is committed by the transition's
+		// binding plan; recursively entering the observation publisher here
+		// would attempt to reacquire the spawn lock.
+		if candidate := i.queryOpenCodeSession(); candidate != "" {
+			i.OpenCodeSessionID = candidate
+			i.OpenCodeDetectedAt = time.Now()
+			i.OpenCodeStartedAt = 0
+		}
 
 		// Try to get session ID from tmux environment if not already set
 		// (async detection stores it there but Instance might not have been saved)
@@ -720,7 +875,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 		i.ensureProfileEnv()
 		i.ensureClaudeConfigDirEnv()
 
-		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+		if err := i.respawnRuntimePane(transition, resumeCmd); err != nil {
 			sessionLog.Info("restart_opencode_respawn_failed", slog.String("error", err.Error()))
 			return fmt.Errorf("failed to restart OpenCode session: %w", err)
 		}
@@ -737,9 +892,6 @@ func (i *Instance) restart(env map[string]string) (err error) {
 			WriteHookSessionAnchor(i.ID, i.OpenCodeSessionID)
 		}
 
-		// Issue #666: sweep cross-tmux duplicates on the respawn path too.
-		i.sweepDuplicateToolSessions()
-
 		i.Status = StatusWaiting
 		return nil
 	}
@@ -753,7 +905,8 @@ func (i *Instance) restart(env map[string]string) (err error) {
 		i.mu.Lock()
 		i.pendingCodexRestartWarning = ""
 		i.mu.Unlock()
-		if missingDep := i.updateCodexSession(nil, true); missingDep != "" {
+		candidate := i.adoptCodexSessionForRestart()
+		if missingDep := candidate.missingDependency; missingDep != "" {
 			i.mu.Lock()
 			i.pendingCodexRestartWarning = codexProbeMissingWarning(missingDep)
 			i.mu.Unlock()
@@ -763,11 +916,14 @@ func (i *Instance) restart(env map[string]string) (err error) {
 
 	// If Codex session AND tmux session exists, use respawn-pane
 	if IsCodexCompatible(i.Tool) && i.tmuxSession != nil && i.tmuxSession.Exists() {
-		// Try to get session ID from tmux environment if not already set
+		// Try to get session ID from tmux environment if not already set.
+		// Written under i.mu, as adoptCodexSessionForRestart does.
 		if i.CodexSessionID == "" {
 			if envID, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && envID != "" {
+				i.mu.Lock()
 				i.CodexSessionID = envID
 				i.CodexDetectedAt = time.Now()
+				i.mu.Unlock()
 				sessionLog.Info("restart_codex_recovered_id", slog.String("session_id", envID))
 			}
 		}
@@ -795,7 +951,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 		i.ensureProfileEnv()
 		i.ensureClaudeConfigDirEnv()
 
-		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+		if err := i.respawnRuntimePane(transition, resumeCmd); err != nil {
 			sessionLog.Info("restart_codex_respawn_failed", slog.String("error", err.Error()))
 			return fmt.Errorf("failed to restart Codex session: %w", err)
 		}
@@ -809,9 +965,6 @@ func (i *Instance) restart(env map[string]string) (err error) {
 
 		// Persist .sid sidecar so hook events after restart can be correlated
 		WriteHookSessionAnchor(i.ID, i.CodexSessionID)
-
-		// Issue #666: sweep cross-tmux duplicates on the respawn path too.
-		i.sweepDuplicateToolSessions()
 
 		i.Status = StatusWaiting
 		return nil
@@ -837,13 +990,12 @@ func (i *Instance) restart(env map[string]string) (err error) {
 		i.ensureProfileEnv()
 		i.ensureClaudeConfigDirEnv()
 
-		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+		if err := i.respawnRuntimePane(transition, resumeCmd); err != nil {
 			sessionLog.Info("restart_cursor_respawn_failed", slog.String("error", err.Error()))
 			return fmt.Errorf("failed to restart Cursor session: %w", err)
 		}
 
 		sessionLog.Info("restart_cursor_respawn_succeeded")
-		i.sweepDuplicateToolSessions()
 		i.CaptureLoadedMCPs()
 		i.Status = StatusWaiting
 		return nil
@@ -890,7 +1042,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 			i.ensureProfileEnv()
 			i.ensureClaudeConfigDirEnv()
 
-			if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+			if err := i.respawnRuntimePane(transition, resumeCmd); err != nil {
 				sessionLog.Info(
 					"restart_generic_respawn_failed",
 					slog.String("tool", i.Tool),
@@ -901,23 +1053,26 @@ func (i *Instance) restart(env map[string]string) (err error) {
 
 			sessionLog.Info("restart_generic_respawn_succeeded", slog.String("tool", i.Tool))
 
-			i.loadCustomPatternsFromConfig() // Reload custom patterns
+			i.loadCustomPatternsFromConfig(i.tmuxSession) // Reload custom patterns
 			i.Status = StatusWaiting
 			return nil
 		}
 		// toolDef vanished or id emptied between checks — fall through to recreate.
 	}
 
+fallbackRecreate:
 	mcpLog.Debug("restart_fallback_recreate")
 
 	// (the watcher was already superseded at the top of restart(), which covers
 	// this path and every early-returning respawn fast path alike.)
 
-	// Kill old tmux session to prevent orphans before recreating (#138)
-	if i.tmuxSession != nil && i.tmuxSession.Exists() {
-		mcpLog.Debug("restart_killing_old_session", slog.String("session_name", i.tmuxSession.Name))
-		if killErr := i.tmuxSession.Kill(); killErr != nil {
-			mcpLog.Warn("restart_kill_old_session_failed", slog.String("error", killErr.Error()))
+	// Kill the exact predecessor captured under transition authority. A mutable
+	// tmux pointer may already describe a replacement and must never be used as
+	// the target of this destructive fallback.
+	if transition.expected.TmuxSession != "" && !transition.predecessorTerminated {
+		mcpLog.Debug("restart_killing_old_session", slog.String("session_name", transition.expected.TmuxSession))
+		if killErr := i.terminateTransitionPredecessor(transition); killErr != nil {
+			return fmt.Errorf("failed to kill predecessor runtime: %w", killErr)
 		}
 	}
 
@@ -939,7 +1094,9 @@ func (i *Instance) restart(env map[string]string) (err error) {
 		command = i.buildCodexCommand(i.Command)
 	} else if i.Tool == "hermes" {
 		// Issue #2582: resume only the id this entry's own hooks recorded.
-		i.prepareHermesResume()
+		if !transition.fresh {
+			i.prepareHermesResume()
+		}
 		// Drop any stale hook state from the previous process, then seed a
 		// synthetic "waiting" baseline. Hermes fires on_session_start only at
 		// the FIRST TURN of a brand-new session (not at process launch), so
@@ -953,7 +1110,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 		}
 		command = i.buildHermesCommand(i.Command)
 	} else if i.Tool == "deepseek" {
-		// Re-discover the workspace's newest dsh session on EVERY restart, for
+		// Re-discover the workspace's newest dsh session on every resumptive restart, for
 		// the same self-healing reason as hermes: a pruned session yields the
 		// current newest, or "" — in which case the launch boots fresh instead
 		// of resuming a dead ID forever. A no-op when [deepseek].resume_flag is
@@ -999,7 +1156,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 		case i.Tool == "crush":
 			command = i.buildCrushCommand(i.Command)
 		case i.Tool == "cursor":
-			command = i.buildCursorCommand(i.Command, true)
+			command = i.buildCursorCommand(i.Command, !transition.fresh)
 		default:
 			// Check if this is a custom tool with session resume config
 			if toolDef := GetToolDef(i.Tool); toolDef != nil {
@@ -1030,7 +1187,7 @@ func (i *Instance) restart(env map[string]string) (err error) {
 	}
 
 	// Load custom patterns for status detection (for custom tools).
-	i.loadCustomPatternsFromConfig()
+	i.loadCustomPatternsFromConfig(i.tmuxSession)
 
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
@@ -1088,13 +1245,6 @@ func (i *Instance) restart(env map[string]string) (err error) {
 	// builders that no longer embed "tmux set-environment" in the shell string.
 	i.SyncSessionIDsToTmux()
 
-	// Kill any other agentdeck tmux session that duplicates this instance.
-	// Routed through sweepDuplicateToolSessions so the fallback restart path
-	// gets the same tool-session-id guard (#596) AND instance-id guard (#678)
-	// as the respawn-pane paths. The instance-id guard is what catches shell
-	// / placeholder sessions that have no tool-level session id.
-	i.sweepDuplicateToolSessions()
-
 	// Re-capture MCPs after restart
 	i.CaptureLoadedMCPs()
 
@@ -1115,15 +1265,6 @@ func (i *Instance) restart(env map[string]string) (err error) {
 		i.Status = StatusIdle
 	}
 
-	// #1870: this is the only path that mints a new tmux session name, so it is
-	// the only place that has to make it durable. Callers that never save --
-	// mcp/skill/plugin attach|detach --restart -- used to leave the killed
-	// session's name on disk, so agent-deck reported a live session as broken
-	// and orphaned its tmux session. Status travels with it because the two are
-	// one fact about the restart. See restart_tmux_persist.go for why this is a
-	// targeted write and why a failure here is recorded rather than returned.
-	i.recordRestartOutcome()
-
 	return nil
 }
 
@@ -1132,44 +1273,19 @@ func (i *Instance) restart(env map[string]string) (err error) {
 var restartFreshBindingCleared = func(*Instance) {}
 
 // RestartFresh restarts the current tool without resuming the existing tool session.
-// This recreates the tmux session and clears the stored tool session binding first,
-// so the next start gets a brand-new tool session ID.
+// Binding release/selection is prepared only after transition authority and is
+// committed atomically with the replacement runtime generation.
 func (i *Instance) RestartFresh() error {
-	i.prepareRestartMCPConfig()
-	i.spawnGen.Add(1)
+	return i.restartFresh(nil)
+}
 
-	// Rotate the Hermes hook generation before the binding is cleared and the
-	// old process is killed, as Restart does: a late hook from the old process
-	// then fails the generation check instead of writing its id back.
-	if i.Tool == "hermes" {
-		if _, err := i.seedHermesHookGeneration("starting", false); err != nil {
-			return fmt.Errorf("seed hermes fresh restart generation: %w", err)
+func (i *Instance) restartFresh(result *statedb.RuntimeState) error {
+	if _, err := i.restart(nil, true, result); err != nil {
+		if !IsRestartPartialSuccess(err) {
+			i.Status = StatusError
 		}
-		i.hermesStartFresh = true
-	}
-
-	i.clearSessionBindingForFreshStart()
-	restartFreshBindingCleared(i)
-
-	// #1775: same reasoning as the restart-fallback-recreate path above, and
-	// likewise unconditional — an old watcher whose session is already gone is
-	// the one most likely to write a spurious failure.
-	i.bumpSpawnGenAndBarrier()
-
-	if i.tmuxSession != nil && i.tmuxSession.Exists() {
-		if killErr := i.tmuxSession.Kill(); killErr != nil {
-			mcpLog.Warn("restart_fresh_kill_old_session_failed", slog.String("error", killErr.Error()))
-		}
-	}
-
-	i.recreateTmuxSession()
-
-	if err := i.Start(); err != nil {
-		i.hermesStartFresh = false // a failed start must not make a later one fresh
-		i.Status = StatusError
 		return fmt.Errorf("failed to restart session fresh: %w", err)
 	}
-
 	return nil
 }
 

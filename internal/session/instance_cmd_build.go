@@ -1211,15 +1211,20 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	// `resume <stale-uuid>` on every restart and Codex exits immediately,
 	// flipping the session back to error in an infinite loop. Drop the
 	// stale ID, clear the .sid sidecar so the next hook tick rebinds
-	// cleanly, and spawn fresh.
+	// cleanly, and spawn fresh. The start or restart building this command
+	// holds the spawn lock, not i.mu, and every status pass observes the
+	// binding under i.mu alone (captureActiveRuntimeBindingObservation), so
+	// the drop is written under i.mu.
 	if i.CodexSessionID != "" && !codexRolloutExistsInHome(i.CodexSessionID, codexHome) {
 		sessionLog.Warn("codex_resume_stale_sid_dropped",
 			slog.String("instance_id", i.ID),
 			slog.String("title", i.Title),
 			slog.String("sid", i.CodexSessionID),
 			slog.String("codex_home", codexHome))
+		i.mu.Lock()
 		i.CodexSessionID = ""
 		i.CodexDetectedAt = time.Time{}
+		i.mu.Unlock()
 		ClearHookSessionAnchor(i.ID)
 	}
 
@@ -1234,10 +1239,16 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	if i.CodexSessionID != "" && codexSessionNeedsFork(i.CodexSessionID, codexHome) {
 		if parentID := codexGuardianParentThreadID(i.CodexSessionID, codexHome); parentID != "" {
 			oldID := i.CodexSessionID
-			if err := i.bindCodexSessionFromHook(parentID, "guardian_parent_recovery"); err != nil {
+			observation := i.CaptureRuntimeBindingObservation("codex")
+			if err := i.PublishRuntimeBindingObservation(observation, parentID, time.Now()); err != nil {
 				return envPrefix + fmt.Sprintf("%s%s%s%s%s fork %s",
 					command, yoloFlag, modelFlag, reasoningFlag, identityFlag, shellescape.Quote(oldID))
 			}
+			i.recordCodexOwnership(parentID)
+			if tmuxSession := i.GetTmuxSession(); tmuxSession != nil && tmuxSession.Exists() {
+				_ = tmuxSession.SetEnvironment("CODEX_SESSION_ID", parentID)
+			}
+			_ = i.RecordRecallLink("codex")
 			_ = WriteSessionIDLifecycleEvent(SessionIDLifecycleEvent{
 				InstanceID: i.ID, Tool: i.Tool, Action: "rebind",
 				Source: "guardian_parent_recovery", OldID: oldID, NewID: parentID,

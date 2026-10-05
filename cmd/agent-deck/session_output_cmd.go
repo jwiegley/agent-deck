@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/clipboard"
 	"github.com/asheshgoplani/agent-deck/internal/comms"
@@ -101,12 +100,7 @@ func handleSessionOutput(profile string, args []string) {
 	// The DB-stored ClaudeSessionID may be stale if /clear created a new session
 	// or PostStartSync timed out. This matches the refresh in handleSessionSend.
 	if session.IsClaudeCompatible(inst.Tool) {
-		if freshID := inst.GetSessionIDFromTmux(); freshID != "" {
-			inst.ClaudeSessionID = freshID
-			// #1815: own pane env — weak vouch.
-			session.NoteClaudeSessionIDFromOwnPane(inst)
-			inst.ClaudeDetectedAt = time.Now()
-		}
+		inst.RefreshLiveSessionIDs()
 	}
 
 	// #1101: --pane short-circuits the transcript path and returns the live

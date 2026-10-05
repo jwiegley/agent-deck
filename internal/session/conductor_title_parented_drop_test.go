@@ -52,8 +52,10 @@ func seedNotifyInstances(t *testing.T, profile string, insts ...*Instance) {
 		t.Fatalf("NewStorageWithProfile: %v", err)
 	}
 	defer storage.Close()
-	if err := storage.SaveWithGroups(insts, nil); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	for _, inst := range insts {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert %s: %v", inst.ID, err)
+		}
 	}
 }
 

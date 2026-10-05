@@ -679,10 +679,12 @@ func (i *Instance) hasEffectiveWrapper() bool {
 }
 
 // loadCustomPatternsFromConfig loads detection patterns from built-in defaults + config.toml
-// overrides, and sets them on the tmux session for status detection and tool auto-detection.
+// overrides, and sets them on sess for status detection and tool auto-detection.
 // Works for ALL tools: built-in (claude, gemini, opencode, codex) and custom.
-func (i *Instance) loadCustomPatternsFromConfig() {
-	if i.tmuxSession == nil {
+// sess is i's wrapper, or one configureTmuxWrapperLocked prepares for it; only
+// i.Tool is read.
+func (i *Instance) loadCustomPatternsFromConfig(sess *tmux.Session) {
+	if sess == nil {
 		return
 	}
 
@@ -694,13 +696,13 @@ func (i *Instance) loadCustomPatternsFromConfig() {
 			sessionLog.Warn("pattern_compile_error", slog.String("tool", i.Tool), slog.String("error", err.Error()))
 		}
 		if resolved != nil {
-			i.tmuxSession.SetPatterns(resolved)
+			sess.SetPatterns(resolved)
 		}
 	}
 
 	// Keep detect patterns for DetectTool() (separate from busy/prompt detection)
 	if toolDef := GetToolDef(i.Tool); toolDef != nil {
-		i.tmuxSession.SetDetectPatterns(i.Tool, toolDef.DetectPatterns)
+		sess.SetDetectPatterns(i.Tool, toolDef.DetectPatterns)
 	}
 }
 

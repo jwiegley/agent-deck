@@ -122,9 +122,7 @@ func TestSessionLifecycleMatrix_CustomToolSessionID(t *testing.T) {
 
 	instances := []*Instance{a, b, c, unk, claude, shellInst, noResume}
 	tree := NewGroupTreeWithGroups(instances, nil)
-	if err := storage.SaveWithGroups(instances, tree); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
-	}
+	insertTestInstances(t, storage, instances, tree)
 
 	loaded, _, err := storage.LoadWithGroups()
 	if err != nil {
@@ -317,9 +315,7 @@ func TestClearToolSessionID_SurvivesStickyMergeOnSave(t *testing.T) {
 	inst.Tool = "shell"
 	inst.GenericSessionID = "must-not-resurrect"
 	inst.GenericDetectedAt = time.Now()
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	// Intentional clear (CLI/TUI SetField path) then full-table save.
 	if _, _, err := SetField(inst, FieldToolSessionID, "", nil); err != nil {
@@ -357,9 +353,7 @@ func TestClearToolSessionID_FlagConsumedAfterSave(t *testing.T) {
 	inst.Tool = "shell"
 	inst.GenericSessionID = "first-id"
 	inst.GenericDetectedAt = time.Now()
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatal(err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 
 	if _, _, err := SetField(inst, FieldToolSessionID, "", nil); err != nil {
 		t.Fatal(err)

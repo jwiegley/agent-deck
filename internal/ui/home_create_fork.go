@@ -19,6 +19,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/jujutsu"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/vcs"
@@ -310,13 +311,24 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			slog.String("path", inst.ProjectPath),
 			slog.Bool("sandbox", inst.IsSandboxed()),
 		)
-		if err := inst.Start(); err != nil {
-			uiLog.Error("session_create_failed", slog.String("error", err.Error()))
-			return sessionCreatedMsg{err: err, tempID: tempID}
+		token := h.beginSessionTransitionFor(inst)
+		seed, seeded, err := h.seedPhysicalInstance(inst)
+		if err != nil {
+			return sessionCreatedMsg{sessionID: inst.ID, token: token, err: fmt.Errorf("seed session: %w", err), tempID: tempID}
+		}
+		runtime, startErr := h.startRuntime(inst)
+		runtime, startErr, warning := h.consumePhysicalRuntimeResult(inst, runtime, startErr)
+		if startErr != nil {
+			uiLog.Error("session_create_failed", slog.String("error", startErr.Error()))
+			rolledBack, rollbackErr := h.rollbackPhysicalSeed(inst, seed, seeded, startErr)
+			return sessionCreatedMsg{sessionID: inst.ID, token: token, seeded: seeded, seed: seed, rolledBack: rolledBack, err: rollbackErr, tempID: tempID}
 		}
 		inst.RecordTelemetryCreate(telemetry.ViaTUINew)
 		uiLog.Info("session_create_succeeded", slog.String("id", inst.ID))
-		return sessionCreatedMsg{instance: inst, tempID: tempID, setupWarning: setupWarning}
+		return sessionCreatedMsg{
+			instance: inst, sessionID: inst.ID, token: token, runtime: runtime,
+			warning: warning, seeded: seeded, seed: seed, tempID: tempID, setupWarning: setupWarning,
+		}
 	}
 }
 
@@ -1084,6 +1096,11 @@ type forkInstanceDeps struct {
 	createInstance     func(source *session.Instance, title, groupPath string, opts *session.ClaudeOptions, parent session.ForkParent) (*session.Instance, error)
 	createMultiRepoDir func(inst, source *session.Instance) error
 	startInstance      func(inst *session.Instance) error
+	startRuntime       func(inst *session.Instance) (statedb.RuntimeState, error)
+	seedInstance       func(inst *session.Instance) (statedb.InstanceSeedToken, bool, error)
+	rollbackSeed       func(inst *session.Instance, seed statedb.InstanceSeedToken, seeded bool, cause error) (bool, error)
+	beginTransition    func(inst *session.Instance) uint64
+	consumeResult      func(inst *session.Instance, runtime statedb.RuntimeState, err error) (statedb.RuntimeState, error, string)
 	rollback           func(repoRoot, worktreePath, branch string)
 }
 
@@ -1137,18 +1154,35 @@ func defaultForkInstanceDeps() forkInstanceDeps {
 			}
 			return nil
 		},
-		startInstance: func(inst *session.Instance) error {
-			if err := inst.Start(); err != nil {
-				return err
-			}
-			inst.RecordTelemetryCreate(telemetry.ViaTUIFork)
-			telemetry.FeatureUsed("fork", false)
-			return nil
+		startInstance: func(inst *session.Instance) error { return inst.Start() },
+		startRuntime:  func(inst *session.Instance) (statedb.RuntimeState, error) { return inst.StartRuntime() },
+		consumeResult: func(inst *session.Instance, runtime statedb.RuntimeState, err error) (statedb.RuntimeState, error, string) {
+			return consumePhysicalRuntimeResult(inst, runtime, err, (*session.Instance).ReconcileRestartResult)
 		},
 		rollback: func(repoRoot, worktreePath, branch string) {
 			_ = rollbackForkWithStateWorktree(repoRoot, worktreePath, branch)
 		},
 	}
+}
+
+func (h *Home) forkInstanceDeps() forkInstanceDeps {
+	deps := defaultForkInstanceDeps()
+	deps.startRuntime = h.startRuntime
+	deps.seedInstance = h.seedPhysicalInstance
+	deps.rollbackSeed = h.rollbackPhysicalSeed
+	deps.beginTransition = func(inst *session.Instance) uint64 { return h.beginSessionTransitionFor(inst) }
+	deps.consumeResult = h.consumePhysicalRuntimeResult
+	return deps
+}
+
+type forkCompletion struct {
+	instance   *session.Instance
+	runtime    statedb.RuntimeState
+	token      uint64
+	warning    string
+	seeded     bool
+	seed       statedb.InstanceSeedToken
+	rolledBack bool
 }
 
 // completeFork performs the post-forkWithStateWorktree sequence: create the
@@ -1162,7 +1196,7 @@ func defaultForkInstanceDeps() forkInstanceDeps {
 // title), so without the lock the #572 name sync clobbers the title the user
 // typed in the fork dialog on the fork's first hook event. Quick fork leaves
 // it false — its "<title> (fork)" name is auto-generated, not user intent.
-func completeFork(
+func completeForkRuntime(
 	source *session.Instance,
 	title, groupPath string,
 	toggles forkToggles,
@@ -1170,7 +1204,7 @@ func completeFork(
 	parentSessionID, parentProjectPath string,
 	withStateWorktreeCreated bool,
 	deps forkInstanceDeps,
-) (*session.Instance, error) {
+) (forkCompletion, error) {
 	// The parent goes into the fork's construction, not onto the finished
 	// instance: a Claude fork's first start runs the command baked here, and
 	// its launch env depends on the parent.
@@ -1180,7 +1214,7 @@ func completeFork(
 		if withStateWorktreeCreated {
 			deps.rollback(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch)
 		}
-		return nil, fmt.Errorf("cannot create forked instance: %w", err)
+		return forkCompletion{}, fmt.Errorf("cannot create forked instance: %w", err)
 	}
 	if toggles.LockTitle {
 		inst.TitleLocked = true
@@ -1195,22 +1229,78 @@ func completeFork(
 		if withStateWorktreeCreated {
 			deps.rollback(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch)
 		}
-		return nil, err
+		return forkCompletion{}, err
 	}
 
-	if err := deps.startInstance(inst); err != nil {
+	token := uint64(0)
+	if deps.beginTransition != nil {
+		token = deps.beginTransition(inst)
+	}
+	seeded := false
+	var seed statedb.InstanceSeedToken
+	rolledBack := false
+	if deps.seedInstance != nil {
+		var err error
+		seed, seeded, err = deps.seedInstance(inst)
+		if err != nil {
+			if deps.rollbackSeed != nil {
+				rolledBack, err = deps.rollbackSeed(inst, seed, seeded, err)
+			}
+			if withStateWorktreeCreated {
+				deps.rollback(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch)
+			}
+			return forkCompletion{instance: inst, token: token, seeded: seeded, seed: seed, rolledBack: rolledBack}, fmt.Errorf("seed forked session: %w", err)
+		}
+	}
+	var runtime statedb.RuntimeState
+	if deps.startRuntime != nil {
+		runtime, err = deps.startRuntime(inst)
+	} else {
+		err = deps.startInstance(inst)
+		runtime = inst.RuntimeState()
+	}
+	warning := ""
+	if deps.consumeResult != nil {
+		runtime, err, warning = deps.consumeResult(inst, runtime, err)
+	}
+	if err != nil {
+		if deps.rollbackSeed != nil {
+			rolledBack, err = deps.rollbackSeed(inst, seed, seeded, err)
+		}
 		if withStateWorktreeCreated {
 			deps.rollback(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch)
 		}
-		return nil, err
+		return forkCompletion{instance: inst, runtime: runtime, token: token, seeded: seeded, seed: seed, rolledBack: rolledBack}, err
 	}
+
+	inst.RecordTelemetryCreate(telemetry.ViaTUIFork)
+	telemetry.FeatureUsed("fork", false)
 
 	switch inst.Tool {
 	case "opencode":
 		go inst.DetectOpenCodeSession()
 	}
 
-	return inst, nil
+	return forkCompletion{instance: inst, runtime: runtime, token: token, warning: warning, seeded: seeded, seed: seed}, nil
+}
+
+func completeFork(
+	source *session.Instance,
+	title, groupPath string,
+	toggles forkToggles,
+	opts *session.ClaudeOptions,
+	parentSessionID, parentProjectPath string,
+	withStateWorktreeCreated bool,
+	deps forkInstanceDeps,
+) (*session.Instance, error) {
+	completed, err := completeForkRuntime(
+		source, title, groupPath, toggles, opts, parentSessionID, parentProjectPath,
+		withStateWorktreeCreated, deps,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return completed.instance, err
 }
 
 type forkBuildResult struct {

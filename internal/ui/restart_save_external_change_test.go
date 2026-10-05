@@ -15,12 +15,13 @@ import (
 // SessionPrefix + name + "_" + a fresh short id unconditionally. That name is
 // the only handle anything has on the live process.
 //
-// The name and the status the restart ended in are made durable where they are
-// produced, by a targeted two-column write inside Instance.restart. What is
-// under test here is the TUI half: the save that follows a restart must persist
-// the rest of the restart WITHOUT ever pushing this TUI's whole in-memory
-// snapshot, because that snapshot may be stale and a whole-snapshot write
-// reverts whatever another process changed in the meantime.
+// The name and status the restart ended in are made durable together by the
+// authoritative runtime-generation commit. Instance.restart then acknowledges
+// that exact physical tuple and emits a targeted reload stamp. What is under
+// test here is the TUI half: the save that follows a restart must persist the
+// rest of the restart WITHOUT ever pushing this TUI's whole in-memory snapshot,
+// because that snapshot may be stale and a whole-snapshot write reverts whatever
+// another process changed in the meantime.
 
 func skipIfNoTmuxBinaryUI(t *testing.T) {
 	t.Helper()
@@ -53,7 +54,7 @@ func TestRestartMsg_ConcurrentRenameSurvivesAndOutcomePersists(t *testing.T) {
 	renameThroughAnotherProcess(t, keeper.ID, renamed)
 
 	// The TUI restarts the OTHER session for real. This mints a new tmux name
-	// and records it, plus the status, at the chokepoint.
+	// and commits it, plus the status, at the lifecycle chokepoint.
 	if err := target.Restart(); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
@@ -87,9 +88,10 @@ func TestRestartMsg_ConcurrentRenameSurvivesAndOutcomePersists(t *testing.T) {
 }
 
 // TestRestartMsg_OwnWriteIsNotTreatedAsExternal pins the other half. With no
-// other writer, the restart's own targeted write must not make the TUI mistake
-// itself for a competing process — that false positive is what aborted the save
-// after every restart and dropped the rest of the restart's in-memory state.
+// other writer, the restart's own targeted acknowledgement must not make the
+// TUI mistake itself for a competing process — that false positive is what
+// aborted the save after every restart and dropped the rest of the restart's
+// in-memory state.
 func TestRestartMsg_OwnWriteIsNotTreatedAsExternal(t *testing.T) {
 	skipIfNoTmuxBinaryUI(t)
 
@@ -251,15 +253,29 @@ func newRestartSaveHome(t *testing.T, profile string) (*Home, *session.Storage) 
 	))
 
 	instances := []*session.Instance{keeper, target}
+	groupTree := session.NewGroupTree(instances)
+	for _, inst := range instances {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("InsertSessionAndVerify(%s): %v", inst.ID, err)
+		}
+	}
+	if err := storage.SaveGroupsOnly(groupTree); err != nil {
+		t.Fatalf("SaveGroupsOnly: %v", err)
+	}
+	loadedAt, err := storage.GetFileMtime()
+	if err != nil {
+		t.Fatalf("GetFileMtime: %v", err)
+	}
 	home.instancesMu.Lock()
 	home.instances = instances
 	for _, inst := range instances {
 		home.instanceByID[inst.ID] = inst
 	}
 	home.instancesMu.Unlock()
-	home.groupTree = session.NewGroupTree(home.instances)
+	home.groupTree = groupTree
 	home.rebuildFlatItems()
-
-	home.forceSaveInstances()
+	home.reloadMu.Lock()
+	home.lastLoadMtime = loadedAt
+	home.reloadMu.Unlock()
 	return home, storage
 }

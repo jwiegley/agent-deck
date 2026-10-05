@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // HarnessSwitchOptions is the common execution input for the CLI and TUI.
@@ -34,6 +36,7 @@ type HarnessSwitchOptions struct {
 	// predates the source's) is always archived automatically regardless of
 	// this flag.
 	ArchiveDestination bool
+	runtime            *nativeSwitchRuntime
 }
 
 // ErrSwitchDestinationDivergent marks the specific "destination already has a
@@ -87,18 +90,20 @@ type HarnessSwitchResult struct {
 var ErrSwitchBusy = errors.New("session switch already in progress")
 
 const (
-	switchJournalVersion = 3
-	switchPrepared       = "prepared"
-	switchStaged         = "staged"
-	switchInstalled      = "installed"
-	switchCommitted      = "committed"
-	switchCompleted      = "completed"
-	switchFailed         = "failed"
+	switchJournalVersion   = 3
+	switchPrepared         = "prepared"
+	switchStaged           = "staged"
+	switchInstalled        = "installed"
+	switchAccountPersisted = "account-persisted"
+	switchCommitted        = "committed"
+	switchCompleted        = "completed"
+	switchFailed           = "failed"
 )
 
 type switchIdentity struct {
-	InstanceID string `json:"instance_id"`
-	Tool       string `json:"tool"`
+	InstanceID  string `json:"instance_id"`
+	Incarnation string `json:"incarnation,omitempty"`
+	Tool        string `json:"tool"`
 	// StorageTool preserves the exact configured tool key for the registry CAS;
 	// Tool remains the canonical harness used for switch routing.
 	StorageTool   string    `json:"storage_tool,omitempty"`
@@ -143,12 +148,19 @@ type switchJournal struct {
 	// chosen transcript to (one per project key the destination harness could
 	// resume from). Older journals lack it; Destination remains the primary.
 	Installed []string `json:"installed,omitempty"`
+	runtime   *nativeSwitchRuntime
+}
+
+type nativeSwitchRuntime struct {
+	authority         *runtimeTransitionAuthority
+	partial           error
+	metadataCommitted bool
 }
 
 // ExecuteHarnessSwitch is the only mutating account/harness switch entry
 // point. PreviewSwitch is repeated inside the operation lock: a CLI preview
 // and a later TUI/CLI execution must not race a changed registry or artifact.
-func ExecuteHarnessSwitch(cfg *UserConfig, inst *Instance, opts HarnessSwitchOptions) (*HarnessSwitchResult, error) {
+func ExecuteHarnessSwitch(cfg *UserConfig, inst *Instance, opts HarnessSwitchOptions) (result *HarnessSwitchResult, resultErr error) {
 	if inst == nil {
 		return nil, fmt.Errorf("session is nil")
 	}
@@ -164,6 +176,8 @@ func ExecuteHarnessSwitch(cfg *UserConfig, inst *Instance, opts HarnessSwitchOpt
 	}
 	defer sourceLock.Release()
 
+	selection := inst.CaptureRuntimeSelection()
+	sourceIdentity := nativeSwitchStorageIdentity(identityForInstance(inst))
 	preview := PreviewSwitch(cfg, inst, opts.Target)
 	if preview.Refusal != nil {
 		return nil, fmt.Errorf("switch refused [%s]: %s", preview.Refusal.Code, preview.Refusal.Message)
@@ -261,6 +275,49 @@ func ExecuteHarnessSwitch(cfg *UserConfig, inst *Instance, opts HarnessSwitchOpt
 		}
 		journal = nil
 	}
+	if journal != nil && journal.State == switchAccountPersisted {
+		return nil, fmt.Errorf("native switch requires recovery after account persistence; launch will not be replayed")
+	}
+	authority, winner, err := inst.beginRuntimeTransition(false)
+	if err != nil {
+		return nil, err
+	}
+	if winner != nil {
+		return nil, destructiveRuntimeConflict(*winner, selection.State)
+	}
+	opts.runtime = &nativeSwitchRuntime{authority: authority}
+	defer func() {
+		authority.close()
+		if opts.runtime.partial != nil {
+			runtime, _ := RestartRuntimeCandidate(opts.runtime.partial)
+			_, _, warning := ConsumePhysicalRuntimeResult(inst, runtime, opts.runtime.partial, nil)
+			if result != nil {
+				result.Warnings = append(result.Warnings, warning)
+			} else if warning != "" {
+				resultErr = fmt.Errorf("%w; %s", resultErr, warning)
+			}
+		}
+		if resultErr == nil && result != nil && result.Committed && opts.Storage != nil {
+			resultErr = opts.Storage.CommitNativeHarnessSwitch(inst, result)
+		}
+	}()
+	// Status is liveness, not identity (#2344): a status observation committed
+	// since the source was loaded or captured must not cancel the switch. The
+	// lifecycle lock now pins the generation and tmux identity compared here.
+	currentIdentity := nativeSwitchStorageIdentity(identityForInstance(inst))
+	// ToolDataExtras are the target write set, not part of source identity.
+	sameSource := sourceIdentity.ID == currentIdentity.ID &&
+		sourceIdentity.Incarnation == currentIdentity.Incarnation &&
+		sourceIdentity.Tool == currentIdentity.Tool &&
+		sourceIdentity.Account == currentIdentity.Account &&
+		sourceIdentity.ProjectPath == currentIdentity.ProjectPath &&
+		sourceIdentity.Command == currentIdentity.Command &&
+		sourceIdentity.ClaudeSessionID == currentIdentity.ClaudeSessionID &&
+		sourceIdentity.CodexSessionID == currentIdentity.CodexSessionID &&
+		sourceIdentity.ParentSessionID == currentIdentity.ParentSessionID
+	if !samePhysicalRuntime(authority.expected, selection.State) || !sameSource {
+		return nil, fmt.Errorf("native switch source changed before runtime authority was acquired")
+	}
 	if IsClaudeCompatible(preview.SourceTool) && IsClaudeCompatible(preview.TargetHarness) {
 		return executeNativeClaudeSwitch(cfg, inst, preview, opts, journalPath, journal)
 	}
@@ -298,6 +355,7 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 			Source: identityForInstance(inst), Target: targetIdentityFor(inst, preview), WasRunning: wasRunning, NoStart: opts.NoStart,
 			RequestGeneration: switchRequestGeneration(identityForInstance(inst), opts.Target, opts.NoStart)}
 	}
+	j.runtime = opts.runtime
 	if err := writeSwitchJournal(journalPath, j); err != nil {
 		return nil, err
 	}
@@ -374,7 +432,7 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 	}
 
 	if wasRunning && nativeSwitchRunning(inst) {
-		if err := nativeSwitchStop(inst); err != nil {
+		if err := nativeSwitchStop(inst, j.runtime.authority); err != nil {
 			return switchFailedNative(journalPath, j, fmt.Errorf("stop source before install: %w", err))
 		}
 	}
@@ -516,7 +574,7 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 	result.nativeJournalPath = journalPath
 	result.nativeStorageAcknowledgement = storageAcknowledged
 	if !opts.NoStart && wasRunning {
-		if err := startNativeSwitchInstance(inst); err != nil && nativeSwitchLiveOnAccount(inst, targetDir) {
+		if err := startNativeSwitchInstance(inst, j); err != nil && nativeSwitchLiveOnAccount(inst, targetDir) {
 			// The start reported an error, yet this session's Claude is
 			// running on the target account (its pane came up anyway, e.g.
 			// re-created concurrently between stop and start). Rolling back
@@ -530,7 +588,7 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 			inst.Account = oldAccount
 			if restoreErr := revertNativeSwitchStorage(opts.Storage, inst, storageAcknowledged, j.Target, j.Source, prevLimit); restoreErr != nil {
 				j.Failure = fmt.Sprintf("target start failed: %v; persisted account restore failed: %v", err, restoreErr)
-			} else if restartErr := startNativeSwitchInstance(inst); restartErr != nil {
+			} else if restartErr := startNativeSwitchInstance(inst, j); restartErr != nil {
 				j.Failure = fmt.Sprintf("target start failed: %v; source rollback failed: %v", err, restartErr)
 			} else {
 				j.Failure = "target start failed; source account restored"
@@ -547,10 +605,7 @@ func executeNativeClaudeSwitch(cfg *UserConfig, inst *Instance, preview *SwitchP
 			result.Conversation = migrated + "; target start requested; native destination readiness remains pending"
 		}
 	}
-	// The lifecycle journal remains committed until the caller's scoped storage
-	// CAS succeeds and completeNativeHarnessSwitchJournal durably acknowledges
-	// that success. Start is never acknowledgement evidence.
-	return result, nil
+	return finishNativeSwitch(journalPath, j, result)
 }
 
 func executeNativeCodexSwitch(cfg *UserConfig, inst *Instance, preview *SwitchPreview, opts HarnessSwitchOptions, journalPath string, journal *switchJournal) (*HarnessSwitchResult, error) {
@@ -578,6 +633,7 @@ func executeNativeCodexSwitch(cfg *UserConfig, inst *Instance, preview *SwitchPr
 		j = &switchJournal{Version: switchJournalVersion, OperationID: switchOperationIDForRequest(inst.ID, switchRequestGeneration(identityForInstance(inst), opts.Target, opts.NoStart)), State: switchPrepared, Source: identityForInstance(inst), Target: targetIdentityFor(inst, preview), WasRunning: wasRunning, NoStart: opts.NoStart,
 			RequestGeneration: switchRequestGeneration(identityForInstance(inst), opts.Target, opts.NoStart)}
 	}
+	j.runtime = opts.runtime
 	j.SourcePath, j.SourceSHA256 = sourcePath, sourceHash
 	// The prepared receipt is the first durable boundary. Do not create a
 	// staging directory or copy a rollout until it exists: otherwise a failed
@@ -617,7 +673,7 @@ func executeNativeCodexSwitch(cfg *UserConfig, inst *Instance, preview *SwitchPr
 		return nil, err
 	}
 	if wasRunning && nativeSwitchRunning(inst) {
-		if err := nativeSwitchStop(inst); err != nil {
+		if err := nativeSwitchStop(inst, j.runtime.authority); err != nil {
 			return switchFailedNative(journalPath, j, err)
 		}
 	}
@@ -679,13 +735,13 @@ func executeNativeCodexSwitch(cfg *UserConfig, inst *Instance, preview *SwitchPr
 	result.nativeJournalPath = journalPath
 	result.nativeStorageAcknowledgement = storageAcknowledged
 	if !opts.NoStart && wasRunning {
-		if err := startNativeSwitchInstance(inst); err != nil {
+		if err := startNativeSwitchInstance(inst, j); err != nil {
 			result.Committed = false
 			restoreSwitchIdentity(inst, oldIdentity, oldIdentity.Command)
 			storageErr := revertNativeSwitchStorage(opts.Storage, inst, storageAcknowledged, j.Target, j.Source, prevLimit)
 			var rollbackErr error
 			if storageErr == nil {
-				rollbackErr = startNativeSwitchInstance(inst)
+				rollbackErr = startNativeSwitchInstance(inst, j)
 			}
 			j.State, j.Failure = switchFailed, err.Error()
 			if storageErr != nil {
@@ -708,10 +764,7 @@ func executeNativeCodexSwitch(cfg *UserConfig, inst *Instance, preview *SwitchPr
 		result.Restarted = true
 		result.Conversation = "Codex rollout migrated; target start requested; native destination readiness remains pending"
 	}
-	// The lifecycle journal remains committed until the caller's scoped storage
-	// CAS succeeds and completeNativeHarnessSwitchJournal durably acknowledges
-	// that success. Start is never acknowledgement evidence.
-	return result, nil
+	return finishNativeSwitch(journalPath, j, result)
 }
 
 func executeClaudeCodexSwitch(cfg *UserConfig, inst *Instance, preview *SwitchPreview, opts HarnessSwitchOptions, journalPath string, journal *switchJournal) (*HarnessSwitchResult, error) {
@@ -845,19 +898,71 @@ func executeClaudeCodexSwitch(cfg *UserConfig, inst *Instance, preview *SwitchPr
 	return result, nil
 }
 
+// nativeSwitchStopAttempts bounds the stop's retries when a status observation
+// wins the destruction reservation's revision CAS.
+const nativeSwitchStopAttempts = 3
+
 // Narrow seams keep native executor regressions filesystem-only: tests inject
 // lifecycle state, stop/start outcomes, and journal failures without creating
 // a tmux session.
 var (
-	nativeSwitchStart         = func(inst *Instance) error { return inst.Start() }
+	nativeSwitchStart = func(inst *Instance, authority *runtimeTransitionAuthority) error {
+		return inst.restartWithTransition(authority, nil, nil)
+	}
 	nativeSwitchRunning       = func(inst *Instance) bool { return inst.Exists() }
 	nativeSwitchLiveOnAccount = liveOnAccount
-	nativeSwitchStop          = func(inst *Instance) error { return inst.KillAndWait() }
+	nativeSwitchStop          = func(inst *Instance, authority *runtimeTransitionAuthority) error {
+		// A status observation that lands while the source is staged, or
+		// between this re-read and the destruction reservation, is adopted
+		// rather than failing the confirmed switch (#2344).
+		var runtime statedb.RuntimeState
+		for attempt := 1; ; attempt++ {
+			if err := authority.adoptStatusObservation(inst); err != nil {
+				return err
+			}
+			selection := RuntimeSelection{State: authority.expected, Incarnation: authority.incarnation}
+			err := inst.killInternalLocked(selection, true, false, true, &runtime, nil)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, statedb.ErrStatusRevisionConflict) || attempt == nativeSwitchStopAttempts {
+				return err
+			}
+		}
+		authority.expected = runtime
+		authority.predecessorTerminated = true
+		return nil
+	}
 	harnessSwitchJournalWrite = writeSwitchJournal
 )
 
-func startNativeSwitchInstance(inst *Instance) error {
-	return nativeSwitchStart(inst)
+func startNativeSwitchInstance(inst *Instance, j *switchJournal) error {
+	var authority *runtimeTransitionAuthority
+	if j.runtime != nil {
+		authority = j.runtime.authority
+		if j.runtime.metadataCommitted && inst.Account == j.Source.Account {
+			if _, err := authority.db.CommitNativeHarnessSwitch(nativeSwitchStorageIdentity(j.Target), nativeSwitchStorageIdentity(j.Source)); err != nil {
+				inst.Account = j.Target.Account
+				return fmt.Errorf("restore source account before restart: %w", err)
+			}
+			j.runtime.metadataCommitted = false
+		}
+	}
+	err := nativeSwitchStart(inst, authority)
+	if IsRestartPartialSuccess(err) && j.runtime != nil {
+		j.runtime.partial = err
+		return nil
+	}
+	return err
+}
+
+func finishNativeSwitch(path string, j *switchJournal, result *HarnessSwitchResult) (*HarnessSwitchResult, error) {
+	result.nativeStorageAcknowledgement = result.nativeStorageAcknowledgement || (j.runtime != nil && j.runtime.metadataCommitted)
+	j.State = switchCommitted
+	if err := harnessSwitchJournalWrite(path, j); err != nil {
+		return result, fmt.Errorf("persist native lifecycle outcome: %w", err)
+	}
+	return result, nil
 }
 
 // commitNativeSwitchAccount is the last durable boundary before a native
@@ -878,14 +983,29 @@ func commitNativeSwitchAccount(path string, j *switchJournal, inst *Instance, ac
 	if inst == nil || j == nil {
 		return false, fmt.Errorf("native switch commit is missing source identity")
 	}
-	inst.Account = account
 	j.State = switchCommitted
-	if err := harnessSwitchJournalWrite(path, j); err != nil {
-		returnCause := fmt.Errorf("persist native switch commit: %w", err)
-		_, rollbackErr := switchFailedAfterStop(path, j, inst, wasRunning, returnCause)
+	if j.runtime != nil && j.runtime.authority.durable {
+		j.State = switchAccountPersisted
+	}
+	_, err := commitSwitchAccount(inst, account, func() error {
+		if err := harnessSwitchJournalWrite(path, j); err != nil {
+			return fmt.Errorf("persist native switch commit: %w", err)
+		}
+		if j.runtime != nil && j.runtime.authority.durable {
+			if _, err := j.runtime.authority.db.CommitNativeHarnessSwitch(nativeSwitchStorageIdentity(j.Source), nativeSwitchStorageIdentity(j.Target)); err != nil {
+				return err
+			}
+			j.runtime.metadataCommitted = true
+		}
+		return nil
+	})
+	if err != nil {
+		_, rollbackErr := switchFailedAfterStop(path, j, inst, wasRunning, err)
 		return false, rollbackErr
 	}
-	if storage == nil {
+	// Durable lifecycle authority already owns both the forward CAS and its
+	// rollback. Optional Storage acknowledges it after the lifecycle finishes.
+	if storage == nil || (j.runtime != nil && j.runtime.metadataCommitted) {
 		return false, nil
 	}
 	stub := nativeHarnessSwitchResult(&HarnessSwitchResult{Committed: true}, j.Source, identityForInstance(inst))
@@ -951,7 +1071,7 @@ func completeNativeHarnessSwitchJournal(result *HarnessSwitchResult) error {
 }
 
 func sameSwitchIdentity(left, right switchIdentity) bool {
-	return left.InstanceID == right.InstanceID &&
+	return left.InstanceID == right.InstanceID && left.Incarnation == right.Incarnation &&
 		left.Tool == right.Tool &&
 		left.StorageTool == right.StorageTool &&
 		left.SessionID == right.SessionID &&
@@ -996,7 +1116,7 @@ func switchFailedAfterStop(path string, j *switchJournal, inst *Instance, wasRun
 	restoreSwitchIdentity(inst, j.Source, j.Source.Command)
 	var restoreErr error
 	if wasRunning {
-		restoreErr = startNativeSwitchInstance(inst)
+		restoreErr = startNativeSwitchInstance(inst, j)
 	}
 	j.State, j.Failure, j.UpdatedAt = switchFailed, cause.Error(), time.Now()
 	if restoreErr != nil {
@@ -1440,7 +1560,7 @@ func identityForInstance(inst *Instance) switchIdentity {
 	if tool == "" {
 		tool = strings.ToLower(strings.TrimSpace(inst.Tool))
 	}
-	return switchIdentity{InstanceID: inst.ID, Tool: tool, StorageTool: inst.Tool, SessionID: resolveSourceSessionID(inst), ClaudeID: inst.ClaudeSessionID, CodexID: inst.CodexSessionID, Account: strings.TrimSpace(inst.Account), ProjectPath: canonicalSwitchPath(inst.ProjectPath), WorkingDir: canonicalSwitchPath(inst.EffectiveWorkingDir()), Title: inst.Title, GroupPath: inst.GroupPath, Command: inst.Command, Status: inst.Status, LastStartedAt: inst.LastStartedAt}
+	return switchIdentity{InstanceID: inst.ID, Incarnation: inst.persistenceIncarnationSnapshot(), Tool: tool, StorageTool: inst.Tool, SessionID: resolveSourceSessionID(inst), ClaudeID: inst.ClaudeSessionID, CodexID: inst.CodexSessionID, Account: strings.TrimSpace(inst.Account), ProjectPath: canonicalSwitchPath(inst.ProjectPath), WorkingDir: canonicalSwitchPath(inst.EffectiveWorkingDir()), Title: inst.Title, GroupPath: inst.GroupPath, Command: inst.Command, Status: inst.Status, LastStartedAt: inst.LastStartedAt}
 }
 
 func canonicalSwitchPath(path string) string {

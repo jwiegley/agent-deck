@@ -50,9 +50,7 @@ func newBoundGenericInstance(t *testing.T, id string) *Instance {
 	inst.GenericSessionCommand = scope.Command
 	inst.GenericSessionLocation = scope.Location
 
-	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil)); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
-	}
+	insertTestInstances(t, storage, []*Instance{inst}, NewGroupTreeWithGroups([]*Instance{inst}, nil))
 	if got := inst.GetGenericSessionID(); got != id {
 		t.Fatalf("fixture: GetGenericSessionID() = %q, want %q", got, id)
 	}

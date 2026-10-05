@@ -55,10 +55,10 @@ func TestDrainGroupQueueTwoDrainersStartOnce(t *testing.T) {
 			failed = append(failed, ev)
 		}
 	})
-	if got := drainGroupQueue(ctx, a, "serial", first, groups); got == nil {
+	if got, _ := drainGroupQueue(ctx, a, "serial", first, groups); got == nil {
 		t.Fatal("first drainer started nothing")
 	}
-	if got := drainGroupQueue(ctx, b, "serial", second, groups); got != nil {
+	if got, _ := drainGroupQueue(ctx, b, "serial", second, groups); got != nil {
 		t.Errorf("second drainer also started %s", got.Title)
 	}
 	if spawns != 1 || len(failed) != 0 {
@@ -88,7 +88,7 @@ func TestDrainGroupQueueSaveFailureAfterSpawnIsNotADrainFailure(t *testing.T) {
 			failed = append(failed, ev)
 		}
 	})
-	if got := drainGroupQueue(ctx, storage, "serial", instances, groups); got == nil || len(failed) != 0 {
+	if got, _ := drainGroupQueue(ctx, storage, "serial", instances, groups); got == nil || len(failed) != 0 {
 		t.Fatalf("drained %v with failures %+v; want next reported as started", got, failed)
 	}
 }

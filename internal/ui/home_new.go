@@ -147,7 +147,13 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	if storage != nil && statedb.GetGlobal() == nil {
 		if db := storage.GetDB(); db != nil {
 			statedb.SetGlobal(db)
-			_ = db.RegisterInstance(false)
+			if err := db.RegisterInstance(false); err != nil {
+				uiLog.Error("statedb_register_failed", slog.String("error", err.Error()))
+				storageWarning = fmt.Sprintf("⚠ Storage disabled: writer registration failed: %v", err)
+				statedb.SetGlobal(nil)
+				_ = storage.Close()
+				storage = nil
+			}
 		}
 	}
 
@@ -214,6 +220,10 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		instances:                 []*session.Instance{},
 		instanceByID:              make(map[string]*session.Instance),
 		switchGenerations:         make(map[string]uint64),
+		transitionTokens:          make(map[string]uint64),
+		transitionFloors:          make(map[string]uint64),
+		transitionPending:         make(map[string]*session.Instance),
+		transitionDeferred:        make(map[string]*session.Instance),
 		groupTree:                 session.NewGroupTree([]*session.Instance{}),
 		flatItems:                 []session.Item{},
 		previewCache:              make(map[string]string),

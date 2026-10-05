@@ -14,6 +14,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/watcher"
@@ -21,8 +22,9 @@ import (
 
 // sessionDeletedMsg signals that a session was deleted
 type sessionDeletedMsg struct {
-	deletedID string
-	killErr   error // Error from Kill() if any
+	deletedID   string
+	incarnation string
+	killErr     error // Error from Kill() if any
 }
 
 // sessionClosedMsg signals that a session process was closed without deleting metadata.
@@ -32,24 +34,52 @@ type sessionClosedMsg struct {
 }
 
 type sessionArchivedMsg struct {
-	sessionID string
-	killErr   error
+	sessionID   string
+	incarnation string
+	runtime     statedb.RuntimeState
+	archivedAt  time.Time
+	killErr     error
 }
 
 type sessionUnarchivedMsg struct {
-	sessionID string
+	sessionID   string
+	incarnation string
 }
 
 // sessionRestoredMsg signals that an undo-delete restore completed
 type sessionRestoredMsg struct {
-	instance *session.Instance
-	err      error
-	warning  string
+	instance   *session.Instance
+	sessionID  string
+	token      uint64
+	runtime    statedb.RuntimeState
+	seeded     bool
+	seed       statedb.InstanceSeedToken
+	rolledBack bool
+	err        error
+	warning    string
+}
+
+// markPendingDeleteSweep records the pending inbox and notify-state sweep of
+// an undoable delete before the captured delete removes the row, so a crash
+// right after the delete still leaves it for the startup reconcile
+// (session.Storage.MarkPendingDeleteSweep). The returned func drops the record
+// again when the delete is refused and the row stays.
+func markPendingDeleteSweep(storage *session.Storage, id string) (refused func()) {
+	if err := storage.MarkPendingDeleteSweep(id); err != nil {
+		uiLog.Warn("mark_pending_sweep_err", slog.String("id", id), slog.String("err", err.Error()))
+	}
+	return func() {
+		if err := storage.ClearPendingDeleteSweep(id); err != nil {
+			uiLog.Warn("clear_pending_sweep_err", slog.String("id", id), slog.String("err", err.Error()))
+		}
+	}
 }
 
 // deleteSession deletes a session
 func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 	id := inst.ID
+	selection := inst.CaptureRuntimeSelection()
+	storage := h.storage
 	isWorktree := inst.IsWorktree()
 	worktreePath := inst.WorktreePath
 	worktreeRepoRoot := inst.WorktreeRepoRoot
@@ -70,43 +100,49 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 		h.instancesMu.RUnlock()
 	}
 	return func() tea.Msg {
-		killErr := inst.Kill()
-		inst.RecordTelemetryEnd(telemetry.EndDelete)
-		if isWorktree && sharedWorktree {
-			// #1449: another live session still references this worktree; skip
-			// the destructive removal + branch delete and merely drop this
-			// session's record so the siblings are not stranded.
-			uiLog.Info("worktree_remove_skipped", slog.String("path", worktreePath), slog.String("repo", worktreeRepoRoot), slog.String("reason", "another live session still references this worktree (#1449)"))
-		} else if isWorktree {
-			// #1200: route worktree teardown through the session guard so a
-			// worktree_reuse session (WorktreePath == the user's original repo)
-			// is never os.RemoveAll'd. Only genuine agent-deck-created linked
-			// worktrees are removed; a reused repo is left intact and merely
-			// dropped from the registry.
-			snap := &session.Instance{ID: id, WorktreePath: worktreePath, WorktreeRepoRoot: worktreeRepoRoot}
-			switch removed, err := session.RemoveSessionWorktree(snap); {
-			case err != nil:
-				uiLog.Warn("worktree_remove_err", slog.String("path", worktreePath), slog.String("err", err.Error()))
-			case !removed:
-				uiLog.Info("worktree_remove_skipped", slog.String("path", worktreePath), slog.String("repo", worktreeRepoRoot), slog.String("reason", "reused or non-linked worktree (#1200 guard)"))
-			}
-		}
-		if isMultiRepo {
-			// Clean up multi-repo temp directory
-			if multiRepoTempDir != "" {
-				_ = os.RemoveAll(multiRepoTempDir)
-			}
-			// Clean up per-repo worktrees
-			for _, wt := range multiRepoWorktrees {
-				if err := git.RemoveWorktree(wt.RepoRoot, wt.WorktreePath, true); err != nil {
-					uiLog.Warn("worktree_remove_err", slog.String("path", wt.WorktreePath), slog.String("err", err.Error()))
-				}
-				if err := git.PruneWorktrees(wt.RepoRoot); err != nil {
-					uiLog.Warn("worktree_prune_err", slog.String("repo", wt.RepoRoot), slog.String("err", err.Error()))
+		refused := markPendingDeleteSweep(storage, id)
+		killErr := inst.DeleteCapturedWithCleanup(selection, func() {
+			if isWorktree && sharedWorktree {
+				// #1449: another live session still references this worktree; skip
+				// the destructive removal + branch delete and merely drop this
+				// session's record so the siblings are not stranded.
+				uiLog.Info("worktree_remove_skipped", slog.String("path", worktreePath), slog.String("repo", worktreeRepoRoot), slog.String("reason", "another live session still references this worktree (#1449)"))
+			} else if isWorktree {
+				// #1200: route worktree teardown through the session guard so a
+				// worktree_reuse session (WorktreePath == the user's original repo)
+				// is never os.RemoveAll'd. Only genuine agent-deck-created linked
+				// worktrees are removed; a reused repo is left intact and merely
+				// dropped from the registry.
+				snap := &session.Instance{ID: id, WorktreePath: worktreePath, WorktreeRepoRoot: worktreeRepoRoot}
+				switch removed, err := session.RemoveSessionWorktree(snap); {
+				case err != nil:
+					uiLog.Warn("worktree_remove_err", slog.String("path", worktreePath), slog.String("err", err.Error()))
+				case !removed:
+					uiLog.Info("worktree_remove_skipped", slog.String("path", worktreePath), slog.String("repo", worktreeRepoRoot), slog.String("reason", "reused or non-linked worktree (#1200 guard)"))
 				}
 			}
+			if isMultiRepo {
+				// Clean up multi-repo temp directory
+				if multiRepoTempDir != "" {
+					_ = os.RemoveAll(multiRepoTempDir)
+				}
+				// Clean up per-repo worktrees
+				for _, wt := range multiRepoWorktrees {
+					if err := git.RemoveWorktree(wt.RepoRoot, wt.WorktreePath, true); err != nil {
+						uiLog.Warn("worktree_remove_err", slog.String("path", wt.WorktreePath), slog.String("err", err.Error()))
+					}
+					if err := git.PruneWorktrees(wt.RepoRoot); err != nil {
+						uiLog.Warn("worktree_prune_err", slog.String("repo", wt.RepoRoot), slog.String("err", err.Error()))
+					}
+				}
+			}
+		})
+		if killErr == nil {
+			inst.RecordTelemetryEnd(telemetry.EndDelete)
+		} else {
+			refused()
 		}
-		return sessionDeletedMsg{deletedID: id, killErr: killErr}
+		return sessionDeletedMsg{deletedID: id, incarnation: selection.Incarnation, killErr: killErr}
 	}
 }
 
@@ -156,17 +192,12 @@ func (h *Home) captureAutoNameBeforeStop(inst *session.Instance) {
 // closeSession stops a session process but keeps metadata in list/storage.
 func (h *Home) closeSession(inst *session.Instance) tea.Cmd {
 	id := inst.ID
-	storage := h.storage
+	selection := inst.CaptureRuntimeSelection()
 	return func() tea.Msg {
-		// Defect 317: write stopped right after the kill; the daemon's error
-		// sample of it would otherwise refuse the full save below, leaving the
-		// row in error for the idle-death watch (#2806).
-		loaded := session.BeforeStopKill(storage, id)
-		killErr := inst.Kill()
+		killErr := inst.KillCaptured(selection)
 		if killErr == nil {
-			session.WriteStoppedAfterKill(storage, inst, loaded)
+			inst.RecordTelemetryEnd(telemetry.EndStop)
 		}
-		inst.RecordTelemetryEnd(telemetry.EndStop)
 		return sessionClosedMsg{sessionID: id, killErr: killErr}
 	}
 }
@@ -174,9 +205,17 @@ func (h *Home) closeSession(inst *session.Instance) tea.Cmd {
 // persistArchived writes the instance's archive timestamp to the database with a
 // targeted single-row UPDATE. This deliberately bypasses saveInstances(), whose
 // external-change guard aborts (and reloads) under concurrent writers, silently
-// reverting the archive. The in-memory inst.ArchivedAt is already set by
-// archiveSession/unarchiveSession; this only persists it.
+// reverting the archive. Callers using this object-shaped helper have already
+// set inst.ArchivedAt; delayed unarchive uses persistArchivedIncarnation so it
+// can defer the in-memory mutation until the exact parent update succeeds.
 func (h *Home) persistArchived(inst *session.Instance) error {
+	if inst == nil {
+		return fmt.Errorf("session is nil")
+	}
+	return h.persistArchivedIncarnation(inst.ID, inst.PersistenceIncarnation(), inst.ArchivedAtThreadSafe())
+}
+
+func (h *Home) persistArchivedIncarnation(id, incarnation string, at time.Time) error {
 	if h.storage == nil {
 		return nil
 	}
@@ -184,7 +223,18 @@ func (h *Home) persistArchived(inst *session.Instance) error {
 	if db == nil {
 		return nil
 	}
-	return db.SetArchived(inst.ID, inst.ArchivedAtThreadSafe())
+	return db.SetArchivedIfIncarnation(id, incarnation, at)
+}
+
+func (h *Home) persistArchivedIfRuntime(expected statedb.RuntimeState, incarnation string, at time.Time) error {
+	if h.storage == nil {
+		return fmt.Errorf("state database unavailable")
+	}
+	db := h.storage.GetDB()
+	if db == nil {
+		return fmt.Errorf("state database unavailable")
+	}
+	return db.SetArchivedIfRuntime(expected, incarnation, at)
 }
 
 // archiveSession stops a session and marks it archived.
@@ -193,26 +243,25 @@ func (h *Home) archiveSession(inst *session.Instance) tea.Cmd {
 	// background Kill tears down the pane that title comes from.
 	h.captureAutoNameBeforeStop(inst)
 	id := inst.ID
-	storage := h.storage
+	selection := inst.CaptureRuntimeSelection()
 	return func() tea.Msg {
-		loaded := session.BeforeStopKill(storage, id)
-		if killErr := inst.Kill(); killErr != nil {
-			return sessionArchivedMsg{sessionID: id, killErr: killErr}
+		runtime, killErr := inst.KillCapturedRuntime(selection)
+		if killErr != nil {
+			return sessionArchivedMsg{sessionID: id, incarnation: selection.Incarnation, killErr: killErr}
 		}
-		// Defect 317: the row reads stopped, not the daemon's error sample of
-		// this kill (archived_at alone already keeps #2806 quiet).
-		session.WriteStoppedAfterKill(storage, inst, loaded)
-		inst.SetArchivedAtThreadSafe(time.Now().UTC())
-		return sessionArchivedMsg{sessionID: id}
+		return sessionArchivedMsg{
+			sessionID: id, incarnation: selection.Incarnation,
+			runtime: runtime, archivedAt: time.Now().UTC(),
+		}
 	}
 }
 
 // unarchiveSession clears the archive flag without restarting tmux.
 func (h *Home) unarchiveSession(inst *session.Instance) tea.Cmd {
 	id := inst.ID
+	incarnation := inst.PersistenceIncarnation()
 	return func() tea.Msg {
-		inst.SetArchivedAtThreadSafe(time.Time{})
-		return sessionUnarchivedMsg{sessionID: id}
+		return sessionUnarchivedMsg{sessionID: id, incarnation: incarnation}
 	}
 }
 
@@ -222,8 +271,15 @@ func (h *Home) unarchiveSession(inst *session.Instance) tea.Cmd {
 // handler in Update persists the change.
 func (h *Home) removeSession(inst *session.Instance) tea.Cmd {
 	id := inst.ID
+	selection := inst.CaptureRuntimeSelection()
+	storage := h.storage
 	return func() tea.Msg {
-		return sessionDeletedMsg{deletedID: id}
+		refused := markPendingDeleteSweep(storage, id)
+		err := inst.RemoveCaptured(selection)
+		if err != nil {
+			refused()
+		}
+		return sessionDeletedMsg{deletedID: id, incarnation: selection.Incarnation, killErr: err}
 	}
 }
 
@@ -232,20 +288,35 @@ func (h *Home) removeSession(inst *session.Instance) tea.Cmd {
 // on repeated deletedIDs.
 func (h *Home) bulkRemoveErrored() tea.Cmd {
 	h.instancesMu.RLock()
-	ids := make([]string, 0, len(h.instances))
+	type removal struct {
+		inst      *session.Instance
+		selection session.RuntimeSelection
+	}
+	removals := make([]removal, 0, len(h.instances))
 	for _, inst := range h.instances {
 		// pin-protects-from-stop: pinned errored sessions are left alone in
 		// bulk removal; an explicit Shift+D on the session still works.
 		if inst.Status == session.StatusError && inst.Pin == session.PinNone {
-			ids = append(ids, inst.ID)
+			removals = append(removals, removal{inst: inst, selection: inst.CaptureRuntimeSelection()})
 		}
 	}
 	h.instancesMu.RUnlock()
 
-	cmds := make([]tea.Cmd, 0, len(ids))
-	for _, id := range ids {
-		id := id
-		cmds = append(cmds, func() tea.Msg { return sessionDeletedMsg{deletedID: id} })
+	storage := h.storage
+	cmds := make([]tea.Cmd, 0, len(removals))
+	for _, item := range removals {
+		item := item
+		cmds = append(cmds, func() tea.Msg {
+			refused := markPendingDeleteSweep(storage, item.inst.ID)
+			err := item.inst.RemoveCaptured(item.selection)
+			if err != nil {
+				refused()
+			}
+			return sessionDeletedMsg{
+				deletedID: item.inst.ID, incarnation: item.selection.Incarnation,
+				killErr: err,
+			}
+		})
 	}
 	return tea.Batch(cmds...)
 }
@@ -511,10 +582,442 @@ func (h *Home) switchSessionHarnessWithOptions(sessionID, harness, account strin
 
 type sessionRestartedMsg struct {
 	sessionID  string
+	token      uint64
+	runtime    statedb.RuntimeState
 	err        error
 	warning    string
 	fresh      bool
 	unarchived bool
+}
+
+func (h *Home) beginSessionTransition(instanceID string) uint64 {
+	return h.beginSessionTransitionFor(h.getInstanceByID(instanceID), instanceID)
+}
+
+func (h *Home) beginSessionTransitionFor(inst *session.Instance, instanceID ...string) uint64 {
+	id := ""
+	if inst != nil {
+		id = inst.ID
+	} else if len(instanceID) > 0 {
+		id = instanceID[0]
+	}
+	h.transitionMu.Lock()
+	defer h.transitionMu.Unlock()
+	h.transitionSeq++
+	if h.transitionTokens == nil {
+		h.transitionTokens = make(map[string]uint64)
+	}
+	if h.transitionFloors == nil {
+		h.transitionFloors = make(map[string]uint64)
+	}
+	if h.transitionPending == nil {
+		h.transitionPending = make(map[string]*session.Instance)
+	}
+	if h.transitionDeferred == nil {
+		h.transitionDeferred = make(map[string]*session.Instance)
+	}
+	delete(h.transitionDeferred, id)
+	h.transitionTokens[id] = h.transitionSeq
+	if inst != nil {
+		h.transitionFloors[id] = inst.RuntimeState().Generation + 1
+		h.transitionPending[id] = inst
+	}
+	return h.transitionSeq
+}
+
+func (h *Home) transitionCurrent(instanceID string, token uint64) bool {
+	if token == 0 {
+		return true
+	}
+	h.transitionMu.Lock()
+	defer h.transitionMu.Unlock()
+	return h.transitionTokens[instanceID] == token
+}
+
+// selectedTransitionInstance returns the exact logical parent that the user
+// selected when the asynchronous command was queued. Reloads may merge the
+// same incarnation into that object, but a delete/reinsert replacement cancels
+// the token and must never be substituted merely because it reused the ID.
+func (h *Home) selectedTransitionInstance(selected *session.Instance, token uint64) (*session.Instance, error) {
+	if selected == nil {
+		return nil, fmt.Errorf("session no longer exists")
+	}
+	if !h.transitionCurrent(selected.ID, token) {
+		return nil, fmt.Errorf("session was replaced before the operation ran: %w", statedb.ErrInstanceParentConflict)
+	}
+	h.instancesMu.RLock()
+	current := h.instanceByID[selected.ID]
+	h.instancesMu.RUnlock()
+	if current == nil {
+		return nil, fmt.Errorf("session no longer exists")
+	}
+	incarnation := selected.PersistenceIncarnation()
+	if incarnation == "" || !current.MatchesPersistenceIncarnation(incarnation) {
+		return nil, fmt.Errorf("session was replaced before the operation ran: %w", statedb.ErrInstanceParentConflict)
+	}
+	return selected, nil
+}
+
+func (h *Home) transitionSnapshot(instanceID string) (*session.Instance, uint64) {
+	h.transitionMu.Lock()
+	defer h.transitionMu.Unlock()
+	return h.transitionPending[instanceID], h.transitionFloors[instanceID]
+}
+
+func (h *Home) finishSessionTransition(instanceID string, token uint64) bool {
+	if token == 0 {
+		return false
+	}
+	h.transitionMu.Lock()
+	if h.transitionTokens[instanceID] != token {
+		h.transitionMu.Unlock()
+		return false
+	}
+	pending := h.transitionPending[instanceID]
+	deferred := h.transitionDeferred[instanceID]
+	if pending == nil || deferred == nil || !canMergePersistenceIncarnation(pending, deferred) || h.storage == nil {
+		delete(h.transitionTokens, instanceID)
+		delete(h.transitionFloors, instanceID)
+		delete(h.transitionPending, instanceID)
+		delete(h.transitionDeferred, instanceID)
+		h.transitionMu.Unlock()
+		return false
+	}
+	h.transitionMu.Unlock()
+
+	// The captured reload is only evidence that metadata changed while launch
+	// inputs were frozen. Read the row again after the transition has finished:
+	// a local rename or another writer may have committed a newer edit after
+	// that captured snapshot.
+	loaded, _, err := h.storage.LoadWithGroups()
+	if err != nil {
+		h.transitionMu.Lock()
+		if h.transitionTokens[instanceID] == token {
+			delete(h.transitionTokens, instanceID)
+			delete(h.transitionFloors, instanceID)
+			delete(h.transitionPending, instanceID)
+			delete(h.transitionDeferred, instanceID)
+		}
+		h.transitionMu.Unlock()
+		uiLog.Warn("deferred_transition_reload_failed",
+			slog.String("session_id", instanceID), slog.Any("error", err))
+		return false
+	}
+	var latest *session.Instance
+	for _, candidate := range loaded {
+		if candidate.ID == instanceID && canMergePersistenceIncarnation(pending, candidate) {
+			latest = candidate
+			break
+		}
+	}
+	if latest == nil {
+		h.transitionMu.Lock()
+		if h.transitionTokens[instanceID] == token {
+			delete(h.transitionTokens, instanceID)
+			delete(h.transitionFloors, instanceID)
+			delete(h.transitionPending, instanceID)
+			delete(h.transitionDeferred, instanceID)
+		}
+		h.transitionMu.Unlock()
+		return false
+	}
+
+	// A newer transition may have replaced this token while the durable read was
+	// in flight. Recheck every authority predicate in the established
+	// instancesMu -> transitionMu lock order, merge, and clear atomically with
+	// respect to beginSessionTransitionFor.
+	h.instancesMu.RLock()
+	h.transitionMu.Lock()
+	if h.transitionTokens[instanceID] != token ||
+		h.transitionPending[instanceID] != pending ||
+		h.transitionDeferred[instanceID] == nil ||
+		h.instanceByID[instanceID] != pending ||
+		!canMergePersistenceIncarnation(pending, latest) {
+		h.transitionMu.Unlock()
+		h.instancesMu.RUnlock()
+		return false
+	}
+	merged := pending.MergeDeferredReload(latest)
+	if merged {
+		// A rename whose save was intentionally deferred during reload is newer
+		// than the durable row. Keep that explicit local intent on top of the fresh
+		// snapshot; the transition completion's normal save will persist it.
+		if rename, ok := h.pendingTitleChanges[instanceID]; ok {
+			pending.SetTitleThreadSafe(rename.title)
+			pending.TitleLocked = rename.locked
+			pending.SetAutoName(false)
+		}
+	}
+	delete(h.transitionTokens, instanceID)
+	delete(h.transitionFloors, instanceID)
+	delete(h.transitionPending, instanceID)
+	delete(h.transitionDeferred, instanceID)
+	h.transitionMu.Unlock()
+	h.instancesMu.RUnlock()
+
+	return merged
+}
+
+// resyncDeferredTransitionViews runs only on the Bubble Tea event loop after
+// finishSessionTransition reports that metadata was drained. Web mutators can
+// finish lifecycle authority from their own goroutines without racing these
+// UI-owned projections.
+func (h *Home) resyncDeferredTransitionViews() {
+	identity := h.captureSelectedItemIdentity()
+	h.instancesMu.RLock()
+	instances := append([]*session.Instance(nil), h.instances...)
+	h.instancesMu.RUnlock()
+
+	var searchSelectionID string
+	if h.search != nil && h.search.cursor >= 0 && h.search.cursor < len(h.search.results) {
+		if selected := h.search.results[h.search.cursor]; selected != nil {
+			searchSelectionID = selected.ID
+		}
+	}
+	if h.groupTree != nil {
+		h.groupTree.SyncWithInstances(instances)
+		for _, group := range h.groupTree.Groups {
+			session.SortInstancesByActionable(group.Sessions)
+		}
+		h.rebuildFlatItemsPreservingSelection(identity)
+	}
+	if h.search != nil {
+		h.search.SetItems(instances)
+		if searchSelectionID != "" {
+			for index, candidate := range h.search.results {
+				if candidate != nil && candidate.ID == searchSelectionID {
+					h.search.cursor = index
+					break
+				}
+			}
+		}
+	}
+	h.refreshSessionRenderSnapshot(instances)
+}
+
+func (h *Home) deferTransitionReload(instanceID string, pending *session.Instance, floor uint64, loaded *session.Instance) bool {
+	h.transitionMu.Lock()
+	defer h.transitionMu.Unlock()
+	if pending == nil || h.transitionPending[instanceID] != pending || h.transitionFloors[instanceID] != floor {
+		return false
+	}
+	if h.transitionDeferred == nil {
+		h.transitionDeferred = make(map[string]*session.Instance)
+	}
+	h.transitionDeferred[instanceID] = loaded
+	return true
+}
+
+func (h *Home) cancelSessionTransitionForReplacement(instanceID string, pending *session.Instance) {
+	if pending == nil {
+		return
+	}
+	h.transitionMu.Lock()
+	defer h.transitionMu.Unlock()
+	if h.transitionPending[instanceID] != pending {
+		return
+	}
+	delete(h.transitionTokens, instanceID)
+	delete(h.transitionFloors, instanceID)
+	delete(h.transitionPending, instanceID)
+	delete(h.transitionDeferred, instanceID)
+}
+
+func canMergePersistenceIncarnation(current, incoming *session.Instance) bool {
+	if current == nil || incoming == nil || current.ID != incoming.ID {
+		return false
+	}
+	currentIncarnation := current.PersistenceIncarnation()
+	incomingIncarnation := incoming.PersistenceIncarnation()
+	return currentIncarnation == incomingIncarnation ||
+		(currentIncarnation == "" && incomingIncarnation != "")
+}
+
+func (h *Home) startRuntime(inst *session.Instance) (statedb.RuntimeState, error) {
+	if h.startRuntimeFn != nil {
+		return h.startRuntimeFn(inst)
+	}
+	return inst.StartRuntime()
+}
+
+func (h *Home) restartRuntime(inst *session.Instance) (statedb.RuntimeState, error) {
+	if h.restartRuntimeFn != nil {
+		return h.restartRuntimeFn(inst)
+	}
+	return inst.RestartRuntime()
+}
+
+func (h *Home) restartFreshRuntime(inst *session.Instance) (statedb.RuntimeState, error) {
+	if h.restartFreshRuntimeFn != nil {
+		return h.restartFreshRuntimeFn(inst)
+	}
+	return inst.RestartFreshRuntime()
+}
+
+func (h *Home) reconcileRestartResult(inst *session.Instance, err error) error {
+	if h.reconcileRestartFn != nil {
+		return h.reconcileRestartFn(inst, err)
+	}
+	return inst.ReconcileRestartResult(err)
+}
+
+func consumePhysicalRuntimeResult(
+	inst *session.Instance,
+	runtime statedb.RuntimeState,
+	err error,
+	reconcile func(*session.Instance, error) error,
+) (statedb.RuntimeState, error, string) {
+	return session.ConsumePhysicalRuntimeResult(inst, runtime, err, reconcile)
+}
+
+func (h *Home) consumePhysicalRuntimeResult(inst *session.Instance, runtime statedb.RuntimeState, err error) (statedb.RuntimeState, error, string) {
+	return consumePhysicalRuntimeResult(inst, runtime, err, h.reconcileRestartResult)
+}
+
+func (h *Home) seedPhysicalInstance(inst *session.Instance) (statedb.InstanceSeedToken, bool, error) {
+	if h.storage == nil {
+		return statedb.InstanceSeedToken{}, false, nil
+	}
+	seed, err := h.storage.InsertSessionIfAbsent(inst)
+	return seed, err == nil, err
+}
+
+func (h *Home) rollbackPhysicalSeed(inst *session.Instance, seed statedb.InstanceSeedToken, seeded bool, cause error) (bool, error) {
+	if !seeded || h.storage == nil {
+		return false, cause
+	}
+	if err := h.storage.RollbackSessionSeed(seed); err != nil {
+		return false, errors.Join(cause, fmt.Errorf("rollback session seed: %w", err))
+	}
+	return true, cause
+}
+
+func (h *Home) mergeReloadedInstance(loaded, current *session.Instance) *session.Instance {
+	pending, floor := h.transitionSnapshot(loaded.ID)
+	canonical := current
+	if pending != nil {
+		canonical = pending
+	}
+	if canonical == nil {
+		return loaded
+	}
+	if !canMergePersistenceIncarnation(canonical, loaded) {
+		// The durable row was deleted and recreated with the same logical ID.
+		// It is not a reload of the in-flight object: retire that transition so
+		// its eventual completion cannot publish into the replacement.
+		h.cancelSessionTransitionForReplacement(loaded.ID, pending)
+		return loaded
+	}
+	if pending != nil {
+		// Every detached row observed during a physical transition carries launch
+		// metadata that must stay frozen, even when its runtime generation is
+		// already at or above the transition floor. Queue metadata first, then
+		// merge only authoritative runtime state and bindings.
+		if h.deferTransitionReload(loaded.ID, pending, floor, loaded) {
+			if !canonical.MergeReloadedRuntimeOnly(loaded) {
+				return loaded
+			}
+			return canonical
+		}
+	}
+	if !canonical.MergeReloaded(loaded) {
+		return loaded
+	}
+	return canonical
+}
+
+func (h *Home) publishCompletedInstance(inst *session.Instance, runtime statedb.RuntimeState) (*session.Instance, bool) {
+	pending, _ := h.transitionSnapshot(inst.ID)
+	h.instancesMu.Lock()
+	if h.instanceByID == nil {
+		h.instanceByID = make(map[string]*session.Instance)
+	}
+	canonical := h.instanceByID[inst.ID]
+	if pending != nil {
+		canonical = pending
+	}
+	var replaced *session.Instance
+	if canonical == nil {
+		canonical = inst
+	} else if canonical != inst {
+		if canMergePersistenceIncarnation(canonical, inst) {
+			canonical.MergeReloaded(inst)
+		} else {
+			replaced = canonical
+			canonical = inst
+		}
+	}
+	if runtime.InstanceID != "" {
+		canonical.ApplyRuntimeState(runtime)
+	}
+	added := true
+	for idx, existing := range h.instances {
+		if existing.ID == inst.ID {
+			h.instances[idx] = canonical
+			added = false
+			break
+		}
+	}
+	if added {
+		h.instances = append(h.instances, canonical)
+	}
+	h.instanceByID[inst.ID] = canonical
+	session.UpdateClaudeSessionsWithDedup(h.instances)
+	h.instancesMu.Unlock()
+	if replaced != nil && h.groupTree != nil {
+		h.groupTree.RemoveSession(replaced)
+		h.groupTree.AddSession(canonical)
+	}
+	return canonical, added
+}
+
+func (h *Home) removeFailedSeededInstance(instanceID string) {
+	h.removeInMemoryInstance(instanceID, nil)
+}
+
+// removeRolledBackSeededInstance removes only the exact incarnation whose
+// durable rollback succeeded. A same-ID replacement that arrived before the
+// Tea completion is a distinct logical instance and must remain visible.
+func (h *Home) removeRolledBackSeededInstance(instanceID string, seed statedb.InstanceSeedToken) {
+	if seed.Incarnation == "" {
+		return
+	}
+	h.removeInMemoryInstance(instanceID, func(inst *session.Instance) bool {
+		return inst.MatchesPersistenceIncarnation(seed.Incarnation)
+	})
+}
+
+func (h *Home) removeInMemoryInstance(instanceID string, matches func(*session.Instance) bool) {
+	var removed *session.Instance
+	h.instancesMu.Lock()
+	for idx, inst := range h.instances {
+		if inst.ID == instanceID && (matches == nil || matches(inst)) {
+			removed = inst
+			h.instances = append(h.instances[:idx], h.instances[idx+1:]...)
+			break
+		}
+	}
+	if mapped := h.instanceByID[instanceID]; mapped != nil && (matches == nil || matches(mapped)) {
+		delete(h.instanceByID, instanceID)
+	}
+	h.instancesMu.Unlock()
+	if removed != nil && h.groupTree != nil {
+		h.groupTree.RemoveSession(removed)
+	}
+	if h.search != nil {
+		h.search.SetItems(h.instances)
+	}
+	h.rebuildFlatItems()
+}
+
+func normalizeRestartResult(err error, warning string) (error, string) {
+	if !session.IsRestartPartialSuccess(err) {
+		return err, warning
+	}
+	if warning != "" {
+		warning += "; "
+	}
+	return nil, warning + err.Error()
 }
 
 // mcpRestartedMsg signals that an MCP-triggered restart completed and should auto-attach
@@ -543,6 +1046,9 @@ func restartWithArchiveTransition(
 	}
 
 	if err := restart(); err != nil {
+		if session.IsRestartPartialSuccess(err) {
+			return true, err
+		}
 		inst.SetArchivedAtThreadSafe(archivedAt)
 		if rollbackErr := persist(inst); rollbackErr != nil {
 			return false, fmt.Errorf("restart failed: %w; restoring archive state failed: %v", err, rollbackErr)
@@ -552,11 +1058,41 @@ func restartWithArchiveTransition(
 	return true, nil
 }
 
+func restartWithArchiveTransitionRuntime(
+	inst *session.Instance,
+	persist func(*session.Instance) error,
+	restart func() (statedb.RuntimeState, error),
+	consume func(statedb.RuntimeState, error) (statedb.RuntimeState, error, string),
+) (bool, statedb.RuntimeState, error, string) {
+	archivedAt := inst.ArchivedAtThreadSafe()
+	unarchived := inst.IsArchived()
+	if unarchived {
+		inst.SetArchivedAtThreadSafe(time.Time{})
+		if err := persist(inst); err != nil {
+			inst.SetArchivedAtThreadSafe(archivedAt)
+			return false, statedb.RuntimeState{}, fmt.Errorf("failed to unarchive session before restart: %w", err), ""
+		}
+	}
+	runtime, err := restart()
+	runtime, err, warning := consume(runtime, err)
+	if err == nil {
+		return unarchived, runtime, nil, warning
+	}
+	if unarchived {
+		inst.SetArchivedAtThreadSafe(archivedAt)
+		if rollbackErr := persist(inst); rollbackErr != nil {
+			return false, runtime, fmt.Errorf("restart failed: %w; restoring archive state failed: %v", err, rollbackErr), warning
+		}
+	}
+	return false, runtime, err, warning
+}
+
 // restartSession restarts a session, unarchiving it first when invoked from
 // the archived view.
 func (h *Home) restartSession(inst *session.Instance) tea.Cmd {
 	id := inst.ID
 	previewSize := h.detachedRestartPreviewSize(id)
+	token := h.beginSessionTransitionFor(inst)
 	mcpUILog.Debug(
 		"restart_session_called",
 		slog.String("id", inst.ID),
@@ -566,28 +1102,31 @@ func (h *Home) restartSession(inst *session.Instance) tea.Cmd {
 	return func() tea.Msg {
 		mcpUILog.Debug("restart_session_executing", slog.String("id", id))
 
-		// Resolve current instance by ID at execution time. During storage reloads,
-		// the pointer captured from the key event can be replaced before this cmd runs.
-		h.instancesMu.RLock()
-		current := h.instanceByID[id]
-		h.instancesMu.RUnlock()
-		if current == nil {
-			err := fmt.Errorf("session no longer exists")
+		selected, err := h.selectedTransitionInstance(inst, token)
+		if err != nil {
 			mcpUILog.Debug("restart_session_result", slog.String("id", id), slog.Any("error", err))
-			return sessionRestartedMsg{sessionID: id, err: err}
+			return sessionRestartedMsg{sessionID: id, token: token, err: err}
 		}
 
-		unarchived, err := restartWithArchiveTransition(current, h.persistArchived, current.Restart)
+		unarchived, runtime, err, warning := restartWithArchiveTransitionRuntime(
+			selected, h.persistArchived,
+			func() (statedb.RuntimeState, error) { return h.restartRuntime(selected) },
+			func(runtime statedb.RuntimeState, err error) (statedb.RuntimeState, error, string) {
+				return h.consumePhysicalRuntimeResult(selected, runtime, err)
+			},
+		)
 		if err == nil {
-			if fitErr := fitRestartedPreview(current, previewSize); fitErr != nil {
+			if fitErr := fitRestartedPreview(selected, previewSize); fitErr != nil {
 				uiLog.Debug("restart_preview_resize_failed", slog.String("session", id), slog.Any("error", fitErr))
 			}
 		}
 		mcpUILog.Debug("restart_session_result", slog.String("id", id), slog.Any("error", err))
 		return sessionRestartedMsg{
 			sessionID:  id,
+			token:      token,
+			runtime:    runtime,
 			err:        err,
-			warning:    current.ConsumeCodexRestartWarning(),
+			warning:    joinForkNotices(warning, selected.ConsumeCodexRestartWarning()),
 			unarchived: unarchived,
 		}
 	}
@@ -595,7 +1134,39 @@ func (h *Home) restartSession(inst *session.Instance) tea.Cmd {
 
 // restartSessionFresh restarts a session without resuming the previous tool session.
 func (h *Home) restartSessionFresh(inst *session.Instance) tea.Cmd {
-	return h.restartSessionFreshWith(inst, h.persistArchived, (*session.Instance).RestartFresh)
+	return h.restartSessionFreshRuntimeWith(inst, h.persistArchived, h.restartFreshRuntime)
+}
+
+func (h *Home) restartSessionFreshRuntimeWith(
+	inst *session.Instance,
+	persist func(*session.Instance) error,
+	restartFresh func(*session.Instance) (statedb.RuntimeState, error),
+) tea.Cmd {
+	id := inst.ID
+	previewSize := h.detachedRestartPreviewSize(id)
+	token := h.beginSessionTransitionFor(inst)
+	return func() tea.Msg {
+		selected, err := h.selectedTransitionInstance(inst, token)
+		if err != nil {
+			return sessionRestartedMsg{sessionID: id, token: token, err: err, fresh: true}
+		}
+		unarchived, runtime, err, warning := restartWithArchiveTransitionRuntime(
+			selected, persist,
+			func() (statedb.RuntimeState, error) { return restartFresh(selected) },
+			func(runtime statedb.RuntimeState, err error) (statedb.RuntimeState, error, string) {
+				return h.consumePhysicalRuntimeResult(selected, runtime, err)
+			},
+		)
+		if err == nil {
+			if fitErr := fitRestartedPreview(selected, previewSize); fitErr != nil {
+				uiLog.Debug("restart_preview_resize_failed", slog.String("session", id), slog.Any("error", fitErr))
+			}
+		}
+		return sessionRestartedMsg{
+			sessionID: id, token: token, runtime: runtime, err: err,
+			warning: joinForkNotices(warning, selected.ConsumeCodexRestartWarning()), fresh: true, unarchived: unarchived,
+		}
+	}
 }
 
 func (h *Home) restartSessionFreshWith(
@@ -605,6 +1176,7 @@ func (h *Home) restartSessionFreshWith(
 ) tea.Cmd {
 	id := inst.ID
 	previewSize := h.detachedRestartPreviewSize(id)
+	token := h.beginSessionTransitionFor(inst)
 	mcpUILog.Debug(
 		"restart_session_fresh_called",
 		slog.String("id", inst.ID),
@@ -614,28 +1186,35 @@ func (h *Home) restartSessionFreshWith(
 	return func() tea.Msg {
 		mcpUILog.Debug("restart_session_fresh_executing", slog.String("id", id))
 
-		h.instancesMu.RLock()
-		current := h.instanceByID[id]
-		h.instancesMu.RUnlock()
-		if current == nil {
-			err := fmt.Errorf("session no longer exists")
+		selected, err := h.selectedTransitionInstance(inst, token)
+		if err != nil {
 			mcpUILog.Debug("restart_session_fresh_result", slog.String("id", id), slog.Any("error", err))
-			return sessionRestartedMsg{sessionID: id, err: err, fresh: true}
+			return sessionRestartedMsg{sessionID: id, token: token, err: err, fresh: true}
 		}
 
-		unarchived, err := restartWithArchiveTransition(current, persist, func() error {
-			return restartFresh(current)
+		unarchived, err := restartWithArchiveTransition(selected, persist, func() error {
+			return restartFresh(selected)
 		})
+		runtime := selected.RuntimeState()
+		if candidate, ok := session.RestartRuntimeCandidate(err); ok {
+			runtime = candidate
+		}
+		err = selected.ReconcileRestartResult(err)
 		if err == nil {
-			if fitErr := fitRestartedPreview(current, previewSize); fitErr != nil {
+			runtime = selected.RuntimeState()
+		}
+		if err == nil {
+			if fitErr := fitRestartedPreview(selected, previewSize); fitErr != nil {
 				uiLog.Debug("restart_preview_resize_failed", slog.String("session", id), slog.Any("error", fitErr))
 			}
 		}
 		mcpUILog.Debug("restart_session_fresh_result", slog.String("id", id), slog.Any("error", err))
 		return sessionRestartedMsg{
 			sessionID:  id,
+			token:      token,
+			runtime:    runtime,
 			err:        err,
-			warning:    current.ConsumeCodexRestartWarning(),
+			warning:    selected.ConsumeCodexRestartWarning(),
 			fresh:      true,
 			unarchived: unarchived,
 		}
@@ -943,7 +1522,7 @@ func (h *Home) runWorktreeSetup(inst *session.Instance) tea.Cmd {
 
 // finishWorktree performs the worktree finish operation asynchronously:
 // merge branch, remove worktree, delete branch, kill session, remove from storage
-func (h *Home) finishWorktree(inst *session.Instance, sessionID, sessionTitle, branchName, repoRoot, worktreePath string, mergeEnabled bool, targetBranch string, keepBranch bool, sharedWorktree bool) tea.Cmd {
+func (h *Home) finishWorktree(inst *session.Instance, selection session.RuntimeSelection, sessionID, sessionTitle, branchName, repoRoot, worktreePath string, mergeEnabled bool, targetBranch string, keepBranch bool, sharedWorktree bool) tea.Cmd {
 	return func() tea.Msg {
 		merged := false
 
@@ -958,6 +1537,15 @@ func (h *Home) finishWorktree(inst *session.Instance, sessionID, sessionTitle, b
 				}
 			}
 			merged = true
+		}
+
+		// Claim the captured runtime and delete its row before any irreversible
+		// worktree or branch removal. A delayed selection aborts the whole delete.
+		if err := inst.DeleteCaptured(selection); err != nil {
+			return worktreeFinishResultMsg{
+				sessionID: sessionID, sessionTitle: sessionTitle,
+				err: fmt.Errorf("session changed before finish: %w", err),
+			}
 		}
 
 		// #1449: when other live sessions still share this worktree, the
@@ -983,11 +1571,6 @@ func (h *Home) finishWorktree(inst *session.Instance, sessionID, sessionTitle, b
 				// Use force delete if we merged (branch is fully merged), regular delete otherwise
 				_ = git.DeleteBranch(repoRoot, branchName, merged)
 			}
-		}
-
-		// Step 4: Kill tmux session
-		if inst != nil && inst.Exists() {
-			_ = inst.Kill()
 		}
 
 		return worktreeFinishResultMsg{

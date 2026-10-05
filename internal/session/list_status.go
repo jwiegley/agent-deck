@@ -88,3 +88,8 @@ func (i *Instance) classifyAbsentError(sess *tmux.Session) {
 	i.setTerminatedPaneExitCode(exitCode, haveExitCode)
 	i.refreshAuthHoldOnDeathLocked()
 }
+
+func (i *Instance) neverStarted() bool {
+	return i.addedThisProcess && i.lastStartTime.IsZero() &&
+		(i.Status == StatusIdle || i.Status == StatusStarting)
+}

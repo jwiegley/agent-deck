@@ -37,10 +37,6 @@ func (i *Instance) DetectCodexSession() {
 	i.detectCodexSessionAsync()
 }
 
-// detectCodexSessionAsync detects the Codex session ID after startup
-// Codex stores sessions in ~/.codex/sessions/YYYY/MM/DD/*.jsonl
-// Session ID is a UUID that can be extracted from the filename
-// Since Codex has no "session list" command, we scan the filesystem
 func (i *Instance) resolveCodexDetectionCandidate(sessionID string, probeErr error) string {
 	sessionID = i.filterCodexProcessProbeCandidate(sessionID)
 	if sessionID == "" && probeErr == nil {
@@ -49,8 +45,6 @@ func (i *Instance) resolveCodexDetectionCandidate(sessionID string, probeErr err
 			return threadID
 		}
 		var pass StatusUpdatePass
-		// Warm evidence before serializing selection; no subprocess holds the
-		// bootstrap mutex, including asynchronous startup detection.
 		i.codexExclusions(&pass)
 		codexBootstrapMu.Lock()
 		defer codexBootstrapMu.Unlock()
@@ -58,7 +52,7 @@ func (i *Instance) resolveCodexDetectionCandidate(sessionID string, probeErr err
 		if exclude == nil {
 			return ""
 		}
-		sessionID = i.queryCodexSession(exclude, true)
+		sessionID = i.queryCodexSession(codexSessionExclusions{explicit: exclude}, true)
 		i.recordCodexOwnership(sessionID)
 		return sessionID
 	}
@@ -66,47 +60,95 @@ func (i *Instance) resolveCodexDetectionCandidate(sessionID string, probeErr err
 	return sessionID
 }
 
+// codexDetectionDelays is how long detectCodexSessionAsync waits before each
+// attempt: a brief wait for Codex to initialize, then short retry delays.
+var codexDetectionDelays = []time.Duration{time.Second, time.Second, 2 * time.Second}
+
+// detectCodexSessionAsync detects the Codex session ID after startup. Codex
+// stores sessions in ~/.codex/sessions/YYYY/MM/DD/*.jsonl, and the session ID
+// is the UUID in the file name. Codex has no "session list" command, so the
+// live-process probe and the filesystem scan find it.
+//
+// A start or restart launches it, and it outlives that transition. Each
+// attempt therefore holds the instance spawn lock, as the status pass's Codex
+// refresh does (updateCodexSessionForPass). A start, restart or stop holds
+// that lock while it writes fields an attempt reads, without i.mu: the tmux
+// wrapper (a fallback recreate replaces it, then configures and starts it),
+// the sandbox container and CodexStartedAt among them. The first attempt runs
+// once the launching transition has committed its runtime and released the
+// lock, and it fixes the runtime generation detection serves. Once another
+// transition has replaced that runtime, detection stops; the replacement's own
+// start or restart detects for it.
 func (i *Instance) detectCodexSessionAsync() {
-	// Brief wait for Codex to initialize
-	time.Sleep(1 * time.Second)
-
-	// Try up to 3 times with short delays
-	delays := []time.Duration{0, 1 * time.Second, 2 * time.Second}
-
-	for attempt, delay := range delays {
-		if delay > 0 {
-			time.Sleep(delay)
-		}
-
-		sessionID, _, probeErr := i.queryCodexSessionFromProcessFiles(nil)
-		sessionID = i.resolveCodexDetectionCandidate(sessionID, probeErr)
-		if sessionID != "" {
-			i.CodexSessionID = sessionID
-			i.CodexDetectedAt = time.Now()
-
-			// Store in tmux environment for restart
-			if i.tmuxSession != nil {
-				if err := i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID); err != nil {
-					sessionLog.Warn("codex_set_env_failed", slog.String("error", err.Error()))
-				}
-			}
-
-			sessionLog.Debug(
-				"codex_session_detected",
-				slog.String("session_id", sessionID),
-				slog.Int("attempt", attempt+1),
-			)
+	var served codexDetectionRuntime
+	for attempt, delay := range codexDetectionDelays {
+		time.Sleep(delay)
+		if i.detectCodexSessionAttempt(attempt, &served) {
 			return
 		}
+	}
+	sessionLog.Warn("codex_detection_failed", slog.Int("attempts", len(codexDetectionDelays)))
+}
 
+// codexDetectionRuntime is the runtime generation detectCodexSessionAsync
+// serves, fixed by its first attempt that holds the spawn lock.
+type codexDetectionRuntime struct {
+	generation uint64
+	fixed      bool
+}
+
+// detectCodexSessionAttempt is one detection attempt, made under the instance
+// spawn lock. It reports whether detection is over: the thread it found was
+// published or refused, or the runtime it serves was replaced.
+func (i *Instance) detectCodexSessionAttempt(attempt int, served *codexDetectionRuntime) bool {
+	release, err := acquireInstanceSpawnLock(i.ID)
+	if err != nil {
+		sessionLog.Debug("codex_detection_lock_failed",
+			slog.Int("attempt", attempt+1), slog.String("error", err.Error()))
+		return false
+	}
+	defer release()
+
+	observation := i.CaptureRuntimeBindingObservation("codex")
+	if !served.fixed {
+		served.generation, served.fixed = observation.generation, true
+	} else if observation.generation != served.generation {
+		sessionLog.Debug("codex_detection_superseded", slog.Int("attempt", attempt+1),
+			slog.Uint64("generation", served.generation), slog.Uint64("current_generation", observation.generation))
+		return true
+	}
+	sessionID, _, probeErr := i.queryCodexSessionFromProcessFiles(nil)
+	sessionID = i.resolveCodexDetectionCandidate(sessionID, probeErr)
+	if sessionID == "" {
 		if probeErr != nil {
 			sessionLog.Debug("codex_session_probe_undetermined", slog.Int("attempt", attempt+1), slog.Any("error", probeErr))
 		} else {
-			sessionLog.Debug("codex_session_not_found", slog.Int("attempt", attempt+1), slog.Int("total", len(delays)))
+			sessionLog.Debug("codex_session_not_found", slog.Int("attempt", attempt+1), slog.Int("total", len(codexDetectionDelays)))
+		}
+		return false
+	}
+	if err := i.publishRuntimeBindingObservationLocked(observation, sessionID, time.Now()); err != nil {
+		sessionLog.Debug("codex_binding_rejected",
+			slog.String("session_id", sessionID), slog.String("error", err.Error()))
+		return true
+	}
+
+	// Store in tmux environment for restart
+	i.mu.RLock()
+	tmuxSession := i.tmuxSession
+	i.mu.RUnlock()
+	if tmuxSession != nil {
+		if err := tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID); err != nil {
+			sessionLog.Warn("codex_set_env_failed", slog.String("error", err.Error()))
 		}
 	}
 
-	sessionLog.Warn("codex_detection_failed", slog.Int("attempts", len(delays)))
+	sessionLog.Debug(
+		"codex_session_detected",
+		slog.String("session_id", sessionID),
+		slog.Int("attempt", attempt+1),
+	)
+	return true
 }
 
 func getCodexHomeDir() string {
@@ -182,21 +224,46 @@ func runWithTimeout(timeout time.Duration, op func()) bool {
 // while still preventing indefinite hangs.
 const codexWalkDirTimeout = 5 * time.Second
 
+// codexSessionExclusions is a read-only view used by the fallback disk walk.
+// Explicit caller maps preserve the public UpdateCodexSession contract. Shared
+// ownership snapshots carry owner counts so the current tmux session's ID can
+// be allowed without accidentally allowing a duplicate owned by a sibling.
+type codexSessionExclusions struct {
+	explicit map[string]bool
+	ownedIDs map[string]int
+	ownID    string
+}
+
+func (e codexSessionExclusions) contains(id string) bool {
+	if e.explicit != nil {
+		return e.explicit[id]
+	}
+	owners := e.ownedIDs[id]
+	if id == e.ownID && owners == 1 {
+		return false
+	}
+	return owners > 0
+}
+
 // queryCodexSession scans Codex sessions and returns the best candidate.
 // Selection strategy:
 //  1. Prefer sessions whose JSONL metadata matches this instance's project path.
 //  2. Optionally allow unscoped fallback (no cwd metadata) for initial bootstrap.
-func (i *Instance) queryCodexSession(excludeIDs map[string]bool, allowUnscoped bool) string {
-	return queryCodexSessionWith(i.getCodexHomeDir(), i.ProjectPath, i.CodexStartedAt, i.ID, excludeIDs, allowUnscoped)
+//
+// The caller must not hold i.mu. The inputs are read under it once, as in
+// queryCodexSessionFromProcessFiles, and the walk, which can outlive its
+// timeout, reads only that snapshot.
+func (i *Instance) queryCodexSession(exclusions codexSessionExclusions, allowUnscoped bool) string {
+	i.mu.RLock()
+	codexHome, projectPath, codexStartedAt, instanceID := i.getCodexHomeDir(), i.ProjectPath, i.CodexStartedAt, i.ID
+	i.mu.RUnlock()
+	return queryCodexSessionWith(codexHome, projectPath, codexStartedAt, instanceID, exclusions, allowUnscoped)
 }
 
-// codexWalkDir walks $CODEX_HOME/sessions during bootstrap discovery. Test seam.
+// Test seam for a bounded walk that must not hold Instance.mu.
 var codexWalkDir = filepath.WalkDir
 
-// queryCodexSessionWith is queryCodexSession over explicit inputs, so the
-// status pass can run the (up to codexWalkDirTimeout) walk without holding
-// i.mu, and a timed-out walk goroutine never reads Instance fields (#2674).
-func queryCodexSessionWith(codexHome, projectPath string, codexStartedAt int64, instanceID string, excludeIDs map[string]bool, allowUnscoped bool) string {
+func queryCodexSessionWith(codexHome, projectPath string, codexStartedAt int64, instanceID string, exclusions codexSessionExclusions, allowUnscoped bool) string {
 	sessionsDir := filepath.Join(codexHome, "sessions")
 	if _, err := os.Stat(sessionsDir); os.IsNotExist(err) {
 		return ""
@@ -226,7 +293,7 @@ func queryCodexSessionWith(codexHome, projectPath string, codexStartedAt int64, 
 			if sessionID == "" {
 				return nil
 			}
-			if excludeIDs != nil && excludeIDs[sessionID] {
+			if exclusions.contains(sessionID) {
 				return nil
 			}
 
@@ -395,24 +462,22 @@ func (i *Instance) collectOtherCodexSessionIDs() map[string]bool {
 	return i.codexExclusions(nil)
 }
 
-// shouldScanCodexSession returns whether we should run an expensive filesystem
-// scan for Codex session rotation right now.
-func (i *Instance) shouldScanCodexSession(allowUnscoped bool) bool {
-	interval := codexRotationScanInterval
+func codexSessionScanInterval(allowUnscoped bool) time.Duration {
 	if allowUnscoped {
-		interval = codexBootstrapScanInterval
+		return codexBootstrapScanInterval
 	}
+	return codexRotationScanInterval
+}
 
-	if !i.lastCodexScanAt.IsZero() && time.Since(i.lastCodexScanAt) < interval {
-		return false
-	}
-
-	i.lastCodexScanAt = time.Now()
-	return true
+func (i *Instance) codexSessionScanDue(allowUnscoped bool) bool {
+	return i.lastCodexScanAt.IsZero() ||
+		time.Since(i.lastCodexScanAt) >= codexSessionScanInterval(allowUnscoped)
 }
 
 // shouldRunCodexProcessProbe returns whether we should run Codex process/file
-// probing right now.
+// probing right now. The caller must not hold i.mu: it holds the spawn lock
+// (the status pass, a restart), but a storage reload rebinds the thread under
+// i.mu without that lock, so the binding is read under i.mu.
 func (i *Instance) shouldRunCodexProcessProbe(force bool) bool {
 	if force {
 		i.lastCodexProbeAt = time.Now()
@@ -423,8 +488,11 @@ func (i *Instance) shouldRunCodexProcessProbe(force bool) bool {
 	// bounded by discovery succeeding within seconds. Once an ID is known the
 	// probe is just a rotation safety net behind the notify hook and tmux env,
 	// so it backs off to the rotation cadence (issue #1552).
+	i.mu.RLock()
+	bound := i.CodexSessionID != ""
+	i.mu.RUnlock()
 	interval := codexBootstrapScanInterval
-	if i.CodexSessionID != "" {
+	if bound {
 		interval = codexRotationScanInterval
 	}
 
@@ -451,12 +519,20 @@ func (i *Instance) PaneProcessTreePIDs() ([]int, error) {
 // (its first caller); it is not codex-specific — see PaneProcessTreePIDs.
 // A status pass shares one process-table snapshot across its rows; nil reads
 // a fresh one.
+//
+// The caller must not hold i.mu. The wrapper and socket are read under it: a
+// runtime commit adopts them under i.mu, and a storage reload replaces them
+// under i.mu without the spawn lock that Codex detection and the status pass
+// hold.
 func (i *Instance) collectTmuxPaneProcessTreePIDs(pass *StatusUpdatePass) ([]int, error) {
-	if i.tmuxSession == nil || !i.tmuxSession.Exists() {
+	i.mu.RLock()
+	tmuxSession, socketName := i.tmuxSession, i.TmuxSocketName
+	i.mu.RUnlock()
+	if tmuxSession == nil || !tmuxSession.Exists() {
 		return nil, errors.New("codex process probe: tmux session is unavailable")
 	}
 
-	target := i.tmuxSession.Name
+	target := tmuxSession.TmuxName()
 	// Target the same tmux server the session was created on (issue #687).
 	// A session on an isolated agent-deck socket would return no panes from
 	// the default server and we would mistakenly treat it as empty.
@@ -464,7 +540,7 @@ func (i *Instance) collectTmuxPaneProcessTreePIDs(pass *StatusUpdatePass) ([]int
 	// a tmux client that has exhausted its fd table never exits, so this probe
 	// would hang the caller forever. -s makes list-panes cover every window in
 	// the session rather than only the target's current window.
-	out, err := tmux.OutputBounded(i.TmuxSocketName, "list-panes", "-s", "-t", target, "-F", "#{pane_pid}")
+	out, err := tmux.OutputBounded(socketName, "list-panes", "-s", "-t", target, "-F", "#{pane_pid}")
 	if err != nil {
 		return nil, fmt.Errorf("codex process probe: list tmux panes: %w", err)
 	}
@@ -828,7 +904,10 @@ fi`,
 }
 
 func (i *Instance) queryCodexSessionFromDockerProcFD() (string, string, error) {
-	if strings.TrimSpace(i.SandboxContainer) == "" {
+	i.mu.RLock()
+	container := i.SandboxContainer
+	i.mu.RUnlock()
+	if strings.TrimSpace(container) == "" {
 		return "", "", errors.New("codex process probe: sandbox container is unavailable")
 	}
 
@@ -836,7 +915,7 @@ func (i *Instance) queryCodexSessionFromDockerProcFD() (string, string, error) {
 	// #nosec G204 -- "docker exec" with internal SandboxContainer name and a
 	// hardcoded shell probe script (the sentinels are compile-time constants);
 	// no external input flows here.
-	out, err := exec.Command("docker", "exec", i.SandboxContainer, "sh", "-lc", script).Output()
+	out, err := exec.Command("docker", "exec", container, "sh", "-lc", script).Output()
 	if sessionID := i.extractAcceptedCodexSessionIDFromOutput(out); sessionID != "" {
 		return sessionID, "", nil
 	}
@@ -916,9 +995,18 @@ func (i *Instance) queryCodexSessionFromHostLsof(pids []int) (string, string, er
 // the active session UUID inferred from open rollout JSONL files. Empty ID with
 // nil error means definitely absent; a non-nil error means undetermined. The
 // second return value names a missing dependency, when applicable.
+// A status pass shares one process-table snapshot across its rows; nil reads
+// a fresh one.
+//
+// The caller must not hold i.mu: every step reads the Instance under it,
+// because a storage reload writes those fields under i.mu without the spawn
+// lock its callers (a detection attempt, the status pass) hold.
 func (i *Instance) queryCodexSessionFromProcessFiles(pass *StatusUpdatePass) (string, string, error) {
+	i.mu.RLock()
+	sandboxed := i.IsSandboxed()
+	i.mu.RUnlock()
 	// Sandboxed sessions run Codex inside Docker; probe container /proc.
-	if i.IsSandboxed() {
+	if sandboxed {
 		return i.queryCodexSessionFromDockerProcFD()
 	}
 
@@ -973,197 +1061,190 @@ func (i *Instance) UpdateCodexSession(excludeIDs map[string]bool) {
 	i.updateCodexSession(excludeIDs, false)
 }
 
-// updateCodexSession refreshes Codex session ID from env/process-files/disk.
-// Returns missing dependency name when probe prerequisites are unavailable.
-func (i *Instance) updateCodexSession(excludeIDs map[string]bool, forceProbe bool) string {
-	return i.updateCodexSessionForPass(excludeIDs, forceProbe, nil, false)
+type codexSessionCandidate struct {
+	id, envID, source, missingDependency string
 }
 
-// statusLocked is true only when called from updateStatus with i.mu held.
-func (i *Instance) updateCodexSessionForPass(excludeIDs map[string]bool, forceProbe bool, pass *StatusUpdatePass, statusLocked bool) string {
-	if !IsCodexCompatible(i.Tool) {
+// updateCodexSession refreshes Codex bindings through the versioned publisher.
+func (i *Instance) updateCodexSession(excludeIDs map[string]bool, forceProbe bool) string {
+	return i.updateCodexSessionForPass(excludeIDs, forceProbe, nil)
+}
+
+func (i *Instance) updateCodexSessionForPass(excludeIDs map[string]bool, forceProbe bool, pass *StatusUpdatePass) string {
+	// Match restart's lock order: instance authority before bootstrap claims.
+	release, err := acquireInstanceSpawnLock(i.ID)
+	if err != nil {
+		sessionLog.Debug("codex_binding_lock_failed", slog.String("error", err.Error()))
 		return ""
 	}
+	defer release()
+	observation := i.CaptureRuntimeBindingObservation("codex")
+	if observation.value == "" && pass == nil {
+		pass = &StatusUpdatePass{}
+	}
+	// The disk fallback takes the bootstrap claim just before it selects, and
+	// it is held through publication below. The tmux environment read and the
+	// process probe are authoritative and never wait for it.
+	var bootstrap codexBootstrapClaim
+	defer bootstrap.release()
+	candidate := i.queryCodexSessionCandidateForPass(excludeIDs, forceProbe, observation.value, pass, &bootstrap)
+	if candidate.id != "" {
+		if err := i.publishRuntimeBindingObservationLocked(observation, candidate.id, time.Now()); err != nil {
+			sessionLog.Debug("codex_binding_rejected",
+				slog.String("session_id", candidate.id), slog.String("source", candidate.source),
+				slog.String("error", err.Error()))
+		} else {
+			i.syncPublishedCodexCandidate(candidate, observation.value)
+		}
+	}
+	return candidate.missingDependency
+}
 
-	envSessionID := ""
+// adoptCodexSessionForRestart is a restart's Codex detection, run under the
+// restart's transition authority. Like the status pass it takes the bootstrap
+// claim lazily, on the way into the disk fallback, so it cannot select the
+// rollout a peer bootstrapping in the same project is selecting from the same
+// ownership snapshot. It publishes its selection to peers before releasing
+// the claim: recordCodexOwnership for this process and the tmux environment
+// for others, as the status pass's publication does. The durable binding
+// follows with the restart's generation; holding the claim across the spawn
+// would stall every peer's fallback behind it. The selection is written under
+// i.mu: the restart holds the spawn lock, not i.mu, and every status pass
+// observes the binding under i.mu alone (captureActiveRuntimeBindingObservation).
+func (i *Instance) adoptCodexSessionForRestart() codexSessionCandidate {
+	var bootstrap codexBootstrapClaim
+	defer bootstrap.release()
+	candidate := i.queryCodexSessionCandidateForPass(nil, true, i.CodexSessionID, &StatusUpdatePass{}, &bootstrap)
+	if candidate.id != "" {
+		i.mu.Lock()
+		i.CodexSessionID = candidate.id
+		i.CodexDetectedAt = time.Now()
+		i.mu.Unlock()
+		i.recordCodexOwnership(candidate.id)
+		i.syncPublishedCodexCandidate(candidate, "")
+	}
+	return candidate
+}
 
-	// 1. Try to read from tmux environment first (authoritative if set)
-	if i.tmuxSession != nil {
-		if sessionID, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && sessionID != "" {
-			envSessionID = sessionID
-			if i.CodexSessionID != sessionID {
-				i.CodexSessionID = sessionID
-			}
-			i.CodexDetectedAt = time.Now()
-			i.recordCodexOwnership(i.CodexSessionID)
+// codexBootstrapClaim holds codexBootstrapMu from the moment the disk fallback
+// starts selecting until its caller has published the result, so peers sharing
+// a project cannot claim one rollout from the same ownership snapshot. It is
+// taken lazily, only on the way into the fallback: authoritative evidence is
+// read without it, as codexBootstrapMu's contract requires. The zero value
+// holds nothing, and release is idempotent.
+type codexBootstrapClaim struct{ held bool }
+
+func (c *codexBootstrapClaim) acquire() {
+	if !c.held {
+		codexBootstrapMu.Lock()
+		c.held = true
+	}
+}
+
+func (c *codexBootstrapClaim) release() {
+	if c.held {
+		c.held = false
+		codexBootstrapMu.Unlock()
+	}
+}
+
+// queryCodexSessionCandidateForPass reads the tmux environment and the process
+// probe, then falls back to the disk scan. A non-nil bootstrap is acquired
+// just before that scan and left held for the caller to release once it has
+// published the candidate.
+func (i *Instance) queryCodexSessionCandidateForPass(excludeIDs map[string]bool, forceProbe bool, currentID string, pass *StatusUpdatePass, bootstrap *codexBootstrapClaim) codexSessionCandidate {
+	i.mu.RLock()
+	tool := i.Tool
+	tmuxSession := i.tmuxSession
+	startedAt := i.CodexStartedAt
+	hookID := i.hookSessionID
+	i.mu.RUnlock()
+	if !IsCodexCompatible(tool) {
+		return codexSessionCandidate{}
+	}
+
+	candidate := codexSessionCandidate{}
+	if tmuxSession != nil {
+		if sessionID, err := tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && sessionID != "" {
+			candidate.id, candidate.envID, candidate.source = sessionID, sessionID, "tmux_env"
 		}
 	}
 
-	// 2. Prefer live-process file detection (Linux /proc, macOS lsof fallback).
-	missingProbeDep := ""
 	if i.shouldRunCodexProcessProbe(forceProbe) {
+		// Every ID the probe returns has passed its subagent gate
+		// (filterCodexProcessProbeCandidate), which records the rejections.
 		sessionID, missingDep, probeErr := i.queryCodexSessionFromProcessFiles(pass)
-		sessionID = i.filterCodexProcessProbeCandidate(sessionID)
 		if sessionID != "" {
-			changed := sessionID != i.CodexSessionID
-			if changed {
-				sessionLog.Debug(
-					"codex_session_update_from_probe",
-					slog.String("old_id", i.CodexSessionID),
-					slog.String("new_id", sessionID),
-				)
-			}
-			i.CodexSessionID = sessionID
-			i.CodexDetectedAt = time.Now()
-			i.recordCodexOwnership(i.CodexSessionID)
-			if i.tmuxSession != nil && i.tmuxSession.Exists() && (changed || envSessionID == "") {
-				_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", i.CodexSessionID)
-			}
-			return ""
+			candidate.id, candidate.source = sessionID, "process_probe"
+			return candidate
 		}
 		if missingDep != "" {
-			missingProbeDep = missingDep
+			candidate.missingDependency = missingDep
 		}
 		if probeErr != nil {
 			sessionLog.Debug("codex_session_probe_undetermined", slog.Any("error", probeErr))
-			return missingProbeDep
+			return candidate
 		}
 	}
-
-	// 3. Use disk scan only as a bootstrap fallback. Once a session ID is
-	// known, rotation must come from authoritative live evidence above (tmux
-	// env, hook payload, or the Codex process' open rollout file). Polling the
-	// full historical $CODEX_HOME/sessions tree for every active Codex session
-	// burns CPU on large histories and has no stronger ownership signal than the
-	// current binding.
-	if i.CodexSessionID != "" {
-		return missingProbeDep
+	if candidate.id != "" || currentID != "" {
+		return candidate
 	}
 
-	// Only allow unscoped fallback when we don't have a known session ID yet.
-	allowUnscoped := envSessionID == "" && i.CodexSessionID == "" && i.CodexStartedAt > 0
-	if !i.shouldScanCodexSession(allowUnscoped) {
-		return missingProbeDep
+	allowUnscoped := candidate.envID == "" && startedAt > 0
+	if !i.codexSessionScanDue(allowUnscoped) {
+		return candidate
 	}
+	// Stamped before the live-process check as well as the disk scan: a live
+	// Codex that owns no thread yet would otherwise walk the pane's process
+	// tree and list its open files on every pass.
+	i.lastCodexScanAt = time.Now()
+	// When a Codex process runs in the pane, only the thread it holds open (its
+	// rollout or thread writer lock) may bind: a child launched without a
+	// message has no rollout yet, and the newest rollout in the project is a
+	// sibling's (#2394). An incomplete probe binds nothing this pass. The caller
+	// publishes the live thread through the runtime binding authority, which
+	// records its ownership and the pane's CODEX_SESSION_ID.
 	if threadID, live := i.liveCodexBootstrapEvidence(pass); live {
 		if threadID != "" {
-			i.CodexSessionID = threadID
-			i.CodexDetectedAt = time.Now()
-			i.recordCodexOwnership(threadID)
-			if i.tmuxSession != nil && i.tmuxSession.Exists() {
-				_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", threadID)
-			}
+			candidate.id, candidate.source = threadID, "live_thread"
 		}
-		return missingProbeDep
+		return candidate
 	}
-
-	if statusLocked {
-		return i.bootstrapCodexSessionStatusLocked(excludeIDs, pass, allowUnscoped, envSessionID, missingProbeDep)
-	}
-
-	// Fetch peer ownership before taking the bootstrap selection lock. Status
-	// readers and authoritative hook updates must remain available during I/O.
-	if excludeIDs == nil {
-		if pass == nil {
-			pass = &StatusUpdatePass{}
+	if bootstrap != nil {
+		if excludeIDs == nil {
+			i.codexExclusions(pass) // Fetch peer ownership before the claim; no subprocess runs under it.
 		}
-		socket := tmux.DefaultSocketName()
-		if i.tmuxSession != nil {
-			socket = i.tmuxSession.SocketName
-		}
-		pass.codexOwnership(socket)
+		bootstrap.acquire()
 	}
-
-	// Serialize fallback selection with publication so peers sharing a project
-	// cannot claim the same rollout from a pinned ownership snapshot.
-	codexBootstrapMu.Lock()
-	defer codexBootstrapMu.Unlock()
-	// Collect peer ownership only when a bootstrap disk scan will actually run.
 	if excludeIDs == nil {
 		excludeIDs = i.codexExclusions(pass)
 		if excludeIDs == nil {
-			return missingProbeDep // Unknown ownership must not become a guessed binding.
+			return candidate
 		}
 	}
-
-	if sessionID := i.queryCodexSession(excludeIDs, allowUnscoped); sessionID != "" {
-		i.publishCodexBootstrapSession(sessionID, envSessionID)
-	}
-	return missingProbeDep
-}
-
-// bootstrapCodexSessionStatusLocked runs the bootstrap disk scan for the
-// status pass. It is entered and returns with i.mu held, but releases i.mu
-// around the ownership refresh and the $CODEX_HOME walk: holding it there
-// stalled every render-path reader for up to codexWalkDirTimeout (#2674).
-// Lock order is codexBootstrapMu before i.mu.
-func (i *Instance) bootstrapCodexSessionStatusLocked(excludeIDs map[string]bool, pass *StatusUpdatePass, allowUnscoped bool, envSessionID, missingProbeDep string) string {
-	if pass == nil {
-		pass = &StatusUpdatePass{}
-	}
-	socket := tmux.DefaultSocketName()
-	ts := i.tmuxSession
-	started := i.lastStartTime
-	hookID := i.hookSessionID
-	if ts != nil {
-		socket = ts.SocketName
-	}
-	// A stop, restart, or authoritative binding while unlocked supersedes
-	// this bootstrap attempt. Do not resurrect or overwrite it.
-	superseded := func() bool {
-		return i.tmuxSession != ts || i.lastStartTime != started || i.hookSessionID != hookID ||
-			i.CodexSessionID != "" || !IsCodexCompatible(i.Tool) ||
-			(i.Status != StatusRunning && i.Status != StatusWaiting)
-	}
-
-	i.mu.Unlock()
-	if excludeIDs == nil {
-		pass.codexOwnership(socket)
-	}
-	codexBootstrapMu.Lock()
-	defer codexBootstrapMu.Unlock() // runs after return, with i.mu re-held
-	i.mu.Lock()
-	if superseded() {
-		return missingProbeDep
-	}
-	if excludeIDs == nil {
-		excludeIDs = i.codexExclusions(pass) // ownership is warm in pass
-		if excludeIDs == nil {
-			return missingProbeDep // Unknown ownership must not become a guessed binding.
+	exclusions := codexSessionExclusions{explicit: excludeIDs}
+	if sessionID := i.queryCodexSession(exclusions, allowUnscoped); sessionID != "" {
+		i.mu.RLock()
+		hookUnchanged := i.hookSessionID == hookID
+		i.mu.RUnlock()
+		if !hookUnchanged {
+			return candidate
 		}
+		candidate.id, candidate.source = sessionID, "disk"
 	}
-	codexHome, projectPath, startedAt, id := i.getCodexHomeDir(), i.ProjectPath, i.CodexStartedAt, i.ID
-
-	i.mu.Unlock()
-	sessionID := queryCodexSessionWith(codexHome, projectPath, startedAt, id, excludeIDs, allowUnscoped)
-	i.mu.Lock()
-
-	if sessionID != "" && !superseded() {
-		i.publishCodexBootstrapSession(sessionID, envSessionID)
-	}
-	return missingProbeDep
+	return candidate
 }
 
-// publishCodexBootstrapSession binds a disk-scan result. Callers hold
-// codexBootstrapMu and, when called from the status pass, i.mu.
-func (i *Instance) publishCodexBootstrapSession(sessionID, envSessionID string) {
-	// queryCodexSession already filters subagent rollouts out of candidacy
-	// (incident 2026-07-15), so sessionID here is always a user thread.
-	changed := sessionID != i.CodexSessionID
-	if changed {
-		sessionLog.Debug(
-			"codex_session_update",
-			slog.String("old_id", i.CodexSessionID),
-			slog.String("new_id", sessionID),
-		)
+func (i *Instance) syncPublishedCodexCandidate(candidate codexSessionCandidate, oldID string) {
+	if candidate.id != oldID {
+		sessionLog.Debug("codex_session_update",
+			slog.String("old_id", oldID), slog.String("new_id", candidate.id),
+			slog.String("source", candidate.source))
 	}
-	i.CodexSessionID = sessionID
-	i.CodexDetectedAt = time.Now()
-	i.recordCodexOwnership(i.CodexSessionID)
-
-	// Sync back to tmux environment for future restarts
-	// Skip redundant writes when env already matches: each write is a tmux subprocess.
-	if i.tmuxSession != nil && i.tmuxSession.Exists() && (changed || envSessionID == "") {
-		_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", i.CodexSessionID)
+	i.mu.RLock()
+	tmuxSession := i.tmuxSession
+	i.mu.RUnlock()
+	if tmuxSession != nil && tmuxSession.Exists() && (candidate.id != oldID || candidate.envID == "") {
+		_ = tmuxSession.SetEnvironment("CODEX_SESSION_ID", candidate.id)
 	}
 }

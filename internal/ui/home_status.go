@@ -846,6 +846,28 @@ func (h *Home) feedHookStatuses(instances []*session.Instance) {
 	}
 }
 
+func applySharedStatusRow(
+	inst *session.Instance,
+	row statedb.StatusRow,
+	readRuntime func(string) (statedb.RuntimeState, bool, error),
+) bool {
+	before := inst.RuntimeState()
+	if applied, changed := inst.ApplyStatusIfRuntimeVersion(
+		row.Generation,
+		row.StatusRevision,
+		session.Status(row.Status),
+	); applied {
+		return changed
+	}
+	durable, found, err := readRuntime(inst.ID)
+	if err != nil || !found {
+		return false
+	}
+	inst.ApplyRuntimeState(durable)
+	after := inst.RuntimeState()
+	return after.Generation != before.Generation || after.StatusRevision != before.StatusRevision || after.Status != before.Status
+}
+
 // syncNotificationsBackground updates the tmux notification bar directly
 // Called from background worker - does NOT depend on Bubble Tea
 func (h *Home) syncNotificationsBackground() {

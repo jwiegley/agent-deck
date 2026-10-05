@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -1105,6 +1106,81 @@ func (h *Home) measureRemoteLatencies() tea.Msg {
 	wg.Wait()
 
 	return remoteLatenciesFetchedMsg{latencies: results}
+}
+
+func (h *Home) beginReload() uint64 {
+	h.reloadMu.Lock()
+	defer h.reloadMu.Unlock()
+	h.isReloading = true
+	h.reloadVersion++
+	return h.reloadVersion
+}
+
+func (h *Home) reconcileRuntime(inst *session.Instance) (session.RuntimeReconciliationResult, error) {
+	if h.reconcileRuntimeFn != nil {
+		return h.reconcileRuntimeFn(inst)
+	}
+	return inst.ReconcileRuntime()
+}
+
+func formatRuntimeReconcileWarning(inst *session.Instance, err error) string {
+	var ambiguity *session.RuntimeReconciliationAmbiguityError
+	if !errors.As(err, &ambiguity) {
+		return fmt.Sprintf("runtime reconciliation for %s failed: %v", inst.ID, err)
+	}
+	candidates := make([]string, 0, len(ambiguity.Candidates))
+	for _, candidate := range ambiguity.Candidates {
+		candidates = append(candidates, fmt.Sprintf(
+			"socket=%q session=%q generation=%d known=%t pid=%d proof=%q",
+			candidate.SocketName, candidate.SessionName, candidate.Generation,
+			candidate.GenerationKnown, candidate.PanePID, candidate.ProofError,
+		))
+	}
+	return fmt.Sprintf(
+		"runtime reconciliation for %s is ambiguous: %s; candidates: %s",
+		ambiguity.InstanceID, ambiguity.Reason, strings.Join(candidates, ", "),
+	)
+}
+
+func (h *Home) reconcileStartupInstances(instances []*session.Instance) []string {
+	if len(instances) == 0 {
+		return nil
+	}
+	var warnings []string
+	h.startupReconcileOnce.Do(func() {
+		record := func(inst *session.Instance, result session.RuntimeReconciliationResult, err error) {
+			if err != nil {
+				warning := formatRuntimeReconcileWarning(inst, err)
+				warnings = append(warnings, warning)
+				uiLog.Warn("startup_runtime_reconcile_failed", slog.String("detail", warning))
+				return
+			}
+			if result.State.InstanceID != "" {
+				inst.ApplyRuntimeState(result.State)
+			}
+		}
+		// Tests may retain the single-instance seam. Production always uses one
+		// socket-complete snapshot for the full loaded set.
+		if h.reconcileRuntimeFn != nil {
+			for _, inst := range instances {
+				result, err := h.reconcileRuntime(inst)
+				record(inst, result, err)
+			}
+			return
+		}
+		byID := make(map[string]*session.Instance, len(instances))
+		for _, inst := range instances {
+			if inst != nil {
+				byID[inst.ID] = inst
+			}
+		}
+		for _, outcome := range session.ReconcileStartupRuntimes(instances) {
+			if inst := byID[outcome.InstanceID]; inst != nil {
+				record(inst, outcome.Result, outcome.Err)
+			}
+		}
+	})
+	return warnings
 }
 
 // stampRemoteFetch marks a remote dialog fetch's answer with the generation

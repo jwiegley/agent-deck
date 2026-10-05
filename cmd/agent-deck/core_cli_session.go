@@ -68,7 +68,11 @@ func cliSessionStart(profile string, args []string) {
 		Message: initialMessage,
 		Yolo:    *yoloMode,
 		NoWait:  *noWait,
-	}, nil)
+	}, func(ev core.Event) {
+		if ev.Kind == core.EventRuntimeWarning && !out.jsonMode && !out.quietMode {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", ev.Message)
+		}
+	})
 	if res.Err != nil {
 		exitCoreError(out, &jsonOutput, res, nil)
 	}
@@ -119,27 +123,13 @@ func cliSessionStart(profile string, args []string) {
 		printEnvelope(res)
 		return
 	}
-	jsonData := map[string]interface{}{
-		"success": true,
-		"id":      started.ID,
-		"title":   started.Title,
-	}
-	if started.Warning != "" {
-		jsonData["warning"] = started.Warning
-	}
-	if started.Tmux != "" {
-		jsonData["tmux"] = started.Tmux
-	}
-	if started.ClaudeSessionID != "" {
-		jsonData["claude_session_id"] = started.ClaudeSessionID
-	}
-	if started.Message != "" {
-		jsonData["message"] = started.Message
-		jsonData["message_pending"] = false
-		out.Success(fmt.Sprintf("Started session: %s (message sent)", started.Title), jsonData)
-	} else {
-		out.Success(fmt.Sprintf("Started session: %s", started.Title), jsonData)
-	}
+	jsonData := map[string]interface{}{}
+	line := renderStartSuccess(startSuccess{
+		verb: "Started", id: started.ID, title: started.Title, warning: started.Warning,
+		tmux: started.Tmux, claudeSessionID: started.ClaudeSessionID,
+		message: started.Message, messageUndelivered: started.MessagePending,
+	}, jsonData)
+	out.Success(line, jsonData)
 }
 
 func cliSessionStop(profile string, args []string) {
@@ -165,8 +155,16 @@ func cliSessionStop(profile string, args []string) {
 	out := NewCLIOutput(jsonOutput.enabled(), *quiet || *quietShort)
 
 	res := runCore(profile, &jsonOutput, core.IDSessionStop, core.SessionStopIn{Profile: profile, Session: fs.Arg(0)}, func(ev core.Event) {
-		if ev.Kind == core.EventQueueDrainFailed {
+		switch ev.Kind {
+		case core.EventQueueDrainFailed:
 			fmt.Fprintf(os.Stderr, "queue drain failed to start %s: %v\n", ev.Title, ev.Err)
+			if ev.Message != "" {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", ev.Message)
+			}
+		case core.EventRuntimeWarning:
+			if !out.jsonMode && !out.quietMode {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", ev.Message)
+			}
 		}
 	})
 	if res.Err != nil {
@@ -185,6 +183,9 @@ func cliSessionStop(profile string, args []string) {
 		if stopped.Drained != "" {
 			result["drained"] = stopped.Drained
 			result["drained_title"] = stopped.DrainedTitle
+		}
+		if stopped.Warning != "" {
+			result["warning"] = stopped.Warning
 		}
 		out.Success(fmt.Sprintf("Stopped session: %s", stopped.Title), result)
 	}

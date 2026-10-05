@@ -106,8 +106,9 @@ func bootstrapDaemonProfile(t *testing.T, profile string) (*TransitionDaemon, *S
 	}
 	t.Cleanup(func() { _ = storage.Close() })
 
-	// Wire the global DB so bindClaudeSessionFromHook's WriteClaudeSessionBinding
-	// persists into the same DB we read back from.
+	// Wire the global DB so bindClaudeSessionFromHook's runtime binding
+	// publish, and the recall link recorded after it, persist into the same
+	// DB we read back from.
 	statedb.SetGlobal(storage.GetDB())
 	t.Cleanup(func() { statedb.SetGlobal(nil) })
 
@@ -199,7 +200,7 @@ func TestSyncOnce_DoesNotRebindStoppedSession(t *testing.T) {
 	if err := os.MkdirAll(inst.ProjectPath, 0o755); err != nil {
 		t.Fatalf("mkdir project: %v", err)
 	}
-	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -555,7 +556,7 @@ func TestSyncOnce_StillRebindsLiveSession(t *testing.T) {
 	// Attach the live tmux session the same way the TUI does on cold start, so
 	// inst.Exists() resolves true against the real tmux server.
 	inst.SetTmuxSessionForTest(tmux.ReconnectSessionLazy(sessName, inst.ID, projectPath, "claude", "running"))
-	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 

@@ -1199,17 +1199,16 @@ func (h *Home) handleEditSessionDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // applyMultiRepoPathChanges updates the symlink directory and restarts the session.
 func (h *Home) applyMultiRepoPathChanges(inst *session.Instance, newPaths []string) tea.Cmd {
 	id := inst.ID
+	token := h.beginSessionTransitionFor(inst)
 	return func() tea.Msg {
-		h.instancesMu.RLock()
-		current := h.instanceByID[id]
-		h.instancesMu.RUnlock()
-		if current == nil {
-			return sessionRestartedMsg{sessionID: id, err: fmt.Errorf("session no longer exists")}
+		selected, err := h.selectedTransitionInstance(inst, token)
+		if err != nil {
+			return sessionRestartedMsg{sessionID: id, token: token, err: err}
 		}
 
-		tempDir := current.MultiRepoTempDir
+		tempDir := selected.MultiRepoTempDir
 		if tempDir == "" {
-			return sessionRestartedMsg{sessionID: id, err: fmt.Errorf("no multi-repo temp dir")}
+			return sessionRestartedMsg{sessionID: id, token: token, err: fmt.Errorf("no multi-repo temp dir")}
 		}
 
 		// Remove all existing symlinks/entries in tempDir
@@ -1235,17 +1234,18 @@ func (h *Home) applyMultiRepoPathChanges(inst *session.Instance, newPaths []stri
 		// Update instance fields under write lock to avoid races with
 		// the background status worker that reads via instanceByID.
 		h.instancesMu.Lock()
-		current.ProjectPath = newProjectPath
-		current.AdditionalPaths = newAdditionalPaths
-		if current.GetTmuxSession() != nil {
-			current.GetTmuxSession().WorkDir = tempDir
+		selected.ProjectPath = newProjectPath
+		selected.AdditionalPaths = newAdditionalPaths
+		if selected.GetTmuxSession() != nil {
+			selected.GetTmuxSession().WorkDir = tempDir
 		}
 		h.instancesMu.Unlock()
 
 		h.saveInstances()
 
-		err := current.Restart()
-		return sessionRestartedMsg{sessionID: id, err: err}
+		runtime, err := h.restartRuntime(selected)
+		runtime, err, warning := h.consumePhysicalRuntimeResult(selected, runtime, err)
+		return sessionRestartedMsg{sessionID: id, token: token, runtime: runtime, err: err, warning: warning}
 	}
 }
 
@@ -1746,8 +1746,14 @@ func (h *Home) handleWorktreeFinishDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd
 			h.instances,
 		)
 		h.instancesMu.RUnlock()
+		if inst == nil {
+			return h, func() tea.Msg {
+				return worktreeFinishResultMsg{sessionID: sid, sessionTitle: sTitle, err: fmt.Errorf("session not found: %s", sid)}
+			}
+		}
+		selection := inst.CaptureRuntimeSelection()
 
-		return h, h.finishWorktree(inst, sid, sTitle, branch, repoRoot, wtPath, mergeEnabled, targetBranch, keepBranch, shared)
+		return h, h.finishWorktree(inst, selection, sid, sTitle, branch, repoRoot, wtPath, mergeEnabled, targetBranch, keepBranch, shared)
 
 	case "input":
 		// Pass through to text input
@@ -1784,19 +1790,31 @@ func (h *Home) getOtherActiveSessions(excludeID string) []*session.Instance {
 // Falls back to tmux scrollback capture when structured response lookup
 // returns no content.
 func getSessionContent(inst *session.Instance) (string, error) {
-	var live string
 	if session.IsClaudeCompatible(inst.Tool) {
-		live = inst.GetSessionIDFromTmux()
+		observed := inst.CaptureRuntimeBindingObservation("claude")
+		live := inst.GetSessionIDFromTmux()
+		return getSessionContentWithLiveObservation(inst, observed, live)
 	}
-	return getSessionContentWithLive(inst, live)
+	return getSessionContentWithLive(inst, "")
 }
 
 // getSessionContentWithLive is the testable core: given a live Claude session
 // ID (may be empty), prefer it over any stored ID before reading the last
 // response, then fall back to tmux scrollback.
 func getSessionContentWithLive(inst *session.Instance, liveClaudeID string) (string, error) {
-	if session.IsClaudeCompatible(inst.Tool) && liveClaudeID != "" && liveClaudeID != inst.ClaudeSessionID {
-		inst.ClaudeSessionID = liveClaudeID
+	observed := inst.CaptureRuntimeBindingObservation("claude")
+	return getSessionContentWithLiveObservation(inst, observed, liveClaudeID)
+}
+
+func getSessionContentWithLiveObservation(
+	inst *session.Instance,
+	observed session.RuntimeBindingObservation,
+	liveClaudeID string,
+) (string, error) {
+	if session.IsClaudeCompatible(inst.Tool) && liveClaudeID != "" {
+		if err := inst.PublishRuntimeBindingObservation(observed, liveClaudeID, time.Now()); err != nil {
+			return "", fmt.Errorf("refresh live Claude session binding: %w", err)
+		}
 		// #1815: read from this session's OWN pane env — weak vouch.
 		session.NoteClaudeSessionIDFromOwnPane(inst)
 	}

@@ -20,6 +20,9 @@ func TestParsePaneDeadStatus(t *testing.T) {
 		{"dead pane, non-numeric status", "1|foo", 0, false},
 		{"malformed, no separator", "1", 0, false},
 		{"empty", "", 0, false},
+		// A split window lists every pane; only the first (primary) counts.
+		{"primary dead beside live split", "1|5\n0|\n", 5, true},
+		{"primary live beside dead split", "0|\n1|3\n", 0, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

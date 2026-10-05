@@ -50,7 +50,7 @@ func defect317Stop(t *testing.T, id string, hook func(storage *session.Storage, 
 		session.StopAfterKillHook = func(id string) { hook(storage, id) }
 		t.Cleanup(func() { session.StopAfterKillHook = nil })
 	}
-	_, err = stopInstanceAndSave(storage, inst, instances, groups)
+	_, _, err = stopInstanceAndSave(storage, inst, inst.CaptureRuntimeSelection(), instances, groups)
 	return err
 }
 

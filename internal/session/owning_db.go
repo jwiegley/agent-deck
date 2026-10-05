@@ -30,8 +30,22 @@ import (
 // An instance never loaded or saved through a Storage has no owner yet; it
 // keeps the old behaviour and uses the global handle, or returns
 // errNoStateDB when there is none.
+//
+// owningDB is guarded by i.mu, so a caller that already holds i.mu uses
+// withOwningStateDBLocked instead.
 func (i *Instance) withOwningStateDB(write func(*statedb.StateDB) error) error {
-	owner := i.restartDB.Load()
+	i.mu.RLock()
+	owner := i.owningDB
+	i.mu.RUnlock()
+	return i.withOwningStateDBHandle(owner, write)
+}
+
+// withOwningStateDBLocked is withOwningStateDB for a caller holding i.mu.
+func (i *Instance) withOwningStateDBLocked(write func(*statedb.StateDB) error) error {
+	return i.withOwningStateDBHandle(i.owningDB, write)
+}
+
+func (i *Instance) withOwningStateDBHandle(owner *statedb.StateDB, write func(*statedb.StateDB) error) error {
 	if owner == nil {
 		db := statedb.GetGlobal()
 		if db == nil {

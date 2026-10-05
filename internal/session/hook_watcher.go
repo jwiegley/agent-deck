@@ -31,6 +31,19 @@ const (
 	codexConsumeLockDelay    = 5 * time.Millisecond
 )
 
+// HookStatusFingerprint identifies the exact hook file contents that produced
+// a status observation. Hook timestamps have whole-second granularity, so they
+// cannot safely distinguish two different events written during one second.
+type HookStatusFingerprint [sha256.Size]byte
+
+func hookStatusSourceFingerprint(data []byte) HookStatusFingerprint {
+	return sha256.Sum256(data)
+}
+
+func (f HookStatusFingerprint) valid() bool {
+	return f != HookStatusFingerprint{}
+}
+
 // readStatusFileNoFollow reads a hook status file without following a
 // final-component symlink (O_NOFOLLOW) and bounded in size, so a compromised
 // sandbox cannot symlink <id>.json at a sibling/host/device file to exfiltrate
@@ -193,6 +206,7 @@ type HookStatus struct {
 	HookGeneration           string
 	Sequence                 uint64
 	codexCompletionConsumed  bool
+	Fingerprint              HookStatusFingerprint // Exact source-file identity
 	// PiSettleTurnID, PiSettleSessionID and PiSettledAt are a pi run's identity,
 	// merged into the status file by the run's agent_settled without a status
 	// edge. The next turn_start rebuilds the file and erases them.
@@ -617,8 +631,10 @@ func (w *StatusFileWatcher) scanDirEntriesInto(out map[string]*HookStatus, dir s
 			PiSettledAt:              raw.PiSettledAt,
 			Settles:                  raw.Settles,
 			PiRunID:                  raw.PiRunID,
-			PiOrphanRuns:             orphanArray(raw.PiOrphanRuns), PiOrphanCount: min(len(raw.PiOrphanRuns), PiOrphanRunsMax),
-			ReceivedAt: receivedAtFromNS(raw.ReceivedAtNS),
+			PiOrphanRuns:             orphanArray(raw.PiOrphanRuns),
+			PiOrphanCount:            min(len(raw.PiOrphanRuns), PiOrphanRunsMax),
+			ReceivedAt:               receivedAtFromNS(raw.ReceivedAtNS),
+			Fingerprint:              hookStatusSourceFingerprint(data),
 		}
 		maskConsumedCodexCompletion(instanceID, hookStatus)
 		out[instanceID] = hookStatus
@@ -813,8 +829,10 @@ func (w *StatusFileWatcher) processFile(filePath string) {
 		PiSettledAt:              status.PiSettledAt,
 		Settles:                  status.Settles,
 		PiRunID:                  status.PiRunID,
-		PiOrphanRuns:             orphanArray(status.PiOrphanRuns), PiOrphanCount: min(len(status.PiOrphanRuns), PiOrphanRunsMax),
-		ReceivedAt: receivedAtFromNS(status.ReceivedAtNS),
+		PiOrphanRuns:             orphanArray(status.PiOrphanRuns),
+		PiOrphanCount:            min(len(status.PiOrphanRuns), PiOrphanRunsMax),
+		ReceivedAt:               receivedAtFromNS(status.ReceivedAtNS),
+		Fingerprint:              hookStatusSourceFingerprint(data),
 	}
 	maskConsumedCodexCompletion(instanceID, hookStatus)
 

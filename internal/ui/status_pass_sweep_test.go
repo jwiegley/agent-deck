@@ -15,6 +15,7 @@ import (
 // Drive the actual ten-worker sweep. Delayed per-instance env reads make the
 // sweep exceed ownership's TTL; a fresh pass per worker would repeat the scan.
 func TestBackgroundStatusPassOwnershipLinear(t *testing.T) {
+	isolateStatusFleetDB(t)
 	const n = 40
 	dir := t.TempDir()
 	t.Setenv("CODEX_HOME", dir)

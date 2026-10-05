@@ -54,21 +54,3 @@ func appendClearScreen(cmd tea.Cmd) tea.Cmd {
 	}
 	return tea.Batch(cmd, tea.ClearScreen)
 }
-
-// hookCleanupCmd keeps best-effort filesystem cleanup outside Update. Registry
-// failures return nil cleanup, preserving the handler's existing error logging.
-func hookCleanupCmd(cleanup func(), done chan struct{}) tea.Cmd {
-	if cleanup == nil {
-		if done != nil {
-			close(done)
-		}
-		return nil
-	}
-	return func() tea.Msg {
-		if done != nil {
-			defer close(done)
-		}
-		cleanup()
-		return nil
-	}
-}
