@@ -1,11 +1,14 @@
 package session
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // Status-detection audit 2026-09-23. Each test renders a REAL captured pane
@@ -173,24 +176,24 @@ func TestAudit_DaemonCarriesFlipDebounceAcrossPasses(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	// The probe stands in for updateStatus's tmux path: one pane sample per
-	// pass, run through the real debounce with the instance's carried state.
+	// The candidate probe stands in for probeStatusCandidate's tmux path: one
+	// pane sample per pass, run through the real debounce with the instance's
+	// carried state. The status authority still commits each verdict.
 	sample := StatusRunning
-	orig := updateInstanceStatus.Load()
-	defer updateInstanceStatus.Store(orig)
-	updateInstanceStatus.Store(statusProbeFunc(func(inst *Instance) error {
+	orig := statusProbeCandidateOverride
+	defer func() { statusProbeCandidateOverride = orig }()
+	statusProbeCandidateOverride = func(_ context.Context, inst *Instance, observed statedb.RuntimeState) (Status, error) {
 		inst.mu.Lock()
 		defer inst.mu.Unlock()
-		prev := inst.Status
+		prev := Status(observed.Status)
 		if !inst.statusSampledLive {
 			prev = ""
 		}
 		inst.statusSampledLive = true
 		apply, next, _ := debounceFlipFromRunning(prev, sample, string(sample), inst.hookStatus, inst.tmuxFlipFromRunningPending)
-		inst.Status = apply
 		inst.tmuxFlipFromRunningPending = next
-		return nil
-	}))
+		return apply, nil
+	}
 
 	d := NewTransitionDaemon()
 	d.turnLiveCheck = func(*Instance) bool { return false }

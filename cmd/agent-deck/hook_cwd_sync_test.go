@@ -15,8 +15,8 @@ func seedCwdSyncInstance(t *testing.T, profile string, inst *session.Instance) *
 		t.Fatalf("new storage: %v", err)
 	}
 	t.Cleanup(func() { _ = storage.Close() })
-	if err := storage.Save([]*session.Instance{inst}); err != nil {
-		t.Fatalf("seed save: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("seed insert: %v", err)
 	}
 	return storage
 }

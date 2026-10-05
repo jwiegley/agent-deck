@@ -305,7 +305,23 @@ func TestRecall_GateRefusesWhileASessionIsBusy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open state.db at %s: %v", dbPath, err)
 	}
-	if _, err := db.DB().Exec(`UPDATE instances SET status='running' WHERE title='busy-one'`); err != nil {
+	// Mark it running through the status writer: a runtime-authoritative
+	// store keeps the status in instance_runtime_state, where a raw write
+	// to the legacy instances.status column is shadowed.
+	rows, err := db.LoadInstances()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var busy *statedb.InstanceRow
+	for _, row := range rows {
+		if row.Title == "busy-one" {
+			busy = row
+		}
+	}
+	if busy == nil {
+		t.Fatalf("busy-one missing from state.db: %d rows", len(rows))
+	}
+	if err := db.WriteStatus(busy.ID, "running", busy.Tool); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()

@@ -9,6 +9,7 @@ Commands:
   cleanup [--days N]      Purge dead sessions idle N+ days (dry-run unless --yes)
   archive <id|title>      Stop session and hide it from active lists (retained in storage)
   unarchive <id|title>    Restore an archived session (does not restart it)
+  adopt-runtime <id>      Plan or authorize one migrated generation-0 runtime
   restart [id] [--all] [--env KEY=VALUE]  Restart session (Claude: reload MCPs)
   revive [--all|--name]   Rebuild dead control pipes for errored sessions
   fork <id>               Fork Claude, OpenCode, Pi, Codex, or Oh My Pi session with context
@@ -74,6 +75,8 @@ Examples:
   agent-deck session recent --json --limit 5           # Same, machine-readable, top 5
   agent-deck session annotate auth-fix --ticket SB-412 --tag auth  # Durable hints for recall
   agent-deck session annotate --self --outcome worked  # An agent annotating its own session
+  agent-deck session adopt-runtime my-project           # Dry-run legacy recovery
+  agent-deck session adopt-runtime my-project --yes     # Stamp the exact planned runtime
 
 Set command fields:
   title              Session title

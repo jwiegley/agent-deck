@@ -7,6 +7,8 @@ import (
 	"slices"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/ui"
@@ -22,7 +24,7 @@ func TestTmuxAvailable(t *testing.T) {
 func TestHomeInit(t *testing.T) {
 	previousDB := statedb.GetGlobal()
 	t.Cleanup(func() { statedb.SetGlobal(previousDB) })
-	home := ui.NewHome()
+	home := newTestHome(t)
 	if home == nil {
 		t.Fatal("NewHome() returned nil")
 	}
@@ -31,11 +33,38 @@ func TestHomeInit(t *testing.T) {
 func TestHomeView(t *testing.T) {
 	previousDB := statedb.GetGlobal()
 	t.Cleanup(func() { statedb.SetGlobal(previousDB) })
-	home := ui.NewHome()
+	home := newTestHome(t)
 	view := home.View()
 	if view == "" {
 		t.Error("View() returned empty string")
 	}
+}
+
+func newTestHome(t *testing.T) *ui.Home {
+	t.Helper()
+	previousDB := statedb.GetGlobal()
+	home := ui.NewHome()
+	db := statedb.GetGlobal()
+	t.Cleanup(func() {
+		_, quitCmd := home.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+		if quitCmd == nil {
+			t.Error("Home quit did not return a command")
+		} else {
+			_, shutdownCmd := home.Update(quitCmd())
+			if shutdownCmd == nil {
+				t.Error("Home quit did not return a shutdown command")
+			} else {
+				_ = shutdownCmd()
+			}
+		}
+		statedb.SetGlobal(previousDB)
+		if db != nil && db != previousDB {
+			if err := db.Close(); err != nil {
+				t.Errorf("close Home StateDB: %v", err)
+			}
+		}
+	})
+	return home
 }
 
 // TestNestedSessionAllowsCLICommands verifies that CLI subcommands are NOT

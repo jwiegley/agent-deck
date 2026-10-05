@@ -8,9 +8,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// launchRaceFixture inserts the row `agent-deck launch` writes BEFORE it spawns
-// anything (save 1): configuration complete, nothing the spawn produces yet.
-// It returns that row as the launch's baseline for its post-start save.
+// launchRaceFixture inserts the parent/runtime seed written before a launch
+// spawns anything and returns the caller's metadata baseline.
 func launchRaceFixture(t *testing.T) (*StateDB, *InstanceRow) {
 	t.Helper()
 	db := newTestDB(t)
@@ -27,8 +26,51 @@ func launchRaceFixture(t *testing.T) (*StateDB, *InstanceRow) {
 	return db, rows[0]
 }
 
-// postStartSave is the launch's third save: the spawn receipt (tmux session
-// name), its own pane-derived status, and its own detection stamp.
+func publishLaunchRuntime(t *testing.T, db *StateDB, base *InstanceRow) RuntimeState {
+	t.Helper()
+	initial, found, err := db.ReadRuntimeState(base.ID)
+	require.NoError(t, err)
+	require.True(t, found)
+	next := initial
+	next.Generation++
+	next.TmuxSession = "agentdeck_worker_c5322ee1"
+	next.Status = "running"
+	next.LastStartedAt = time.Unix(1999, 0).UTC()
+	require.NoError(t, db.CommitRuntimeTransitionWithBindingPlan(
+		initial.Generation, base.Incarnation, next, []RuntimeBindingTransition{{
+			Kind: "claude", ExpectedRevision: 0, NextValue: "conv-1", DetectedAt: time.Unix(1999, 0),
+		}},
+	))
+	return next
+}
+
+func advanceLaunchStatus(t *testing.T, db *StateDB, base *InstanceRow, status string) {
+	t.Helper()
+	current, found, err := db.ReadRuntimeState(base.ID)
+	require.NoError(t, err)
+	require.True(t, found)
+	applied, err := db.WriteStatusIfVersion(
+		base.ID, base.Incarnation, current.Generation, current.StatusRevision, status)
+	require.NoError(t, err)
+	require.True(t, applied)
+}
+
+func advanceLaunchBinding(t *testing.T, db *StateDB, base *InstanceRow, value string, detectedAt time.Time) {
+	t.Helper()
+	state, found, err := db.ReadRuntimeState(base.ID)
+	require.NoError(t, err)
+	require.True(t, found)
+	current, found, err := db.ReadRuntimeBinding(base.ID, "claude")
+	require.NoError(t, err)
+	require.True(t, found)
+	_, applied, err := db.WriteRuntimeBindingIfVersion(
+		base.ID, base.Incarnation, state.Generation, "claude", current.Revision, value, detectedAt)
+	require.NoError(t, err)
+	require.True(t, applied)
+}
+
+// postStartSave is the metadata snapshot a launch submits after publishing its
+// runtime. Runtime fields are deliberately stale input to the metadata merger.
 func postStartSave(base *InstanceRow) *InstanceRow {
 	desired := CloneInstanceRow(base)
 	desired.TmuxSession = "agentdeck_worker_c5322ee1"
@@ -40,31 +82,24 @@ func postStartSave(base *InstanceRow) *InstanceRow {
 
 func TestLaunchPostStartSaveMergesConcurrentDetection(t *testing.T) {
 	db, base := launchRaceFixture(t)
+	publishLaunchRuntime(t, db, base)
 
-	// A concurrent UpdateHookStatus caller (TUI tick, daemon, another CLI)
-	// binds the SAME conversation while the launch is inside PostStartSync,
-	// stamping its own time.Now(), and the monitor samples the pane.
-	require.NoError(t, db.WriteClaudeSessionBinding("sess", "conv-1", time.Unix(2000, 0)))
-	require.NoError(t, db.WriteStatus("sess", "waiting", "claude"))
+	// A concurrent detector advances the same binding and samples the pane.
+	advanceLaunchBinding(t, db, base, "conv-1", time.Unix(2000, 0))
+	advanceLaunchStatus(t, db, base, "waiting")
 
 	committed, err := db.MergeInstanceSnapshots(
 		[]InstanceSnapshot{{Original: base, Stored: base, Desired: postStartSave(base)}}, nil)
-	require.NoError(t, err, "post-start save must merge, not abort")
+	require.NoError(t, err, "post-start metadata save must not clobber runtime")
 	require.Len(t, committed, 1)
 	got := committed[0]
-
-	// The spawn receipt is launch-owned and must never be lost.
 	require.Equal(t, "agentdeck_worker_c5322ee1", got.TmuxSession)
-	// Liveness: the committed observation wins, it is the fresher one.
 	require.Equal(t, "waiting", got.Status)
-	// Neither detector write touched last_accessed, so the launch's own later
-	// activity time is the fresher observation here.
-	require.Equal(t, int64(1999), got.LastAccessed.Unix(), "later LastAccessed wins")
+	require.Equal(t, int64(1999), got.LastAccessed.Unix())
 	require.JSONEq(t,
-		`{"loaded_mcp_names":["neo4j"],"claude_session_id":"conv-1","claude_detected_at":2000}`,
+		`{"loaded_mcp_names":["neo4j"],"claude_session_id":"conv-1","claude_detected_at":2000,"last_started_at":1999}`,
 		string(got.ToolData))
 
-	// No field loss on the launch-owned configuration, and no duplicate rows.
 	rows, err := db.LoadInstances()
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
@@ -80,15 +115,10 @@ func TestLaunchPostStartSaveMergesConcurrentDetection(t *testing.T) {
 
 func TestLaunchPostStartSaveMergesStatusVariant(t *testing.T) {
 	db, base := launchRaceFixture(t)
-	// The monitor samples the pane before the launch's own stamp lands, with
-	// no conversation binding at all: the `stale concurrent Status conflict`
-	// sibling from the issue.
-	require.NoError(t, db.WriteStatus("sess", "idle", "claude"))
-	desired := CloneInstanceRow(base)
-	desired.TmuxSession = "agentdeck_worker_c5322ee1"
-	desired.Status = "running"
+	publishLaunchRuntime(t, db, base)
+	advanceLaunchStatus(t, db, base, "idle")
 	committed, err := db.MergeInstanceSnapshots(
-		[]InstanceSnapshot{{Original: base, Stored: base, Desired: desired}}, nil)
+		[]InstanceSnapshot{{Original: base, Stored: base, Desired: postStartSave(base)}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, "idle", committed[0].Status)
 	require.Equal(t, "agentdeck_worker_c5322ee1", committed[0].TmuxSession)
@@ -117,46 +147,13 @@ func TestLivenessMergeLastAccessedKeepsLater(t *testing.T) {
 	}
 }
 
-// Everything that is intent rather than observation must still conflict.
-func TestLivenessMergeStillConflictsOnIntent(t *testing.T) {
+func TestMetadataMergeStillConflictsOnMetadataIntent(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		committed func(t *testing.T, db *StateDB)
 		edit      func(desired *InstanceRow)
 		wantErr   string
 	}{
-		{
-			"stopped is intent, not observation",
-			func(t *testing.T, db *StateDB) { require.NoError(t, db.WriteStatus("sess", "stopped", "claude")) },
-			func(d *InstanceRow) { d.Status = "running" },
-			"stale concurrent Status conflict",
-		},
-		{
-			"queued is intent, not observation",
-			func(t *testing.T, db *StateDB) { require.NoError(t, db.WriteStatus("sess", "waiting", "claude")) },
-			func(d *InstanceRow) { d.Status = "queued" },
-			"stale concurrent Status conflict",
-		},
-		{
-			"a diverging session id is a real lost update",
-			func(t *testing.T, db *StateDB) {
-				require.NoError(t, db.WriteClaudeSessionBinding("sess", "conv-other", time.Unix(2000, 0)))
-			},
-			func(d *InstanceRow) {
-				d.ToolData = json.RawMessage(`{"loaded_mcp_names":["neo4j"],"claude_session_id":"conv-1","claude_detected_at":1999}`)
-			},
-			"stale concurrent tool_data.claude_session_id conflict",
-		},
-		{
-			"an explicit clear racing a stamp is intent",
-			func(t *testing.T, db *StateDB) {
-				require.NoError(t, db.WriteClaudeSessionBinding("sess", "conv-1", time.Unix(2000, 0)))
-			},
-			func(d *InstanceRow) {
-				d.ToolData = json.RawMessage(`{"loaded_mcp_names":["neo4j"],"claude_session_id":"conv-1","claude_detected_at":0}`)
-			},
-			"stale concurrent tool_data.claude_detected_at conflict",
-		},
 		{
 			"configuration keys keep the hard conflict",
 			func(t *testing.T, db *StateDB) {
@@ -180,38 +177,84 @@ func TestLivenessMergeStillConflictsOnIntent(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, base := launchRaceFixture(t)
+			expected := publishLaunchRuntime(t, db, base)
 			tc.committed(t, db)
-			desired := CloneInstanceRow(base)
-			desired.TmuxSession = "agentdeck_worker_c5322ee1"
+			desired := postStartSave(base)
 			tc.edit(desired)
 			_, err := db.MergeInstanceSnapshots(
 				[]InstanceSnapshot{{Original: base, Stored: base, Desired: desired}}, nil)
 			require.ErrorContains(t, err, tc.wantErr)
-			rows, err := db.LoadInstances()
-			require.NoError(t, err)
-			require.Len(t, rows, 1)
-			require.Empty(t, rows[0].TmuxSession, "a refused save must not partially commit")
+			state, found, readErr := db.ReadRuntimeState(base.ID)
+			require.NoError(t, readErr)
+			require.True(t, found)
+			require.Equal(t, expected, state, "a refused metadata save must not alter runtime")
 		})
 	}
 }
 
-func TestLivenessMergeStampConflictsWhenPairedIDDiverges(t *testing.T) {
-	db := newTestDB(t)
-	// The caller already carries a bound conversation and only re-stamps it.
-	require.NoError(t, db.SaveInstance(&InstanceRow{
-		ID: "sess", Title: "worker", Tool: "claude", Status: "running", CreatedAt: time.Unix(1000, 0),
-		ToolData: json.RawMessage(`{"claude_session_id":"conv-1","claude_detected_at":1500}`),
-	}))
-	rows, err := db.LoadInstances()
-	require.NoError(t, err)
-	base := rows[0]
-	// Another writer rebound the row to a different conversation: the two
-	// stamps are timing two different conversations, so committed-wins on
-	// the stamp alone would hide a real lost update.
-	require.NoError(t, db.WriteClaudeSessionBinding("sess", "conv-other", time.Unix(2000, 0)))
-	desired := CloneInstanceRow(base)
-	desired.ToolData = json.RawMessage(`{"claude_session_id":"conv-1","claude_detected_at":1999}`)
-	_, err = db.MergeInstanceSnapshots(
-		[]InstanceSnapshot{{Original: base, Stored: base, Desired: desired}}, nil)
-	require.ErrorContains(t, err, "stale concurrent tool_data.claude_detected_at conflict")
+func TestMetadataMergeCannotClobberRuntimeAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		advance func(t *testing.T, db *StateDB, base *InstanceRow)
+		edit    func(desired *InstanceRow)
+	}{
+		{
+			"stopped status",
+			func(t *testing.T, db *StateDB, base *InstanceRow) { advanceLaunchStatus(t, db, base, "stopped") },
+			func(d *InstanceRow) { d.Status = "running" },
+		},
+		{
+			"queued status",
+			func(t *testing.T, db *StateDB, base *InstanceRow) { advanceLaunchStatus(t, db, base, "queued") },
+			func(d *InstanceRow) { d.Status = "running" },
+		},
+		{
+			"diverging session binding",
+			func(t *testing.T, db *StateDB, base *InstanceRow) {
+				advanceLaunchBinding(t, db, base, "conv-other", time.Unix(2000, 0))
+			},
+			func(d *InstanceRow) {
+				d.ToolData = json.RawMessage(`{"loaded_mcp_names":["neo4j"],"claude_session_id":"conv-1","claude_detected_at":1999}`)
+			},
+		},
+		{
+			"explicit stale binding clear",
+			func(t *testing.T, db *StateDB, base *InstanceRow) {
+				advanceLaunchBinding(t, db, base, "conv-1", time.Unix(2000, 0))
+			},
+			func(d *InstanceRow) {
+				d.ToolData = json.RawMessage(`{"loaded_mcp_names":["neo4j"],"claude_session_id":"conv-1","claude_detected_at":0}`)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, base := launchRaceFixture(t)
+			publishLaunchRuntime(t, db, base)
+			tc.advance(t, db, base)
+			expectedState, found, err := db.ReadRuntimeState(base.ID)
+			require.NoError(t, err)
+			require.True(t, found)
+			expectedBinding, bindingFound, err := db.ReadRuntimeBinding(base.ID, "claude")
+			require.NoError(t, err)
+
+			desired := postStartSave(base)
+			desired.Title = "updated"
+			tc.edit(desired)
+			_, err = db.MergeInstanceSnapshots(
+				[]InstanceSnapshot{{Original: base, Stored: base, Desired: desired}}, nil)
+			require.NoError(t, err)
+
+			state, found, err := db.ReadRuntimeState(base.ID)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, expectedState, state)
+			binding, found, err := db.ReadRuntimeBinding(base.ID, "claude")
+			require.NoError(t, err)
+			require.Equal(t, bindingFound, found)
+			require.Equal(t, expectedBinding, binding)
+			rows, err := db.LoadInstances()
+			require.NoError(t, err)
+			require.Equal(t, "updated", rows[0].Title)
+		})
+	}
 }

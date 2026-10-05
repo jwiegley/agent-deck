@@ -24,9 +24,12 @@ import (
 // in memory and emitted the lifecycle event, but no `UpdateHookStatus`
 // caller (TUI tick, web refresh, CLI status refresh) called `Save`
 // afterwards. The PERSIST-12 contract above the function assumed an
-// external save cycle would; in practice none ran. The fix added a
-// targeted `WriteClaudeSessionBinding` UPDATE inside the bind path so
-// the row is current the instant the bind decision is made.
+// external save cycle would; in practice none ran. Upstream's fix added
+// a targeted `WriteClaudeSessionBinding` UPDATE inside the bind path.
+// The fork's bind path publishes through the runtime binding CAS
+// instead (`publishObservedRuntimeBindingLocked`), which commits the
+// durable binding and its tool_data projection before the in-memory id
+// changes, so the row is current the instant the bind decision is made.
 //
 // These tests pin the fix: both the cold `bind` branch and the
 // `rebind` branch must leave `tool_data.claude_session_id` matching
@@ -54,6 +57,25 @@ func withTempGlobalStateDB(t *testing.T) *statedb.StateDB {
 		_ = db.Close()
 	})
 	return db
+}
+
+// saveHookBindingTestInstance mirrors the production new-instance boundary:
+// constructors pre-mint the incarnation before any runtime observation, and
+// the first parent insert preserves that exact token. A hand-written blank
+// InstanceRow would make SQLite mint a different logical insertion and the
+// hook publisher must then reject this Instance as stale.
+func saveHookBindingTestInstance(t *testing.T, db *statedb.StateDB, inst *Instance, row *statedb.InstanceRow) {
+	t.Helper()
+	row.Incarnation = inst.PersistenceIncarnation()
+	if row.Incarnation == "" {
+		t.Fatal("new hook-binding instance has no pre-minted incarnation")
+	}
+	if err := db.SaveInstance(row); err != nil {
+		t.Fatalf("SaveInstance seed: %v", err)
+	}
+	if row.Incarnation != inst.PersistenceIncarnation() {
+		t.Fatalf("seed incarnation = %q, instance = %q", row.Incarnation, inst.PersistenceIncarnation())
+	}
 }
 
 // readClaudeSessionIDFromDB returns tool_data.claude_session_id for the
@@ -125,9 +147,7 @@ func TestRebindPersistsClaudeSessionIDToDB(t *testing.T) {
 		CreatedAt:   now,
 		ToolData:    json.RawMessage(`{"claude_session_id":"` + oldID + `"}`),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	// /clear shape: old rich session, smaller-but-fresh candidate.
 	// Mtime gap >= clearRebindMtimeGrace makes the rebind branch fire
@@ -208,9 +228,7 @@ func TestBindPersistsClaudeSessionIDToDB(t *testing.T) {
 		// No claude_session_id yet — cold start.
 		ToolData: json.RawMessage(`{}`),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	inst.UpdateHookStatus(&HookStatus{
 		Status:    "running",
@@ -267,13 +285,14 @@ func TestRebindNoOpWhenStateDBUnset(t *testing.T) {
 }
 
 // TestRebindPreservesUnrelatedToolDataKeys pins the json_set semantics
-// of WriteClaudeSessionBinding: only $.claude_session_id and
-// $.claude_detected_at may be rewritten — every other key in tool_data
-// must survive untouched. This is the contract that prevents a future
-// "let's just do tool_data = ?" simplification from silently dropping
-// latest_prompt, notes, MCP attachments, sandbox config, plugins,
-// auto-linked channels, or any user-managed unmodeled keys (e.g.
-// clear_on_compact) on every Claude /clear.
+// of the bind path's tool_data write (the runtime binding CAS's
+// projection, as upstream's WriteClaudeSessionBinding was): only
+// $.claude_session_id and $.claude_detected_at may be rewritten — every
+// other key in tool_data must survive untouched. This is the contract
+// that prevents a future "let's just do tool_data = ?" simplification
+// from silently dropping latest_prompt, notes, MCP attachments, sandbox
+// config, plugins, auto-linked channels, or any user-managed unmodeled
+// keys (e.g. clear_on_compact) on every Claude /clear.
 func TestRebindPreservesUnrelatedToolDataKeys(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
@@ -323,9 +342,7 @@ func TestRebindPreservesUnrelatedToolDataKeys(t *testing.T) {
 		CreatedAt:   time.Now(),
 		ToolData:    json.RawMessage(seedJSON),
 	}
-	if err := db.SaveInstance(seedRow); err != nil {
-		t.Fatalf("SaveInstance seed: %v", err)
-	}
+	saveHookBindingTestInstance(t, db, inst, seedRow)
 
 	// Trigger the cold-start bind branch (simpler than the rebind
 	// branch — no JSONL/mtime setup needed — and the persistence path

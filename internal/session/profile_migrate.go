@@ -49,6 +49,15 @@ var ErrProfileMissing = errors.New("target profile does not exist")
 // ErrSameProfile is returned when source == target.
 var ErrSameProfile = errors.New("source and target profile are the same")
 
+// ErrProfileRuntimeConflict prevents a partial migration retry from deleting
+// a source whose destination core metadata, runtime, or bindings differ.
+var ErrProfileRuntimeConflict = errors.New("target profile snapshot differs from source")
+
+var (
+	profileMigrateBeforeSourceDeleteFn   = func(string) {}
+	profileMigrateBeforeTargetRollbackFn = func(string) {}
+)
+
 // MigrateSessionsToProfile moves the listed session rows from sourceProfile to
 // targetProfile. All associated rows (cost_events, watcher_events linked via
 // session_id or triage_session_id) are moved alongside. The session's group
@@ -274,13 +283,26 @@ func MigrateGroupToProfile(groupPath, sourceProfile, targetProfile string, opts 
 // migrateOneSession is the primitive that all three public entrypoints call.
 // It mutates the running result struct, appending counts and ids.
 func migrateOneSession(src, dst *statedb.StateDB, sessionID string, opts ProfileMigrateOptions, result *ProfileMigrateResult) error {
-	srcRow, err := src.LoadInstanceByID(sessionID)
+	release, err := acquireInstanceSpawnLock(sessionID)
+	if err != nil {
+		return fmt.Errorf("lock session %s for profile migration: %w", sessionID, err)
+	}
+	defer release()
+
+	srcSnapshot, err := src.LoadMigrationSnapshot(sessionID)
 	if err != nil {
 		return fmt.Errorf("load source instance %s: %w", sessionID, err)
 	}
-	dstRow, err := dst.LoadInstanceByID(sessionID)
+	dstSnapshot, err := dst.LoadMigrationSnapshot(sessionID)
 	if err != nil {
 		return fmt.Errorf("load target instance %s: %w", sessionID, err)
+	}
+	var srcRow, dstRow *statedb.InstanceRow
+	if srcSnapshot != nil {
+		srcRow = srcSnapshot.Instance
+	}
+	if dstSnapshot != nil {
+		dstRow = dstSnapshot.Instance
 	}
 
 	// Pure idempotent no-op: row already at dst, nothing in src.
@@ -292,22 +314,17 @@ func migrateOneSession(src, dst *statedb.StateDB, sessionID string, opts Profile
 	if srcRow == nil && dstRow == nil {
 		return fmt.Errorf("session %s not found", sessionID)
 	}
+	if srcRow != nil && dstRow != nil && !statedb.MigrationCoreMatchesTransfer(srcSnapshot, dstSnapshot) {
+		return fmt.Errorf("%w: session %s", ErrProfileRuntimeConflict, sessionID)
+	}
 
 	// Running-session guard.
 	if srcRow != nil && srcRow.Status == "running" && !opts.Force {
 		return fmt.Errorf("%w: session %s (%s)", ErrSessionRunning, sessionID, srcRow.Title)
 	}
 
-	// Read associated rows from the source. We collect them BEFORE writing to
-	// dst so a read failure aborts without touching state.
-	costRows, err := src.LoadCostEventsForSession(sessionID)
-	if err != nil {
-		return fmt.Errorf("load cost_events for %s: %w", sessionID, err)
-	}
-	watcherRows, err := src.LoadWatcherEventsForSession(sessionID)
-	if err != nil {
-		return fmt.Errorf("load watcher_events for %s: %w", sessionID, err)
-	}
+	costRows := srcSnapshot.CostEvents
+	watcherRows := srcSnapshot.WatcherEvents
 
 	// Ensure the destination group exists.
 	createdGroup, err := ensureGroupAtDst(src, dst, srcRow.GroupPath)
@@ -320,20 +337,24 @@ func migrateOneSession(src, dst *statedb.StateDB, sessionID string, opts Profile
 
 	// Target-write phase. If any step fails, we have not touched src yet —
 	// return the error and let the user retry.
+	var insertedTargetSnapshot *statedb.MigrationSnapshot
+	var insertedTargetCosts []*statedb.CostEventRow
+	var insertedTargetWatchers []*statedb.WatcherEventRow
 	if dstRow == nil {
-		if err := dst.InsertInstanceRow(srcRow); err != nil {
+		inserted, err := dst.InsertInstanceRowForMigration(srcSnapshot)
+		if err != nil {
 			return fmt.Errorf("insert instance at target: %w", err)
 		}
+		insertedTargetSnapshot = inserted
 	}
 	for _, ev := range costRows {
-		if err := dst.InsertCostEventRow(ev); err != nil {
-			// Best-effort rollback: drop the instance we just wrote (only if
-			// it wasn't already in dst).
-			if dstRow == nil {
-				_ = dst.DeleteInstanceRow(sessionID)
-				_ = dst.DeleteCostEventsForSession(sessionID)
-			}
+		inserted, err := dst.InsertCostEventRowForMigration(ev)
+		if err != nil {
+			rollbackTargetWrites(dst, sessionID, insertedTargetSnapshot, insertedTargetCosts, insertedTargetWatchers)
 			return fmt.Errorf("insert cost_event at target: %w", err)
+		}
+		if inserted != nil {
+			insertedTargetCosts = append(insertedTargetCosts, inserted)
 		}
 		result.MovedCostEvents++
 	}
@@ -347,58 +368,52 @@ func migrateOneSession(src, dst *statedb.StateDB, sessionID string, opts Profile
 		if !seenWatchers[ev.WatcherID] {
 			seenWatchers[ev.WatcherID] = true
 			if err := ensureWatcherAtDst(src, dst, ev.WatcherID); err != nil {
-				if dstRow == nil {
-					_ = dst.DeleteInstanceRow(sessionID)
-					_ = dst.DeleteCostEventsForSession(sessionID)
-					_ = dst.DeleteWatcherEventsForSession(sessionID)
-				}
+				rollbackTargetWrites(dst, sessionID, insertedTargetSnapshot, insertedTargetCosts, insertedTargetWatchers)
 				return fmt.Errorf("ensure watcher %q at target: %w", ev.WatcherID, err)
 			}
 		}
-		if err := dst.InsertWatcherEventRow(ev); err != nil {
-			if dstRow == nil {
-				_ = dst.DeleteInstanceRow(sessionID)
-				_ = dst.DeleteCostEventsForSession(sessionID)
-				_ = dst.DeleteWatcherEventsForSession(sessionID)
-			}
+		inserted, err := dst.InsertWatcherEventRowForMigration(ev)
+		if err != nil {
+			rollbackTargetWrites(dst, sessionID, insertedTargetSnapshot, insertedTargetCosts, insertedTargetWatchers)
 			return fmt.Errorf("insert watcher_event at target: %w", err)
+		}
+		if inserted != nil {
+			insertedTargetWatchers = append(insertedTargetWatchers, inserted)
 		}
 		result.MovedWatcherEvents++
 	}
 
-	// Source-delete phase. On any failure, attempt to roll back the target
-	// inserts so the user is not left with a duplicate.
-	if err := src.DeleteWatcherEventsForSession(sessionID); err != nil {
-		rollbackTargetWrites(dst, sessionID, dstRow != nil)
-		return fmt.Errorf("delete watcher_events from source: %w", err)
-	}
-	if err := src.DeleteCostEventsForSession(sessionID); err != nil {
-		rollbackTargetWrites(dst, sessionID, dstRow != nil)
-		return fmt.Errorf("delete cost_events from source: %w", err)
-	}
-	if err := src.DeleteInstanceRow(sessionID); err != nil {
-		rollbackTargetWrites(dst, sessionID, dstRow != nil)
-		return fmt.Errorf("delete instance from source: %w", err)
+	// Source-delete phase. Production lifecycle deletion shares the instance
+	// lock held above. Keep the destination SQLite writer lease from the final
+	// validation through the source CAS so an uncoordinated target deletion or
+	// replacement cannot interleave and leave both profiles empty.
+	profileMigrateBeforeSourceDeleteFn(sessionID)
+	if err := dst.WithMigrationTargetLease(srcSnapshot, func() error {
+		return src.DeleteMigrationSource(srcSnapshot)
+	}); err != nil {
+		rollbackTargetWrites(dst, sessionID, insertedTargetSnapshot, insertedTargetCosts, insertedTargetWatchers)
+		if errors.Is(err, statedb.ErrMigrationTargetConflict) {
+			return fmt.Errorf("%w: session %s changed before source deletion", ErrProfileRuntimeConflict, sessionID)
+		}
+		return fmt.Errorf("delete instance from source under target lease: %w", err)
 	}
 
 	result.MovedSessionIDs = append(result.MovedSessionIDs, sessionID)
 	return nil
 }
 
-// rollbackTargetWrites removes rows from dst that the current call inserted.
-// If targetAlreadyHadInstance is true, the destination may have legitimately
-// pre-existing cost_events / watcher_events for this session_id (e.g., from
-// a partial prior migration that we are now re-running). Bulk-deleting them
-// would clobber legitimate data, so in that branch we leave everything in
-// place — re-running the migration is safe (INSERT OR IGNORE / INSERT OR
-// REPLACE on every target write).
-func rollbackTargetWrites(dst *statedb.StateDB, sessionID string, targetAlreadyHadInstance bool) {
-	if targetAlreadyHadInstance {
-		return
-	}
-	_ = dst.DeleteWatcherEventsForSession(sessionID)
-	_ = dst.DeleteCostEventsForSession(sessionID)
-	_ = dst.DeleteInstanceRow(sessionID)
+// rollbackTargetWrites removes only rows inserted by this call. A nil snapshot
+// means the core pre-existed, so rollback is limited to precisely tracked event
+// rows and cannot clobber prior target data.
+func rollbackTargetWrites(
+	dst *statedb.StateDB,
+	sessionID string,
+	insertedSnapshot *statedb.MigrationSnapshot,
+	insertedCosts []*statedb.CostEventRow,
+	insertedWatchers []*statedb.WatcherEventRow,
+) {
+	profileMigrateBeforeTargetRollbackFn(sessionID)
+	_ = dst.RollbackMigrationTarget(insertedSnapshot, insertedCosts, insertedWatchers)
 }
 
 // ensureWatcherAtDst copies the watchers row referenced by a watcher_event

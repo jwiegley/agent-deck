@@ -561,6 +561,7 @@ func TestCLIGoldens(t *testing.T) {
 
 	t.Run("safe", func(t *testing.T) {
 		home, env := goldensSandbox(t)
+		commitGoldensObservations(t, bin, env, home) // fork: goldens_observations_test.go
 		for _, spec := range safeSpecs() {
 			spec := spec
 			t.Run(spec.name, func(t *testing.T) {

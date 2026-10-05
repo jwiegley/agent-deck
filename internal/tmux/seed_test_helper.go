@@ -75,6 +75,48 @@ func ExpireStartupWindowForTest(t testing.TB, s *Session) {
 	s.mu.Unlock()
 }
 
+// ResetDefaultServerSessionsForTest drops the foreign-server guard's cached
+// default-server listing (foreign_server.go), now and at cleanup, so a test
+// that stages a default server is not answered from a listing up to
+// defaultServerSessionsTTL old.
+func ResetDefaultServerSessionsForTest(t testing.TB) {
+	t.Helper()
+	reset := func() {
+		defaultServerSessions.Lock()
+		defaultServerSessions.names, defaultServerSessions.err, defaultServerSessions.at = nil, nil, time.Time{}
+		defaultServerSessions.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
+}
+
+// StageDefaultServerSessionsForTest makes the foreign-server guard see a
+// default server that lists exactly names or, with a non-nil err, one this
+// process cannot list. It drops the cached listing now and restores the real
+// listing at cleanup. Packages outside internal/tmux use it to drive the
+// guard's verdict without a tmux server; the real listing's classification is
+// covered by TestAbsenceIsForeignServer_UnlistableDefaultServerFormsNoVerdict.
+func StageDefaultServerSessionsForTest(t testing.TB, err error, names ...string) {
+	t.Helper()
+	install := func(list func() (map[string]struct{}, error)) {
+		defaultServerSessions.Lock()
+		listDefaultServerSessionsFn = list
+		defaultServerSessions.names, defaultServerSessions.err, defaultServerSessions.at = nil, nil, time.Time{}
+		defaultServerSessions.Unlock()
+	}
+	install(func() (map[string]struct{}, error) {
+		if err != nil {
+			return nil, err
+		}
+		listed := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			listed[name] = struct{}{}
+		}
+		return listed, nil
+	})
+	t.Cleanup(func() { install(listDefaultServerSessions) })
+}
+
 // ExpirePaneInfoCacheForTest leaves the cache contents intact but rewinds the
 // timestamp past the freshness threshold so GetCachedPaneInfo treats it as
 // stale. Used to model the case where backgroundStatusUpdate hasn't run for a
@@ -92,4 +134,55 @@ func ExpirePaneInfoCacheForTest(t testing.TB) {
 		paneCacheTime = time.Time{}
 		paneCacheMu.Unlock()
 	})
+}
+
+// SeedSessionPresenceForTest makes this process believe each of names is live
+// on socketName, the way a recent RefreshSessionCache plus Start's
+// registerSessionInCache (the shared cache, which describes the default
+// socket) or a warm per-socket refresh would. socketName becomes the default
+// socket so Session.Exists consults the shared cache for it. Every cache and
+// the default socket are restored at cleanup. Packages outside internal/tmux
+// use it, with SessionPresenceCachedForTest, to pin that a session known to be
+// gone stops reading live (ForgetSessionPresence) without a tmux server.
+func SeedSessionPresenceForTest(t testing.TB, socketName string, names ...string) {
+	t.Helper()
+	oldDefault := DefaultSocketName()
+	shared := make(map[string]int64, len(names))
+	perSocket := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		shared[name] = time.Now().Unix()
+		perSocket[name] = struct{}{}
+	}
+	sessionCacheMu.Lock()
+	oldData, oldTime := sessionCacheData, sessionCacheTime
+	sessionCacheData, sessionCacheTime = shared, time.Now()
+	sessionCacheMu.Unlock()
+	socketSessionCacheMu.Lock()
+	oldSocketCache := socketSessionCache
+	socketSessionCache = map[string]*socketSessionsEntry{socketName: {
+		names: perSocket, refreshedAt: time.Now(), warm: true,
+	}}
+	socketSessionCacheMu.Unlock()
+	SetDefaultSocketName(socketName)
+	t.Cleanup(func() {
+		SetDefaultSocketName(oldDefault)
+		sessionCacheMu.Lock()
+		sessionCacheData, sessionCacheTime = oldData, oldTime
+		sessionCacheMu.Unlock()
+		socketSessionCacheMu.Lock()
+		socketSessionCache = oldSocketCache
+		socketSessionCacheMu.Unlock()
+	})
+}
+
+// SessionPresenceCachedForTest reports whether the shared presence cache and
+// socketName's per-socket cache still hold name as live.
+func SessionPresenceCachedForTest(socketName, name string) (shared, perSocket bool) {
+	shared, _ = sessionExistsFromCache(name)
+	socketSessionCacheMu.Lock()
+	defer socketSessionCacheMu.Unlock()
+	if entry := socketSessionCache[socketName]; entry != nil {
+		_, perSocket = entry.names[name]
+	}
+	return shared, perSocket
 }

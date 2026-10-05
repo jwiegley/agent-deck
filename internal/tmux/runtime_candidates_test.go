@@ -1,0 +1,416 @@
+package tmux
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestRuntimeLifecycle_RuntimeCandidateSnapshotScalesWithSocketsNotInstances(t *testing.T) {
+	oldOutput := runtimeCandidateSnapshotOutputFn
+	t.Cleanup(func() { runtimeCandidateSnapshotOutputFn = oldOutput })
+
+	sockets := []string{"socket-a", "socket-b", "socket-c"}
+	calls := make(map[string]int)
+	runtimeCandidateSnapshotOutputFn = func(socketName string, args ...string) ([]byte, error) {
+		calls[socketName]++
+		if len(args) != 3 || args[0] != "list-sessions" || args[1] != "-F" || args[2] != runtimeCandidateFormat() {
+			t.Fatalf("snapshot command for %q = %q", socketName, args)
+		}
+		var output strings.Builder
+		for index := 0; index < 200; index++ {
+			instanceID := fmt.Sprintf("%s-instance-%03d", socketName, index)
+			fmt.Fprintln(&output, strings.Join([]string{
+				fmt.Sprintf("$%d", index+1), SessionPrefix + instanceID, fmt.Sprintf("%%%d", index+1),
+				instanceID, "7", "3", "running", "1000000000", "codex", "4242", instanceID, "binding|value",
+			}, tmuxFieldSep))
+		}
+		return []byte(output.String()), nil
+	}
+
+	snapshot := SnapshotRuntimeCandidates(append(sockets, "socket-a"))
+	if len(calls) != len(sockets) {
+		t.Fatalf("snapshot subprocess sockets = %v, want %v", calls, sockets)
+	}
+	for _, socketName := range sockets {
+		if calls[socketName] != 1 {
+			t.Fatalf("snapshot subprocesses for %q = %d, want 1", socketName, calls[socketName])
+		}
+		for index := 0; index < 200; index++ {
+			instanceID := fmt.Sprintf("%s-instance-%03d", socketName, index)
+			candidates, err := snapshot.Candidates(instanceID, sockets...)
+			if err != nil {
+				t.Fatalf("candidates for %q: %v", instanceID, err)
+			}
+			if len(candidates) != 1 || candidates[0].InstanceID != instanceID ||
+				candidates[0].SessionID == "" || candidates[0].PaneID == "" || candidates[0].BindingValue != "binding|value" {
+				t.Fatalf("candidates for %q = %#v", instanceID, candidates)
+			}
+		}
+	}
+	if len(calls) != len(sockets) {
+		t.Fatalf("instance lookups spawned more subprocesses: %v", calls)
+	}
+}
+
+func TestRuntimeLifecycle_RuntimeCandidateSnapshotDoesNotTreatFailedSocketAsEmpty(t *testing.T) {
+	wantErr := fmt.Errorf("blocked tmux inventory")
+	snapshot := RuntimeCandidateSnapshot{
+		"blocked": {Err: wantErr},
+	}
+	if _, err := snapshot.Candidates("one", "blocked"); err != wantErr {
+		t.Fatalf("failed socket error = %v, want %v", err, wantErr)
+	}
+	if _, err := snapshot.Candidates("one", "not-inventoried"); err == nil {
+		t.Fatal("omitted socket was treated as an empty inventory")
+	}
+}
+
+func TestRuntimeLifecycle_ListRuntimeCandidatesAcceptsEmptyInventory(t *testing.T) {
+	oldOutput := runtimeCandidateSnapshotOutputFn
+	runtimeCandidateSnapshotOutputFn = func(string, ...string) ([]byte, error) { return nil, nil }
+	t.Cleanup(func() { runtimeCandidateSnapshotOutputFn = oldOutput })
+
+	candidates, err := ListRuntimeCandidates("", "instance")
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("empty inventory = %#v, err=%v", candidates, err)
+	}
+}
+
+// runtimeCandidateRecordForTest formats one snapshot row: generation 7,
+// revision 3, running, a start stamp, the codex binding and pane pid 4242.
+// option is what the session's effective instance option expands to.
+func runtimeCandidateRecordForTest(sessionID, name, paneID, instanceID, option string) string {
+	return strings.Join([]string{
+		sessionID, name, paneID, instanceID, "7", "3", "running", "1000000000", "codex", "4242", option, "value",
+	}, tmuxFieldSep)
+}
+
+// A runtime Agent Deck started under an unprefixed tmux name (an imported or
+// fixture name) is still Agent Deck's once its session-local cleanup stamp
+// names the instance. Inherited #{E:} values without that stamp, a partial
+// stamp, a stamp for another instance, or an inherited global option never
+// admit one. Only claims whose effective instance option names the claimed
+// instance reach the local-option batch: the others cannot carry that stamp,
+// so an inherited environment that turns every user session into a claim does
+// not grow the batch.
+func TestRuntimeLifecycle_RuntimeCandidateSnapshotAdmitsStampedUnprefixedSession(t *testing.T) {
+	oldOutput := runtimeCandidateSnapshotOutputFn
+	oldLocal := runtimeCleanupLocalOptionsFn
+	t.Cleanup(func() {
+		runtimeCandidateSnapshotOutputFn = oldOutput
+		runtimeCleanupLocalOptionsFn = oldLocal
+	})
+	runtimeCandidateSnapshotOutputFn = func(socketName string, args ...string) ([]byte, error) {
+		if socketName != "isolated" || len(args) != 3 || args[0] != "list-sessions" {
+			t.Fatalf("snapshot command = %q %q", socketName, args)
+		}
+		rows := []string{
+			runtimeCandidateRecordForTest("$1", "agentdeck_prefixed", "%1", "prefixed", ""),
+			runtimeCandidateRecordForTest("$2", "ad-golden-sess-shell", "%2", "stamped", "stamped"),
+			runtimeCandidateRecordForTest("$3", "user-work", "%3", "inherited", ""),
+			runtimeCandidateRecordForTest("$4", "partial", "%4", "partial", "partial"),
+			runtimeCandidateRecordForTest("$5", "other-stamp", "%5", "claimed", "someone-else"),
+			runtimeCandidateRecordForTest("$6", "plain-shell", "%6", "", ""),
+			runtimeCandidateRecordForTest("$7", "global-option", "%7", "global", "global"),
+		}
+		return []byte(strings.Join(rows, "\n") + "\n"), nil
+	}
+	partial := runtimeCleanupLocalOptionsForTest("partial", 7, "CODEX_SESSION_ID", "value")
+	delete(partial, runtimeCleanupGenerationOption)
+	bySession := map[string]map[string]runtimeCleanupLocalOption{
+		"$2": runtimeCleanupLocalOptionsForTest("stamped", 7, "CODEX_SESSION_ID", "value"),
+		"$4": partial,
+		"$5": runtimeCleanupLocalOptionsForTest("someone-else", 7, "CODEX_SESSION_ID", "value"),
+		// $7's option expands only from the server's global options.
+	}
+	var localReads [][]string
+	runtimeCleanupLocalOptionsFn = func(socketName string, candidates []RuntimeBindingCandidate) (map[string]map[string]runtimeCleanupLocalOption, error) {
+		if socketName != "isolated" {
+			t.Fatalf("local stamp socket = %q", socketName)
+		}
+		ids := make([]string, 0, len(candidates))
+		result := make(map[string]map[string]runtimeCleanupLocalOption, len(candidates))
+		for _, candidate := range candidates {
+			ids = append(ids, candidate.SessionID)
+			result[candidate.SessionID] = bySession[candidate.SessionID]
+		}
+		localReads = append(localReads, ids)
+		return result, nil
+	}
+
+	snapshot := SnapshotRuntimeCandidates([]string{"isolated"})
+	if want := [][]string{{"$2", "$4", "$7"}}; !reflect.DeepEqual(localReads, want) {
+		t.Fatalf("local stamp reads = %q, want one batch for the claims whose option names them %q", localReads, want)
+	}
+	for instanceID, wantSession := range map[string]string{
+		"prefixed": "agentdeck_prefixed", "stamped": "ad-golden-sess-shell",
+		"inherited": "", "partial": "", "claimed": "", "someone-else": "", "global": "",
+	} {
+		candidates, err := snapshot.Candidates(instanceID, "isolated")
+		if err != nil {
+			t.Fatalf("candidates for %q: %v", instanceID, err)
+		}
+		if wantSession == "" {
+			if len(candidates) != 0 {
+				t.Fatalf("candidates for %q = %#v, want none", instanceID, candidates)
+			}
+			continue
+		}
+		if len(candidates) != 1 || candidates[0].SessionName != wantSession || !candidates[0].GenerationKnown ||
+			candidates[0].Generation != 7 || candidates[0].PanePID != 4242 {
+			t.Fatalf("candidates for %q = %#v, want %q", instanceID, candidates, wantSession)
+		}
+	}
+}
+
+// A failed local-stamp read leaves the socket indeterminate; it never silently
+// drops a runtime that may be stamped. The socket is listed once more, but
+// while every claim is still there the failure stands.
+func TestRuntimeLifecycle_RuntimeCandidateSnapshotUnprefixedStampReadFailureIsIndeterminate(t *testing.T) {
+	oldOutput := runtimeCandidateSnapshotOutputFn
+	oldLocal := runtimeCleanupLocalOptionsFn
+	t.Cleanup(func() {
+		runtimeCandidateSnapshotOutputFn = oldOutput
+		runtimeCleanupLocalOptionsFn = oldLocal
+	})
+	listings := 0
+	runtimeCandidateSnapshotOutputFn = func(string, ...string) ([]byte, error) {
+		listings++
+		return []byte(runtimeCandidateRecordForTest("$2", "ad-golden-sess-shell", "%2", "stamped", "stamped") + "\n"), nil
+	}
+	blocked := errors.New("blocked local stamp read")
+	reads := 0
+	runtimeCleanupLocalOptionsFn = func(string, []RuntimeBindingCandidate) (map[string]map[string]runtimeCleanupLocalOption, error) {
+		reads++
+		return nil, blocked
+	}
+
+	if _, err := ListRuntimeCandidates("isolated", "stamped"); !errors.Is(err, blocked) {
+		t.Fatalf("inventory error = %v, want the failed local stamp read", err)
+	}
+	if listings != 2 || reads != 1 {
+		t.Fatalf("listings=%d local reads=%d, want one re-list and no second read while every claim remains", listings, reads)
+	}
+}
+
+// A claim that closed between the listing and the local-stamp batch can fail
+// the batch for every other claim (tmux drops the rest of a command list after
+// an error). The socket is listed once more; the vanished claim is absent and
+// the claims that remain are read again, instead of the whole socket, and so
+// every instance reconciled from it, turning indeterminate.
+func TestRuntimeLifecycle_RuntimeCandidateSnapshotRelistsWhenAClaimVanishes(t *testing.T) {
+	oldOutput := runtimeCandidateSnapshotOutputFn
+	oldLocal := runtimeCleanupLocalOptionsFn
+	t.Cleanup(func() {
+		runtimeCandidateSnapshotOutputFn = oldOutput
+		runtimeCleanupLocalOptionsFn = oldLocal
+	})
+	stamped := runtimeCandidateRecordForTest("$2", "ad-golden-sess-shell", "%2", "stamped", "stamped")
+	closing := runtimeCandidateRecordForTest("$3", "closing", "%3", "closing", "closing")
+	listings := 0
+	runtimeCandidateSnapshotOutputFn = func(string, ...string) ([]byte, error) {
+		listings++
+		if listings == 1 {
+			return []byte(stamped + "\n" + closing + "\n"), nil
+		}
+		return []byte(stamped + "\n"), nil
+	}
+	var reads [][]string
+	runtimeCleanupLocalOptionsFn = func(_ string, candidates []RuntimeBindingCandidate) (map[string]map[string]runtimeCleanupLocalOption, error) {
+		ids := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			ids = append(ids, candidate.SessionID)
+		}
+		reads = append(reads, ids)
+		if len(reads) == 1 {
+			return nil, errors.New("can't find session: $3")
+		}
+		return map[string]map[string]runtimeCleanupLocalOption{
+			"$2": runtimeCleanupLocalOptionsForTest("stamped", 7, "CODEX_SESSION_ID", "value"),
+		}, nil
+	}
+
+	candidates, err := ListRuntimeCandidates("isolated", "stamped")
+	if err != nil {
+		t.Fatalf("inventory after a claim vanished: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].SessionID != "$2" {
+		t.Fatalf("candidates = %#v, want the remaining stamped claim", candidates)
+	}
+	if want := [][]string{{"$2", "$3"}, {"$2"}}; listings != 2 || !reflect.DeepEqual(reads, want) {
+		t.Fatalf("listings=%d local reads=%q, want 2 and %q", listings, reads, want)
+	}
+}
+
+// The cleanup inventory, and so every destructive capture and lower-generation
+// sweep, sees a runtime Agent Deck stamped whatever its tmux name. A session
+// without the complete local stamp stays invisible, prefixed or not.
+func TestRuntimeLifecycle_RuntimeCleanupInventoryAdmitsStampedUnprefixedSession(t *testing.T) {
+	oldOutput := runtimeBindingCandidateOutputFn
+	t.Cleanup(func() { runtimeBindingCandidateOutputFn = oldOutput })
+	runtimeBindingCandidateOutputFn = func(socketName string, args ...string) ([]byte, error) {
+		if socketName != "isolated" || len(args) != 3 || args[0] != "list-sessions" || args[2] != runtimeCleanupCandidateFormat() {
+			t.Fatalf("inventory command = %q %q", socketName, args)
+		}
+		rows := []string{
+			tmuxFmt("$1", "agentdeck_prefixed", "%1", "4101", "prefixed"),
+			tmuxFmt("$2", "ad-golden-sess-shell", "%2", "4102", "stamped"),
+			tmuxFmt("$3", "user-work", "%3", "4103", "inherited-global"),
+			tmuxFmt("$4", "agentdeck_unstamped", "%4", "4104", ""),
+		}
+		return []byte(strings.Join(rows, "\n") + "\n"), nil
+	}
+	stubRuntimeCleanupLocalOptions(t, map[string]map[string]runtimeCleanupLocalOption{
+		"$1": runtimeCleanupLocalOptionsForTest("prefixed", 3, "", ""),
+		"$2": runtimeCleanupLocalOptionsForTest("stamped", 5, "", ""),
+	})
+
+	inventory, err := ListRuntimeCleanupCandidates("isolated", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, candidate := range inventory {
+		names = append(names, candidate.SessionName)
+	}
+	if want := []string{"agentdeck_prefixed", "ad-golden-sess-shell"}; !reflect.DeepEqual(names, want) {
+		t.Fatalf("cleanup inventory = %q, want only the stamped sessions %q", names, want)
+	}
+	candidates, err := ListRuntimeGenerationCandidates("isolated", "stamped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := RuntimeGenerationCandidate{
+		SessionName: "ad-golden-sess-shell", SessionID: "$2", SocketName: "isolated",
+		PaneID: "%2", PanePID: 4102, InstanceID: "stamped", Generation: 5, GenerationKnown: true,
+	}
+	if len(candidates) != 1 || candidates[0] != want {
+		t.Fatalf("generation candidates = %#v, want %#v", candidates, want)
+	}
+}
+
+// The conditional kill proves ownership by the local stamp and the exact
+// stable identity, so an unprefixed stamped runtime is killed like any other,
+// with its exact name in the tmux-server condition.
+func TestRuntimeLifecycle_KillRuntimeGenerationCandidateKillsStampedUnprefixedSession(t *testing.T) {
+	stubProcessStartIdentityForTest(t)
+	oldTree := runtimeGenerationProcessTreeFn
+	oldKill := runtimeBindingConditionalKillFn
+	oldEnsure := runtimeGenerationEnsurePIDsDeadFn
+	t.Cleanup(func() {
+		runtimeGenerationProcessTreeFn = oldTree
+		runtimeBindingConditionalKillFn = oldKill
+		runtimeGenerationEnsurePIDsDeadFn = oldEnsure
+	})
+	candidate := RuntimeGenerationCandidate{
+		SessionName: "ad-golden-sess-shell", SessionID: "$2", SocketName: "isolated",
+		PaneID: "%2", PanePID: 4102, InstanceID: "stamped", Generation: 5, GenerationKnown: true,
+	}
+	stubRuntimeCleanupLocalOptions(t, map[string]map[string]runtimeCleanupLocalOption{
+		"$2": runtimeCleanupLocalOptionsForTest("stamped", 5, "", ""),
+	})
+	runtimeGenerationProcessTreeFn = func(string, string) ([]int, error) { return []int{candidate.PanePID}, nil }
+	var condition string
+	runtimeBindingConditionalKillFn = func(_ context.Context, socketName string, args ...string) ([]byte, error) {
+		if socketName != "isolated" || len(args) != 7 || args[0] != "if-shell" {
+			t.Fatalf("conditional kill = %q %q", socketName, args)
+		}
+		condition = args[4]
+		return nil, nil
+	}
+	reaped := false
+	runtimeGenerationEnsurePIDsDeadFn = func([]ProcessIdentity, time.Duration) error {
+		reaped = true
+		return nil
+	}
+
+	if err := KillRuntimeGenerationCandidate(candidate, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, check := range []string{
+		"#{==:#{session_name},#{l:ad-golden-sess-shell}}",
+		"#{==:#{" + runtimeCleanupInstanceOption + "},#{l:stamped}}",
+		"#{==:#{" + runtimeCleanupGenerationOption + "},#{l:5}}",
+	} {
+		if !strings.Contains(condition, check) {
+			t.Fatalf("kill condition %q lacks %q", condition, check)
+		}
+	}
+	if !reaped {
+		t.Fatal("killed runtime's process tree was not reaped")
+	}
+}
+
+// ProbeExactSession and SelectedRuntimeSessionExists ask for exactly the named
+// session on its own socket through probeSessionExistence, and read only
+// tmux's canonical absence answers as absence. The one difference is a missing
+// socket file: indeterminate to the exact probe, and absence to the
+// destruction probe, which shares the empty inventories' trade-off.
+func TestRuntimeLifecycle_SelectedRuntimeSessionExistsClassifiesExactProbe(t *testing.T) {
+	tests := []struct {
+		name         string
+		stderr       string
+		exit         int
+		wantPresent  bool
+		wantErr      bool
+		wantExactErr bool
+	}{
+		{name: "answers", wantPresent: true},
+		{name: "missing session", stderr: "can't find session: ad-golden-sess-shell", exit: 1},
+		{name: "no server", stderr: "no server running on /tmp/tmux-501/isolated", exit: 1},
+		{name: "no sessions", stderr: "no sessions", exit: 1},
+		{name: "no socket file", stderr: "error connecting to /tmp/tmux-501/isolated (No such file or directory)", exit: 1, wantExactErr: true},
+		{name: "another session missing", stderr: "can't find session: ad-golden", exit: 1, wantErr: true, wantExactErr: true},
+		{name: "permission", stderr: "error connecting to /tmp/tmux-501/isolated (Permission denied)", exit: 1, wantErr: true, wantExactErr: true},
+		{name: "protocol", stderr: "protocol version mismatch", exit: 1, wantErr: true, wantExactErr: true},
+	}
+	probes := []struct {
+		name  string
+		probe func(string, string) (bool, error)
+	}{
+		{name: "selected", probe: SelectedRuntimeSessionExists},
+		{name: "exact", probe: ProbeExactSession},
+	}
+	for _, tt := range tests {
+		for _, probe := range probes {
+			t.Run(tt.name+"/"+probe.name, func(t *testing.T) {
+				binDir := t.TempDir()
+				argsFile := filepath.Join(binDir, "args")
+				script := "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done > " + argsFile + "\n"
+				if tt.stderr != "" {
+					script += fmt.Sprintf("printf '%%s\\n' %q >&2\n", tt.stderr)
+				}
+				script += fmt.Sprintf("exit %d\n", tt.exit)
+				if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("PATH", binDir)
+
+				wantErr := tt.wantErr
+				if probe.name == "exact" {
+					wantErr = tt.wantExactErr
+				}
+				present, err := probe.probe("isolated", "ad-golden-sess-shell")
+				if present != tt.wantPresent || (err != nil) != wantErr {
+					t.Fatalf("probe = (%v, %v), want present=%v error=%v", present, err, tt.wantPresent, wantErr)
+				}
+				raw, readErr := os.ReadFile(argsFile)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				args := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+				want := []string{"-L", "isolated", "has-session", "-t", "=ad-golden-sess-shell"}
+				if len(args) < len(want) || !reflect.DeepEqual(args[len(args)-len(want):], want) {
+					t.Fatalf("tmux args = %q, want to end with %q", args, want)
+				}
+			})
+		}
+	}
+}

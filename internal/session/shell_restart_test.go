@@ -92,10 +92,14 @@ func TestRestart_ShellSession_AdoptsLiveTmuxOnNameMismatch(t *testing.T) {
 		t.Fatalf("tmux session %q never appeared after Start", inst.tmuxSession.Name)
 	}
 	liveName := inst.tmuxSession.Name
+	storage := newTestStorage(t)
+	if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+		t.Fatalf("persist authoritative live runtime: %v", err)
+	}
 
 	// Mutate inst.tmuxSession.Name to a stale value that does not exist.
-	// This exactly reproduces the user-reported state where agent-deck's
-	// view of "my tmux session is dead" disagrees with reality.
+	// The durable tuple still owns liveName, so restart must reconcile to that
+	// exact stamped candidate without guessing from the title prefix.
 	staleSess := tmux.NewSession(title, t.TempDir())
 	staleSess.SocketName = inst.TmuxSocketName
 	if staleSess.Name == liveName {

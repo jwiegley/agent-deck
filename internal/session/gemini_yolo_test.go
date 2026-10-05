@@ -255,10 +255,11 @@ func TestInstance_GeminiYoloMode_Persistence(t *testing.T) {
 			}
 
 			// Save
-			err := s.SaveWithGroups([]*Instance{inst}, nil)
+			err := s.InsertSessionAndVerify(inst, nil)
 			if err != nil {
-				t.Fatalf("SaveWithGroups failed: %v", err)
+				t.Fatalf("InsertSessionAndVerify failed: %v", err)
 			}
+			defer func() { _ = s.DeleteInstance(inst.ID) }()
 
 			// Load
 			loaded, _, err := s.LoadWithGroups()

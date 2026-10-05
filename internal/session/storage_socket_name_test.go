@@ -39,7 +39,7 @@ func TestStorage_TmuxSocketName_Roundtrip(t *testing.T) {
 	}
 
 	tree := NewGroupTreeWithGroups([]*Instance{inst}, nil)
-	if err := storage.SaveWithGroups([]*Instance{inst}, tree); err != nil {
+	if err := storage.InsertSessionAndVerify(inst, tree); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := storage.Close(); err != nil {
@@ -116,7 +116,7 @@ func TestStorage_TmuxSocketName_EmptyRoundtrip(t *testing.T) {
 	}
 
 	tree := NewGroupTreeWithGroups([]*Instance{inst}, nil)
-	if err := storage.SaveWithGroups([]*Instance{inst}, tree); err != nil {
+	if err := storage.InsertSessionAndVerify(inst, tree); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if err := storage.Close(); err != nil {

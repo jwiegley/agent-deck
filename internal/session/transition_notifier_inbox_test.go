@@ -45,8 +45,8 @@ func TestNotifier_OrphanChildLogsWarnOnce(t *testing.T) {
 		Status:          StatusWaiting,
 		CreatedAt:       now,
 	}
-	if err := storage.SaveWithGroups([]*Instance{child}, nil); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(child, nil); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	n := NewTransitionNotifier()
@@ -113,8 +113,8 @@ func TestNotifier_TopLevelConductorSelfSuppress(t *testing.T) {
 		Status:          StatusWaiting,
 		CreatedAt:       now,
 	}
-	if err := storage.SaveWithGroups([]*Instance{conductor}, nil); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(conductor, nil); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	n := NewTransitionNotifier()
@@ -185,8 +185,10 @@ func TestNotifyTransition_BusyParentStillCommittedToInbox(t *testing.T) {
 		Status:      StatusRunning, // parent is mid-task — must NOT block delivery
 		CreatedAt:   now,
 	}
-	if err := storage.SaveWithGroups([]*Instance{child, parent}, nil); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	for _, inst := range []*Instance{parent, child} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert %s: %v", inst.ID, err)
+		}
 	}
 
 	n := NewTransitionNotifier()

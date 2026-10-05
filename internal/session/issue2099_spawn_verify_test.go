@@ -63,10 +63,10 @@ func TestIssue2099_VerifySpawnedNoSessionNoRecord(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not exist")
 }
 
-// TestIssue2099_VerifySpawnedDiesBeforePane is the behavioral repro: the
-// initial process exits before the fast-death watcher's first tick, so
-// Start() returns nil and the session is already gone. Pre-fix the CLI
-// printed "Started"; VerifySpawned must fail with the recorded reason.
+// The initial process exits before the first watcher tick. Start returns nil
+// once tmux accepted the spawn, even when the pane is gone before its
+// generation could be published; the CLI consumes that result and still
+// verifies the pane before reporting success.
 func TestIssue2099_VerifySpawnedDiesBeforePane(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 
@@ -78,7 +78,11 @@ func TestIssue2099_VerifySpawnedDiesBeforePane(t *testing.T) {
 		clearSpawnFailureRecord(inst.ID)
 	})
 
-	require.NoError(t, inst.Start(), "Start itself reports success: tmux accepted the spawn")
+	runtime, startErr := inst.StartRuntime()
+	require.NoError(t, startErr, "tmux accepted the spawn; verification must report its death")
+	_, failure, warning := ConsumePhysicalRuntimeResult(inst, runtime, startErr, nil)
+	require.NoError(t, failure, "tmux accepted the spawn; verification must report its death")
+	require.Empty(t, warning, "nothing was published, so there is no durability warning")
 
 	err := inst.VerifySpawned(3 * time.Second)
 	require.Error(t, err, "a session whose pane died must not verify as started")

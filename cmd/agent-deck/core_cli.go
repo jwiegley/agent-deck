@@ -159,6 +159,9 @@ func exitCoreError(out *CLIOutput, mode *jsonModeFlag, res *core.Result, usage f
 		os.Exit(exit)
 	}
 	if sf, ok := ce.Data.(*core.SpawnFailure); ok && ce.Code == core.CodeSpawnFailed {
+		if sf.StatusErr != nil && !out.jsonMode {
+			fmt.Fprintf(os.Stderr, "Warning: failed to save session error status: %v\n", sf.StatusErr)
+		}
 		if sf.SaveErr != nil && !out.jsonMode {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save session state: %v\n", sf.SaveErr)
 		}

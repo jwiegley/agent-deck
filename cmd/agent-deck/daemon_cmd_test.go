@@ -401,11 +401,10 @@ func TestDaemonAndDirectCLIShareMutationLock(t *testing.T) {
 	if err := <-argvDone; err != nil {
 		t.Fatalf("argv start: %v: %s", err, argvOut.String())
 	}
-	stdout, stderr, code := runAgentDeckEnv(t, home, "", env, "list", "--json=envelope")
-	if code != 0 || !strings.Contains(stdout, `"title": "alpha"`) || !strings.Contains(stdout, `"title": "beta"`) {
-		t.Fatalf("raced store missing a session: exit %d: %s %s", code, stdout, stderr)
-	}
+	// list publishes the status it observes through the runtime status
+	// authority, so the raced store is compared before list reads it.
 	raced := canonicalStateDB(t, home)
+	matched := false
 	for i, order := range [][]string{{"alpha", "beta"}, {"beta", "alpha"}} {
 		for _, name := range order {
 			out, errOut, code := runAgentDeckEnv(t, serialHomes[i], "", serialEnvs[i], "session", "start", name, "--json=envelope")
@@ -415,10 +414,17 @@ func TestDaemonAndDirectCLIShareMutationLock(t *testing.T) {
 		}
 		alignStorageTimes(t, home, serialHomes[i])
 		if bytes.Equal(raced, canonicalStateDB(t, serialHomes[i])) {
-			return
+			matched = true
+			break
 		}
 	}
-	t.Fatal("raced storage bytes differ from both serial execution orders after aligning only time fields")
+	stdout, stderr, code := runAgentDeckEnv(t, home, "", env, "list", "--json=envelope")
+	if code != 0 || !strings.Contains(stdout, `"title": "alpha"`) || !strings.Contains(stdout, `"title": "beta"`) {
+		t.Fatalf("raced store missing a session: exit %d: %s %s", code, stdout, stderr)
+	}
+	if !matched {
+		t.Fatal("raced storage bytes differ from both serial execution orders after aligning only time fields")
+	}
 }
 
 // Start records wall-clock seconds in tool_data, and every save records a
@@ -457,6 +463,7 @@ func alignStorageTimes(t *testing.T, racedHome, serialHome string) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
+	alignRuntimeStartTimes(t, raced, serial)
 	var modified string
 	if err := raced.QueryRow("SELECT value FROM metadata WHERE key='last_modified'").Scan(&modified); err != nil {
 		t.Fatal(err)

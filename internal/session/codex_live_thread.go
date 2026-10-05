@@ -67,16 +67,25 @@ func procFDLinkTargets(pid int) ([]string, error) {
 // process owns, from the rollout and writer lock it holds open under this
 // instance's Codex home. It returns "" when the evidence is incomplete or
 // names more than one thread (for example after /new, while the old rollout is
-// still open), so callers fail closed rather than guess.
+// still open), so callers fail closed rather than guess. The caller must not
+// hold i.mu: a storage reload rewrites the fields that pick the Codex home
+// under i.mu alone, so they are read under it.
 func (i *Instance) LiveCodexThreadID() string {
-	if i == nil || !IsCodexCompatible(i.Tool) || !i.CodexRolloutIsResolvableLocally() {
+	if i == nil {
+		return ""
+	}
+	i.mu.RLock()
+	eligible := IsCodexCompatible(i.Tool) && i.CodexRolloutIsResolvableLocally()
+	codexHome := i.getCodexHomeDir()
+	i.mu.RUnlock()
+	if !eligible {
 		return ""
 	}
 	paths, err := codexPaneOpenPaths(i)
 	if err != nil {
 		return ""
 	}
-	lockDir := filepath.Join(ExpandPath(i.getCodexHomeDir()), "thread-writer-locks")
+	lockDir := filepath.Join(ExpandPath(codexHome), "thread-writer-locks")
 	if resolved, err := filepath.EvalSymlinks(lockDir); err == nil {
 		lockDir = resolved
 	}
@@ -106,9 +115,16 @@ func (i *Instance) LiveCodexThreadID() string {
 // then only the thread it holds open may bind ("" while it owns none yet, or
 // when the probe is incomplete or ambiguous). A disk scan at that point can
 // only find someone else's rollout, such as a sibling's in the same project,
-// since this process has not written one (#2394).
+// since this process has not written one (#2394). The caller must not hold
+// i.mu (see LiveCodexThreadID).
 func (i *Instance) liveCodexBootstrapEvidence() (threadID string, live bool) {
-	if i == nil || !IsCodexCompatible(i.Tool) || !i.CodexRolloutIsResolvableLocally() {
+	if i == nil {
+		return "", false
+	}
+	i.mu.RLock()
+	eligible := IsCodexCompatible(i.Tool) && i.CodexRolloutIsResolvableLocally()
+	i.mu.RUnlock()
+	if !eligible {
 		return "", false
 	}
 	pids, err := codexPaneProcessPIDs(i)

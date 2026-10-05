@@ -306,8 +306,8 @@ func TestIssue1143_IdleTimeout_SQLiteRoundTrip(t *testing.T) {
 	inst.IdleTimeoutSecs = 1800
 
 	groupTree := NewGroupTreeWithGroups([]*Instance{inst}, nil)
-	if err := storage.SaveWithGroups([]*Instance{inst}, groupTree); err != nil {
-		t.Fatalf("SaveWithGroups: %v", err)
+	if err := storage.InsertSessionAndVerify(inst, groupTree); err != nil {
+		t.Fatalf("InsertSessionAndVerify: %v", err)
 	}
 
 	// Reload from the same SQLite DB through the public load path.

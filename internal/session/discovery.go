@@ -8,7 +8,9 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
-// DiscoverExistingTmuxSessions finds all tmux sessions and converts them to instances
+// DiscoverExistingTmuxSessions finds all tmux sessions and converts them to instances.
+// It stamps nothing: an import's ownership grant runs only once
+// InsertSessionAndVerify has persisted the instance (runtime_import.go).
 func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, error) {
 	// Get all tmux sessions
 	tmuxSessions, err := tmux.DiscoverAllTmuxSessions()
@@ -57,10 +59,6 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 			projectPath = "~"
 		}
 
-		// Enable mouse mode for proper scrolling in imported sessions
-		// Ignore errors - non-fatal, older tmux versions may not support all options
-		_ = sess.EnableMouseMode()
-
 		// Determine tool type - for orphaned agent-deck sessions, assume claude (most common)
 		tool := detectToolFromName(title)
 		if isOrphaned && tool == "shell" {
@@ -68,15 +66,26 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 		}
 
 		inst := &Instance{
-			ID:             GenerateID(),
-			Title:          title,
-			ProjectPath:    projectPath,
-			GroupPath:      groupPath,
-			Status:         StatusIdle,
-			Tool:           tool,
-			TmuxSocketName: sess.SocketName, // Inherit from the tmux session we discovered (#687)
-			tmuxSession:    sess,
+			ID:                     GenerateID(),
+			persistenceIncarnation: newPersistenceIncarnation(),
+			Title:                  title,
+			ProjectPath:            projectPath,
+			GroupPath:              groupPath,
+			Status:                 StatusIdle,
+			Tool:                   tool,
+			TmuxSocketName:         sess.SocketName, // Inherit from the tmux session we discovered (#687)
+			tmuxSession:            sess,
+			// Importing is the user's grant of ownership, applied once the
+			// import's insert commits this instance (runtime_import.go).
+			importOwnershipPending: true,
 		}
+		// DiscoverAllTmuxSessions builds bare wrappers; configure this one the
+		// way storage load does before touching the live session with it.
+		inst.configureTmuxWrapperLocked(sess)
+
+		// Enable mouse mode for proper scrolling in imported sessions
+		// Ignore errors - non-fatal, older tmux versions may not support all options
+		_ = sess.EnableMouseMode()
 		_ = inst.UpdateStatus()
 		discovered = append(discovered, inst)
 	}

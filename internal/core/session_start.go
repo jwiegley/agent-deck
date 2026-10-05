@@ -21,21 +21,28 @@ type SessionStartOut struct {
 	ID    string `json:"id"`
 	Title string `json:"title"`
 	// Status is "started", or "queued" when the group is at its concurrency cap.
-	Status          string `json:"status" doc:"started or queued"`
-	Group           string `json:"group" doc:"Group path of the session"`
-	MaxConcurrent   int    `json:"max_concurrent,omitempty" doc:"Group cap that queued the session"`
-	Tmux            string `json:"tmux,omitempty" doc:"tmux session name"`
-	ClaudeSessionID string `json:"claude_session_id,omitempty"`
-	Message         string `json:"message,omitempty" doc:"Initial message that was sent"`
+	Status          StartStatus `json:"status" doc:"started or queued"`
+	Group           string      `json:"group" doc:"Group path of the session"`
+	MaxConcurrent   int         `json:"max_concurrent,omitempty" doc:"Group cap that queued the session"`
+	Tmux            string      `json:"tmux,omitempty" doc:"tmux session name"`
+	ClaudeSessionID string      `json:"claude_session_id,omitempty"`
+	Message         string      `json:"message,omitempty" doc:"Initial message requested for the session"`
+	MessagePending  bool        `json:"message_pending,omitempty" doc:"The initial message was not delivered; the session is live without it"`
+	Warning         string      `json:"warning,omitempty" doc:"Runtime durability warning of a start that completed"`
 	// Instance is the in-process handle of the started session (for a
 	// surface that attaches to it). Never serialized.
 	Instance *session.Instance `json:"-"`
 }
 
+// StartStatus is a session start's verdict. It is a type of its own, not an
+// untyped string, so a start verdict cannot be assigned to an Instance's
+// runtime-owned session.Status.
+type StartStatus string
+
 // Session start statuses.
 const (
-	StartStatusStarted = "started"
-	StartStatusQueued  = "queued"
+	StartStatusStarted StartStatus = "started"
+	StartStatusQueued  StartStatus = "queued"
 )
 
 func (deps Deps) sessionStart(ctx context.Context, in SessionStartIn) (SessionStartOut, error) {
@@ -63,26 +70,32 @@ func (deps Deps) sessionStart(ctx context.Context, in SessionStartIn) (SessionSt
 	tree := session.NewGroupTreeWithGroups(d.instances, d.groups)
 	max := session.GroupMaxConcurrent(tree, inst.GroupPath)
 	if session.ShouldQueue(d.instances, inst.GroupPath, max) {
-		inst.Status = session.StatusQueued
+		// The save persists the yolo override; the runtime-owned queued
+		// status goes through the status CAS, which a snapshot save cannot.
 		if err := d.saveOr("failed to save queued state"); err != nil {
 			return SessionStartOut{}, err
+		}
+		if err := session.PersistSelectedStatus(d.storage, inst, session.StatusQueued); err != nil {
+			return SessionStartOut{}, &Error{Code: CodeInvalid, Message: fmt.Sprintf("failed to save queued state: %v", err), Cause: err}
 		}
 		out.Status = StartStatusQueued
 		out.MaxConcurrent = max
 		return out, nil
 	}
 
-	if in.Message != "" {
-		err = inst.StartWithMessage(in.Message)
-	} else {
-		err = inst.Start()
-	}
+	runtime, err := startRuntime(inst, in.Message)
+	messageUndelivered := session.InitialMessageUndelivered(err)
+	err, warning := consumeRuntime(inst, runtime, err)
 	if err != nil {
 		return SessionStartOut{}, &Error{Code: CodeInvalid, Message: fmt.Sprintf("failed to start session: %v", err), Cause: err}
 	}
+	if warning != "" {
+		Warn(ctx, warning)
+		Emit(ctx, Event{Kind: EventRuntimeWarning, ID: inst.ID, Title: inst.Title, Message: warning})
+	}
 	// #2099: nil from Start only means tmux accepted the spawn.
 	if err := inst.VerifySpawned(SpawnVerifyWait); err != nil {
-		return SessionStartOut{}, d.failSpawn("start", inst, err)
+		return SessionStartOut{}, d.failSpawn(ctx, "start", inst, err)
 	}
 	if !in.NoWait {
 		inst.PostStartSync(PostStartSyncWait)
@@ -97,5 +110,7 @@ func (deps Deps) sessionStart(ctx context.Context, in SessionStartIn) (SessionSt
 	}
 	out.ClaudeSessionID = inst.ClaudeSessionID
 	out.Message = in.Message
+	out.MessagePending = messageUndelivered
+	out.Warning = warning
 	return out, nil
 }

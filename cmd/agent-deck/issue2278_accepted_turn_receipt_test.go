@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -240,6 +241,7 @@ func appendCodexTurnStart(path, turnID string) error {
 }
 
 func TestCodexAcceptanceGuardHydratesLegacyIdentity(t *testing.T) {
+	isolateCodexIdentityStore(t)
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
 	project := filepath.Join(home, "project")
@@ -300,6 +302,19 @@ func TestCodexAcceptanceGuardHydratesLegacyIdentity(t *testing.T) {
 	if persisted := persistedCodexIdentity(t, storage, inst.ID); persisted != sessionID {
 		t.Fatalf("persisted identity = %q, want %q", persisted, sessionID)
 	}
+}
+
+// isolateCodexIdentityStore gives the test its own agent-deck home. A runtime
+// binding's value is unique within a profile store, so a repeated run
+// (-count>1) must not meet the identities an earlier run bound there.
+func isolateCodexIdentityStore(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	for _, key := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(key, "")
+	}
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
 }
 
 func persistedCodexIdentity(t *testing.T, storage *session.Storage, instanceID string) string {
@@ -398,6 +413,7 @@ func TestLegacyCodexIdentityHydrationRefusesUntrustedCandidates(t *testing.T) {
 		{name: "stale peer binding owns live identity", startPane: true, paneID: candidate, rolloutIDs: []string{candidate}, peer: true, want: "already owned"},
 	}
 
+	isolateCodexIdentityStore(t)
 	for n, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			home := filepath.Join(t.TempDir(), "codex")
@@ -448,6 +464,7 @@ func TestLegacyCodexIdentityHydrationRefusesUntrustedCandidates(t *testing.T) {
 }
 
 func TestLegacyCodexIdentityHydrationRequiresCurrentGeneration(t *testing.T) {
+	isolateCodexIdentityStore(t)
 	home := filepath.Join(t.TempDir(), "codex")
 	t.Setenv("CODEX_HOME", home)
 	project := filepath.Join(t.TempDir(), "project")
@@ -485,6 +502,178 @@ func TestLegacyCodexIdentityHydrationRequiresCurrentGeneration(t *testing.T) {
 	}
 	if after := countCodexAcceptanceArtifacts(t); after != before {
 		t.Fatalf("empty-generation refusal created lock/marker artifacts: before=%d after=%d", before, after)
+	}
+}
+
+// stageLegacyCodexPaneIdentity replaces hydration's pane query for one test.
+func stageLegacyCodexPaneIdentity(t *testing.T, query func(*session.Instance) (string, bool)) {
+	t.Helper()
+	previous := legacyCodexPaneIdentityFn
+	legacyCodexPaneIdentityFn = query
+	t.Cleanup(func() { legacyCodexPaneIdentityFn = previous })
+}
+
+// A restart can replace the runtime while hydration reads the pane. The
+// identity it read belongs to the runtime its binding token was captured
+// from, so the publish must refuse it as stale and bind nothing to the
+// replacement.
+func TestLegacyCodexIdentityHydrationRefusesStaleObservation(t *testing.T) {
+	isolateCodexIdentityStore(t)
+	home := filepath.Join(t.TempDir(), "codex")
+	t.Setenv("CODEX_HOME", home)
+	project := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const identity = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	writeLegacyCodexRollout(t, home, identity, "15")
+
+	inst := session.NewInstanceWithTool("legacy-stale-observation", project, "codex")
+	storage, err := session.NewStorageWithProfile("legacy_stale_observation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	if err := storage.SaveWithGroups([]*session.Instance{inst}, nil); err != nil {
+		t.Fatal(err)
+	}
+	db := storage.GetDB()
+	stageLegacyCodexPaneIdentity(t, func(inst *session.Instance) (string, bool) {
+		current, found, err := db.ReadRuntimeState(inst.ID)
+		if err != nil || !found {
+			t.Fatalf("read runtime: found=%v err=%v", found, err)
+		}
+		replacement := current
+		replacement.Generation++
+		replacement.StatusRevision = 0
+		replacement.TmuxSession = current.TmuxSession + "-replacement"
+		replacement.Status = string(session.StatusRunning)
+		replacement.LastStartedAt = time.Now().UTC()
+		if err := db.CommitRuntimeTransition(current.Generation, inst.PersistenceIncarnation(), replacement); err != nil {
+			t.Fatalf("commit replacement runtime: %v", err)
+		}
+		if !inst.ApplyRuntimeState(replacement) {
+			t.Fatal("instance did not adopt the replacement runtime")
+		}
+		return identity, false
+	})
+
+	err = hydrateLegacyCodexIdentity(inst, []*session.Instance{inst}, storage)
+	if !errors.Is(err, session.ErrRuntimeBindingObservationStale) {
+		t.Fatalf("hydration error = %v, want a stale observation", err)
+	}
+	if inst.CodexSessionID != "" || persistedCodexIdentity(t, storage, inst.ID) != "" {
+		t.Fatal("stale identity was retained in memory or storage")
+	}
+	if binding, found, err := db.ReadRuntimeBinding(inst.ID, "codex"); err != nil || found {
+		t.Fatalf("stale identity bound the replacement: binding=%+v found=%v err=%v", binding, found, err)
+	}
+}
+
+// The published binding is durable and adopted before hydration adds its
+// recall link, so a failed link reports the error without rolling the
+// in-memory identity back behind storage's. The identity stays bound, so the
+// next hydration takes the bound path, which must repair the missing link.
+func TestLegacyCodexIdentityHydrationKeepsPublishedIdentityWhenRecallLinkFails(t *testing.T) {
+	isolateCodexIdentityStore(t)
+	home := filepath.Join(t.TempDir(), "codex")
+	t.Setenv("CODEX_HOME", home)
+	project := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const identity = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	writeLegacyCodexRollout(t, home, identity, "15")
+
+	inst := session.NewInstanceWithTool("legacy-recall-link", project, "codex")
+	startLegacyCodexPane(t, inst, identity)
+	storage, err := session.NewStorageWithProfile("legacy_recall_link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	if err := storage.SaveWithGroups([]*session.Instance{inst}, nil); err != nil {
+		t.Fatal(err)
+	}
+	db := storage.GetDB()
+	if _, err := db.DB().Exec(`CREATE TRIGGER hydration_test_fail_recall_link BEFORE INSERT ON session_links
+		BEGIN SELECT RAISE(ABORT, 'injected recall link failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	err = hydrateLegacyCodexIdentity(inst, []*session.Instance{inst}, storage)
+	if err == nil || !strings.Contains(err.Error(), "injected recall link failure") {
+		t.Fatalf("hydration error = %v, want the recall link failure", err)
+	}
+	if inst.CodexSessionID != identity {
+		t.Fatalf("in-memory identity = %q, want the published %q kept", inst.CodexSessionID, identity)
+	}
+	if persisted := persistedCodexIdentity(t, storage, inst.ID); persisted != identity {
+		t.Fatalf("persisted identity = %q, want %q", persisted, identity)
+	}
+	if binding, found, err := db.ReadRuntimeBinding(inst.ID, "codex"); err != nil || !found || binding.Value != identity {
+		t.Fatalf("durable binding = %+v found=%v err=%v, want %q", binding, found, err, identity)
+	}
+	if links, err := db.ListSessionLinks(inst.ID); err != nil || len(links) != 0 {
+		t.Fatalf("links after the failed write = %+v err=%v, want none", links, err)
+	}
+
+	if _, err := db.DB().Exec(`DROP TRIGGER hydration_test_fail_recall_link`); err != nil {
+		t.Fatal(err)
+	}
+	if err := hydrateLegacyCodexIdentity(inst, []*session.Instance{inst}, storage); err != nil {
+		t.Fatalf("hydration of the bound identity: %v", err)
+	}
+	links, err := db.ListSessionLinks(inst.ID)
+	if err != nil || len(links) != 1 || links[0].Harness != "codex" || links[0].NativeID != identity || !links[0].Authoritative {
+		t.Fatalf("links after the repair = %+v err=%v, want one authoritative codex/%s", links, err, identity)
+	}
+}
+
+// A state.db stamped at the current schema by a build that predates the
+// recall tables has no session_links. The startup Migrate must create it, so
+// the first hydration of an unbound Codex identity records its link instead
+// of refusing the send.
+func TestLegacyCodexIdentityHydrationLinksOnCurrentSchemaWithoutRecallTables(t *testing.T) {
+	isolateCodexIdentityStore(t)
+	home := filepath.Join(t.TempDir(), "codex")
+	t.Setenv("CODEX_HOME", home)
+	project := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const identity = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	writeLegacyCodexRollout(t, home, identity, "15")
+
+	inst := session.NewInstanceWithTool("legacy-no-recall-tables", project, "codex")
+	storage, err := session.NewStorageWithProfile("legacy_no_recall_tables")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	if err := storage.SaveWithGroups([]*session.Instance{inst}, nil); err != nil {
+		t.Fatal(err)
+	}
+	db := storage.GetDB()
+	for _, table := range []string{"session_hints", "session_tags", "session_links"} {
+		if _, err := db.DB().Exec(`DROP TABLE ` + table); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("startup Migrate: %v", err)
+	}
+	stageLegacyCodexPaneIdentity(t, func(*session.Instance) (string, bool) { return identity, false })
+
+	if err := hydrateLegacyCodexIdentity(inst, []*session.Instance{inst}, storage); err != nil {
+		t.Fatalf("hydration on a current-schema database without recall tables: %v", err)
+	}
+	if persisted := persistedCodexIdentity(t, storage, inst.ID); persisted != identity {
+		t.Fatalf("persisted identity = %q, want %q", persisted, identity)
+	}
+	links, err := db.ListSessionLinks(inst.ID)
+	if err != nil || len(links) != 1 || links[0].Harness != "codex" || links[0].NativeID != identity || !links[0].Authoritative {
+		t.Fatalf("links after hydration = %+v err=%v, want one authoritative codex/%s", links, err, identity)
 	}
 }
 

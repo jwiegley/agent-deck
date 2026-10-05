@@ -10,10 +10,13 @@ package session
 // durable record is still present for the next-turn drain.
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // newWakeNudgeFixture seeds a child→parent pair in a fresh profile and returns a
@@ -52,8 +55,10 @@ func newWakeNudgeFixture(t *testing.T) (*TransitionNotifier, string, TransitionN
 		Status:      StatusIdle,
 		CreatedAt:   now,
 	}
-	if err := storage.SaveWithGroups([]*Instance{child, parent}, nil); err != nil {
-		t.Fatalf("save: %v", err)
+	for _, inst := range []*Instance{parent, child} {
+		if err := storage.InsertSessionAndVerify(inst, nil); err != nil {
+			t.Fatalf("insert %s: %v", inst.ID, err)
+		}
 	}
 
 	event := TransitionNotificationEvent{
@@ -205,7 +210,9 @@ func TestIssue1225_ParentIsNudgeableIdle(t *testing.T) {
 func withNoopStatusProbe(t *testing.T) {
 	t.Helper()
 	orig := updateInstanceStatus.Load().(statusProbeFunc)
-	updateInstanceStatus.Store(statusProbeFunc(func(*Instance) error { return nil }))
+	updateInstanceStatus.Store(statusProbeFunc(func(_ context.Context, _ *Instance, observed statedb.RuntimeState, _ string) (statedb.RuntimeState, error) {
+		return observed, nil
+	}))
 	t.Cleanup(func() { updateInstanceStatus.Store(orig) })
 }
 
@@ -222,9 +229,10 @@ func TestWakeNudge_IdleGateUsesFreshStatus(t *testing.T) {
 	})
 
 	// Stale running row, fresh probe says idle: nudgeable.
-	updateInstanceStatus.Store(statusProbeFunc(func(inst *Instance) error {
+	updateInstanceStatus.Store(statusProbeFunc(func(_ context.Context, inst *Instance, observed statedb.RuntimeState, _ string) (statedb.RuntimeState, error) {
 		inst.Status = StatusIdle
-		return nil
+		observed.Status = string(StatusIdle)
+		return observed, nil
 	}))
 	stale := &Instance{ID: "p", Title: "conductor-x", Status: StatusRunning}
 	if !parentIsNudgeableIdle(stale) {
@@ -232,9 +240,10 @@ func TestWakeNudge_IdleGateUsesFreshStatus(t *testing.T) {
 	}
 
 	// Stale idle row, fresh probe says running (mid-turn): not nudgeable.
-	updateInstanceStatus.Store(statusProbeFunc(func(inst *Instance) error {
+	updateInstanceStatus.Store(statusProbeFunc(func(_ context.Context, inst *Instance, observed statedb.RuntimeState, _ string) (statedb.RuntimeState, error) {
 		inst.Status = StatusRunning
-		return nil
+		observed.Status = string(StatusRunning)
+		return observed, nil
 	}))
 	busy := &Instance{ID: "p", Title: "conductor-x", Status: StatusIdle}
 	if parentIsNudgeableIdle(busy) {
@@ -245,9 +254,9 @@ func TestWakeNudge_IdleGateUsesFreshStatus(t *testing.T) {
 	statusProbeBudget = 50 * time.Millisecond
 	block := make(chan struct{})
 	t.Cleanup(func() { close(block) })
-	updateInstanceStatus.Store(statusProbeFunc(func(*Instance) error {
+	updateInstanceStatus.Store(statusProbeFunc(func(_ context.Context, _ *Instance, observed statedb.RuntimeState, _ string) (statedb.RuntimeState, error) {
 		<-block
-		return nil
+		return observed, nil
 	}))
 	hung := &Instance{ID: "p", Title: "conductor-x", Status: StatusIdle}
 	start := time.Now()
