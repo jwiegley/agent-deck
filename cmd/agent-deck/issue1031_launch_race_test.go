@@ -297,6 +297,9 @@ func tmuxEnvForIssue1031() []string {
 		}
 		env = append(env, kv)
 	}
+	if privateRoot := os.Getenv("TMUX_TMPDIR"); privateRoot != "" {
+		env = append(env, "TMUX_TMPDIR="+privateRoot)
+	}
 	return env
 }
 

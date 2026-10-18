@@ -516,7 +516,9 @@ func TestInstallTickCancellationPreservesNonce(t *testing.T) {
 		<-ctx.Done()
 		return postResult{err: ctx.Err()}
 	})
-	if r.Sent || !r.Attempted || time.Since(start) > time.Second {
+	// The deadline can expire while preparing the body, before the POST is
+	// attempted. Both paths must leave the reserved nonce available for retry.
+	if r.Sent || (!r.Attempted && r.Reason != context.DeadlineExceeded.Error()) || time.Since(start) > time.Second {
 		t.Fatalf("deadline not respected: %+v", r)
 	}
 	before, _ := readInstallTick()

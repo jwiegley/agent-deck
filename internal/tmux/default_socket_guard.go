@@ -49,7 +49,23 @@ const defaultTmuxSocketName = "default"
 // binaries: production is entitled to the default socket, which is the whole
 // point of the empty-socket default (#697).
 func assertTmuxSpawnIsolated(socketName string, args []string) {
-	assertTmuxSpawnIsolatedFor(os.Getenv, looksLikeGoTestBinary(), os.Getuid(), socketName, args)
+	// CLI subprocesses launched by a Go test have ordinary executable names.
+	// TestMain's marker must guard them too when a fixture drops TMUX_TMPDIR.
+	testBinary := looksLikeGoTestBinary()
+	if !testBinary && os.Getenv(testIsolationMarkerEnv) == "1" {
+		// A marked CLI can itself run inside a test-owned tmux pane. Its
+		// inherited live socket is safe; the default socket used when a
+		// fixture loses TMUX_TMPDIR is the one this marker must refuse.
+		socket := resolveTmuxSocketPath(os.Getenv, os.Getuid(), socketName, args)
+		if !isStandardDefaultTmuxSocketPath(os.Getuid(), socket) {
+			return
+		}
+	}
+	assertTmuxSpawnIsolatedFor(os.Getenv, testTmuxGuardEnabled(testBinary, os.Getenv(testIsolationMarkerEnv)), os.Getuid(), socketName, args)
+}
+
+func testTmuxGuardEnabled(testBinary bool, marker string) bool {
+	return testBinary || marker == "1"
 }
 
 // assertTmuxSpawnIsolatedFor is the injectable core of assertTmuxSpawnIsolated.
@@ -125,27 +141,27 @@ func isUserDefaultTmuxSocketPath(lookupEnv func(string) string, uid int, socket 
 		return false
 	}
 	target := normalizeTmpPath(socket)
+	if isStandardDefaultTmuxSocketPath(uid, socket) {
+		return true
+	}
+	// $TMUX names the server of the pane the test was launched from, which is a
+	// live server full of the user's sessions no matter where its socket lives.
+	if envPath := socketPathFromTmuxEnv(lookupEnv("TMUX")); envPath != "" {
+		if target == normalizeTmpPath(envPath) && isExistingSocket(envPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func isStandardDefaultTmuxSocketPath(uid int, socket string) bool {
+	target := normalizeTmpPath(socket)
 	suffix := filepath.Join(fmt.Sprintf("tmux-%d", uid), defaultTmuxSocketName)
 	// Every base tmux might resolve the default socket under. os.TempDir()
 	// honours $TMPDIR, which on darwin is a per-user /var/folders/... path.
 	bases := []string{"/tmp", "/private/tmp", os.TempDir()}
 	for _, base := range bases {
 		if target == normalizeTmpPath(filepath.Join(base, suffix)) {
-			return true
-		}
-	}
-	// $TMUX names the server of the pane the test was launched from, which is a
-	// live server full of the user's sessions no matter where its socket lives
-	// (a user may run tmux under a custom TMUX_TMPDIR entirely outside /tmp).
-	//
-	// This branch requires the socket to EXIST and be a socket, because $TMUX is
-	// also a value tests fabricate to exercise parsing ("/tmp/tmux-1000/default",
-	// "/tmp/tmux-test.sock"). A path with no listener cannot be a live server, so
-	// demanding a real socket keeps the guard from refusing those. The shape
-	// check above deliberately does NOT require existence: a spawn that would
-	// CREATE the user's default server must be refused too.
-	if envPath := socketPathFromTmuxEnv(lookupEnv("TMUX")); envPath != "" {
-		if target == normalizeTmpPath(envPath) && isExistingSocket(envPath) {
 			return true
 		}
 	}

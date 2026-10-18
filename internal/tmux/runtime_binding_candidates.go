@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -511,28 +512,38 @@ func relistRuntimeCleanupIdentities(
 // readRuntimeCleanupLocalOptions reads only options set on each session. tmux
 // format expansion returns inherited global values, while show-options without
 // -A uses options_get_only and therefore provides the required local provenance.
-// All commands share one bounded tmux client, independent of session count.
+// Bound each command list: tmux rejects long batches before executing them.
 func readRuntimeCleanupLocalOptions(socketName string, candidates []RuntimeBindingCandidate) (map[string]map[string]runtimeCleanupLocalOption, error) {
 	result := make(map[string]map[string]runtimeCleanupLocalOption, len(candidates))
 	if len(candidates) == 0 {
 		return result, nil
 	}
-	var args []string
-	for _, candidate := range candidates {
-		for _, option := range runtimeCleanupOptionNames {
-			if len(args) != 0 {
-				args = append(args, ";")
+	const candidatesPerQuery = 3
+	var out []byte
+	for start := 0; start < len(candidates); start += candidatesPerQuery {
+		end := min(start+candidatesPerQuery, len(candidates))
+		var args []string
+		for _, candidate := range candidates[start:end] {
+			for _, option := range runtimeCleanupOptionNames {
+				if len(args) != 0 {
+					args = append(args, ";")
+				}
+				args = append(args,
+					"display-message", "-p", "-t", candidate.SessionID,
+					runtimeCleanupLocalOptionMarker(candidate.SessionID, option),
+					";", "show-options", "-qv", "-t", candidate.SessionID, option,
+				)
 			}
-			args = append(args,
-				"display-message", "-p", "-t", candidate.SessionID,
-				runtimeCleanupLocalOptionMarker(candidate.SessionID, option),
-				";", "show-options", "-qv", "-t", candidate.SessionID, option,
-			)
 		}
-	}
-	out, err := runtimeBindingCandidateOutputFn(socketName, args...)
-	if err != nil {
-		return nil, fmt.Errorf("tmux: read local runtime cleanup options: %w", err)
+		chunk, err := runtimeBindingCandidateOutputFn(socketName, args...)
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) && len(exitErr.Stderr) != 0 {
+				return nil, fmt.Errorf("tmux: read local runtime cleanup options (%d candidates, %d argv bytes): %w: %s", end-start, len(strings.Join(args, " ")), err, strings.TrimSpace(string(exitErr.Stderr)))
+			}
+			return nil, fmt.Errorf("tmux: read local runtime cleanup options: %w", err)
+		}
+		out = append(out, chunk...)
 	}
 	lines := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
 	line := 0

@@ -160,6 +160,7 @@ func TestIssue2673_PreAcceptLaunchTrustSeedsAccountConfigRoot(t *testing.T) {
 	preAcceptLaunchTrust(inst)
 
 	assertLaunchTrustSeeded(t, filepath.Join(slotDir, ".claude.json"), projectDir)
-	// The home root keeps its seed too (unchanged #2102 behavior).
-	assertLaunchTrustSeeded(t, filepath.Join(home, ".claude.json"), projectDir)
+	if _, err := os.Stat(filepath.Join(home, ".claude.json")); !os.IsNotExist(err) {
+		t.Fatalf("the unused home root was seeded: %v", err)
+	}
 }

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // Oracle for #2529, identical on origin/main and the PR head. It writes the
@@ -50,8 +52,13 @@ func TestIssue2529Oracle_HookKeepsUserThread(t *testing.T) {
 // Symptom 2: restart resumes the saved guardian thread.
 func TestIssue2529Oracle_RestartDoesNotResumeGuardian(t *testing.T) {
 	inst, mainSID, guardianSID := issue2529Fixture(t)
-	_ = withTempGlobalStateDB(t)
+	db := withTempGlobalStateDB(t)
 	inst.CodexSessionID = guardianSID
+	saveHookBindingTestInstance(t, db, inst, &statedb.InstanceRow{
+		ID: inst.ID, Title: inst.Title, ProjectPath: inst.ProjectPath, GroupPath: inst.GroupPath,
+		Tool: "codex", Status: "idle", CreatedAt: time.Now(),
+		ToolData: json.RawMessage(`{"codex_session_id":"` + guardianSID + `"}`),
+	})
 	cmd := inst.buildCodexCommand("codex")
 	t.Logf("restart command: %s", cmd)
 	if strings.Contains(cmd, "resume "+guardianSID) {

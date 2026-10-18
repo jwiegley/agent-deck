@@ -462,7 +462,6 @@ type Home struct {
 	statusTrigger       chan statusUpdateRequest // Triggers background status update
 	statusWorkerDone    chan struct{}            // Signals worker has stopped
 	lastFullStatusSweep atomic.Int64             // UnixNano timestamp of last periodic status batch (legacy field name)
-	lastPersistedStatus map[string]string        // legacy claim memo; status publication is owned by session.UpdateStatus
 	// lastPersistedAutoNameDesc tracks the last auto-name description written to
 	// SQLite per instance, so the background loop only issues a targeted write
 	// when the live Claude task description actually changes. Keyed by instance ID.
@@ -2153,7 +2152,6 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		statusTrigger:             make(chan statusUpdateRequest, 1), // Buffered to avoid blocking
 		statusWorkerDone:          statusWorkerDone,
 		idleTimeoutWatcher:        session.NewIdleTimeoutWatcher(session.IdleTimeoutWatcherConfig{}),
-		lastPersistedStatus:       make(map[string]string),
 		lastPersistedAutoNameDesc: make(map[string]string),
 		logUpdateChan:             make(chan *session.Instance, 100), // Buffered to absorb bursts
 		hotkeys:                   make(map[string]string),
@@ -7548,73 +7546,6 @@ func (h *Home) refreshAttachedSessionStatus(sessionID string) {
 		h.publishCurrentSessionStates()
 	}
 	h.refreshSessionRenderSnapshot(nil)
-}
-
-// persistPolledStatuses writes the status of every session this process
-// polls to the shared row, skipping unchanged ones, and returns the set of
-// current instance IDs. A write that loses to a status another process
-// committed (a CLI `session stop`, #2669) adopts the committed status.
-func (h *Home) persistPolledStatuses(db *statedb.StateDB, instances []*session.Instance) map[string]struct{} {
-	currentIDs := make(map[string]struct{}, len(instances))
-	adoptedCommitted := false
-	for _, inst := range instances {
-		currentIDs[inst.ID] = struct{}{}
-		if !h.isPolledByMe(inst.ID) {
-			continue
-		}
-		status := string(inst.GetStatusThreadSafe())
-		prev, ok := h.lastPersistedStatus[inst.ID]
-		if ok && prev == status {
-			continue
-		}
-		if !ok {
-			_ = db.WriteStatus(inst.ID, status, inst.Tool)
-			h.lastPersistedStatus[inst.ID] = status
-			continue
-		}
-		// Conditional on the row still holding what this Home last wrote
-		// (#2669): a CLI `session stop` commits "stopped" while this
-		// process still holds the pre-stop status in memory, and the
-		// sweep then classifies the vanished pane as "error". Last writer
-		// wins would turn the deliberate stop into an error.
-		committed, applied := writeStatusIfCurrent(db, inst.ID, prev, status, inst.Tool)
-		if !applied && committed != "" {
-			inst.SetStatusThreadSafe(session.Status(committed))
-			status = committed
-			adoptedCommitted = true
-		}
-		h.lastPersistedStatus[inst.ID] = status
-	}
-	if adoptedCommitted {
-		h.cachedStatusCounts.valid.Store(false)
-		h.publishWebSessionStates(instances)
-		h.refreshSessionRenderSnapshot(instances)
-	}
-	return currentIDs
-}
-
-// writeStatusIfCurrent persists status only while the shared row still holds
-// expected, so a status another process committed in between (a CLI
-// `session stop`, #2669) is not overwritten by this process's stale sample.
-// When the write loses, it returns the committed status for the caller to
-// adopt; committed is "" when the row could not be read or does not exist.
-func writeStatusIfCurrent(db *statedb.StateDB, id, expected, status, tool string) (committed string, applied bool) {
-	applied, err := db.WriteStatusIfCurrent(id, expected, status, tool)
-	if err != nil {
-		return "", false
-	}
-	if applied {
-		return status, true
-	}
-	rows, err := db.ReadAllStatuses()
-	if err != nil {
-		return "", false
-	}
-	row, ok := rows[id]
-	if !ok {
-		return "", false
-	}
-	return row.Status, false
 }
 
 func (h *Home) publishCurrentSessionStates() {

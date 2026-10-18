@@ -330,10 +330,6 @@ func TestMCPDialogFitsScreenAndNamesItsKey(t *testing.T) {
 		m.visible = true
 		view := m.View()
 		mustShow := []string{"MCP Manager", "Tab scope", "Esc cancel"}
-		if sz[1] >= 24 {
-			// At 60x15 the help text scrolls; its top stays on screen.
-			mustShow = append(mustShow, "Then press m again")
-		}
 		assertDialogFits(t, view, sz[0], sz[1], mustShow...)
 		if strings.Contains(stripAnsi(view), "press M again") {
 			t.Errorf("M is Move to group; the MCP Manager key is m:\n%s", stripAnsi(view))
@@ -344,6 +340,11 @@ func TestMCPDialogFitsScreenAndNamesItsKey(t *testing.T) {
 			}
 		}
 	}
+	m := NewMCPDialog()
+	m.SetSize(100, 40)
+	_ = m.Show(t.TempDir(), "sess-1", "claude")
+	m.visible = true
+	assertDialogFits(t, m.View(), 100, 40, "Then press m again")
 }
 
 func TestRecallFitsScreenAndFollowsCursor(t *testing.T) {

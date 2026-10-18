@@ -66,7 +66,10 @@ func TestIssue2521PiOverduePane(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := startPaneWithContent(t, "issue2521-"+tc.name, tc.content, "pi --no-skills", "vendor/model-id")
-			oldPID, _ := s.getPaneProcessTree()
+			oldPID, err := s.PanePID()
+			if err != nil {
+				t.Fatal(err)
+			}
 			s.mu.Lock()
 			s.startupAt = time.Now().Add(-startupStateWindow - time.Second)
 			s.lastStableStatus = "starting"
@@ -78,7 +81,10 @@ func TestIssue2521PiOverduePane(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("status=%q, want %q", got, tc.want)
 			}
-			newPID, _ := s.getPaneProcessTree()
+			newPID, err := s.PanePID()
+			if err != nil {
+				t.Fatal(err)
+			}
 			if oldPID == 0 || newPID != oldPID {
 				t.Fatalf("pane replaced: %d -> %d", oldPID, newPID)
 			}

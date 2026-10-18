@@ -99,7 +99,7 @@ while True:
 			}
 			env = append(env, kv)
 		}
-		return append(env, "HOME="+home, "PATH="+shim+":"+os.Getenv("PATH"), "TERM="+localTERM, "NATIVE_SSH_PID_FILE="+pidFile)
+		return append(env, "HOME="+home, "TMUX_TMPDIR="+os.Getenv("TMUX_TMPDIR"), "PATH="+shim+":"+os.Getenv("PATH"), "TERM="+localTERM, "NATIVE_SSH_PID_FILE="+pidFile)
 	}
 	run := func(args ...string) string {
 		t.Helper()
@@ -140,7 +140,7 @@ while True:
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "tmux", args...)
-		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + remote}
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + remote, "TMUX_TMPDIR=" + os.Getenv("TMUX_TMPDIR")}
 		out, err := cmd.Output()
 		if err != nil {
 			t.Fatalf("tmux probe: %v", err)
@@ -304,7 +304,7 @@ while True:
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "tmux", args...)
-		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + remote}
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + remote, "TMUX_TMPDIR=" + os.Getenv("TMUX_TMPDIR")}
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("grid capture: %v: %s", err, output)

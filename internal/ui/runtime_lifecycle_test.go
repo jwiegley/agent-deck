@@ -173,7 +173,7 @@ func TestRuntimeLifecycle_ForkSeedsBeforeStartAndKeepsPartialSuccess(t *testing.
 	}
 
 	deps := h.forkInstanceDeps()
-	deps.createInstance = func(*session.Instance, string, string, *session.ClaudeOptions) (*session.Instance, error) {
+	deps.createInstance = func(*session.Instance, string, string, *session.ClaudeOptions, session.ForkParent) (*session.Instance, error) {
 		return forked, nil
 	}
 	deps.createMultiRepoDir = func(*session.Instance, *session.Instance) error { return nil }

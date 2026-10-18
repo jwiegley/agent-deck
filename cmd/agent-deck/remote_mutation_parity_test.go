@@ -82,7 +82,7 @@ while True:
 			}
 			cmd.Env = append(cmd.Env, kv)
 		}
-		cmd.Env = append(cmd.Env, "HOME="+home, "PATH="+shim+":"+os.Getenv("PATH"))
+		cmd.Env = append(cmd.Env, "HOME="+home, "TMUX_TMPDIR="+os.Getenv("TMUX_TMPDIR"), "PATH="+shim+":"+os.Getenv("PATH"))
 		cmd.Stdin = strings.NewReader(stdin)
 		var out, stderr bytes.Buffer
 		cmd.Stdout = &out
@@ -151,7 +151,7 @@ while True:
 		state := decode(must(side, "", "session", "show", title, "--json")).(map[string]any)
 		name, _ := state["tmux_session"].(string)
 		cmd := exec.Command("tmux", "-L", sockets[side], "has-session", "-t", name)
-		cmd.Env = []string{"HOME=" + homes[side], "PATH=" + os.Getenv("PATH")}
+		cmd.Env = []string{"HOME=" + homes[side], "PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + os.Getenv("TMUX_TMPDIR")}
 		return cmd.Run() == nil
 	}
 	for side := range homes {

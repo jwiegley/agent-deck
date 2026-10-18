@@ -112,8 +112,11 @@ func startTUIInsideServer(t *testing.T, bin, profile, tmuxCmd string, serverArgs
 	if err := os.WriteFile(configPath, []byte("[claude]\nhooks_enabled = false\n"), 0o600); err != nil { // no first-run dialogs
 		t.Fatal(err)
 	}
+	// Keep the fixture's tmux visible without exposing optional agent binaries
+	// from the caller's PATH to first-run hook consent prompts.
+	path := filepath.Dir(tmuxCmd) + string(os.PathListSeparator) + "/usr/bin:/bin"
 	cmdline := fmt.Sprintf("exec env HOME=%q PATH=%q TMUX_TMPDIR=%q AGENT_DECK_ALLOW_OUTER_TMUX=1 AGENTDECK_SKIP_UPDATE_CHECK=1 AGENTDECK_TELEMETRY=0 TERM=xterm-256color %q -p %q",
-		os.Getenv("HOME"), os.Getenv("PATH"), os.Getenv("TMUX_TMPDIR"), bin, profile)
+		os.Getenv("HOME"), path, os.Getenv("TMUX_TMPDIR"), bin, profile)
 	run := func(args ...string) ([]byte, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

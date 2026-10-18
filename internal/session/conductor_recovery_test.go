@@ -91,16 +91,26 @@ func TestConductorRecoveryOrdinarySession(t *testing.T) {
 
 func TestConductorRecoverySuppressedSpawn(t *testing.T) {
 	inst, capture := recoveryFixture(t, true)
-	old := instanceSpawnLockAcquireFn
-	instanceSpawnLockAcquireFn = func(id string) (func(), error) {
-		recordInstanceSpawn(id) // Another caller won while this one waited.
-		return func() {}, nil
-	}
-	t.Cleanup(func() { instanceSpawnLockAcquireFn = old })
-	if err := inst.Start(); err != nil {
+	storage := newTestStorage(t)
+	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := inst.Restart(); err != nil {
+	db := storage.GetDB()
+	old := runtimeTransitionObservedFn
+	runtimeTransitionObservedFn = func() {
+		current, found, err := db.ReadRuntimeState(inst.ID)
+		if err != nil || !found {
+			t.Fatalf("read runtime: found=%v err=%v", found, err)
+		}
+		winner := current
+		winner.Generation++
+		winner.TmuxSession = "concurrent-conductor-winner"
+		if err := db.CommitRuntimeTransition(current.Generation, inst.PersistenceIncarnation(), winner); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { runtimeTransitionObservedFn = old })
+	if err := inst.Start(); err != nil {
 		t.Fatal(err)
 	}
 	assertRecoveryTurns(t, capture, 0)

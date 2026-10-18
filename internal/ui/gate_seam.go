@@ -133,7 +133,6 @@ func NewGateHome(opts GateHomeOptions) *GateHome {
 		parentChildrenCollapsed:   make(map[string]bool),
 		worktreeDirtyCache:        make(map[string]bool),
 		worktreeDirtyCacheTs:      make(map[string]time.Time),
-		lastPersistedStatus:       make(map[string]string),
 		lastPersistedAutoNameDesc: make(map[string]string),
 		hotkeys:                   make(map[string]string),
 		hotkeyLookup:              make(map[string]string),

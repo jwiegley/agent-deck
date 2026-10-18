@@ -18,7 +18,7 @@ func TestQuickMessageQueueRecipientContinuity(t *testing.T) {
 	marker := filepath.Join(dir, "terminal-keys")
 	t.Setenv("QUEUE_KEYS_MARKER", marker)
 	for name, script := range map[string]string{
-		"tmux":     "#!/bin/sh\nprintf keys >> \"$QUEUE_KEYS_MARKER\"\nexit 1\n",
+		"tmux":     "#!/bin/sh\nfor arg; do case \"$arg\" in send-keys|paste-buffer|load-buffer) printf keys >> \"$QUEUE_KEYS_MARKER\";; esac; done\nexit 1\n",
 		"opencode": "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'opencode v2.0.26\\n'; exit 0; fi\nprintf '%s\\n' '{\"data\":{\"id\":\"msg_queued\",\"sessionID\":\"ses_target\",\"delivery\":\"queue\"}}'\n",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o700); err != nil {

@@ -147,7 +147,7 @@ func startNativeSSH(t *testing.T, remoteHome, binDir string) *nativeSSHProxy {
 	target := reserve.Addr().String()
 	port := reserve.Addr().(*net.TCPAddr).Port
 	_ = reserve.Close()
-	wrapper := write("remote-command", []byte("#!/bin/sh\nunset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME TMUX AGENTDECK_PROFILE CLAUDE_CONFIG_DIR\nexport HOME="+quote(remoteHome)+"\nexport PATH="+quote(os.Getenv("PATH"))+"\ncd "+quote(remoteHome)+" || exit 1\nexec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\"\n"))
+	wrapper := write("remote-command", []byte("#!/bin/sh\nunset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME TMUX AGENTDECK_PROFILE CLAUDE_CONFIG_DIR\nexport HOME="+quote(remoteHome)+"\nexport TMUX_TMPDIR="+quote(os.Getenv("TMUX_TMPDIR"))+"\nexport PATH="+quote(os.Getenv("PATH"))+"\ncd "+quote(remoteHome)+" || exit 1\nexec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\"\n"))
 	// Read only the disposable key without requiring /tmp ancestry to pass StrictModes.
 	// sshd validates that the absolute command is root-owned and not publicly writable.
 	config := write("sshd_config", []byte(fmt.Sprintf("Port %d\nListenAddress 127.0.0.1\nHostKey %s\nPidFile %s\nAuthorizedKeysFile none\nAuthorizedKeysCommand %s %s\nAuthorizedKeysCommandUser %s\nStrictModes yes\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nPermitUserEnvironment no\nAllowUsers %s\nForceCommand %s\nLogLevel VERBOSE\n", port, hostFile, filepath.Join(binDir, "sshd.pid"), authorizedCommand, authorized, account.Username, account.Username, wrapper)))

@@ -407,7 +407,7 @@ func TestBackgroundWork2473_ConductorTemplateMigratesV1624(t *testing.T) {
 		t.Fatal(err)
 	}
 	current := renderConductorInstructionsTemplate(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
-	v1624 := renderConductorInstructionsTemplate(preBackgroundWorkConductorInstructionsTemplate(conductorSharedClaudeMDTemplate), "", DefaultProfile, spec)
+	v1624 := renderConductorInstructionsTemplate(preBackgroundWorkConductorInstructionsTemplate(preQueuedCountConductorInstructionsTemplate(conductorSharedClaudeMDTemplate)), "", DefaultProfile, spec)
 	if v1624 == current || strings.Contains(v1624, "background-work") {
 		t.Fatal("reconstructed v1.16.24 template still carries the new sentence")
 	}

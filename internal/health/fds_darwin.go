@@ -25,13 +25,13 @@ func openFDs() (*int, bool) {
 	const entrySize = unsafe.Sizeof(procFDInfo{})
 	pid := uintptr(os.Getpid())
 	// A nil buffer asks for the descriptor table's size plus headroom.
-	size, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, procInfoCallPIDInfo, pid, procPIDListFDs, 0, 0, 0)
+	size, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, procInfoCallPIDInfo, pid, procPIDListFDs, 0, 0, 0) //nolint:staticcheck // proc_pidinfo has no x/sys wrapper.
 	if errno != 0 || size < entrySize {
 		return nil, true
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		buf := make([]procFDInfo, size/entrySize)
-		n, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, procInfoCallPIDInfo, pid, procPIDListFDs, 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf))*entrySize)
+		n, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, procInfoCallPIDInfo, pid, procPIDListFDs, 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf))*entrySize) //nolint:staticcheck // proc_pidinfo has no x/sys wrapper.
 		if errno != 0 {
 			return nil, true
 		}

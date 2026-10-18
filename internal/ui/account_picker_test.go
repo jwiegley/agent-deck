@@ -51,6 +51,24 @@ func withAccountsConfig(t *testing.T, accounts ...string) *session.UserConfig {
 	return loaded
 }
 
+func accountTestHome(t *testing.T) *Home {
+	t.Helper()
+	home := NewHome()
+	t.Cleanup(func() {
+		home.cancel()
+		if home.hookWatcher != nil {
+			home.hookWatcher.Stop()
+		}
+		if home.storageWatcher != nil {
+			home.storageWatcher.Close()
+		}
+		if home.storage != nil {
+			_ = home.storage.Close()
+		}
+	})
+	return home
+}
+
 // A machine with a single login has nothing to choose between, so the row must
 // not exist at all — no dead control, and no shifted focus indices for the
 // options that were there before.
@@ -269,7 +287,7 @@ func TestEditSessionDialogAccountRowClaudeOnly(t *testing.T) {
 func TestEditSessionDialogCommitRoutesAccountThroughSwitch(t *testing.T) {
 	withAccountsConfig(t, "work", "personal")
 
-	home := NewHome()
+	home := accountTestHome(t)
 	home.width, home.height = 120, 40
 
 	inst := session.NewInstanceWithTool("acct-commit", t.TempDir(), "claude")
@@ -366,7 +384,7 @@ func TestEditSessionDialogCommitRoutesAccountThroughSwitch(t *testing.T) {
 func TestEditSessionDialogClearingAccountIsNotASwitch(t *testing.T) {
 	withAccountsConfig(t, "work", "personal")
 
-	home := NewHome()
+	home := accountTestHome(t)
 	home.width, home.height = 120, 40
 
 	inst := session.NewInstanceWithTool("acct-clear", t.TempDir(), "claude")
@@ -443,7 +461,7 @@ func TestEditSessionDialogRefusesAccountSwitchWithToolChange(t *testing.T) {
 	}
 	session.ClearUserConfigCache()
 
-	home := NewHome()
+	home := accountTestHome(t)
 	home.width, home.height = 120, 40
 
 	project := t.TempDir()
@@ -563,7 +581,7 @@ func accountFieldIndex(t *testing.T, d *EditSessionDialog) int {
 func TestEditSessionDialogAccountSwitchCancelReturnsToRow(t *testing.T) {
 	withAccountsConfig(t, "work", "personal")
 
-	home := NewHome()
+	home := accountTestHome(t)
 	home.width, home.height = 120, 40
 
 	inst := session.NewInstanceWithTool("acct-cancel", t.TempDir(), "claude")

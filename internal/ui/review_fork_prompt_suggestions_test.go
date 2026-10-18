@@ -25,26 +25,28 @@ func TestReview_ParentedTUIForkStartsWithPromptSuggestionsOff(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			source := session.NewInstanceWithTool("fork-source", "/tmp/fork-source", "claude")
+			source := session.NewInstanceWithTool("fork-source", t.TempDir(), "claude")
+			parentPath := t.TempDir()
 			source.ClaudeSessionID = "source-abc-123"
 			source.ClaudeDetectedAt = time.Now()
 
 			deps := defaultForkInstanceDeps()
 			var started *session.Instance
+			deps.startRuntime = nil
 			deps.startInstance = func(inst *session.Instance) error { started = inst; return nil }
 			deps.createMultiRepoDir = func(_, _ *session.Instance) error { return nil }
 			deps.rollback = func(_, _, _ string) {}
 
 			inst, err := completeFork(source, "child fork", "", forkToggles{}, nil,
-				tc.parent, "/tmp/parent", false, deps)
+				tc.parent, parentPath, false, deps)
 			if err != nil {
 				t.Fatalf("completeFork: %v", err)
 			}
 			if started != inst || inst.ParentSessionID != tc.parent {
 				t.Fatalf("fork started=%v parent=%q, want parent %q", started == inst, inst.ParentSessionID, tc.parent)
 			}
-			if tc.parent != "" && inst.ParentProjectPath != "/tmp/parent" {
-				t.Fatalf("ParentProjectPath = %q, want /tmp/parent", inst.ParentProjectPath)
+			if tc.parent != "" && inst.ParentProjectPath != parentPath {
+				t.Fatalf("ParentProjectPath = %q, want %q", inst.ParentProjectPath, parentPath)
 			}
 			if !inst.IsForkAwaitingStart {
 				t.Fatalf("first start must run the baked fork command")

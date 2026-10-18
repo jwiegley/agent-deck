@@ -170,7 +170,21 @@ func claudeLikeFake(t *testing.T, phase string) (*tmux.Session, string) {
 	if err := sess.Start("python3 -I " + filepath.Join(dir, "claude")); err != nil {
 		t.Fatalf("start fake: %v", err)
 	}
-	t.Cleanup(func() { _ = sess.Kill() })
+	t.Cleanup(func() {
+		_ = sess.Kill()
+		// Kill starts process reaping asynchronously. The fake can still write
+		// one last transcript record while TempDir removes its directory.
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			if err := os.RemoveAll(dir); err == nil {
+				return
+			} else if time.Now().After(deadline) {
+				t.Errorf("remove fake Claude directory: %v", err)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
 	want := "All four steps ran."
 	if phase == "busy" {
 		want = "Thundering"

@@ -647,7 +647,8 @@ type Instance struct {
 	// that was never persisted. Not persisted; guarded by mu.
 	importOwnershipPending bool
 
-	paneDeadExitStatusForTest func() (int, bool) // nil uses tmuxSession.PaneDeadExitStatus
+	paneDeadExitStatusForTest  func() (int, bool) // nil uses tmuxSession.PaneDeadExitStatus
+	detectToolForStatusForTest func(*tmux.Session) string
 
 	// terminatedPaneSubstate is set alongside i.Status by classifyTerminatedPane
 	// (via terminatedPaneStatus/applyTerminatedPaneStatus). It is SubstateNone
@@ -7202,6 +7203,7 @@ func (i *Instance) probeTerminatedPaneStatus(ctx context.Context, observed state
 	tool := i.Tool
 	hookStatus := i.hookStatus
 	paneDeadExitStatus := i.paneDeadExitStatusForTest
+	receiptPath := i.trackedCommandExitReceiptPath()
 
 	i.mu.Unlock()
 	exitCode, haveExitCode := 0, false
@@ -7211,6 +7213,9 @@ func (i *Instance) probeTerminatedPaneStatus(ctx context.Context, observed state
 		}
 		exitCode, haveExitCode = paneDeadExitStatus()
 	}
+	if !haveExitCode && receiptPath != "" {
+		exitCode, haveExitCode = readCommandExitReceipt(receiptPath)
+	}
 	candidate, substate := classifyTerminatedPane(exitCode, haveExitCode, tool, hookStatus)
 	i.mu.Lock()
 	if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
@@ -7219,7 +7224,9 @@ func (i *Instance) probeTerminatedPaneStatus(ctx context.Context, observed state
 	if i.Status == StatusStopped {
 		return StatusStopped, nil
 	}
+	candidate, substate = i.classifyCustomCommandExit(candidate, substate, exitCode, haveExitCode)
 	i.terminatedPaneSubstate = substate
+	i.setTerminatedPaneExitCode(exitCode, haveExitCode)
 	return candidate, nil
 }
 
@@ -7888,6 +7895,7 @@ func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState
 	hookFingerprint := i.hookFingerprint
 	i.releaseAuthHoldIfHealthyLocked()
 	tmuxSession := i.tmuxSession
+	detectToolForTest := i.detectToolForStatusForTest
 	i.mu.Unlock()
 
 	if hookSessionID != "" && runtimeBindingKindSupported(hookObservation.kind) {
@@ -7903,7 +7911,12 @@ func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState
 	if tmuxSession == nil || !paneSampled {
 		return
 	}
-	detectedTool := tmuxSession.DetectTool()
+	detectedTool := ""
+	if detectToolForTest != nil {
+		detectedTool = detectToolForTest(tmuxSession)
+	} else {
+		detectedTool = tmuxSession.DetectTool()
+	}
 	i.mu.Lock()
 	if i.tmuxSession != tmuxSession || !sameStatusRuntime(committed, i.runtimeStateLocked()) {
 		i.mu.Unlock()
@@ -10899,6 +10912,11 @@ func (i *Instance) killInternalWithCleanup(selection RuntimeSelection, sync, del
 	defer release()
 	err = i.killInternalLocked(selection, sync, deleteRow, terminate, result, beforeDelete)
 	if err == nil && deleteRow {
+		if db := i.restartPersistenceDB(); db != nil && db.Path() != "" {
+			if cleanupErr := cleanupImageUploads(filepath.Dir(db.Path()), expected.InstanceID); cleanupErr != nil {
+				sessionLog.Warn("image_upload_cleanup_failed", slog.String("id", expected.InstanceID), slog.String("error", cleanupErr.Error()))
+			}
+		}
 		if cleanupErr := pruneHookArtifacts(expected.InstanceID); cleanupErr != nil {
 			sessionLog.Warn("hook_cleanup_failed", slog.String("id", expected.InstanceID), slog.String("error", cleanupErr.Error()))
 		}
@@ -11240,6 +11258,7 @@ func (i *Instance) restartWithTransition(transition *runtimeTransitionAuthority,
 			i.recordRestartOutcome(candidate, transition.incarnation)
 		}
 		runtimeDuplicateSweepFn(i, transition.expected.TmuxSocketName)
+		i.recoverConductorAfterSpawn()
 	}()
 
 	var validatedDeepSeekRestartCommand string

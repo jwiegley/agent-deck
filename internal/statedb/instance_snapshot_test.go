@@ -9,6 +9,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestMergeRegistrySnapshotsSkipsIdenticalInstanceWrite(t *testing.T) {
+	db := newTestDB(t)
+	require.NoError(t, db.SaveInstance(&InstanceRow{ID: "same", Title: "original", Tool: "shell", CreatedAt: time.Unix(100, 0), ToolData: json.RawMessage(`{}`)}))
+	rows, err := db.LoadInstances()
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	base := rows[0]
+	_, err = db.DB().Exec(`CREATE TABLE snapshot_writes (n INTEGER); CREATE TRIGGER count_snapshot_update AFTER UPDATE ON instances BEGIN INSERT INTO snapshot_writes (n) VALUES (1); END`)
+	require.NoError(t, err)
+	update := InstanceSnapshot{Original: base, Stored: base, Desired: CloneInstanceRow(base)}
+	_, err = db.MergeRegistrySnapshots([]InstanceSnapshot{update}, nil)
+	require.NoError(t, err)
+	var writes int
+	require.NoError(t, db.DB().QueryRow(`SELECT count(*) FROM snapshot_writes`).Scan(&writes))
+	require.Zero(t, writes)
+	update.Desired.Title = "changed"
+	_, err = db.MergeRegistrySnapshots([]InstanceSnapshot{update}, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.DB().QueryRow(`SELECT count(*) FROM snapshot_writes`).Scan(&writes))
+	require.Equal(t, 1, writes)
+}
+
 func TestInstanceSnapshotsPreserveEveryPersistedColumn(t *testing.T) {
 	rowType := reflect.TypeOf(InstanceRow{})
 	for field := 0; field < rowType.NumField(); field++ {

@@ -113,11 +113,14 @@ func (d *TransitionDaemon) emitTurn(profile string, inst *Instance, byID map[str
 		// One bus frame per turn, as the noise rule gave before: a repeat
 		// sighting publishes only when the child was seen to run again.
 		seen := TurnJournalEntry{UUID: facts.UUID, TextHash: facts.TextHash, Status: to}
-		repeat := d.lastSelfTurn[inst.ID] == seen
+		repeat := d.lastSelfTurn[profile][inst.ID] == seen
 		if d.lastSelfTurn == nil {
-			d.lastSelfTurn = map[string]TurnJournalEntry{}
+			d.lastSelfTurn = map[string]map[string]TurnJournalEntry{}
 		}
-		d.lastSelfTurn[inst.ID] = seen
+		if d.lastSelfTurn[profile] == nil {
+			d.lastSelfTurn[profile] = map[string]TurnJournalEntry{}
+		}
+		d.lastSelfTurn[profile][inst.ID] = seen
 		return dropSelfConductorTurn(event, observedFlip || !repeat), true
 	}
 
@@ -127,7 +130,7 @@ func (d *TransitionDaemon) emitTurn(profile string, inst *Instance, byID map[str
 	}
 	prev := LastTurnJournalEntry(inst.ID)
 	classPrev := prev
-	if last, ok := d.lastSelfTurn[inst.ID]; ok && prev == nil {
+	if last, ok := d.lastSelfTurn[profile][inst.ID]; ok && prev == nil {
 		// A conductor reparented after its last (skipped, unjournaled) turn:
 		// a re-observation of that turn is not news for the new parent.
 		classPrev = &last

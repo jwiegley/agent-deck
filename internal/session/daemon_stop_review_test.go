@@ -27,9 +27,9 @@ func TestDaemonPreservesPersistedStopAfterLiveSample(t *testing.T) {
 	inst.CreatedAt = time.Now().Add(-time.Minute)
 	inst.TmuxSocketName = "daemon-stop-review-" + inst.ID
 	inst.tmuxSession.SocketName = inst.TmuxSocketName
-	require.NoError(t, inst.tmuxSession.Start(""))
 	t.Cleanup(func() { _ = inst.Kill() })
 	require.NoError(t, storage.SaveWithGroups([]*Instance{inst}, nil))
+	require.NoError(t, inst.Start())
 
 	d := NewTransitionDaemon()
 	t.Cleanup(d.Flush)

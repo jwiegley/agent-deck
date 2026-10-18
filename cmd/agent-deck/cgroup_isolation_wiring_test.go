@@ -75,6 +75,7 @@ func TestLogCgroupIsolationDecision_WiredIntoBootstrap(t *testing.T) {
 		}
 		env = append(env,
 			"HOME="+tmpHome,
+			"TMUX_TMPDIR="+os.Getenv("TMUX_TMPDIR"),
 			"XDG_CONFIG_HOME="+xdgConfigHome,
 			"XDG_DATA_HOME="+xdgDataHome,
 			"XDG_CACHE_HOME="+xdgCacheHome,

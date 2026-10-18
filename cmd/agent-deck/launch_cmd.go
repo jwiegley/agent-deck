@@ -44,7 +44,7 @@ func applyAssertDone(message string, enabled bool) string {
 // an explicit config root (-account, conductor, group, env or profile
 // config_dir) the session runs with CLAUDE_CONFIG_DIR=<dir> and reads
 // <dir>/.claude.json, so seeding only ~/.claude.json left it stuck on the
-// trust prompt (#2673). The home root is still seeded too, as before.
+// trust prompt (#2673). Only the selected root is seeded.
 func preAcceptLaunchTrust(inst *session.Instance) {
 	if inst.Tool != "claude" {
 		return
@@ -53,18 +53,13 @@ func preAcceptLaunchTrust(inst *session.Instance) {
 	if real, err := filepath.EvalSymlinks(trustDir); err == nil {
 		trustDir = real
 	}
-	targets := []string{session.GetUserMCPRootPath()}
+	claudeJSON := session.GetUserMCPRootPath()
 	if session.IsClaudeConfigDirExplicitForInstance(inst) {
 		if dir := session.GetClaudeConfigDirForInstance(inst); dir != "" {
-			if p := filepath.Join(dir, ".claude.json"); p != targets[0] {
-				targets = append(targets, p)
-			}
+			claudeJSON = filepath.Join(dir, ".claude.json")
 		}
 	}
-	for _, claudeJSON := range targets {
-		if claudeJSON == "" {
-			continue
-		}
+	if claudeJSON != "" {
 		if err := session.PreAcceptClaudeTrust(claudeJSON, trustDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: folder trust pre-seed for %q in %s failed (Claude launch may stall on the trust prompt): %v\n", trustDir, claudeJSON, err)
 		}

@@ -215,6 +215,7 @@ func cliEnvForIssue961(home string) []string {
 	}
 	env = append(env,
 		"HOME="+home,
+		"TMUX_TMPDIR="+os.Getenv("TMUX_TMPDIR"),
 		"AGENTDECK_PROFILE=ch_support_test",
 		"TERM=dumb",
 	)

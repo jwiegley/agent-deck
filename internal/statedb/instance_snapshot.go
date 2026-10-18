@@ -409,6 +409,9 @@ func (s *StateDB) mergeRegistrySnapshotsOnce(updates []InstanceSnapshot, groups 
 		}
 	}
 	for _, row := range merged {
+		if previous := byID[row.ID]; previous != nil && reflect.DeepEqual(row, previous) {
+			continue
+		}
 		if err := writeSnapshotRow(tx, row, byID[row.ID] != nil); err != nil {
 			return nil, err
 		}

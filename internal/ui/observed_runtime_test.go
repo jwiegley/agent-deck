@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"os/exec"
 	"testing"
 	"time"
@@ -22,6 +23,10 @@ func TestObservedRuntimeRenderingPreservesLaunchTool(t *testing.T) {
 			inst := session.NewInstance("observed-runtime-render", t.TempDir())
 			inst.Tool = "shell"
 			inst.Command = "sleep 60"
+			storage, err := session.NewStorageWithProfile(fmt.Sprintf("_test_observed_runtime_%d", time.Now().UnixNano()))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = storage.Close() })
+			require.NoError(t, storage.SaveWithGroups([]*session.Instance{inst}, nil))
 			require.NoError(t, inst.Start())
 			t.Cleanup(func() { _ = inst.Kill() })
 			time.Sleep(2 * time.Second)
