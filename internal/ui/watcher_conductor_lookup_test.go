@@ -69,7 +69,7 @@ func TestConductorPane_ReadsArchiveStateUnderInstanceLock(t *testing.T) {
 		for {
 			select {
 			case <-stop:
-				home.unarchiveSession(inst)()
+				inst.SetArchivedAtThreadSafe(time.Time{})
 				return
 			default:
 			}
@@ -120,7 +120,16 @@ func TestConductorPane_HeadlessReadsStorage(t *testing.T) {
 	if id, got := home.conductorPane("demo"); got == nil || got.Name != "agentdeck_conductor-demo_1" || id != "conductor-demo-id" {
 		t.Fatalf("headless lookup = %q %v, want the conductor's id and tmux session from storage", id, got)
 	}
-	save("agentdeck_conductor-demo_2")
+	current, found, err := storage.GetDB().ReadRuntimeState(inst.ID)
+	if err != nil || !found {
+		t.Fatalf("read conductor runtime: found=%v err=%v", found, err)
+	}
+	next := current
+	next.Generation++
+	next.TmuxSession = "agentdeck_conductor-demo_2"
+	if err := storage.GetDB().CommitRuntimeTransition(current.Generation, inst.PersistenceIncarnation(), next); err != nil {
+		t.Fatal(err)
+	}
 	if _, got := home.conductorPane("demo"); got == nil || got.Name != "agentdeck_conductor-demo_2" {
 		t.Fatalf("headless lookup after a restart = %v, want the new tmux session", got)
 	}

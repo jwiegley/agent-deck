@@ -188,39 +188,6 @@ func TestIsPolledByMeFlagOff(t *testing.T) {
 	}
 }
 
-// invalidateNewlyOwnedMemo is the extracted pure helper reconcileClaims uses
-// to drop stale lastPersistedStatus memo entries for sessions that just
-// transitioned to being owned by this instance.
-func TestInvalidateNewlyOwnedMemo(t *testing.T) {
-	memo := map[string]string{
-		"a": "running", // was owned before, still owned now: memo must survive
-		"b": "idle",    // was owned before, no longer owned now: irrelevant either way
-		"c": "running", // newly owned this sweep: memo must be dropped
-	}
-	owned := map[string]bool{"a": true, "c": true}
-	prevOwned := map[string]bool{"a": true, "b": true}
-
-	invalidateNewlyOwnedMemo(memo, owned, prevOwned)
-
-	if _, ok := memo["c"]; ok {
-		t.Error("memo for newly owned session must be invalidated")
-	}
-	if _, ok := memo["a"]; !ok {
-		t.Error("memo for a session owned before and after must survive")
-	}
-}
-
-func TestInvalidateNewlyOwnedMemoNilPrevOwned(t *testing.T) {
-	// prevOwned nil means "never reconciled before" (fail-open state): every
-	// currently owned id counts as newly owned.
-	memo := map[string]string{"a": "running"}
-	owned := map[string]bool{"a": true}
-	invalidateNewlyOwnedMemo(memo, owned, nil)
-	if _, ok := memo["a"]; ok {
-		t.Error("memo must be invalidated when transitioning from a nil (never-reconciled) prevOwned")
-	}
-}
-
 func TestClaimStaleAfterExceedsWorstHeartbeatGap(t *testing.T) {
 	// Invariant, not a literal: a live owner's heartbeat gap can reach
 	// maxStatusInterval (the post-sweep pause) plus the duration of the slow

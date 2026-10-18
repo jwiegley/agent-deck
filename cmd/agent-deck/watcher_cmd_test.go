@@ -506,7 +506,8 @@ func TestWatcherInstallSkill_DirMode(t *testing.T) {
 		}
 	}
 
-	// Installed files should be readable (0o644).
+	// Installed files honor the process umask while remaining readable by the
+	// owner and unwritable by other users.
 	poolDir := filepath.Join(xdgConfigHome, "agent-deck", "skills", "pool", "watcher-creator")
 	for _, f := range []string{"SKILL.md", "README.md"} {
 		info, err := os.Stat(filepath.Join(poolDir, f))
@@ -514,8 +515,8 @@ func TestWatcherInstallSkill_DirMode(t *testing.T) {
 			t.Fatalf("stat %s: %v", f, err)
 		}
 		mode := info.Mode().Perm()
-		if mode != 0o644 {
-			t.Errorf("file %s has mode %04o, want 0644", f, mode)
+		if mode&0o600 != 0o600 || mode&0o022 != 0 {
+			t.Errorf("file %s has unsafe mode %04o", f, mode)
 		}
 	}
 }

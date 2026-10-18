@@ -26,6 +26,10 @@ func TestWriteGeneratedFileOrMigrateReplacesInodeAndRejectsUnsafeTargets(t *test
 		if err := os.Link(path, backup); err != nil {
 			t.Fatal(err)
 		}
+		original, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := writeGeneratedFileOrMigrate(path, []string{"old"}, "new", 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -34,8 +38,8 @@ func TestWriteGeneratedFileOrMigrateReplacesInodeAndRejectsUnsafeTargets(t *test
 			t.Fatalf("hard-linked backup mutated to %q", got)
 		}
 		info, _ := os.Stat(path)
-		if info.Mode().Perm() != 0o640 {
-			t.Fatalf("mode = %o, want 640", info.Mode().Perm())
+		if info.Mode().Perm() != original.Mode().Perm() {
+			t.Fatalf("mode = %o, want %o", info.Mode().Perm(), original.Mode().Perm())
 		}
 	})
 

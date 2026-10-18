@@ -105,7 +105,7 @@ func startParitySSH(t *testing.T, remoteHome, binDir string) {
 								}
 								cmd.Env = append(cmd.Env, kv)
 							}
-							cmd.Env = append(cmd.Env, "HOME="+remoteHome, "PATH="+binDir+":"+os.Getenv("PATH"))
+							cmd.Env = append(cmd.Env, "HOME="+remoteHome, "TMUX_TMPDIR="+os.Getenv("TMUX_TMPDIR"), "PATH="+binDir+":"+os.Getenv("PATH"))
 							cmd.Stdin, cmd.Stdout, cmd.Stderr = channel, channel, channel.Stderr()
 							status := uint32(0)
 							if err := cmd.Run(); err != nil {

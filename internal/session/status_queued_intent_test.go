@@ -128,27 +128,20 @@ func TestStatusQueued_TUIPollKeepsQueuedSession(t *testing.T) {
 	}
 }
 
-// The 30-second recheck throttle trusts only the runtime whose absence it
-// confirmed. Another process that drains a command-less queued session
-// commits the next generation still queued, now with a live tmux session. A
-// poller that confirmed the old generation absent moments earlier must probe
-// the adopted one at once: until the throttle expired it showed the live
-// session queued, CountRunningInGroup undercounted its group, and
-// FindNextQueued could offer it to the drain again.
-func TestStatusQueued_AdoptedGenerationEscapesRecheckThrottle(t *testing.T) {
+// An absent queued pane forms no verdict. Another process may drain the queue
+// and publish a live generation, which the next poll must probe immediately.
+func TestStatusQueued_AdoptedGenerationProbesLivePane(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 	t.Setenv("HOME", t.TempDir())
 	storage, inst := loadStatusMetadataFixture(t, "claude", "agentdeck-status-queued-waiting", StatusQueued)
 	stageForeignServerGuard(t, func(*tmux.Session) bool { return false })
-	// The first poll confirms the queued generation's tmux session absent; the
-	// second, at the same generation, is throttled.
-	for n, throttled := range []bool{false, true} {
+	for n := 1; n <= 2; n++ {
 		evidence, err := inst.updateStatusWithEvidence(nil, true)
 		if err != nil {
-			t.Fatalf("poll %d: %v", n+1, err)
+			t.Fatalf("poll %d: %v", n, err)
 		}
-		if got := inst.GetStatusThreadSafe(); got != StatusQueued || evidence.noVerdict.Load() != throttled {
-			t.Fatalf("poll %d: status = %q, no verdict = %v; want queued, %v", n+1, got, evidence.noVerdict.Load(), throttled)
+		if got := inst.GetStatusThreadSafe(); got != StatusQueued || !evidence.noVerdict.Load() {
+			t.Fatalf("poll %d: status = %q, no verdict = %v; want queued with no verdict", n, got, evidence.noVerdict.Load())
 		}
 	}
 

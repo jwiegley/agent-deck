@@ -440,6 +440,7 @@ func (i *Instance) probeTerminatedPaneStatus(ctx context.Context, observed state
 	tool := i.Tool
 	hookStatus := i.hookStatus
 	paneDeadExitStatus := i.paneDeadExitStatusForTest
+	receiptPath := i.trackedCommandExitReceiptPath()
 
 	i.mu.Unlock()
 	exitCode, haveExitCode := 0, false
@@ -449,6 +450,9 @@ func (i *Instance) probeTerminatedPaneStatus(ctx context.Context, observed state
 		}
 		exitCode, haveExitCode = paneDeadExitStatus()
 	}
+	if !haveExitCode && receiptPath != "" {
+		exitCode, haveExitCode = readCommandExitReceipt(receiptPath)
+	}
 	candidate, substate := classifyTerminatedPane(exitCode, haveExitCode, tool, hookStatus)
 	i.mu.Lock()
 	if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
@@ -457,7 +461,9 @@ func (i *Instance) probeTerminatedPaneStatus(ctx context.Context, observed state
 	if i.Status == StatusStopped {
 		return StatusStopped, nil
 	}
+	candidate, substate = i.classifyCustomCommandExit(candidate, substate, exitCode, haveExitCode)
 	i.terminatedPaneSubstate = substate
+	i.setTerminatedPaneExitCode(exitCode, haveExitCode)
 	return candidate, nil
 }
 

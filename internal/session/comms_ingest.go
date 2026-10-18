@@ -189,7 +189,10 @@ func (d *TransitionDaemon) ingestCommsSpool(profile string, byID map[string]*Ins
 	// in the profile list) never gets a ledger directory.
 	var l *comms.Ledger
 	if d.commsPrompts == nil {
-		d.commsPrompts = map[string]CommsSpoolEntry{}
+		d.commsPrompts = map[string]map[string]CommsSpoolEntry{}
+	}
+	if d.commsPrompts[profile] == nil {
+		d.commsPrompts[profile] = map[string]CommsSpoolEntry{}
 	}
 	for _, id := range ListCommsSpoolInstances() {
 		inst := byID[id]
@@ -228,10 +231,10 @@ func (d *TransitionDaemon) ingestCommsSpool(profile string, byID map[string]*Ins
 func (d *TransitionDaemon) ingestCommsEntry(l *comms.Ledger, profile string, inst *Instance, byID map[string]*Instance, e CommsSpoolEntry) bool {
 	switch e.Edge {
 	case CommsEdgePromptStart:
-		if prev, ok := d.commsPrompts[inst.ID]; ok && prev.path != e.path {
+		if prev, ok := d.commsPrompts[profile][inst.ID]; ok && prev.path != e.path {
 			RemoveCommsSpoolEntry(prev)
 		}
-		d.commsPrompts[inst.ID] = e
+		d.commsPrompts[profile][inst.ID] = e
 		// An enrolled parent's prompt confirms the records a wake line
 		// showed it (how a Codex parent's wake is acknowledged).
 		d.commsAckPrompt(l, inst, e.Prompt)
@@ -263,7 +266,7 @@ func (d *TransitionDaemon) ingestCommsEntry(l *comms.Ledger, profile string, ins
 		TSignal: e.TSignal,
 	}
 	cfg := ResolveInboxConfigForInstance(parentInstanceFor(inst, byID))
-	prompt := d.commsPrompts[inst.ID]
+	prompt := d.commsPrompts[profile][inst.ID]
 	facts, classified := commsTurnFacts(inst, e, prompt)
 	owed := commsOwedNone
 	owedFrom := strings.TrimSpace(facts.FromID)
@@ -346,7 +349,7 @@ func (d *TransitionDaemon) ingestCommsEntry(l *comms.Ledger, profile string, ins
 	if prompt.path != "" {
 		RemoveCommsSpoolEntry(prompt)
 	}
-	delete(d.commsPrompts, inst.ID)
+	delete(d.commsPrompts[profile], inst.ID)
 	return true
 }
 

@@ -61,11 +61,9 @@ func TestStatusMetadataRefresh_AbsentPaneKeepsStoredTool(t *testing.T) {
 	}
 }
 
-// The gate must not suppress the refresh a live pane sample still owes: a
-// shell row whose tmux command names claude is promoted to claude. As
-// upstream, that holds for a read-only listing's status-only pass too; only
-// native session-ID discovery is left to the poller.
-func TestStatusMetadataRefresh_LivePaneStillRefreshesTool(t *testing.T) {
+// A live pane sample records its observed tool while keeping the configured
+// launch tool stable. This also holds for a listing's status-only pass.
+func TestStatusMetadataRefresh_LivePaneRecordsObservedTool(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 	for _, c := range []struct {
 		name   string
@@ -87,6 +85,7 @@ func TestStatusMetadataRefresh_LivePaneStillRefreshesTool(t *testing.T) {
 			_, inst := loadStatusMetadataFixture(t, "shell", name, StatusIdle)
 			inst.mu.Lock()
 			inst.tmuxSession = tmux.ReconnectSessionLazy(name, inst.Title, inst.ProjectPath, "claude", string(StatusIdle))
+			inst.detectToolForStatusForTest = func(*tmux.Session) string { return "claude" }
 			inst.mu.Unlock()
 			tmux.RefreshExistingSessions()
 			tmux.RefreshPaneInfoCache()
@@ -94,8 +93,11 @@ func TestStatusMetadataRefresh_LivePaneStillRefreshesTool(t *testing.T) {
 			if err := c.update(inst); err != nil {
 				t.Fatalf("status pass: %v", err)
 			}
-			if got := inst.GetToolThreadSafe(); got != "claude" {
-				t.Fatalf("tool = %q, want live pane detection to promote the shell row to %q", got, "claude")
+			if got := inst.GetToolThreadSafe(); got != "shell" {
+				t.Fatalf("configured tool = %q, want shell", got)
+			}
+			if got := inst.ObservedTool(); got != "claude" {
+				t.Fatalf("observed tool = %q, want claude", got)
 			}
 		})
 	}
@@ -329,6 +331,7 @@ func TestStatusProbe_EarlyExitsTakeNoPaneSample(t *testing.T) {
 			_, inst := loadStatusMetadataFixture(t, c.tool, name, c.status)
 			inst.mu.Lock()
 			inst.tmuxSession = tmux.ReconnectSessionLazy(name, inst.Title, inst.ProjectPath, "codex", string(c.status))
+			inst.detectToolForStatusForTest = func(*tmux.Session) string { return "codex" }
 			inst.mu.Unlock()
 			tmux.RefreshExistingSessions()
 			tmux.RefreshPaneInfoCache()
@@ -349,12 +352,15 @@ func TestStatusProbe_EarlyExitsTakeNoPaneSample(t *testing.T) {
 			if got := evidence.noVerdict.Load(); got != c.noVerdict {
 				t.Fatalf("no verdict = %v, want %v", got, c.noVerdict)
 			}
-			wantTool := c.tool
+			wantObserved := ""
 			if c.sampled {
-				wantTool = "codex"
+				wantObserved = "codex"
 			}
-			if got := inst.GetToolThreadSafe(); got != wantTool {
-				t.Fatalf("tool = %q, want %q", got, wantTool)
+			if got := inst.GetToolThreadSafe(); got != c.tool {
+				t.Fatalf("configured tool = %q, want %q", got, c.tool)
+			}
+			if got := inst.ObservedTool(); got != wantObserved {
+				t.Fatalf("observed tool = %q, want %q", got, wantObserved)
 			}
 		})
 	}

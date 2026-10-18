@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"maps"
-	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -170,51 +169,41 @@ func TestRuntimeLifecycle_ReloadUnchangedToolPreservesDetection(t *testing.T) {
 }
 
 func TestRuntimeLifecycle_ReloadRejectsInFlightToolDetection(t *testing.T) {
-	dir := t.TempDir()
-	entered, release := filepath.Join(dir, "entered"), filepath.Join(dir, "release")
-	t.Setenv("DETECTION_ENTERED", entered)
-	t.Setenv("DETECTION_RELEASE", release)
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(`#!/bin/sh
-case "$*" in
-  *capture-pane*)
-    : > "$DETECTION_ENTERED"
-    while [ ! -e "$DETECTION_RELEASE" ]; do sleep 0.01; done
-    printf 'Claude Code\n'
-    ;;
-esac
-`), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	entered, release := make(chan struct{}), make(chan struct{})
 	canonical := &Instance{
 		ID: "one", Tool: "claude", Command: "wrapper", Status: StatusStopped,
 		tmuxSession: tmux.ReconnectSessionLazy("runtime", "one", "", "wrapper", "stopped"),
 	}
 	state := canonical.RuntimeState()
 	oldWrapper := canonical.tmuxSession
+	canonical.detectToolForStatusForTest = func(session *tmux.Session) string {
+		if session != oldWrapper {
+			return ""
+		}
+		close(entered)
+		<-release
+		return "claude"
+	}
 	done := make(chan struct{})
 	go func() {
 		canonical.refreshStatusMetadataIfCurrent(state, RuntimeBindingObservation{}, true, true, nil)
 		close(done)
 	}()
+	released := false
 	t.Cleanup(func() {
-		_ = os.WriteFile(release, nil, 0o600)
+		if !released {
+			close(release)
+		}
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
 			t.Error("tool detector did not finish")
 		}
 	})
-	// Pause the actual detector's pane read after it captured the old wrapper.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, err := os.Stat(entered); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("old tool detector did not enter capture-pane")
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old tool detector did not start")
 	}
 	select {
 	case <-done:
@@ -224,13 +213,9 @@ esac
 	loaded := &Instance{ID: "one", Tool: "codex", Command: "codex"}
 	loaded.adoptRuntimeState(state)
 	canonical.MergeReloaded(loaded)
-	if err := os.WriteFile(release, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	close(release)
+	released = true
 	<-done
-	if got := oldWrapper.DetectTool(); got != "claude" {
-		t.Fatalf("old wrapper detected %q, want claude", got)
-	}
 	if canonical.Tool != "codex" {
 		t.Fatalf("in-flight old detector restored tool %q after reload", canonical.Tool)
 	}

@@ -42,11 +42,7 @@
       "type": "boolean"
     },
     "warning": {
-      "description": "Runtime durability warning of a start that completed",
-      "type": "string"
-    },
-    "warning": {
-      "description": "Recovery was not sent or submission is uncertain",
+      "description": "Runtime durability or recovery warning of a start that completed",
       "type": "string"
     }
   },

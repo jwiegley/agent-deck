@@ -31,7 +31,7 @@ var supportedSkills = map[string]struct{}{
 //   - skill name must be in supportedSkills whitelist (string equality, no regex).
 //   - source comes from embed.FS (immutable at build time, no path traversal possible).
 //   - target directories are created with mode 0o700.
-//   - target files are written with mode 0o644 (readable doc files).
+//   - target files request mode 0o644 and respect a stricter process umask.
 func handleWatcherInstallSkill(_ string, args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("install-skill requires exactly one argument: the skill name (e.g. watcher-creator)")

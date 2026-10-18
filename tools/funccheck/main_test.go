@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -52,7 +53,11 @@ func TestSandboxRejectsSocketOverrideAndDoesNotInheritIdentity(t *testing.T) {
 	t.Setenv("AGENTDECK_SESSION_ID", "host-parent")
 	t.Setenv("CLAUDE_CONFIG_DIR", "/host/private-account")
 	t.Setenv("TMUX", "/host/private-socket,1,0")
-	s := &suite{bin: "/bin/true", ctx: context.Background()}
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &suite{bin: truePath, ctx: context.Background()}
 	defer s.cleanup()
 	if err := s.setup(); err != nil {
 		t.Fatal(err)
