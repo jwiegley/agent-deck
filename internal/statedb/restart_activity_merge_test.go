@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRestartSaveMergesConcurrentLastActivity(t *testing.T) {
+func TestMetadataSaveMergesConcurrentLastActivityWithoutRuntimeChange(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		mine, theirs int64
@@ -29,7 +29,7 @@ func TestRestartSaveMergesConcurrentLastActivity(t *testing.T) {
 				{Original: base, Stored: base, Desired: desired},
 			}, nil)
 			require.NoError(t, err)
-			require.Equal(t, "agentdeck_restarted", merged[0].TmuxSession)
+			require.Empty(t, merged[0].TmuxSession, "metadata saves cannot publish a physical restart")
 			var saved map[string]json.RawMessage
 			require.NoError(t, json.Unmarshal(merged[0].ToolData, &saved))
 			var at int64

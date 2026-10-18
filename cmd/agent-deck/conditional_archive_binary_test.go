@@ -66,11 +66,26 @@ while [ "$#" -gt 0 ]; do
  case "$1" in
   has-session) [ ! -f "$HOME/archived-fixture" ]; exit $?;;
   kill-session) touch "$HOME/archived-fixture"; exit 0;;
-  list-sessions) printf 'agentdeck_archive_fixture\n'; exit 0;;
-  list-panes) printf '0\n'; exit 0;;
-  show-environment) case "$*" in *CODEX_SESSION_ID*) printf 'CODEX_SESSION_ID=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n';; esac; exit 0;;
+  list-sessions) case "$*" in
+    *AGENTDECK_RUNTIME_GENERATION*) printf '%s\n' '$1|agentdeck_archive_fixture|%1|archive-worker|0|0|waiting|1|codex|12345|archive-worker|aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';;
+    *) printf '%s\n' '$1|agentdeck_archive_fixture|%1|12345|archive-worker';;
+   esac; exit 0;;
+  list-panes) printf '12345\n'; exit 0;;
+  show-environment) case "$*" in
+    *CODEX_SESSION_ID*) printf 'CODEX_SESSION_ID=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n';;
+    *) printf 'AGENTDECK_INSTANCE_ID=archive-worker\nAGENTDECK_RUNTIME_GENERATION=0\nAGENTDECK_RUNTIME_STATUS_REVISION=0\nAGENTDECK_RUNTIME_STATUS=waiting\nAGENTDECK_RUNTIME_STARTED_UNIX_NANO=1\nAGENTDECK_RUNTIME_BINDING_KIND=codex\nAGENTDECK_RUNTIME_BINDING_VALUE=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n';;
+   esac; exit 0;;
   capture-pane) printf 'Ask Codex to do anything\n'; exit 0;;
-  display-message) printf '0\n'; exit 0;;
+  display-message) case "$*" in
+    *agent-deck-runtime-local-option:*) printf '%s\n' \
+      'agent-deck-runtime-local-option:$1:@agentdeck_runtime_instance_id' 'archive-worker' \
+      'agent-deck-runtime-local-option:$1:@agentdeck_runtime_generation' '0' \
+      'agent-deck-runtime-local-option:$1:@agentdeck_runtime_binding_key' 'codex' \
+      'agent-deck-runtime-local-option:$1:@agentdeck_runtime_binding_value' 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';;
+    *session_id*) printf '%s\n' '$1|agentdeck_archive_fixture|%1|12345';;
+    *pane_pid*) printf '12345\n';;
+    *) printf '0\n';;
+   esac; exit 0;;
  esac
  shift
 done
@@ -112,7 +127,8 @@ exit 0
 	output, err = run("session", "archive", "--json", "--expected-parent", "parent",
 		"--expected-content-version", response.Version, id)
 	if err != nil {
-		t.Fatalf("exact completed fixture archive: %v %s", err, output)
+		calls, _ := os.ReadFile(filepath.Join(sb.Home, "archive-tmux-calls"))
+		t.Fatalf("exact completed fixture archive: %v %s; tmux calls: %s", err, output, calls)
 	}
 	stored, err := db.LoadInstanceByID(id)
 	if err != nil || stored == nil || stored.ArchivedAt.IsZero() {

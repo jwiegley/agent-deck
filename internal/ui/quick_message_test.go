@@ -15,15 +15,17 @@ import (
 // terminal keys, even when the session no longer has a live tmux recipient.
 //
 // PATH is process-wide, so the fake tmux also answers goroutines other tests
-// left running (issue 2712). It records only calls naming this session; any
-// delivery to the recipient has to name it. The session-send fallback is
-// caught at its seam rather than by re-running the test binary.
+// left running (issue 2712). It records only key deliveries (send-keys,
+// paste-buffer, load-buffer) naming this session, not the runtime probes
+// that also name it; any delivery to the recipient has to name it. The
+// session-send fallback is caught at its seam rather than by re-running the
+// test binary.
 func TestQuickMessageQueueRecipientContinuity(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "terminal-keys")
 	t.Setenv("QUEUE_KEYS_MARKER", marker)
 	for name, script := range map[string]string{
-		"tmux":     "#!/bin/sh\ncase \"$*\" in *\"$QUEUE_TMUX_TARGET\"*) printf keys >> \"$QUEUE_KEYS_MARKER\" ;; esac\nexit 1\n",
+		"tmux":     "#!/bin/sh\ncase \"$*\" in *\"$QUEUE_TMUX_TARGET\"*) for arg; do case \"$arg\" in send-keys|paste-buffer|load-buffer) printf keys >> \"$QUEUE_KEYS_MARKER\";; esac; done ;; esac\nexit 1\n",
 		"opencode": "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'opencode v2.0.26\\n'; exit 0; fi\nprintf '%s\\n' '{\"data\":{\"id\":\"msg_queued\",\"sessionID\":\"ses_target\",\"delivery\":\"queue\"}}'\n",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o700); err != nil {

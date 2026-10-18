@@ -185,7 +185,6 @@ func seamBNewHome() *Home {
 		boundKeys:            make(map[string]string),
 		pendingTitleChanges:  make(map[string]pendingTitle),
 		clearOnCompactSent:   make(map[string]time.Time),
-		lastPersistedStatus:  make(map[string]string),
 		width:                140,
 		height:               50,
 		lastClickIndex:       -1,

@@ -89,19 +89,6 @@ func (h *Home) isPolledByMe(sessionID string) bool {
 	return h.orphanPolled[sessionID]
 }
 
-// invalidateNewlyOwnedMemo drops memo[id] for every id that is owned now but
-// wasn't in prevOwned (nil prevOwned means "never reconciled before", so
-// every currently owned id counts as newly owned). A stale per-instance
-// status memo inherited from before this instance owned the session must not
-// suppress the first write-through as the new owner.
-func invalidateNewlyOwnedMemo(memo map[string]string, owned, prevOwned map[string]bool) {
-	for id := range owned {
-		if !prevOwned[id] {
-			delete(memo, id)
-		}
-	}
-}
-
 // reconcileClaims claims in-scope sessions, releases out-of-scope ones, and
 // (on the primary, on the sweep the orphan interval is due) refreshes the
 // separate orphan-polled set. Runs once per background status sweep.
@@ -165,11 +152,6 @@ func (h *Home) reconcileClaims(instances []*session.Instance) {
 	if err := db.ReleaseClaims(releaseIDs); err != nil {
 		uiLog.Debug("claim_release_failed", slog.String("error", err.Error()))
 	}
-
-	// Sessions newly owned this sweep may carry a status memo written while a
-	// different instance (or nobody, in fail-open mode) owned them; drop it
-	// so the first sweep as new owner always writes through.
-	invalidateNewlyOwnedMemo(h.lastPersistedStatus, owned, prevOwned)
 
 	h.ownedMu.Lock()
 	h.ownedSessions = owned

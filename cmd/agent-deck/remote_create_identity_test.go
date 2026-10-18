@@ -54,7 +54,7 @@ func TestRemoteCreatePathCarriesIdentity(t *testing.T) {
 			}
 			cmd.Env = append(cmd.Env, kv)
 		}
-		cmd.Env = append(cmd.Env, "HOME="+home, "PATH="+shim+":"+os.Getenv("PATH"))
+		cmd.Env = append(cmd.Env, "HOME="+home, "TMUX_TMPDIR="+os.Getenv("TMUX_TMPDIR"), "PATH="+shim+":"+os.Getenv("PATH"))
 		var out, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &stderr
 		code := 0

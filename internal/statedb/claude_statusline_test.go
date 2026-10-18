@@ -43,16 +43,15 @@ func TestClaudeStatuslineSurvivesSessionSave(t *testing.T) {
 	require.Zero(t, n)
 }
 
-func TestClaudeStatuslineAmbiguousNativeID(t *testing.T) {
+func TestClaudeStatuslineRejectsDuplicateNativeID(t *testing.T) {
 	db := newTestDB(t)
-	for _, id := range []string{"first", "second"} {
-		require.NoError(t, db.SaveInstance(&InstanceRow{ID: id, Title: id, Tool: "claude", ToolData: json.RawMessage(`{"claude_session_id":"shared"}`)}))
-	}
+	require.NoError(t, db.SaveInstance(&InstanceRow{ID: "first", Title: "first", Tool: "claude", ToolData: json.RawMessage(`{"claude_session_id":"shared"}`)}))
+	require.ErrorContains(t, db.SaveInstance(&InstanceRow{ID: "second", Title: "second", Tool: "claude", ToolData: json.RawMessage(`{"claude_session_id":"shared"}`)}), "UNIQUE constraint failed")
 	id, err := db.SaveClaudeStatusline(ClaudeStatusline{ClaudeSessionID: "shared"})
 	require.NoError(t, err)
-	require.Empty(t, id)
+	require.Equal(t, "first", id)
 	_, err = db.ClaudeStatuslineForSession("first")
-	require.Error(t, err)
+	require.NoError(t, err)
 }
 
 // TestClaudeStatuslineLimitsMarkExpired pins the read-time marker: a window

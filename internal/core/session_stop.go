@@ -77,11 +77,10 @@ func (deps Deps) sessionStop(ctx context.Context, in SessionStopIn) (SessionStop
 	}
 	// Journaled after the verdict: RecordSessionEvent writes synchronously
 	// and a slow health volume must not delay the answer. session.end is
-	// recorded here so the default CLI and daemon stops are counted like
+	// recorded after Kill above so the default CLI and daemon stops are counted like
 	// the TUI, web and legacy CLI stops.
 	AfterFunc(ctx, func() {
 		session.RecordSessionEvent(in.Profile, inst.ID, health.KindStop, nil)
-		inst.RecordTelemetryEnd(telemetry.EndStop)
 		session.RecallNotifyInstance(inst, health.KindStop)
 	})
 	return out, nil

@@ -454,6 +454,8 @@ agent_deck_path = "/home/alice/.local/bin/agent-deck"
 // anywhere the record names the tool and the searched PATH.
 func TestSpawnPath_FakeClaudeOnlyInLocalBin(t *testing.T) {
 	skipIfNoTmuxBinary(t)
+	tmuxBinary, err := exec.LookPath("tmux")
+	require.NoError(t, err)
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available")
 	}
@@ -477,6 +479,10 @@ func TestSpawnPath_FakeClaudeOnlyInLocalBin(t *testing.T) {
 		}
 		keep = append(keep, dir)
 	}
+	toolsDir := filepath.Join(home, "test-tools")
+	require.NoError(t, os.MkdirAll(toolsDir, 0o700))
+	require.NoError(t, os.Symlink(tmuxBinary, filepath.Join(toolsDir, "tmux")))
+	keep = append([]string{toolsDir}, keep...)
 	t.Setenv("PATH", strings.Join(keep, string(os.PathListSeparator)))
 	t.Setenv("AGENTDECK_ACCOUNT", "")
 
@@ -519,7 +525,7 @@ func TestSpawnPath_FakeClaudeOnlyInLocalBin(t *testing.T) {
 	}
 	rec := recordFor(missing)
 	assert.True(t, strings.HasPrefix(rec.Reason, "tool not found on PATH: claude (searched: "+localBin+":"), "the searched PATH is the pane's, prepended dir first: %q", rec.Reason)
-	err := missing.VerifySpawned(2 * time.Second)
+	err = missing.VerifySpawned(2 * time.Second)
 	require.Error(t, err)
 	var spawnErr *SpawnFailedError
 	require.ErrorAs(t, err, &spawnErr)

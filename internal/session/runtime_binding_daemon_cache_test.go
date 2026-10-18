@@ -202,7 +202,8 @@ func TestRuntimeLifecycle_DaemonPollStateDoesNotCarryFlipAcrossTUILifetime(t *te
 func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *testing.T) {
 	profileKeyed := []string{
 		"storages", "lastStatus", "initialized", "livePrior", "lastDone", "lastTurn",
-		"lastDoneScan", "journalWriters", "lastJournaled", "pollState",
+		"journaledRun", "lastSelfTurn", "lastDoneScan", "journalWriters", "lastJournaled", "pollState",
+		"ledgers", "ledgerLocks", "ledgerOpenFailed", "commsPrompts", "lastImportPrune",
 	}
 	profilePipeKeyed := []string{"lastProbeStall", "lastDesktopNotify"}
 
@@ -215,11 +216,18 @@ func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *tes
 		d.livePrior[profile] = map[string]liveStatusPrior{"worker": {status: StatusRunning, flipPending: true}}
 		d.lastDone[profile] = map[string]DoneSignal{"worker": {Status: "ok"}}
 		d.lastTurn[profile] = map[string]string{"worker": "waiting|turn"}
+		d.journaledRun[profile] = map[string]string{"worker": "run"}
+		d.lastSelfTurn[profile] = map[string]TurnJournalEntry{"worker": {}}
 		d.lastDoneScan[profile] = map[string]time.Time{"worker": time.Now()}
 		appenders[profile] = &slowJournalAppender{delay: 20 * time.Millisecond}
 		d.journalWriters[profile] = health.NewAsyncWriter(appenders[profile], 8)
 		d.lastJournaled[profile] = map[string]string{"worker": "running|"}
 		d.pollState[profile] = map[string]instancePollingState{"worker": {}}
+		d.ledgers[profile] = nil
+		d.ledgerLocks[profile] = nil
+		d.ledgerOpenFailed[profile] = time.Now()
+		d.commsPrompts[profile] = map[string]CommsSpoolEntry{"worker": {}}
+		d.lastImportPrune[profile] = time.Now()
 		d.lastProbeStall[profile+"|worker"] = time.Now()
 		d.lastDesktopNotify[profile+"|worker"] = "waiting"
 	}
