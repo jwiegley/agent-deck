@@ -95,6 +95,29 @@ func (i *Instance) CaptureRuntimeBindingObservation(kind string) RuntimeBindingO
 	return observation
 }
 
+// A web mutator may close the Storage that last saved this Instance. Reopen
+// only that exact profile database; an unrelated process-global DB must never
+// receive its binding.
+func (i *Instance) runtimeBindingDB() (*statedb.StateDB, func(), error) {
+	i.mu.RLock()
+	db := i.owningDB
+	snapshot := i.storageSnapshot
+	i.mu.RUnlock()
+	if db == nil {
+		return statedb.GetGlobal(), func() {}, nil
+	}
+	if err := db.DB().Ping(); err == nil {
+		return db, func() {}, nil
+	} else if snapshot == nil || snapshot.dbPath == "" {
+		return nil, nil, fmt.Errorf("owning profile database is closed: %w", err)
+	}
+	reopened, err := statedb.Open(snapshot.dbPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reopen owning profile database: %w", err)
+	}
+	return reopened, func() { _ = reopened.Close() }, nil
+}
+
 func (i *Instance) captureActiveRuntimeBindingObservation() RuntimeBindingObservation {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -145,15 +168,16 @@ func (i *Instance) publishRuntimeBindingObservationLocked(observation RuntimeBin
 
 	i.mu.RLock()
 	current := i.runtimeBindingObservationLocked(observation.kind)
-	db := i.owningDB
 	i.mu.RUnlock()
 	if !current.sameVersion(observation) {
 		return i.runtimeBindingPublishError(observation.kind, observation.generation, observation.revision,
 			ErrRuntimeBindingObservationStale)
 	}
-	if db == nil {
-		db = statedb.GetGlobal()
+	db, closeDB, dbErr := i.runtimeBindingDB()
+	if dbErr != nil {
+		return i.runtimeBindingPublishError(observation.kind, observation.generation, observation.revision, dbErr)
 	}
+	defer closeDB()
 
 	// New instances do not have a database until their first save. Preserve the
 	// versioned shape locally so insertInitialRuntimeTx can publish it later.
@@ -317,15 +341,18 @@ func (i *Instance) publishHookRuntimeBindingObservation(observation RuntimeBindi
 	}
 	validated, ok := i.validatedHookBindings[observation.kind]
 	current := i.runtimeBindingObservationLocked(observation.kind)
-	db := i.owningDB
 	i.mu.Unlock()
 	if fingerprint.valid() && ok && validated.fingerprint == fingerprint &&
 		validated.incarnation == observation.incarnation &&
 		validated.generation == observation.generation && validated.revision == observation.revision &&
 		validated.value == value && current.sameVersion(observation) && current.value == value {
-		if db == nil {
-			db = statedb.GetGlobal()
+		db, closeDB, dbErr := i.runtimeBindingDB()
+		if dbErr != nil {
+			return i.runtimeBindingPublishError(
+				observation.kind, observation.generation, observation.revision, dbErr,
+			)
 		}
+		defer closeDB()
 		if db != nil {
 			if err := db.ValidateRuntimeIncarnation(i.ID, observation.incarnation); err != nil {
 				return i.runtimeBindingPublishError(

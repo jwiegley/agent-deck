@@ -652,6 +652,7 @@ func TestBuildIdentityPrompt_CollapsesControlCharactersInFields(t *testing.T) {
 func TestBuildIdentityPrompt_HostAndSkillsSection(t *testing.T) {
 	identityTestEnv(t)
 	inst := identityTestInstance("claude")
+	inst.ProjectPath = t.TempDir()
 	got := inst.BuildIdentityPrompt()
 
 	hostname, err := os.Hostname()
@@ -674,6 +675,7 @@ func TestBuildIdentityPrompt_HostAndSkillsSection(t *testing.T) {
 func TestBuildIdentityPrompt_SkillsSectionListsAttachedSkills(t *testing.T) {
 	identityTestEnv(t)
 	inst := identityTestInstance("claude")
+	inst.ProjectPath = t.TempDir()
 	if err := os.MkdirAll(inst.ProjectPath, 0o755); err != nil {
 		t.Fatal(err)
 	}

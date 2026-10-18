@@ -81,8 +81,9 @@ func startDaemon(t *testing.T, home string, env []string) (*exec.Cmd, daemonStat
 }
 
 // canonicalEnvelope renders an envelope with sorted keys, compact, with the
-// request id and time values scrubbed. Tmux names remain visible. Live
-// status cost counters are excluded by the output schema, not scrubbed here.
+// request id, time values, and status refresh provenance scrubbed. A direct
+// call may be the first observer (live), while the next daemon call sees the
+// already persisted historical verdict (cached). Tmux names remain visible.
 func canonicalEnvelope(t *testing.T, raw []byte) string {
 	t.Helper()
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -95,6 +96,22 @@ func canonicalEnvelope(t *testing.T, raw []byte) string {
 		t.Fatalf("envelope without request_id: %s", raw)
 	}
 	m["request_id"] = "<ID>"
+	if data, ok := m["data"].(map[string]any); ok {
+		if sessions, ok := data["sessions"].([]any); ok {
+			for _, session := range sessions {
+				row, ok := session.(map[string]any)
+				if !ok {
+					continue
+				}
+				if source, ok := row["status_source"].(string); ok {
+					if source != "live" && source != "cached" {
+						t.Fatalf("unexpected status source %q", source)
+					}
+					row["status_source"] = "<FRESHNESS>"
+				}
+			}
+		}
+	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)

@@ -56,7 +56,7 @@ func TestNativeSSHTUIRegistryLifecycle(t *testing.T) {
 		// the TUI under test runs on a real tmux terminal and would
 		// otherwise install a release that lands mid-run and re-exec
 		// itself (issue #2251). CI=true still passes through.
-		return append(out, "HOME="+home, "TERM=xterm-256color", "AGENTDECK_TELEMETRY=0", "AGENTDECK_SKIP_UPDATE_CHECK=1")
+		return append(out, "HOME="+home, "TMUX_TMPDIR="+os.Getenv("TMUX_TMPDIR"), "TERM=xterm-256color", "AGENTDECK_TELEMETRY=0", "AGENTDECK_SKIP_UPDATE_CHECK=1")
 	}
 	command := func(home, executable string, args ...string) (string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

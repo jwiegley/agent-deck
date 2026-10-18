@@ -287,6 +287,11 @@ func (i *Instance) killInternalWithCleanup(selection RuntimeSelection, sync, del
 	defer release()
 	err = i.killInternalLocked(selection, sync, deleteRow, terminate, result, beforeDelete)
 	if err == nil && deleteRow {
+		if db := i.restartPersistenceDB(); db != nil && db.Path() != "" {
+			if cleanupErr := cleanupImageUploads(filepath.Dir(db.Path()), expected.InstanceID); cleanupErr != nil {
+				sessionLog.Warn("image_upload_cleanup_failed", slog.String("id", expected.InstanceID), slog.String("error", cleanupErr.Error()))
+			}
+		}
 		if cleanupErr := pruneHookArtifacts(expected.InstanceID); cleanupErr != nil {
 			sessionLog.Warn("hook_cleanup_failed", slog.String("id", expected.InstanceID), slog.String("error", cleanupErr.Error()))
 		}
@@ -655,6 +660,7 @@ func (i *Instance) restartWithTransition(transition *runtimeTransitionAuthority,
 			i.recordRestartOutcome(candidate, transition.incarnation)
 		}
 		runtimeDuplicateSweepFn(i, transition.expected.TmuxSocketName)
+		i.recoverConductorAfterSpawn()
 	}()
 
 	var validatedDeepSeekRestartCommand string

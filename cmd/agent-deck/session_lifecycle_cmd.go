@@ -641,7 +641,7 @@ func handleSessionUnarchive(profile string, args []string) {
 // migrated from a pre-generation Agent Deck database. Planning is the default;
 // --yes is required before any tmux stamp is written.
 func handleSessionAdoptRuntime(profile string, args []string) {
-	fs := flag.NewFlagSet("session adopt-runtime", flag.ExitOnError)
+	fs := flag.NewFlagSet("session adopt-runtime", flag.ContinueOnError)
 	yes := fs.Bool("yes", false, "Stamp the uniquely proved migrated runtime (default is dry-run)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
@@ -656,6 +656,9 @@ func handleSessionAdoptRuntime(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		exitCLI(1)
 	}
 

@@ -22,6 +22,12 @@ func fakeEnv(kv map[string]string) func(string) string {
 
 const guardUID = 501
 
+func TestMarkedCLISubprocessEnablesTmuxGuard(t *testing.T) {
+	if !testTmuxGuardEnabled(false, "1") || testTmuxGuardEnabled(false, "") {
+		t.Fatal("a marked CLI subprocess must be guarded without a Go test binary name")
+	}
+}
+
 func defaultSocketFor(uid int) string {
 	return filepath.Join("/tmp", fmt.Sprintf("tmux-%d", uid), "default")
 }

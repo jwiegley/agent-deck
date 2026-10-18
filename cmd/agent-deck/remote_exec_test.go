@@ -45,7 +45,7 @@ func TestRemoteCommandParity(t *testing.T) {
 			}
 			cmd.Env = append(cmd.Env, kv)
 		}
-		cmd.Env = append(cmd.Env, "HOME="+home, "PATH="+shim+":"+os.Getenv("PATH"), "PARITY_REMOTE_HOME="+remote)
+		cmd.Env = append(cmd.Env, "HOME="+home, "TMUX_TMPDIR="+os.Getenv("TMUX_TMPDIR"), "PATH="+shim+":"+os.Getenv("PATH"), "PARITY_REMOTE_HOME="+remote)
 		cmd.Stdin = strings.NewReader(stdin)
 		var out, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &stderr
@@ -121,6 +121,20 @@ func TestRemoteCommandParity(t *testing.T) {
 				if err := json.Unmarshal([]byte(forwarded), &r); err != nil {
 					t.Fatalf("remote JSON required: %v: %q", err, forwarded)
 				}
+				if args[0] == "list" {
+					// The first read refreshes status; the second may use that
+					// persisted verdict. Freshness is per request, not a remote
+					// transport difference.
+					for _, value := range []any{l, r} {
+						for _, entry := range value.([]any) {
+							row := entry.(map[string]any)
+							if source, ok := row["status_source"].(string); ok && source != "live" && source != "cached" {
+								t.Fatalf("unexpected status source %q", source)
+							}
+							delete(row, "status_source")
+						}
+					}
+				}
 				if !reflect.DeepEqual(l, r) {
 					t.Errorf("JSON differs:\nlocal %s\nremote %s", local, forwarded)
 				}
@@ -172,7 +186,7 @@ func TestRemoteCommandParity(t *testing.T) {
 		}
 		tmuxName, _ := state["tmux_session"].(string)
 		probeCmd := exec.Command("tmux", "-L", socket, "has-session", "-t", tmuxName)
-		probeCmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + remote}
+		probeCmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + remote, "TMUX_TMPDIR=" + os.Getenv("TMUX_TMPDIR")}
 		probe := probeCmd.Run()
 		if (probe == nil) != (command != "stop") {
 			t.Fatalf("remote %s tmux state mismatch: %v, show %s", command, probe, show)

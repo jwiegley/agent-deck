@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,7 +116,8 @@ func TestCrossProfileLaunchUsesSelectedAccount(t *testing.T) {
 				t.Fatal(err)
 			}
 			marker := filepath.Join(home, "child-config-dir")
-			shim := "#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo 2.0.0; exit 0; fi\nprintf '%s' \"$CLAUDE_SECURESTORAGE_CONFIG_DIR\" > \"$HOME/child-secure-dir\"\nprintf '%s' \"$CLAUDE_CONFIG_DIR\" > \"$HOME/child-config-dir\"\nexec sleep 60\n"
+			secureMarker := filepath.Join(home, "child-secure-dir")
+			shim := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo 2.0.0; exit 0; fi\nprintf '%%s' \"$CLAUDE_SECURESTORAGE_CONFIG_DIR\" > %q\nprintf '%%s' \"$CLAUDE_CONFIG_DIR\" > %q\nexec sleep 60\n", secureMarker, marker)
 			if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(shim), 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -145,11 +147,11 @@ func TestCrossProfileLaunchUsesSelectedAccount(t *testing.T) {
 				wantDir = filepath.Join(home, ".claude-"+tc.explicit)
 			}
 			if string(childDir) != wantDir {
-				t.Errorf("launched Claude config_dir=%q, want %q", childDir, wantDir)
+				t.Errorf("launched Claude config_dir=%q, want %q; launch stdout=%s stderr=%s", childDir, wantDir, stdout, stderr)
 			}
-			secureDir, err := os.ReadFile(filepath.Join(home, "child-secure-dir"))
+			secureDir, err := os.ReadFile(secureMarker)
 			if err != nil {
-				t.Fatalf("child secure-storage marker unavailable: %v", err)
+				t.Fatalf("child secure-storage marker unavailable: %v; launch stdout=%s stderr=%s", err, stdout, stderr)
 			}
 			wantSecure := ""
 			if tc.wantAccount != "" {

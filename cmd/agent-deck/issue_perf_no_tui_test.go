@@ -91,6 +91,7 @@ func TestWebCommand_NoTuiFlag_SkipsBubbleteaBoot(t *testing.T) {
 		}
 		env = append(env,
 			"HOME="+tmpHome,
+			"TMUX_TMPDIR="+os.Getenv("TMUX_TMPDIR"),
 			"AGENTDECK_PROFILE=test-no-tui",
 			"TERM=dumb",
 		)

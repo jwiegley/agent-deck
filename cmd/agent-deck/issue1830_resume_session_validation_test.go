@@ -125,6 +125,7 @@ func sandboxedCLIEnv(tmpHome string) []string {
 	}
 	return append(env,
 		"HOME="+tmpHome,
+		"TMUX_TMPDIR="+os.Getenv("TMUX_TMPDIR"),
 		"XDG_CONFIG_HOME="+filepath.Join(tmpHome, ".config"),
 		"XDG_DATA_HOME="+filepath.Join(tmpHome, ".local", "share"),
 		"XDG_CACHE_HOME="+filepath.Join(tmpHome, ".cache"),

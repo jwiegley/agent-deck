@@ -119,7 +119,11 @@ func TestIssue2549_SendAdoptsRotatedLiveThread(t *testing.T) {
 			if oldHasRollout {
 				writeLegacyCodexRollout(t, home, issue2549OldThread, "21")
 			}
-			inst, storage := newIssue2549Instance(t, root, "issue2549_rotated", "rotated-codex")
+			profile := "issue2549_rotated_without_rollout"
+			if oldHasRollout {
+				profile = "issue2549_rotated_with_rollout"
+			}
+			inst, storage := newIssue2549Instance(t, root, profile, "rotated-codex")
 			if err := storage.SaveWithGroups([]*session.Instance{inst}, nil); err != nil {
 				t.Fatal(err)
 			}

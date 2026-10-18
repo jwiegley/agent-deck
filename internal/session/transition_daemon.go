@@ -92,7 +92,7 @@ type TransitionDaemon struct {
 	// lastSelfTurn is the last turn emitTurn skipped per top-level conductor
 	// (issue #2481). Those turns are not journaled, so this is what tells a
 	// re-observation of the same turn from a new one.
-	lastSelfTurn map[string]TurnJournalEntry
+	lastSelfTurn map[string]map[string]TurnJournalEntry
 
 	// turnLiveCheck decides whether an instance is a live session or a stale
 	// registry row. A seam because the real check probes tmux, which a unit test
@@ -168,7 +168,7 @@ type TransitionDaemon struct {
 	ledgers          map[string]*comms.Ledger
 	ledgerLocks      map[string]*os.File
 	ledgerOpenFailed map[string]time.Time
-	commsPrompts     map[string]CommsSpoolEntry
+	commsPrompts     map[string]map[string]CommsSpoolEntry
 	lastCommsPrune   time.Time
 	lastImportPrune  map[string]time.Time // per profile
 
@@ -207,19 +207,26 @@ type TransitionDaemon struct {
 
 func NewTransitionDaemon() *TransitionDaemon {
 	return &TransitionDaemon{
-		notifier:       NewTransitionNotifier(),
-		deskNotifier:   desknotify.New(),
-		storages:       map[string]*Storage{},
-		lastStatus:     map[string]map[string]string{},
-		initialized:    map[string]bool{},
-		livePrior:      map[string]map[string]liveStatusPrior{},
-		lastDone:       map[string]map[string]DoneSignal{},
-		lastTurn:       map[string]map[string]string{},
-		turnLiveCheck:  func(inst *Instance) bool { return inst.Exists() },
-		lastDoneScan:   map[string]map[string]time.Time{},
-		lastProbeStall: map[string]time.Time{},
-		journalWriters: map[string]*health.AsyncWriter{},
-		lastJournaled:  map[string]map[string]string{},
+		notifier:         NewTransitionNotifier(),
+		deskNotifier:     desknotify.New(),
+		storages:         map[string]*Storage{},
+		lastStatus:       map[string]map[string]string{},
+		initialized:      map[string]bool{},
+		livePrior:        map[string]map[string]liveStatusPrior{},
+		lastDone:         map[string]map[string]DoneSignal{},
+		lastTurn:         map[string]map[string]string{},
+		journaledRun:     map[string]map[string]string{},
+		lastSelfTurn:     map[string]map[string]TurnJournalEntry{},
+		turnLiveCheck:    func(inst *Instance) bool { return inst.Exists() },
+		lastDoneScan:     map[string]map[string]time.Time{},
+		lastProbeStall:   map[string]time.Time{},
+		journalWriters:   map[string]*health.AsyncWriter{},
+		lastJournaled:    map[string]map[string]string{},
+		ledgers:          map[string]*comms.Ledger{},
+		ledgerLocks:      map[string]*os.File{},
+		ledgerOpenFailed: map[string]time.Time{},
+		commsPrompts:     map[string]map[string]CommsSpoolEntry{},
+		lastImportPrune:  map[string]time.Time{},
 
 		lastDesktopNotify: map[string]string{},
 		pollState:         map[string]map[string]instancePollingState{},
@@ -574,6 +581,8 @@ func (d *TransitionDaemon) pruneDeletedProfiles(profiles []string) {
 	retireProfiles(d.livePrior, active, nil)
 	retireProfiles(d.lastDone, active, nil)
 	retireProfiles(d.lastTurn, active, nil)
+	retireProfiles(d.journaledRun, active, nil)
+	retireProfiles(d.lastSelfTurn, active, nil)
 	retireProfiles(d.lastDoneScan, active, nil)
 	retireProfiles(d.lastJournaled, active, nil)
 	// Stop drains what is already queued and ends the writer goroutine,
@@ -582,6 +591,19 @@ func (d *TransitionDaemon) pruneDeletedProfiles(profiles []string) {
 		writer.Stop(journalFlushTimeout)
 	})
 	retireProfiles(d.pollState, active, nil)
+	retireProfiles(d.ledgers, active, func(ledger *comms.Ledger) {
+		if ledger != nil {
+			_ = ledger.Close()
+		}
+	})
+	retireProfiles(d.ledgerLocks, active, func(lock *os.File) {
+		if lock != nil {
+			_ = lock.Close()
+		}
+	})
+	retireProfiles(d.ledgerOpenFailed, active, nil)
+	retireProfiles(d.commsPrompts, active, nil)
+	retireProfiles(d.lastImportPrune, active, nil)
 	retireProfileKeys(d.lastProbeStall, active)
 	retireProfileKeys(d.lastDesktopNotify, active)
 	if d.selfheal != nil {

@@ -651,7 +651,8 @@ type Instance struct {
 	// that was never persisted. Not persisted; guarded by mu.
 	importOwnershipPending bool
 
-	paneDeadExitStatusForTest func() (int, bool) // nil uses tmuxSession.PaneDeadExitStatus
+	paneDeadExitStatusForTest  func() (int, bool) // nil uses tmuxSession.PaneDeadExitStatus
+	detectToolForStatusForTest func(*tmux.Session) string
 
 	// terminatedPaneSubstate is set alongside i.Status by classifyTerminatedPane
 	// (via terminatedPaneStatus/applyTerminatedPaneStatus). It is SubstateNone
@@ -3179,6 +3180,7 @@ func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState
 	hookFingerprint := i.hookFingerprint
 	i.releaseAuthHoldIfHealthyLocked()
 	tmuxSession := i.tmuxSession
+	detectToolForTest := i.detectToolForStatusForTest
 	i.mu.Unlock()
 
 	if hookSessionID != "" && runtimeBindingKindSupported(hookObservation.kind) {
@@ -3194,7 +3196,12 @@ func (i *Instance) refreshStatusMetadataIfCurrent(committed statedb.RuntimeState
 	if tmuxSession == nil || !paneSampled {
 		return
 	}
-	detectedTool := tmuxSession.DetectTool()
+	detectedTool := ""
+	if detectToolForTest != nil {
+		detectedTool = detectToolForTest(tmuxSession)
+	} else {
+		detectedTool = tmuxSession.DetectTool()
+	}
 	i.mu.Lock()
 	if i.tmuxSession != tmuxSession || !sameStatusRuntime(committed, i.runtimeStateLocked()) {
 		i.mu.Unlock()

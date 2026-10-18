@@ -155,6 +155,7 @@ type nativeSwitchRuntime struct {
 	authority         *runtimeTransitionAuthority
 	partial           error
 	metadataCommitted bool
+	previousLimit     limitSwitchState
 }
 
 // ExecuteHarnessSwitch is the only mutating account/harness switch entry
@@ -941,10 +942,13 @@ func startNativeSwitchInstance(inst *Instance, j *switchJournal) error {
 	if j.runtime != nil {
 		authority = j.runtime.authority
 		if j.runtime.metadataCommitted && inst.Account == j.Source.Account {
-			if _, err := authority.db.CommitNativeHarnessSwitch(nativeSwitchStorageIdentity(j.Target), nativeSwitchStorageIdentity(j.Source)); err != nil {
+			restored := nativeSwitchStorageIdentity(j.Source)
+			restored.ToolDataExtras = limitSwitchToolData(j.runtime.previousLimit)
+			if _, err := authority.db.CommitNativeHarnessSwitch(nativeSwitchStorageIdentity(j.Target), restored); err != nil {
 				inst.Account = j.Target.Account
 				return fmt.Errorf("restore source account before restart: %w", err)
 			}
+			inst.applyLimitSwitchState(j.runtime.previousLimit)
 			j.runtime.metadataCommitted = false
 		}
 	}
@@ -983,6 +987,10 @@ func commitNativeSwitchAccount(path string, j *switchJournal, inst *Instance, ac
 	if inst == nil || j == nil {
 		return false, fmt.Errorf("native switch commit is missing source identity")
 	}
+	previousLimit := captureLimitSwitchState(inst)
+	if j.runtime != nil {
+		j.runtime.previousLimit = previousLimit
+	}
 	j.State = switchCommitted
 	if j.runtime != nil && j.runtime.authority.durable {
 		j.State = switchAccountPersisted
@@ -992,7 +1000,9 @@ func commitNativeSwitchAccount(path string, j *switchJournal, inst *Instance, ac
 			return fmt.Errorf("persist native switch commit: %w", err)
 		}
 		if j.runtime != nil && j.runtime.authority.durable {
-			if _, err := j.runtime.authority.db.CommitNativeHarnessSwitch(nativeSwitchStorageIdentity(j.Source), nativeSwitchStorageIdentity(j.Target)); err != nil {
+			target := nativeSwitchStorageIdentity(j.Target)
+			target.ToolDataExtras = limitSwitchToolData(captureLimitSwitchState(inst))
+			if _, err := j.runtime.authority.db.CommitNativeHarnessSwitch(nativeSwitchStorageIdentity(j.Source), target); err != nil {
 				return err
 			}
 			j.runtime.metadataCommitted = true
@@ -1000,6 +1010,7 @@ func commitNativeSwitchAccount(path string, j *switchJournal, inst *Instance, ac
 		return nil
 	})
 	if err != nil {
+		inst.applyLimitSwitchState(previousLimit)
 		_, rollbackErr := switchFailedAfterStop(path, j, inst, wasRunning, err)
 		return false, rollbackErr
 	}

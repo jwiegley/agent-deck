@@ -17,8 +17,8 @@
                         │  ╰──────────────────────────────────────────────────╯      │
                         │    Tip: waiting / running / idle to filter by status       │
                         │                                                            │
-                        │                                                            │
-                        │    No results                                              │
+                        │    › gone (shell)  my-sessions · ?                         │
+                        │    1 result                                                │
                         │    [Enter] Select  [↑↓] Navigate                           │
                         │    [Tab] Global  [Esc] Cancel                              │
                         │                                                            │

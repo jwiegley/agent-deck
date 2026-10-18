@@ -471,7 +471,6 @@ type Home struct {
 	statusTrigger       chan statusUpdateRequest // Triggers background status update
 	statusWorkerDone    chan struct{}            // Signals worker has stopped
 	lastFullStatusSweep atomic.Int64             // UnixNano timestamp of last periodic status batch (legacy field name)
-	lastPersistedStatus map[string]string        // legacy claim memo; status publication is owned by session.UpdateStatus
 	// lastPersistedAutoNameDesc tracks the last auto-name description written to
 	// SQLite per instance, so the background loop only issues a targeted write
 	// when the live Claude task description actually changes. Keyed by instance ID.

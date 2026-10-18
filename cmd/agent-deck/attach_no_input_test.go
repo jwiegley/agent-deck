@@ -58,7 +58,7 @@ while True:
 		}
 		env = append(env, kv)
 	}
-	env = append(env, "HOME="+home, "TERM=xterm-256color")
+	env = append(env, "HOME="+home, "TMUX_TMPDIR="+os.Getenv("TMUX_TMPDIR"), "TERM=xterm-256color")
 	run := func(args ...string) {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -75,7 +75,7 @@ while True:
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "tmux", append([]string{"-L", socket}, args...)...)
-		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home}
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "TMUX_TMPDIR=" + os.Getenv("TMUX_TMPDIR")}
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("tmux %v: %v %s", args, err, out)

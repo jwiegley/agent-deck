@@ -252,7 +252,6 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		statusWorkerDone:          statusWorkerDone,
 		idleTimeoutWatcher:        session.NewIdleTimeoutWatcher(session.IdleTimeoutWatcherConfig{}),
 		waitTimer:                 session.NewWaitTimer(session.WaitTimerConfig{}),
-		lastPersistedStatus:       make(map[string]string),
 		lastPersistedAutoNameDesc: make(map[string]string),
 		logUpdateChan:             make(chan *session.Instance, 100), // Buffered to absorb bursts
 		hotkeys:                   make(map[string]string),

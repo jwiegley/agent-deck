@@ -130,7 +130,7 @@ func fakeRemoteSSH(t *testing.T, mode string) string {
     printf '{"kind":"trailer","sessions":1,"cards":1,"artifacts":0,"edges":0}\n'
     exit 0 ;;
   *"'recall' 'search'"*)
-    printf '{"success": true, "result": {"query": "retry budget", "match": "\"retry\" \"budget\"", "hits": [{"sess_id": 4, "harness": "codex", "native_id": "remote-conv-1", "title": "remote retry budget", "body_hits": 2, "card_hit": true, "snippet": "raise the retry budget"}], "candidates": 2, "elapsed_ms": 3}, "index": {"swept": true, "elapsed_ms": 1}}\n'
+    printf '%s\n' '{"success": true, "result": {"query": "retry budget", "match": "\"retry\" \"budget\"", "hits": [{"sess_id": 4, "harness": "codex", "native_id": "remote-conv-1", "title": "remote retry budget", "body_hits": 2, "card_hit": true, "snippet": "raise the retry budget"}], "candidates": 2, "elapsed_ms": 3}, "index": {"swept": true, "elapsed_ms": 1}}'
     exit 0 ;;`
 	case "v13nophase4":
 		// A real v1.16.13 remote (phases 1-3, no phase-4 verbs): search

@@ -858,6 +858,42 @@ func TestRuntimeLifecycle_RuntimeCleanupLocalOptionParserPreservesOpaqueWhitespa
 	}
 }
 
+func TestRuntimeLifecycle_RuntimeCleanupLocalOptionsBoundTmuxCommandLength(t *testing.T) {
+	oldOutput := runtimeBindingCandidateOutputFn
+	t.Cleanup(func() { runtimeBindingCandidateOutputFn = oldOutput })
+	var candidates []RuntimeBindingCandidate
+	options := make(map[string]map[string]runtimeCleanupLocalOption)
+	for index := range 25 {
+		candidate := RuntimeBindingCandidate{SessionID: fmt.Sprintf("$%d", index)}
+		candidates = append(candidates, candidate)
+		options[candidate.SessionID] = runtimeCleanupLocalOptionsForTest("instance", 1, "codex", "thread")
+	}
+	calls := 0
+	runtimeBindingCandidateOutputFn = func(socketName string, args ...string) ([]byte, error) {
+		if socketName != "isolated" || len(strings.Join(args, " ")) > 2500 {
+			t.Fatalf("unbounded local-option query: socket=%q argv bytes=%d", socketName, len(strings.Join(args, " ")))
+		}
+		var batch []RuntimeBindingCandidate
+		for _, candidate := range candidates {
+			if slices.Contains(args, candidate.SessionID) {
+				batch = append(batch, candidate)
+			}
+		}
+		if len(batch) == 0 || len(batch) > 3 {
+			t.Fatalf("local-option batch has %d candidates", len(batch))
+		}
+		calls++
+		return runtimeCleanupLocalOutputForTest(batch, options), nil
+	}
+	got, err := readRuntimeCleanupLocalOptions("isolated", candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 9 || len(got) != len(candidates) {
+		t.Fatalf("queries=%d options=%d, want 9 queries and %d candidates", calls, len(got), len(candidates))
+	}
+}
+
 func TestRuntimeLifecycle_InvalidateRuntimeIdentityClearsBothGenerationMarkers(t *testing.T) {
 	oldMutation := runtimeBindingConditionalKillFn
 	t.Cleanup(func() { runtimeBindingConditionalKillFn = oldMutation })
@@ -1236,7 +1272,7 @@ func TestRuntimeLifecycle_RuntimeCleanupInventoryPreservesWhitespaceInstanceID(t
 	}
 }
 
-func TestRuntimeLifecycle_RuntimeCleanupCandidateInventoryScalesTwoCallsForHundredSessions(t *testing.T) {
+func TestRuntimeLifecycle_RuntimeCleanupCandidateInventoryBoundsQueriesForHundredSessions(t *testing.T) {
 	oldOutput := runtimeBindingCandidateOutputFn
 	t.Cleanup(func() { runtimeBindingCandidateOutputFn = oldOutput })
 
@@ -1257,7 +1293,16 @@ func TestRuntimeLifecycle_RuntimeCleanupCandidateInventoryScalesTwoCallsForHundr
 			)
 		}
 		if args[0] == "display-message" {
-			return runtimeCleanupLocalOutputForTest(candidates, bySession), nil
+			var batch []RuntimeBindingCandidate
+			for _, candidate := range candidates {
+				if slices.Contains(args, candidate.SessionID) {
+					batch = append(batch, candidate)
+				}
+			}
+			if len(batch) == 0 || len(batch) > 3 {
+				t.Fatalf("local-option batch contains %d candidates", len(batch))
+			}
+			return runtimeCleanupLocalOutputForTest(batch, bySession), nil
 		}
 		if len(args) != 3 || args[0] != "list-sessions" || args[1] != "-F" || args[2] != runtimeCleanupCandidateFormat() {
 			t.Fatalf("inventory call args = %q", args)
@@ -1279,8 +1324,8 @@ func TestRuntimeLifecycle_RuntimeCleanupCandidateInventoryScalesTwoCallsForHundr
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(candidates) != 100 || calls != 2 {
-		t.Fatalf("inventory candidates=%d subprocesses=%d, want 100 and 2", len(candidates), calls)
+	if len(candidates) != 100 || calls != 35 {
+		t.Fatalf("inventory candidates=%d subprocesses=%d, want 100 and 35", len(candidates), calls)
 	}
 }
 

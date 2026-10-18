@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -142,7 +143,11 @@ func TestCompletionRemovalRequiresPaneAbsence(t *testing.T) {
 	for _, requireHooks := range []bool{false, true} {
 		for _, orphan := range []bool{false, true} {
 			t.Run(fmt.Sprintf("hooks=%v/orphan=%v", requireHooks, orphan), func(t *testing.T) {
-				s := &suite{bin: "/bin/true", ctx: context.Background()}
+				truePath, err := exec.LookPath("true")
+				if err != nil {
+					t.Fatal(err)
+				}
+				s := &suite{bin: truePath, ctx: context.Background()}
 				defer s.cleanup()
 				if err := s.setup(); err != nil {
 					t.Fatal(err)
@@ -174,7 +179,7 @@ func TestCompletionRemovalRequiresPaneAbsence(t *testing.T) {
   *) exit 99;;
 esac
 `)
-				_, err := s.removeCompletionSession("child", requireHooks)
+				_, err = s.removeCompletionSession("child", requireHooks)
 				if orphan {
 					if err == nil || !strings.Contains(err.Error(), "pane remains") {
 						t.Fatalf("orphan pane must fail independently of hooks: %v", err)

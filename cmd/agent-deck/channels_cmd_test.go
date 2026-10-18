@@ -238,7 +238,30 @@ func agentDeckTestEnv(home string, extraEnv []string) []string {
 		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
 		"XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),
 	)
+	// TestMain's private socket must reach every CLI subprocess. Without it,
+	// subprocesses silently probe the operator's default tmux server.
+	if tmuxTmpdir := os.Getenv("TMUX_TMPDIR"); tmuxTmpdir != "" {
+		env = append(env, "TMUX_TMPDIR="+tmuxTmpdir)
+	}
 	return append(env, extraEnv...)
+}
+
+func TestAgentDeckTestEnvKeepsPrivateTmuxSocket(t *testing.T) {
+	privateSocketRoot := t.TempDir()
+	t.Setenv("TMUX_TMPDIR", privateSocketRoot)
+	t.Setenv("TMUX", "/host/private-socket,1,0")
+	var socketRoots int
+	for _, entry := range agentDeckTestEnv(t.TempDir(), nil) {
+		if strings.HasPrefix(entry, "TMUX=") || strings.HasPrefix(entry, "TMUX_PANE=") {
+			t.Fatalf("inherited tmux client identity reached a CLI subprocess: %q", entry)
+		}
+		if entry == "TMUX_TMPDIR="+privateSocketRoot {
+			socketRoots++
+		}
+	}
+	if socketRoots != 1 {
+		t.Fatalf("private tmux socket roots = %d, want 1", socketRoots)
+	}
 }
 
 // readSessionsJSON reads the persisted sessions for the test profile.

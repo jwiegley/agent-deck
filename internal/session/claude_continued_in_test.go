@@ -132,13 +132,11 @@ func TestFollowClaudeContinuedIn_PersistsAndPublishesSuccessor(t *testing.T) {
 
 	inst := NewInstanceWithTool("handoff-persist", projectPath, "claude")
 	inst.ClaudeSessionID = oldID
-	if err := db.SaveInstance(&statedb.InstanceRow{
+	saveHookBindingTestInstance(t, db, inst, &statedb.InstanceRow{
 		ID: inst.ID, Title: inst.Title, ProjectPath: inst.ProjectPath, GroupPath: inst.GroupPath,
 		Tool: "claude", Status: "idle", CreatedAt: time.Now(),
 		ToolData: json.RawMessage(`{"claude_session_id":"` + oldID + `"}`),
-	}); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	})
 
 	name := tmux.SessionPrefix + "continued-in_" + fmt.Sprintf("%d", time.Now().UnixNano())
 	if out, err := exec.Command("tmux", "new-session", "-d", "-s", name, "sh", "-c", "sleep 3600").CombinedOutput(); err != nil {

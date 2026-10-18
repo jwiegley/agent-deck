@@ -171,7 +171,12 @@ func TestViewersCached_DeadSocketIsRateLimited(t *testing.T) {
 	for _, n := range []int32{2, 3, 4, 5, 6} {
 		expireViewersCacheForTest("dead")
 		ViewersCached("dead", "agentdeck_x")
-		require.Eventually(t, func() bool { return calls.Load() == n }, 2*time.Second, 5*time.Millisecond)
+		require.Eventually(t, func() bool {
+			viewersCacheMu.Lock()
+			settled := !entry.refreshing && !entry.nextRefresh.IsZero()
+			viewersCacheMu.Unlock()
+			return calls.Load() == n && settled
+		}, 2*time.Second, 5*time.Millisecond)
 		want = min(want*2, viewersCacheMaxBackoff)
 		viewersCacheMu.Lock()
 		got := entry.nextRefresh.Sub(entry.refreshedAt)

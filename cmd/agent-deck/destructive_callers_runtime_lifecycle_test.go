@@ -118,13 +118,13 @@ func TestRuntimeLifecycle_HandleSessionAdoptRuntimeIsDryRunByDefault(t *testing.
 func TestRuntimeLifecycle_HandleSessionArchiveFencesMetadata(t *testing.T) {
 	body := sourceFunctionBody(t, "session_lifecycle_cmd.go", "handleSessionArchive")
 	requireCallOrder(t, body, "CaptureRuntimeSelection()", "inst.IsArchived()")
-	requireCallOrder(t, body, "KillCapturedRuntime(selection)", "inst.ArchivedAt =")
+	requireCallOrder(t, body, "KillCapturedRuntime(selection)", "inst.SetArchivedAtThreadSafe(")
 	requireCallOrder(t, body, "KillCapturedRuntime(selection)", "persistArchivedCLI(storage, inst, runtime, selection.Incarnation)")
 	if strings.Contains(body, "inst.Kill()") {
 		t.Fatalf("handleSessionArchive retains an unfenced kill")
 	}
 	persist := sourceFunctionBody(t, "session_lifecycle_cmd.go", "persistArchivedCLI")
-	if !strings.Contains(persist, "SetArchivedIfRuntime(expected, incarnation, inst.ArchivedAt)") {
+	if !strings.Contains(persist, "SetArchivedIfRuntime(expected, incarnation, inst.ArchivedAtThreadSafe())") {
 		t.Fatal("CLI archive does not fence metadata with the returned runtime")
 	}
 }
