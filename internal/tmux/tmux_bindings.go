@@ -395,11 +395,11 @@ func BindMouseStatusRightDetach() error {
 	// #{m:pattern,string} is evaluated entirely inside tmux's format engine
 	// (see ctrlQDetachIfShellFormat) — never handed to a shell, so a session
 	// name containing shell metacharacters can't break out of anything.
-	return commandRun(tmuxExec(DefaultSocketName(), "bind", "-n", "MouseDown1StatusRight",
-		"if-shell", "-F", ctrlQDetachIfShellFormat(), "detach-client", ""))
+	return runBoundedMutation(DefaultSocketName(), "bind", "-n", "MouseDown1StatusRight",
+		"if-shell", "-F", ctrlQDetachIfShellFormat(), "detach-client", "")
 }
 
 // UnbindMouseStatusClicks removes mouse click bindings from the status bar.
 func UnbindMouseStatusClicks() {
-	_ = commandRun(tmuxExec(DefaultSocketName(), "unbind", "-n", "MouseDown1StatusRight"))
+	_ = runBoundedMutation(DefaultSocketName(), "unbind", "-n", "MouseDown1StatusRight")
 }

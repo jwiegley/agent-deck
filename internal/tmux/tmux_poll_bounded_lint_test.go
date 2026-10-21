@@ -66,12 +66,14 @@ var pollSubcommands = map[string]struct{}{
 // running/waiting statuses fire them repeatedly — a cadence by any other name.
 // Leaving them out let the lint imply coverage the campaign did not have.
 var mutationSubcommands = map[string]struct{}{
+	"bind":           {},
 	"bind-key":       {},
 	"detach-client":  {},
 	"kill-session":   {},
 	"refresh-client": {},
 	"set-option":     {},
 	"switch-client":  {},
+	"unbind":         {},
 	"unbind-key":     {},
 }
 
