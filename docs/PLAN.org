@@ -1,0 +1,86 @@
+#+TITLE: Obr Issues
+#+SEQ_TODO: TODO DOING DRAFT WAIT DEFER NOTE | DONE CANCELED
+#+ISSUE_PREFIX: agent-deck
+
+* TODO [#C] Reproduce tmux blocking PTY read after Eternal Terminal client exit
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-2m2
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-10-20 Tue 17:26]
+:MODIFIED: [2026-10-20 Tue 17:26]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Athena tmux 3.6a with Eternal Terminal 6.2.11: original attached tmux client was a zombie; server blocked in readv(fd=8) -> n_tty_read on the ET PTY. The FD lacked O_NONBLOCK and terminal had ICANON/ECHO enabled. Server stopped accepting commands. Authorized server termination recovered agent-deck. Query deadlines contain the app hang but do not establish or fix the terminal-mode transition that wedged tmux. Reproduce before changing tmux or ET; consider existing dedicated-socket configuration without silently stranding sessions stored on the default socket.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-2m2",
+    "depends_on_id": "agent-deck-oa3",
+    "type": "discovered-from",
+    "created_at": "2026-10-21T00:26:54.012343Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#C] Investigate Nix/macOS tmux integration baseline failures
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-k50
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-10-20 Tue 17:26]
+:MODIFIED: [2026-10-20 Tue 17:26]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Race suite on macOS/Nix reproduces these failures on unchanged HEAD in an isolated worktree: TestStart_SurvivesExternallyPoisonedServer_ShellTool; TestIssue2361_BusyOverdueResolvesWithoutRespawn; TestIssue2361_RosterUnderFooterOverdueResolvesWithoutRespawn; TestIssue2521PiOverduePane/busy; TestCandidateRespawn_ReleasesClaimedStartupTimeout; TestCandidateRespawn_CannotLeaveTimeoutClaimCurrent; TestCandidateRespawn_CannotCrossTimeoutGenerationClaim; cmd/agent-deck TestSubstateDetail_ListJSONParity. Respawn fixtures observe coreutils/zsh rather than sleep. Full changed-tree suite also failed TestStart_KillsSessionBornInDeletedCwd; that failure did not reproduce in ten baseline repetitions, so attribution remains unproven. Focused timeout/viewer/shared-view race tests, go vet, and build pass.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-k50",
+    "depends_on_id": "agent-deck-oa3",
+    "type": "discovered-from",
+    "created_at": "2026-10-21T00:26:53.595359Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* DONE [#B] Bound tmux viewer queries and status mouse bindings
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-oa3
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-10-20 Tue 17:11]
+:MODIFIED: [2026-10-20 Tue 17:28]
+:CREATED_BY: johnw
+:FINISHED: [2026-10-20 Tue 17:28]
+:CLOSE_REASON: Bound ListViewers/ListAllViewers and startup/shutdown mouse bindings; added real frozen-server regressions and bind/unbind lint coverage. Both new failure modes reproduced before the fixes. Focused race suite and three repeated frozen-server runs pass; go vet and build pass. Recovery verified on athena; deployment awaits separate install approval. Baseline integration failures tracked separately.
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Athena tmux 3.6a blocked in readv on a stale Eternal Terminal PTY. CLI viewer queries used contexts without deadlines; TUI startup/shutdown used unbounded bind/unbind aliases that escaped the deadline lint. Bound all four shared operations, centralize the viewer timeout outside the cache, and extend regression coverage using SIGSTOP on private test servers.
+

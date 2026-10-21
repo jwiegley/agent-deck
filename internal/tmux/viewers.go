@@ -44,6 +44,8 @@ const viewerFormat = "#{session_name}\t#{client_name}\t#{client_tty}\t#{client_w
 // a stopped session, and every caller (CLI, listing, cache) must agree on
 // that.
 func ListViewers(ctx context.Context, socketName, sessionName string) ([]Viewer, error) {
+	ctx, cancel := context.WithTimeout(ctx, tmuxPollTimeout)
+	defer cancel()
 	out, err := commandOutput(tmuxExecContext(ctx, socketName, "list-clients", "-t", sessionName, "-F", viewerFormat))
 	if err != nil {
 		if viewersListingIsEmpty(err) {
@@ -60,6 +62,8 @@ func ListViewers(ctx context.Context, socketName, sessionName string) ([]Viewer,
 // row badges want. A socket with no server answers an empty map, not an
 // error: every session on it is stopped.
 func ListAllViewers(ctx context.Context, socketName string) (map[string][]Viewer, error) {
+	ctx, cancel := context.WithTimeout(ctx, tmuxPollTimeout)
+	defer cancel()
 	out, err := commandOutput(tmuxExecContext(ctx, socketName, "list-clients", "-F", viewerFormat))
 	if err != nil {
 		if viewersListingIsEmpty(err) {
