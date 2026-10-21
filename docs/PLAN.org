@@ -34,6 +34,134 @@ Athena tmux 3.6a with Eternal Terminal 6.2.11: original attached tmux client was
 ]
 #+end_src
 
+* TODO [#E] Resume the frozen test tmux server even when the test binary dies
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-80a
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-10-21 Wed 10:16]
+:MODIFIED: [2026-10-21 Wed 10:16]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Review of e28759a4: viewers_timeout_test.go SIGSTOPs a private tmux server and only an in-process t.Cleanup resumes it. If the run is interrupted (Ctrl-C, go test -timeout, a killed process group), the paused server outlives the binary and its socket stays under /tmp/ad-tmux-*/; scripts/reap-stale-tmux.sh probes each socket with tmux list-sessions and no timeout, so it would hang there. Options: resume from a watchdog process in its own session, use a test-owned Unix socket that never answers, or add a timeout to the reap script's probe. Also, the bind and unbind subtests run serially and each waits the full 5 s tmuxMutationTimeout; running them in parallel saves about 5 s per race-suite run.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-80a",
+    "depends_on_id": "agent-deck-oa3",
+    "type": "discovered-from",
+    "created_at": "2026-10-21T17:16:23.297507Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#D] Stamp issue965's test session so the runtime ownership check lets Kill reap it
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-dxo
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-10-21 Wed 10:16]
+:MODIFIED: [2026-10-21 Wed 10:16]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+In a golang:1.26 container (self-check.sh, FULL_TESTS=1), TestKillInternal_DiscoversAndReapsMcpChildrenFromPaneTree_RegressionFor965 (internal/session/issue965_wiring_test.go) fails the same way on 66b6ca79 and 85532d07: inst.Kill returns 'stop refused: tmux session ... is still live, but no Agent Deck ownership stamp proves it is runtime generation 0'. The test creates a raw tmux session with no ownership stamp, so the fork's runtime-lifecycle authority refuses the kill before the pane-tree reaper runs, and the regression for #965 is no longer exercised. Stamp the session the way the runtime does, or create it through the runtime path.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-dxo",
+    "depends_on_id": "agent-deck-oa3",
+    "type": "discovered-from",
+    "created_at": "2026-10-21T17:16:23.006031Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#D] Review the visualcheck 14-fork DIFF against its golden
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-h3v
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-10-21 Wed 10:16]
+:MODIFIED: [2026-10-21 Wed 10:16]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+TestVisualCheckAgainstRealBinary (tools/visualcheck) fails in a golang:1.26 container on 66b6ca79 and 85532d07 alike: every screen passes at 200x50 except 14-fork, which is a DIFF. visualcheck writes contact-sheet.html and redraw frames to $TMPDIR/visualcheck-artifacts; a reviewer must judge the DIFF before the golden is updated.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-h3v",
+    "depends_on_id": "agent-deck-oa3",
+    "type": "discovered-from",
+    "created_at": "2026-10-21T17:16:23.138430Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#E] Log the startup status-bar bind failure instead of discarding it
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-j70
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-10-21 Wed 10:16]
+:MODIFIED: [2026-10-21 Wed 10:16]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Review of e28759a4: internal/ui/home.go discards BindMouseStatusRightDetach's error (_ =), and UnbindMouseStatusClicks drops its own. Now that both are bounded at 5 s, a wedged tmux server leaves click-to-detach dead for that TUI run, and the status-right hint still shows, with nothing logged. Log non-nil errors as performFinalShutdown does for its own timeouts.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-j70",
+    "depends_on_id": "agent-deck-oa3",
+    "type": "discovered-from",
+    "created_at": "2026-10-21T17:16:23.412256Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
 * TODO [#C] Investigate Nix/macOS tmux integration baseline failures
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
@@ -73,7 +201,7 @@ Race suite on macOS/Nix reproduces these failures on unchanged HEAD in an isolat
 :LABELS:   []
 :ISSUE_TYPE: bug
 :CREATED:  [2026-10-20 Tue 17:11]
-:MODIFIED: [2026-10-20 Tue 17:28]
+:MODIFIED: [2026-10-21 Wed 10:16]
 :CREATED_BY: johnw
 :FINISHED: [2026-10-20 Tue 17:28]
 :CLOSE_REASON: Bound ListViewers/ListAllViewers and startup/shutdown mouse bindings; added real frozen-server regressions and bind/unbind lint coverage. Both new failure modes reproduced before the fixes. Focused race suite and three repeated frozen-server runs pass; go vet and build pass. Recovery verified on athena; deployment awaits separate install approval. Baseline integration failures tracked separately.
@@ -83,4 +211,18 @@ Race suite on macOS/Nix reproduces these failures on unchanged HEAD in an isolat
 :END:
 
 Athena tmux 3.6a blocked in readv on a stale Eternal Terminal PTY. CLI viewer queries used contexts without deadlines; TUI startup/shutdown used unbounded bind/unbind aliases that escaped the deadline lint. Bound all four shared operations, centralize the viewer timeout outside the cache, and extend regression coverage using SIGSTOP on private test servers.
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 1,
+    "issue_id": "agent-deck-oa3",
+    "author": "johnw",
+    "text": "The race suite's TestReapableVerbsMatchTheBoundedCommandLists failed on e28759a4: the lint's mutationSubcommands gained bind and unbind, but reapableOneShotVerbs did not, and the parity test requires the sets to be equal. 85532d07 adds both aliases beside bind-key and unbind-key; internal/tmux then passes under -race (scripts/test.sh, 322 s). In a golang:1.26 container the full suite at 85532d07 fails only issue965 and visualcheck 14-fork, which fail identically on 66b6ca79 (agent-deck-dxo, agent-deck-h3v), and the self-check revert-check passes. Three read-only reviews found no blocker; follow-ups agent-deck-80a and agent-deck-j70.",
+    "created_at": "2026-10-21T17:16:31Z"
+  }
+]
+#+end_src
 
