@@ -1037,6 +1037,7 @@ func isTruncatedTmuxComm(comm string) bool {
 // TestPollCommandsAreBounded enforces deadlines for — same commands, same
 // reason: they run on a cadence, so they are the ones that leak.
 var reapableOneShotVerbs = map[string]struct{}{
+	"bind":             {},
 	"bind-key":         {},
 	"capture-pane":     {},
 	"detach-client":    {},
@@ -1051,6 +1052,7 @@ var reapableOneShotVerbs = map[string]struct{}{
 	"show-environment": {},
 	"show-option":      {},
 	"switch-client":    {},
+	"unbind":           {},
 	"unbind-key":       {},
 }
 
