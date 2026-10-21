@@ -40,9 +40,7 @@ var (
 	// listAllViewersOnSocket is a package var so tests can drive the cache
 	// without a live tmux server.
 	listAllViewersOnSocket = func(socketName string) (map[string][]Viewer, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), tmuxPollTimeout)
-		defer cancel()
-		return ListAllViewers(ctx, socketName)
+		return ListAllViewers(context.Background(), socketName)
 	}
 )
 
