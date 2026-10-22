@@ -767,7 +767,7 @@ func validateConditionalArchive(inst *session.Instance, peers []*session.Instanc
 			response.CodexTurnGeneration != latestTurn {
 			return fmt.Errorf("conditional archive refused: latest Codex turn is not the completed response")
 		}
-		if _, err := session.ReconcileCodexSubmissionMarker(inst.ID, inst.CodexSessionID, latestTurn); err != nil {
+		if _, err := session.ReconcileCodexSubmissionMarker(inst.ID, inst.CodexSessionID, latestTurn, inst.CodexTurnTookInputSince); err != nil {
 			return fmt.Errorf("conditional archive refused: %w", err)
 		}
 	} else if session.IsClaudeCompatible(inst.Tool) {
@@ -3966,9 +3966,10 @@ func handleSessionSend(profile string, args []string) {
 		acceptanceGuard = nil
 	}
 	if acceptanceGuard != nil && !retainCodexAcceptanceGuardForCompletion(*wait, acceptedTurn) {
-		// The unresolved marker survives this process. A later sender either
-		// reconciles the exact new generation or refuses with the operator
-		// recovery path; it can never claim this attempt's turn.
+		// The unresolved marker survives this process. A later sender
+		// reconciles the exact new generation or input the running turn took
+		// up after this attempt began, or refuses with the operator recovery
+		// path; it can never claim this attempt's turn.
 		acceptanceGuard.Release()
 		acceptanceGuard = nil
 	}
@@ -4917,7 +4918,9 @@ func acquireCodexAcceptanceGuard(inst *session.Instance, timeout time.Duration) 
 		lock.Release()
 		return nil, errCodexGenerationUnavailable
 	}
-	if _, err := session.ReconcileCodexSubmissionMarker(inst.ID, inst.CodexSessionID, fence.priorTurnGeneration); err != nil {
+	if _, err := session.ReconcileCodexSubmissionMarker(
+		inst.ID, inst.CodexSessionID, fence.priorTurnGeneration, inst.CodexTurnTookInputSince,
+	); err != nil {
 		lock.Release()
 		return nil, err
 	}
