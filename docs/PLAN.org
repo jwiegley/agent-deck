@@ -34,21 +34,33 @@ Athena tmux 3.6a with Eternal Terminal 6.2.11: original attached tmux client was
 ]
 #+end_src
 
-* TODO [#E] Resume the frozen test tmux server even when the test binary dies
+* DONE [#E] Resume the frozen test tmux server even when the test binary dies
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
 :ID:       agent-deck-80a
 :LABELS:   []
 :ISSUE_TYPE: task
 :CREATED:  [2026-10-21 Wed 10:16]
-:MODIFIED: [2026-10-21 Wed 10:16]
+:MODIFIED: [2026-10-23 Fri 12:09]
 :CREATED_BY: johnw
+:FINISHED: [2026-10-23 Fri 12:09]
 :SOURCE_REPO: agent-deck
 :SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
 :ORIGINAL_SIZE: 0
 :END:
 
 Review of e28759a4: viewers_timeout_test.go SIGSTOPs a private tmux server and only an in-process t.Cleanup resumes it. If the run is interrupted (Ctrl-C, go test -timeout, a killed process group), the paused server outlives the binary and its socket stays under /tmp/ad-tmux-*/; scripts/reap-stale-tmux.sh probes each socket with tmux list-sessions and no timeout, so it would hang there. Options: resume from a watchdog process in its own session, use a test-owned Unix socket that never answers, or add a timeout to the reap script's probe. Also, the bind and unbind subtests run serially and each waits the full 5 s tmuxMutationTimeout; running them in parallel saves about 5 s per race-suite run.
+
+** Close Reason
+
+Fixed in dc163e96 (pushed in eba2e06d..ef8209d8, 2026-10-23).
+- scripts/reap-stale-tmux.sh bounds every tmux call against a candidate socket by AGENT_DECK_REAPER_PROBE_TIMEOUT (default 5 s).
+  - perl forks the call and SIGKILLs it at the deadline. macOS has no GNU timeout, and the tmux client does not die of an inherited SIGALRM.
+  - The probe writes to a file, not a $(...) pipe. The client hands its stdout to the server, so a stopped server kept the pipe open after the client died.
+  - A server that does not answer is logged and skipped, never killed.
+- The viewers test helper starts a watchdog in its own process group that resumes the server after 2 min if the test binary dies. Verified by ending the binary with -test.timeout: the server went from T to S 120 s later.
+- The bind and unbind subtests run in parallel.
+- tests/ci/reap-stale-tmux.test.sh gains a stopped-server case, and every pass in it is bounded. Before the fix the pass hung until the 120 s outer bound; after, all 30 checks pass in 3 s.
 
 ** Dependencies
 
@@ -73,7 +85,7 @@ Review of e28759a4: viewers_timeout_test.go SIGSTOPs a private tmux server and o
 :LABELS:   []
 :ISSUE_TYPE: bug
 :CREATED:  [2026-10-21 Wed 10:16]
-:MODIFIED: [2026-10-21 Wed 10:16]
+:MODIFIED: [2026-10-23 Fri 12:09]
 :CREATED_BY: johnw
 :SOURCE_REPO: agent-deck
 :SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
@@ -98,6 +110,20 @@ In a golang:1.26 container (self-check.sh, FULL_TESTS=1), TestKillInternal_Disco
 ]
 #+end_src
 
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 2,
+    "issue_id": "agent-deck-dxo",
+    "author": "johnw",
+    "text": "2026-10-23: the full container suite at dc163e96 still fails TestKillInternal_DiscoversAndReapsMcpChildrenFromPaneTree_RegressionFor965, as expected. Scheduled with the remaining fork work in nix-config epic nix-m4fy (decision 2026-10-23: fold into the approved fork work).",
+    "created_at": "2026-10-23T19:09:04Z"
+  }
+]
+#+end_src
+
 * TODO [#D] Review the visualcheck 14-fork DIFF against its golden
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
@@ -105,7 +131,7 @@ In a golang:1.26 container (self-check.sh, FULL_TESTS=1), TestKillInternal_Disco
 :LABELS:   []
 :ISSUE_TYPE: bug
 :CREATED:  [2026-10-21 Wed 10:16]
-:MODIFIED: [2026-10-21 Wed 10:16]
+:MODIFIED: [2026-10-23 Fri 12:09]
 :CREATED_BY: johnw
 :SOURCE_REPO: agent-deck
 :SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
@@ -130,21 +156,44 @@ TestVisualCheckAgainstRealBinary (tools/visualcheck) fails in a golang:1.26 cont
 ]
 #+end_src
 
-* TODO [#E] Log the startup status-bar bind failure instead of discarding it
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 3,
+    "issue_id": "agent-deck-h3v",
+    "author": "johnw",
+    "text": "Decision 2026-10-23 (John): John judges the 14-fork 200x50 frame. An agent reruns visualcheck in the self-check container, ties the diff to a commit, and shows him the golden and actual frames side by side. TestVisualCheckAgainstRealBinary still fails in the full container suite at dc163e96.",
+    "created_at": "2026-10-23T19:09:05Z"
+  }
+]
+#+end_src
+
+* DONE [#E] Log the startup status-bar bind failure instead of discarding it
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
 :ID:       agent-deck-j70
 :LABELS:   []
 :ISSUE_TYPE: task
 :CREATED:  [2026-10-21 Wed 10:16]
-:MODIFIED: [2026-10-21 Wed 10:16]
+:MODIFIED: [2026-10-23 Fri 12:09]
 :CREATED_BY: johnw
+:FINISHED: [2026-10-23 Fri 12:09]
 :SOURCE_REPO: agent-deck
 :SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
 :ORIGINAL_SIZE: 0
 :END:
 
 Review of e28759a4: internal/ui/home.go discards BindMouseStatusRightDetach's error (_ =), and UnbindMouseStatusClicks drops its own. Now that both are bounded at 5 s, a wedged tmux server leaves click-to-detach dead for that TUI run, and the status-right hint still shows, with nothing logged. Log non-nil errors as performFinalShutdown does for its own timeouts.
+
+** Close Reason
+
+Fixed in b5272ea8 (pushed to jwiegley/agent-deck main in eba2e06d..ef8209d8, 2026-10-23).
+- UnbindMouseStatusClicks now returns tmux’s error, like BindMouseStatusRightDetach.
+- The TUI logs either failure as status_detach_bind_failed or status_detach_unbind_failed.
+- TestStatusMouseBindings_UnresponsiveServer now requires errTmuxTimeout from unbind as well as from bind. Against the old signature it failed to compile, the expected red for this change.
+- Passed in a golang:1.26.10 + tmux 3.5a container.
 
 ** Dependencies
 
