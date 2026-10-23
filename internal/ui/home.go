@@ -2266,8 +2266,11 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	}
 
 	// Bind mouse click on status-right to detach (click the "ctrl+q/click detach" hint)
-	// This is unconditional — the status-right always shows the detach hint
-	_ = tmux.BindMouseStatusRightDetach()
+	// This is unconditional — the status-right always shows the detach hint.
+	// A failure leaves the hint without its binding, so it is logged.
+	if err := tmux.BindMouseStatusRightDetach(); err != nil {
+		uiLog.Warn("status_detach_bind_failed", slog.String("error", err.Error()))
+	}
 
 	h.liveSet = newPipeLiveSet(livePipeLRUCapacity)
 
@@ -4169,7 +4172,9 @@ func (h *Home) livePipeReconciler() {
 // cleanupNotifications removes all notification bar state on exit
 func (h *Home) cleanupNotifications() {
 	// Always unbind status-right mouse click (bound unconditionally at init)
-	tmux.UnbindMouseStatusClicks()
+	if err := tmux.UnbindMouseStatusClicks(); err != nil {
+		uiLog.Warn("status_detach_unbind_failed", slog.String("error", err.Error()))
+	}
 
 	if !h.manageTmuxNotifications || !h.notificationsEnabled || h.notificationManager == nil {
 		return
