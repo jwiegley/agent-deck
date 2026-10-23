@@ -92,10 +92,7 @@ func TestStatusMouseBindings_UnresponsiveServer(t *testing.T) {
 		run  func() error
 	}{
 		{"bind", BindMouseStatusRightDetach},
-		{"unbind", func() error {
-			UnbindMouseStatusClicks()
-			return nil
-		}},
+		{"unbind", UnbindMouseStatusClicks},
 	} {
 		t.Run(binding.name, func(t *testing.T) {
 			// Release the server if an unbounded command regresses, so the test can fail.
@@ -103,9 +100,8 @@ func TestStatusMouseBindings_UnresponsiveServer(t *testing.T) {
 			defer guard.Stop()
 			err := binding.run()
 			require.True(t, guard.Stop(), "binding must finish without the server's cooperation")
-			if binding.name == "bind" {
-				require.ErrorIs(t, err, errTmuxTimeout)
-			}
+			// Both report the failure, so the TUI can log it (agent-deck-j70).
+			require.ErrorIs(t, err, errTmuxTimeout)
 		})
 	}
 }
