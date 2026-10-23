@@ -208,7 +208,9 @@ func (h *Home) livePipeReconciler() {
 // cleanupNotifications removes all notification bar state on exit
 func (h *Home) cleanupNotifications() {
 	// Always unbind status-right mouse click (bound unconditionally at init)
-	tmux.UnbindMouseStatusClicks()
+	if err := tmux.UnbindMouseStatusClicks(); err != nil {
+		uiLog.Warn("status_detach_unbind_failed", slog.String("error", err.Error()))
+	}
 
 	if !h.manageTmuxNotifications || !h.notificationsEnabled || h.notificationManager == nil {
 		return
