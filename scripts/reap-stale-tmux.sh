@@ -80,6 +80,16 @@
 # sandbox; nothing is appended to it.
 #
 #
+# ─── PROBE BOUND ─────────────────────────────────────────────────────────────
+#
+# Every tmux call against a candidate socket is bounded by
+# AGENT_DECK_REAPER_PROBE_TIMEOUT seconds (default 5). A server that never
+# answers, such as one a test SIGSTOPped before it died without resuming it,
+# would otherwise hang the probe and with it the whole pass. Such a server is
+# logged and skipped, never killed: without an answer there is no proof of what
+# it is.
+#
+#
 # ─── MODES ───────────────────────────────────────────────────────────────────
 #
 #   DRY_RUN=1            log every kill it would make, kill nothing.
@@ -109,6 +119,7 @@ fi
 LOG="${AGENT_DECK_REAPER_LOG:-$log_home/.agent-deck/logs/tmux-reaper.log}"
 PTY_WARN_THRESHOLD="${AGENT_DECK_PTY_WARN_THRESHOLD:-400}"
 EVAL_BIN_MAX_AGE_SECONDS="${AGENT_DECK_EVAL_BIN_MAX_AGE_SECONDS:-86400}"
+PROBE_TIMEOUT="${AGENT_DECK_REAPER_PROBE_TIMEOUT:-5}"
 DRY_RUN="${DRY_RUN:-0}"
 LIST_ONLY=0
 [ "${1:-}" = "--list-candidates" ] && LIST_ONLY=1
@@ -122,6 +133,23 @@ log() {
   echo "$(ts) $*" >>"$LOG"
   [ "$DRY_RUN" = "1" ] && echo "$(ts) $*" >&2
   return 0
+}
+
+# bounded runs a command under PROBE_TIMEOUT (see PROBE BOUND) without GNU
+# timeout, which macOS lacks. perl runs the command as its child and SIGKILLs
+# it when the alarm fires: the tmux client does not die of SIGALRM, so an alarm
+# inherited across exec would not bound it. A command it stops exits 137.
+bounded() {
+  perl -e '
+    my $secs = shift;
+    my $pid = fork;
+    defined $pid or die "fork: $!\n";
+    if (!$pid) { exec @ARGV or die "exec $ARGV[0]: $!\n" }
+    $SIG{ALRM} = sub { kill "KILL", $pid };
+    alarm $secs;
+    1 while waitpid($pid, 0) == -1 && $!{EINTR};
+    exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+  ' "$PROBE_TIMEOUT" "$@"
 }
 
 [ "$home_missing" = "1" ] && log "WARNING HOME unset; logging to $LOG"
@@ -307,8 +335,22 @@ if command -v tmux >/dev/null 2>&1; then
     [ -n "$sock" ] || continue
 
     # Probe by socket path. This both identifies the server and proves it is
-    # reachable; a stale socket file with no listener is silently dropped.
-    if ! sessions=$(tmux -S "$sock" list-sessions -F '#{session_name}' 2>/dev/null); then
+    # reachable; a stale socket file with no listener is silently dropped, and
+    # a server that does not answer within the bound is logged and skipped.
+    # The output goes to a file, not a $(...) pipe: the tmux client hands its
+    # stdout to the server, so a server that never answers keeps the pipe's
+    # write end open after the client is killed, and $(...) would wait for an
+    # EOF that never comes.
+    if ! probe_out=$(mktemp "${TMPDIR:-/tmp}/reap-probe.XXXXXX"); then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    bounded tmux -S "$sock" list-sessions -F '#{session_name}' >"$probe_out" 2>/dev/null
+    probe_rc=$?
+    sessions=$(cat "$probe_out")
+    rm -f "$probe_out"
+    if [ "$probe_rc" -ne 0 ]; then
+      [ "$probe_rc" = "137" ] && log "WARNING $sock did not answer within ${PROBE_TIMEOUT}s; skipped"
       skipped=$((skipped + 1))
       continue
     fi
@@ -321,7 +363,7 @@ if command -v tmux >/dev/null 2>&1; then
     fi
 
     # Kill through the SAME socket path we probed. No pid, no name, no argv.
-    if tmux -S "$sock" kill-server 2>/dev/null; then
+    if bounded tmux -S "$sock" kill-server 2>/dev/null; then
       log "reaped $sock ($count session(s))"
       reaped=$((reaped + 1))
     else
