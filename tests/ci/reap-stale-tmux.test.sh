@@ -56,12 +56,17 @@ real_default="${TMUX_TMPDIR:-/tmp}/tmux-$uid/default"
 
 servers=()
 fake_pids=()
+stopped_pids=()
 
 tmux_q() { env -u TMUX -u TMUX_TMPDIR tmux "$@"; }
 
 cleanup() {
   local rc=$?
   local sock pid leaked=0
+  # A stopped server cannot answer kill-server, so resume it first.
+  for pid in ${stopped_pids[@]+"${stopped_pids[@]}"}; do
+    kill -CONT "$pid" 2>/dev/null
+  done
   for sock in ${servers[@]+"${servers[@]}"}; do
     tmux_q -S "$sock" kill-server >/dev/null 2>&1
     # Do not discard the outcome: a surviving test server is exactly the leak
@@ -233,12 +238,17 @@ fi
 # with the pty warning silenced so a busy CI host cannot add noise. $eval_age
 # is the age gate under test and is set by each caller.
 eval_age=86400
+# Every pass is bounded, so a reaper that hangs fails this test instead of
+# hanging it. perl's alarm survives exec; macOS has no GNU timeout.
+probe_timeout=5
 run_reaper() {
-  env -u TMUX -u TMUX_TMPDIR \
+  perl -e 'alarm shift; exec @ARGV or die "exec: $!\n"' 120 \
+    env -u TMUX -u TMUX_TMPDIR \
     AGENT_DECK_REAPER_TMP_ROOTS="$root_a:$root_b" \
     AGENT_DECK_REAPER_LOG="$log" \
     AGENT_DECK_PTY_WARN_THRESHOLD=1000000 \
     AGENT_DECK_EVAL_BIN_MAX_AGE_SECONDS="$eval_age" \
+    AGENT_DECK_REAPER_PROBE_TIMEOUT="$probe_timeout" \
     DRY_RUN=1 \
     bash "$SCRIPT" "$@"
 }
@@ -374,6 +384,45 @@ if grep -qF -- "$real_default" <<<"$log_body"; then
   fail "log mentions the real default socket path: $real_default"
 else
   pass "log never mentions the real default socket path"
+fi
+
+# 5. A server that never answers, as when a test SIGSTOPped it and died before
+# resuming it, is logged and skipped within the probe bound instead of hanging
+# the pass (agent-deck-80a).
+if [ "$tmux_present" = "1" ]; then
+  stopped_sock="$root_a/tmux-$uid/ad1031-stopped"
+  stopped_pid=""
+  if start_server "$stopped_sock"; then
+    stopped_pid=$(tmux_q -S "$stopped_sock" display-message -p '#{pid}' 2>/dev/null)
+  fi
+  if [ -n "$stopped_pid" ] && kill -STOP "$stopped_pid" 2>/dev/null; then
+    stopped_pids+=("$stopped_pid")
+    : >"$log"
+    probe_timeout=2
+    started=$(date +%s)
+    run_reaper >/dev/null 2>&1
+    elapsed=$(($(date +%s) - started))
+    probe_timeout=5
+    kill -CONT "$stopped_pid" 2>/dev/null
+    log_body=$(cat "$log" 2>/dev/null || true)
+    if [ "$elapsed" -lt 30 ]; then
+      pass "a stopped server does not hang the pass (${elapsed}s)"
+    else
+      fail "the pass took ${elapsed}s with a stopped server"
+    fi
+    if grep -qF "WARNING $stopped_sock did not answer" <<<"$log_body"; then
+      pass "a stopped server is logged and skipped"
+    else
+      fail "no warning for the stopped server $stopped_sock"
+    fi
+    if grep -qF "DRY_RUN would reap $stopped_sock " <<<"$log_body"; then
+      fail "a server that never answered was treated as reapable"
+    else
+      pass "a server that never answered is not a reap target"
+    fi
+  else
+    skip "could not stop a sandbox server; the probe bound is not exercised"
+  fi
 fi
 
 echo
