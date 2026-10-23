@@ -4,7 +4,9 @@ package tmux
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
@@ -13,6 +15,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+// unresponsiveServerWatchdog is how long a stopped test server waits before an
+// independent process resumes it, in case this test binary dies first.
+const unresponsiveServerWatchdog = 2 * time.Minute
 
 func newUnresponsiveTmuxSession(t *testing.T, tag string) (*Session, *os.Process) {
 	t.Helper()
@@ -28,6 +34,17 @@ func newUnresponsiveTmuxSession(t *testing.T, tag string) (*Session, *os.Process
 	t.Cleanup(func() {
 		require.NoError(t, server.Signal(syscall.SIGCONT))
 		_ = server.Release()
+	})
+	// If this binary dies before that cleanup (a -timeout panic, a SIGKILL),
+	// a watchdog in its own process group resumes the server, so it does not
+	// stay stopped holding its pty and becomes reapable (agent-deck-80a).
+	watchdog := exec.Command("sh", "-c",
+		fmt.Sprintf("sleep %d; kill -CONT %d", int(unresponsiveServerWatchdog.Seconds()), pid))
+	watchdog.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	require.NoError(t, watchdog.Start())
+	t.Cleanup(func() {
+		_ = watchdog.Process.Kill()
+		_ = watchdog.Wait()
 	})
 	require.NoError(t, server.Signal(syscall.SIGSTOP))
 	return s, server
@@ -95,6 +112,8 @@ func TestStatusMouseBindings_UnresponsiveServer(t *testing.T) {
 		{"unbind", UnbindMouseStatusClicks},
 	} {
 		t.Run(binding.name, func(t *testing.T) {
+			// Each binding waits out the full mutation timeout, so run them together.
+			t.Parallel()
 			// Release the server if an unbounded command regresses, so the test can fail.
 			guard := time.AfterFunc(2*tmuxMutationTimeout, func() { _ = server.Signal(syscall.SIGCONT) })
 			defer guard.Stop()
