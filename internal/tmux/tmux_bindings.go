@@ -399,7 +399,8 @@ func BindMouseStatusRightDetach() error {
 		"if-shell", "-F", ctrlQDetachIfShellFormat(), "detach-client", "")
 }
 
-// UnbindMouseStatusClicks removes mouse click bindings from the status bar.
-func UnbindMouseStatusClicks() {
-	_ = runBoundedMutation(DefaultSocketName(), "unbind", "-n", "MouseDown1StatusRight")
+// UnbindMouseStatusClicks removes mouse click bindings from the status bar and
+// returns tmux's error, so a caller can report a binding left behind.
+func UnbindMouseStatusClicks() error {
+	return runBoundedMutation(DefaultSocketName(), "unbind", "-n", "MouseDown1StatusRight")
 }
