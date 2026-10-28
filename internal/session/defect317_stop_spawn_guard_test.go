@@ -13,6 +13,12 @@ import (
 // process may already have written running. The spawn guard (lock held, or
 // generation moved since the stop's pre-kill read) must keep the stop from
 // writing stopped over it.
+//
+// In this fork these tests pin upstream's stop helpers on their own: no stop
+// path of the fork calls BeforeStopKill or WriteStoppedAfterKill. `session
+// stop` goes through KillCaptured, whose destruction reservation keeps a
+// concurrent status sample from landing over the stop
+// (TestRuntimeLifecycle_StatusPublisherCannotPassReservedKillBarrier).
 
 func defect317SpawnGuardStop(t *testing.T, during func(id string)) string {
 	t.Helper()
@@ -73,18 +79,15 @@ func defect317SpawnGuardStop(t *testing.T, during func(id string)) string {
 }
 
 func TestDefect317_StopDoesNotOverwriteWhileASpawnHoldsTheLock(t *testing.T) {
-	var release func()
-	t.Cleanup(func() {
-		if release != nil {
-			release()
-		}
-	})
 	got := defect317SpawnGuardStop(t, func(id string) {
-		r, err := acquireInstanceSpawnLock(id)
+		release, err := acquireInstanceSpawnLock(id)
 		if err != nil {
 			t.Fatalf("acquire spawn lock: %v", err)
 		}
-		release = r
+		// Registered after the helper's cleanup Kill, so it runs before it:
+		// the fork's Kill takes the spawn lock, and would otherwise wait out
+		// instanceSpawnLockBudget (30 s) for this release.
+		t.Cleanup(release)
 	})
 	if got != string(StatusRunning) {
 		t.Fatalf("row status = %q, want the in-flight restart's running", got)
