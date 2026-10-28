@@ -116,13 +116,22 @@ func runSwitchSettle(inst *session.Instance, run settleRun) (*session.SettleRepo
 	cfg, _ := session.LoadUserConfig()
 	procs := session.NewHostSettleProcReader()
 	restart := func() error {
-		if err := inst.Restart(); err != nil {
-			return err
+		// The result-carrying restart every CLI restart uses: the restart's
+		// own runtime tuple (its start time included) is adopted, and a
+		// partial success (the pane is up, but its runtime publication was not
+		// consumed) is reconciled and reported as a warning, not as a failed
+		// settle.
+		runtime, restartErr := inst.RestartRuntime()
+		restartErr, persistenceWarning := consumeRuntimeResult(inst, runtime, restartErr)
+		if restartErr != nil {
+			return restartErr
+		}
+		if persistenceWarning != "" {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", persistenceWarning)
 		}
 		if err := inst.VerifySpawned(spawnVerifyWait); err != nil {
 			return err
 		}
-		inst.LastStartedAt = time.Now()
 		if run.persist != nil {
 			return run.persist()
 		}

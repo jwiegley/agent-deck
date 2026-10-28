@@ -187,6 +187,7 @@ func TestRuntimeLifecycle_PhysicalEntrypointRoutingContract(t *testing.T) {
 		{"CLI add entry", "cmd/agent-deck/main.go", "handleAdd", []string{"handleAddCommand"}},
 		{"CLI add attach", "cmd/agent-deck/main.go", "handleAddCommand", []string{"StartRuntime", "consumeRuntimeResult"}},
 		{"CLI switch account", "cmd/agent-deck/session_switch_account.go", "handleSessionSwitchAccount", []string{"switchAccountExecute"}},
+		{"CLI switch settle", "cmd/agent-deck/session_switch_settle.go", "runSwitchSettle", []string{"RestartRuntime", "consumeRuntimeResult"}},
 		{"account switch adapter", "internal/session/account_switch.go", "SwitchAccount", []string{"ExecuteHarnessSwitch"}},
 		{"native harness switch", "internal/session/harness_switch.go", "ExecuteHarnessSwitch", []string{"beginRuntimeTransition", "executeNativeClaudeSwitch", "executeNativeCodexSwitch", "ConsumePhysicalRuntimeResult"}},
 		{"cross harness start", "internal/session/cross_harness_switch.go", "StartTarget", []string{"StartWithMessageRuntime", "ConsumePhysicalRuntimeResult"}},
