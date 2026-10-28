@@ -222,6 +222,64 @@ func TestRuntimeLifecycle_PhysicalEntrypointRoutingContract(t *testing.T) {
 			}
 		})
 	}
+
+	// A row above that names a test seam variable proves the route only while
+	// the variable is bound to the lifecycle entry it stands in for.
+	seams := []struct {
+		surface, path, variable, binding string
+	}{
+		{"CLI switch account seam", "cmd/agent-deck/session_switch_account.go", "switchAccountExecute", "session.SwitchAccount"},
+	}
+	for _, seam := range seams {
+		t.Run(seam.surface, func(t *testing.T) {
+			if got := runtimeLifecycleVariableBinding(t, seam.path, seam.variable); got != seam.binding {
+				t.Fatalf("%s binds %s to %q, want %s", seam.path, seam.variable, got, seam.binding)
+			}
+		})
+	}
+}
+
+// runtimeLifecycleVariableBinding returns the package-level selector a
+// variable is initialized to ("pkg.Name"), or "" when its value is anything
+// else.
+func runtimeLifecycleVariableBinding(t *testing.T, path, variable string) string {
+	t.Helper()
+	root := runtimeLifecycleSourceRoot(t)
+	parsed, err := parser.ParseFile(token.NewFileSet(), filepath.Join(root, path), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, declaration := range parsed.Decls {
+		decl, ok := declaration.(*ast.GenDecl)
+		if !ok || decl.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range decl.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for idx, name := range value.Names {
+				if name.Name != variable {
+					continue
+				}
+				if idx >= len(value.Values) {
+					return ""
+				}
+				sel, ok := value.Values[idx].(*ast.SelectorExpr)
+				if !ok {
+					return ""
+				}
+				pkg, ok := sel.X.(*ast.Ident)
+				if !ok {
+					return ""
+				}
+				return pkg.Name + "." + sel.Sel.Name
+			}
+		}
+	}
+	t.Fatalf("variable %s not found in %s", variable, path)
+	return ""
 }
 
 // The core registry is the default path for session start/stop/restart and
