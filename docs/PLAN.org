@@ -78,15 +78,17 @@ Fixed in dc163e96 (pushed in eba2e06d..ef8209d8, 2026-10-23).
 ]
 #+end_src
 
-* TODO [#D] Stamp issue965's test session so the runtime ownership check lets Kill reap it
+* DONE [#D] Stamp issue965's test session so the runtime ownership check lets Kill reap it
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
 :ID:       agent-deck-dxo
 :LABELS:   []
 :ISSUE_TYPE: bug
 :CREATED:  [2026-10-21 Wed 10:16]
-:MODIFIED: [2026-10-23 Fri 12:09]
+:MODIFIED: [2026-10-28 Wed 01:16]
 :CREATED_BY: johnw
+:FINISHED: [2026-10-28 Wed 01:16]
+:CLOSE_REASON: issue965_wiring_test now stamps its tmux session the way a start does (stampRuntimeCandidate, runtime generation 1), so Kill selects it as the instance's runtime and reaches the pane-tree discovery instead of refusing a live session whose ownership is unproven. In the golang:1.26 self-check container the test passes on the v1.16.34 rebase; it still passes with either the terminator's process-tree reap or the #965 child registration removed, and fails, leaving the detached child alive, with both removed. Upstream v1.16.34 passes it unchanged.
 :SOURCE_REPO: agent-deck
 :SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
 :ORIGINAL_SIZE: 0

@@ -123,6 +123,18 @@ func TestKillInternal_DiscoversAndReapsMcpChildrenFromPaneTree_RegressionFor965(
 	}
 	inst.tmuxSession = tmux.ReconnectSessionLazy(sessName, "issue965-wiring", "/tmp", "sh", "running")
 
+	// Kill stops only a live session whose ownership stamp proves it is the
+	// instance's selected runtime generation; an unstamped one is refused
+	// before any reaping (requireSelectedRuntimeGone). Stamp this session the
+	// way a start does, so Kill selects it as the instance's runtime and
+	// reaches the pane-tree discovery this test pins.
+	inst.RuntimeGeneration = 1
+	inst.Status = StatusRunning
+	inst.LastStartedAt = time.Now()
+	if err := stampRuntimeCandidate(inst.tmuxSession, inst.RuntimeState(), "", ""); err != nil {
+		t.Fatalf("stamp %s as the instance's runtime: %v", sessName, err)
+	}
+
 	// Sanity: session is alive immediately before Kill.
 	if has := exec.Command("tmux", "has-session", "-t", sessName).Run(); has != nil {
 		t.Fatalf("session %s gone before inst.Kill: %v", sessName, has)
