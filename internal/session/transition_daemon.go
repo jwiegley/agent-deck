@@ -655,6 +655,8 @@ func (d *TransitionDaemon) pruneDeletedProfiles(profiles []string) {
 	retireProfiles(d.ledgerOpenFailed, active, nil)
 	retireProfiles(d.commsPrompts, active, nil)
 	retireProfiles(d.lastImportPrune, active, nil)
+	retireProfiles(d.idleExitPending, active, nil)
+	retireProfiles(d.idleExitTold, active, nil)
 	retireProfileKeys(d.lastProbeStall, active)
 	retireProfileKeys(d.lastDesktopNotify, active)
 	if d.selfheal != nil {

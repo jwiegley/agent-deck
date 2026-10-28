@@ -46,43 +46,58 @@ func (i *Instance) withOwningStateDBLocked(write func(*statedb.StateDB) error) e
 }
 
 func (i *Instance) withOwningStateDBHandle(owner *statedb.StateDB, write func(*statedb.StateDB) error) error {
-	if owner == nil {
-		db := statedb.GetGlobal()
-		if db == nil {
-			return errNoStateDB
-		}
-		return write(db)
-	}
-	if owner.ReadOnly() {
-		return write(owner)
-	}
-	if owner.DB().Ping() == nil {
+	if owner != nil && !owner.ReadOnly() && owner.DB().Ping() == nil {
 		err := write(owner)
 		if err == nil || owner.DB().Ping() == nil {
 			return err
 		}
 		// Closed between the ping and the write: retry below.
 	}
-	if g := statedb.GetGlobal(); g != nil && !g.ReadOnly() && owner.Path() != "" &&
-		g.Path() == owner.Path() && g.DB().Ping() == nil {
-		return write(g)
-	}
-	if i.storageSnapshot == nil || i.storageSnapshot.dbPath == "" {
-		return write(owner)
-	}
-	path := i.storageSnapshot.dbPath
-	if _, err := os.Stat(path); err != nil {
-		return fmt.Errorf("owning state database %s: %w", path, err)
-	}
-	db, err := statedb.Open(path)
+	db, release, err := i.resolveOwningStateDB(owner, i.storageSnapshot)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = db.Close() }()
-	if p := owner.Profile(); p != "" {
-		if err := db.BindProfile(p); err != nil {
-			return err
-		}
+	defer release()
+	if db == nil {
+		return errNoStateDB
 	}
 	return write(db)
+}
+
+// resolveOwningStateDB picks the handle a targeted write uses, by the rules
+// withOwningStateDB documents, for writers that run several statements on one
+// handle (the fork's runtime binding publication and recall links). snapshot
+// is the instance's storage snapshot, which holds the saved owning path. It
+// returns nil, with no error, for an instance that has no owner when the
+// process has no global handle either. release closes a handle it reopened.
+func (i *Instance) resolveOwningStateDB(owner *statedb.StateDB, snapshot *instanceStorageSnapshot) (db *statedb.StateDB, release func(), err error) {
+	release = func() {}
+	if owner == nil {
+		return statedb.GetGlobal(), release, nil
+	}
+	if owner.ReadOnly() || owner.DB().Ping() == nil {
+		return owner, release, nil
+	}
+	if g := statedb.GetGlobal(); g != nil && !g.ReadOnly() && owner.Path() != "" &&
+		g.Path() == owner.Path() && g.DB().Ping() == nil {
+		return g, release, nil
+	}
+	if snapshot == nil || snapshot.dbPath == "" {
+		return owner, release, nil
+	}
+	path := snapshot.dbPath
+	if _, err := os.Stat(path); err != nil {
+		return nil, release, fmt.Errorf("owning state database %s: %w", path, err)
+	}
+	reopened, err := statedb.Open(path)
+	if err != nil {
+		return nil, release, err
+	}
+	if p := owner.Profile(); p != "" {
+		if err := reopened.BindProfile(p); err != nil {
+			_ = reopened.Close()
+			return nil, release, err
+		}
+	}
+	return reopened, func() { _ = reopened.Close() }, nil
 }

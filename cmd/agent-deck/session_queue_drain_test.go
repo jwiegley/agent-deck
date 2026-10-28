@@ -7,9 +7,10 @@ import (
 )
 
 // F5 on the legacy rollback path (AGENT_DECK_CORE_REGISTRY=0): a queued
-// session whose start fails is durably errored one status revision after the
-// runtime the drain read, so later stops do not retry it ahead of the rest of
-// the queue. An in-memory status would be dropped by the snapshot save.
+// session whose start fails is durably errored, so later stops do not retry
+// it ahead of the rest of the queue. An in-memory status would be dropped by
+// the snapshot save. Two status revisions follow the runtime the drain read:
+// the claim that takes it off the queue (starting) and the error verdict.
 func TestLegacyDrainGroupQueueFailurePersistsErrorStatus(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	for _, key := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"} {
@@ -59,7 +60,7 @@ func TestLegacyDrainGroupQueueFailurePersistsErrorStatus(t *testing.T) {
 	}
 	want := before
 	want.Status = string(session.StatusError)
-	want.StatusRevision++
+	want.StatusRevision += 2
 	got, found, err := storage.GetDB().ReadRuntimeState(queued.ID)
 	if err != nil || !found || got != want {
 		t.Fatalf("durable runtime = %+v, found=%v err=%v; want %+v", got, found, err, want)

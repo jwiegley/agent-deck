@@ -1,7 +1,6 @@
 package statedb
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -20,72 +19,86 @@ import (
 // false, and nothing is written, when another process got there first. Without
 // it (a session that was started or restarted another way), any pending
 // message is taken whatever the status.
+//
+// The runtime row is the status authority (instance_runtime_state); the
+// instances column only projects it. A row with a runtime moves queued to
+// starting through that row, with a status revision of its own, and refuses
+// while a writer from another schema epoch is live, like every other runtime
+// write. Only a row without a runtime (none exists after migration, but a
+// legacy writer can insert one) is moved through the projection alone.
 func (s *StateDB) TakeQueued(id, tool string, claim bool) (message, status string, taken bool, err error) {
 	var from, tmuxName string
 	err = withBusyRetry(func() error {
 		message, status, taken, from, tmuxName = "", "", false, "", ""
-		// BEGIN IMMEDIATE on a pinned connection, as mergeRegistrySnapshotsOnce
-		// does: it takes the write lock up front and waits for a concurrent
-		// writer on busy_timeout. A deferred transaction that reads first
-		// cannot upgrade to a write past a concurrent commit in WAL mode; it
-		// fails with SQLITE_BUSY at once, and the retry budget is far shorter
-		// than busy_timeout.
-		ctx := context.Background()
-		conn, err := s.db.Conn(ctx)
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-		if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-			return err
-		}
-		committed := false
-		defer func() {
-			if !committed {
-				_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return s.withImmediateTransaction(func(tx *immediateTransaction) error {
+			var current string
+			var raw []byte
+			if err := tx.QueryRow(`SELECT status, tool_data, tmux_session FROM instances WHERE id = ?`, id).Scan(&current, &raw, &tmuxName); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil
+				}
+				return err
 			}
-		}()
-		var current string
-		var raw []byte
-		if err := conn.QueryRowContext(ctx, `SELECT status, tool_data, tmux_session FROM instances WHERE id = ?`, id).Scan(&current, &raw, &tmuxName); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
+			var runtimeStatus string
+			hasRuntime := true
+			if err := tx.QueryRow(`SELECT status FROM instance_runtime_state WHERE instance_id = ?`, id).Scan(&runtimeStatus); err != nil {
+				if !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				hasRuntime = false
+			} else {
+				current = runtimeStatus
+			}
+			if claim && current != "queued" {
 				return nil
 			}
-			return err
-		}
-		if claim && current != "queued" {
-			return nil
-		}
-		td := map[string]json.RawMessage{}
-		if len(raw) > 0 {
-			if err := json.Unmarshal(raw, &td); err != nil {
-				return fmt.Errorf("reading tool_data of %s: %w", id, err)
+			td := map[string]json.RawMessage{}
+			if len(raw) > 0 {
+				if err := json.Unmarshal(raw, &td); err != nil {
+					return fmt.Errorf("reading tool_data of %s: %w", id, err)
+				}
 			}
-		}
-		if v, ok := td["queued_message"]; ok {
-			_ = json.Unmarshal(v, &message)
-			delete(td, "queued_message")
-		}
-		if !claim && message == "" && current != "queued" {
-			return nil // nothing to take
-		}
-		next := current
-		if current == "queued" {
-			next = "starting"
-		}
-		out, err := json.Marshal(td)
-		if err != nil {
-			return err
-		}
-		if _, err := conn.ExecContext(ctx, `UPDATE instances SET status = ?, tool = ?, tool_data = ? WHERE id = ?`, next, tool, string(out), id); err != nil {
-			return err
-		}
-		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-			return err
-		}
-		committed = true
-		taken, from, status = true, current, next
-		return nil
+			var msg string
+			if v, ok := td["queued_message"]; ok {
+				_ = json.Unmarshal(v, &msg)
+				delete(td, "queued_message")
+			}
+			if !claim && msg == "" && current != "queued" {
+				return nil // nothing to take
+			}
+			next := current
+			if current == "queued" {
+				next = "starting"
+			}
+			if hasRuntime && next != current {
+				if err := s.requireRuntimeWriterCompatibility(tx, time.Now()); err != nil {
+					return err
+				}
+				res, err := tx.Exec(`UPDATE instance_runtime_state
+					SET status = ?, status_revision = status_revision + 1
+					WHERE instance_id = ? AND status = ?`, next, id, current)
+				if err != nil {
+					return err
+				}
+				if n, err := res.RowsAffected(); err != nil {
+					return err
+				} else if n != 1 {
+					return nil
+				}
+			}
+			out, err := json.Marshal(td)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`UPDATE instances SET status = ?, tool = ?, tool_data = ? WHERE id = ?`, next, tool, string(out), id); err != nil {
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			message, taken, from, status = msg, true, current, next
+			return nil
+		})
 	})
 	if err == nil && taken && from == "queued" {
 		if observe := loadStatusChangeObserver(); observe != nil {

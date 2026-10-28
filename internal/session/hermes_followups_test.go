@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // errRestartFreshStop aborts RestartFresh at the seam, before it kills or
@@ -17,8 +19,14 @@ type errRestartFreshStop struct{}
 // generation) is rejected instead of writing the old id back.
 func TestHermesRestartFreshRotatesGenerationBeforeClearing(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	withTempGlobalStateDB(t)
+	db := withTempGlobalStateDB(t)
 	a := NewInstanceWithTool("hermes-a", t.TempDir(), "hermes")
+	// The fork's RestartFresh runs under runtime transition authority, which
+	// acts only on a stored row.
+	saveHookBindingTestInstance(t, db, a, &statedb.InstanceRow{
+		ID: a.ID, Title: a.Title, ProjectPath: a.ProjectPath, GroupPath: a.GroupPath,
+		Command: a.Command, Tool: "hermes", Status: "idle", CreatedAt: time.Now(),
+	})
 	old, err := a.seedHermesHookGeneration("waiting", false)
 	if err != nil {
 		t.Fatal(err)

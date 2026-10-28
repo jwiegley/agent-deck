@@ -124,21 +124,6 @@ func TestLaunchPostStartSaveMergesStatusVariant(t *testing.T) {
 	require.Equal(t, "agentdeck_worker_c5322ee1", committed[0].TmuxSession)
 }
 
-// A stopped saved from an idle baseline over a restart's committed starting
-// still conflicts: the restart is newer than the stop's view.
-func TestLivenessMergeStoppedOverConcurrentStartingConflicts(t *testing.T) {
-	db, _ := launchRaceFixture(t)
-	require.NoError(t, db.WriteStatus("sess", "waiting", "claude"))
-	base, err := db.LoadInstanceByID("sess")
-	require.NoError(t, err)
-	require.NoError(t, db.WriteStatus("sess", "starting", "claude"))
-	desired := CloneInstanceRow(base)
-	desired.Status = "stopped"
-	_, err = db.MergeInstanceSnapshots(
-		[]InstanceSnapshot{{Original: base, Stored: base, Desired: desired}}, nil)
-	require.ErrorContains(t, err, "stale concurrent Status conflict")
-}
-
 func TestLivenessMergeLastAccessedKeepsLater(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
@@ -162,6 +147,9 @@ func TestLivenessMergeLastAccessedKeepsLater(t *testing.T) {
 	}
 }
 
+// Upstream's Defect 317 cases (#2850) for Status conflicts in a snapshot
+// merge do not apply here: Status is runtime-owned, so a snapshot save drops
+// it and never conflicts on it (TestMetadataMergeCannotClobberRuntimeAuthority).
 func TestMetadataMergeStillConflictsOnMetadataIntent(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -169,26 +157,6 @@ func TestMetadataMergeStillConflictsOnMetadataIntent(t *testing.T) {
 		edit      func(desired *InstanceRow)
 		wantErr   string
 	}{
-		{
-			// Defect 317 is fixed on the stop path, not here: a stopped in a
-			// TUI save can be an observation (classifyTerminatedPane).
-			"an observed stopped does not beat a concurrent error",
-			func(t *testing.T, db *StateDB) { require.NoError(t, db.WriteStatus("sess", "error", "claude")) },
-			func(d *InstanceRow) { d.Status = "stopped" },
-			"stale concurrent Status conflict",
-		},
-		{
-			"error saved over a committed stopped conflicts",
-			func(t *testing.T, db *StateDB) { require.NoError(t, db.WriteStatus("sess", "stopped", "claude")) },
-			func(d *InstanceRow) { d.Status = "error" },
-			"stale concurrent Status conflict",
-		},
-		{
-			"a stopped saved over a committed running conflicts",
-			func(t *testing.T, db *StateDB) { require.NoError(t, db.WriteStatus("sess", "running", "claude")) },
-			func(d *InstanceRow) { d.Status = "stopped" },
-			"stale concurrent Status conflict",
-		},
 		{
 			"configuration keys keep the hard conflict",
 			func(t *testing.T, db *StateDB) {

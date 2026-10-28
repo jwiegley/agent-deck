@@ -764,11 +764,18 @@ func TestElectPrimary_NoHeartbeatRow(t *testing.T) {
 		t.Fatalf("ElectPrimary returned true but recorded %d primary rows for pid %d, want 1", primaries, db.pid)
 	}
 
-	// A second, registered instance must now lose the election.
+	// A second, registered instance must now lose the election. The fork's
+	// RegisterInstance records the live writer process's identity, so the
+	// stand-in pid is registered by its heartbeat row, as
+	// TestElectPrimary_SecondInstance does.
 	firstPID := db.pid
 	db.pid = pickDeadPID(firstPID)
-	if err := db.RegisterInstance(false); err != nil {
-		t.Fatalf("RegisterInstance (second): %v", err)
+	now := time.Now().Unix()
+	if _, err := db.DB().Exec(
+		"INSERT INTO instance_heartbeats (pid, started, heartbeat, is_primary) VALUES (?, ?, ?, 0)",
+		db.pid, now, now,
+	); err != nil {
+		t.Fatalf("register the second instance: %v", err)
 	}
 	isPrimary, err = db.ElectPrimary(30 * time.Second)
 	if err != nil {

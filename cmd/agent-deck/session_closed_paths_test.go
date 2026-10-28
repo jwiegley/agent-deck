@@ -37,7 +37,8 @@ func TestBulkRemoveCleansUpEachRowBeforeAnyExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := extractFuncBody(string(src), "bulkRemoveSessions")
-	del := strings.Index(body, "storage.DeleteInstance(inst.ID)")
+	// The fork deletes each row through its captured runtime selection.
+	del := strings.Index(body, "inst.DeleteAndWaitCaptured(selections[inst.ID])")
 	cleanup := strings.Index(body, "session.CleanupRemovedSession(storage.Profile(), inst.ID)")
 	save := strings.Index(body, "storage.SaveGroupsOnly(")
 	if del < 0 || cleanup < del || save < cleanup {
