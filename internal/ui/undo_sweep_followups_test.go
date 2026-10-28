@@ -111,3 +111,79 @@ func runAllCmds(cmd tea.Cmd) {
 	case <-time.After(2 * time.Second):
 	}
 }
+
+// deletedMsgs runs cmd, and every command of a batch it returns, and collects
+// the sessionDeletedMsg each one produces.
+func deletedMsgs(t *testing.T, cmd tea.Cmd) []sessionDeletedMsg {
+	t.Helper()
+	if cmd == nil {
+		return nil
+	}
+	switch msg := cmd().(type) {
+	case sessionDeletedMsg:
+		return []sessionDeletedMsg{msg}
+	case tea.BatchMsg:
+		var out []sessionDeletedMsg
+		for _, c := range msg {
+			out = append(out, deletedMsgs(t, c)...)
+		}
+		return out
+	default:
+		t.Fatalf("delete command produced %T, want sessionDeletedMsg", msg)
+		return nil
+	}
+}
+
+// Each TUI delete command records its pending sweep itself, before its
+// captured delete removes the row, so a TUI that dies before the delete is
+// final (a crash, kill -9) still leaves the sweep to the next start's
+// reconcile. The commands run for real here, and the reconcile finds the
+// record only if the command wrote it.
+func TestTUIDeleteCommandsRecordPendingSweepForTheReconcile(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status session.Status
+		cmd    func(*Home, *session.Instance) tea.Cmd
+	}{
+		{"delete", session.StatusStopped, (*Home).deleteSession},
+		{"remove", session.StatusStopped, (*Home).removeSession},
+		// The bulk remove takes errored rows only.
+		{"bulk remove errored", session.StatusError, func(h *Home, _ *session.Instance) tea.Cmd { return h.bulkRemoveErrored() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("XDG_DATA_HOME", "")
+			t.Setenv("XDG_CONFIG_HOME", "")
+			session.ClearUserConfigCache()
+			t.Cleanup(session.ClearUserConfigCache)
+			const id = "tui-pending-001"
+			h, storage := newHeadlessHomeForTest(t, "_test_tui_delete_pending")
+			seeded := seedSession(t, storage, nil, id, "doomed")
+			if tc.status != seeded.Status {
+				require.NoError(t, storage.GetDB().WriteStatus(id, string(tc.status), seeded.Tool))
+			}
+			require.NoError(t, h.HydrateInstancesFromStorage())
+			inst := h.instanceByID[id]
+			require.NotNil(t, inst)
+			require.Equal(t, tc.status, inst.Status)
+			pending := seedChildInboxEvent(t, id)
+			recordUISessionClosed(t)
+
+			msgs := deletedMsgs(t, tc.cmd(h, inst))
+			require.Len(t, msgs, 1)
+			require.Equal(t, id, msgs[0].deletedID)
+			require.NoError(t, msgs[0].killErr)
+			row, err := storage.GetDB().LoadInstanceByID(id)
+			require.NoError(t, err)
+			require.Nil(t, row, "the command must delete the row")
+			require.True(t, pending(), "an undoable delete keeps the inbox events")
+
+			// The TUI dies here, before the delete is final.
+			pretendOwnerExited(t, storage)
+			swept, err := storage.ReconcileRemovedSessionSweeps()
+			require.NoError(t, err)
+			require.Contains(t, swept, id, "the delete command left no pending-sweep record")
+			require.False(t, pending(), "the reconcile must sweep the deleted session")
+		})
+	}
+}
