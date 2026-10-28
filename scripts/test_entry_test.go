@@ -31,7 +31,8 @@ if [[ $1 == env ]]; then
 fi
 [[ $1 == test && $GOENV == off ]]
 tmp_root=$(cd /tmp && pwd -P)
-[[ $HOME == "$tmp_root"/agent-deck-tests.*/home && -d $HOME ]]
+[[ $TMPDIR == "$tmp_root"/adt.?????? ]] || { echo "TMPDIR $TMPDIR is not the short sandbox root" >&2; exit 11; }
+[[ $HOME == "$TMPDIR/home" && -d $HOME && $TMUX_TMPDIR == "$TMPDIR/tmux" ]]
 [[ $HOME == "$(cd "$HOME" && pwd -P)" ]]
 [[ $USERPROFILE == "$HOME" && $TMP == "$TMPDIR" && $TEMP == "$TMPDIR" ]]
 [[ -d $TMPDIR && -d $TMUX_TMPDIR && $GOCACHE == "$GOMODCACHE" ]]
