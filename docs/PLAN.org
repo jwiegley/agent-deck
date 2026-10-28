@@ -78,6 +78,23 @@ Fixed in dc163e96 (pushed in eba2e06d..ef8209d8, 2026-10-23).
 ]
 #+end_src
 
+* TODO [#D] Pin the fork's stop against a racing status sample at the CLI or core level
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-bl7
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-10-28 Wed 05:13]
+:MODIFIED: [2026-10-28 Wed 05:13]
+:CREATED_BY: johnw
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+The v1.16.34 rebase (dab9e0a2) removed upstream's twelve Defect 317 (#2850) stop-path race tests; 6d851a3e lists them. They inject a concurrent status writer through StopAfterKillHook between a stop's kill and its stopped write, and no stop path of the fork calls that hook or WriteStoppedAfterKill: `session stop`, the core registry's stop, the TUI's close and archive, and the web stop and archive go through KillCaptured, whose destruction reservation keeps a status sample from landing over the stop. The fork pins that only at the session level (TestRuntimeLifecycle_StatusPublisherCannotPassReservedKillBarrier).
+
+Add one CLI- or core-level test that stops a stored, started session through its real stop path while another writer races a WriteStatusIfVersion sample (error, or running for a dead pane) into the kill window, and requires stopped. internal/session/stop_status.go (BeforeStopKill, WriteStoppedAfterKill, StopAfterKillHook) is kept from upstream with no production caller; only defect317_stop_spawn_guard_test.go and the #2853 emulation use it. Raised by review round 1 of the v1.16.34 rebase (optional there).
+
 * DONE [#D] Stamp issue965's test session so the runtime ownership check lets Kill reap it
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
