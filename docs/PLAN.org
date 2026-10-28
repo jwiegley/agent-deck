@@ -297,7 +297,7 @@ A Codex send that lands while a turn runs starts no turn: Codex records the inpu
 #+begin_src json
 [
   {
-    "id": 1,
+    "id": 4,
     "issue_id": "agent-deck-pdt",
     "author": "johnw",
     "text": "Upstream now carries this fix: c7aa23a2 (fix(codex): reconcile a send the running turn took up (#2836) (#2877)), first released in v1.16.33 and written from eba2e06d with John credited as co-author. The rebase onto v1.16.34 dropped eba2e06d as superseded. The regression tests are upstream's TestIssue2836CodexSendTakenUpMidTurnReconciles (cmd/agent-deck) and TestIssue2836CodexTurnTookInputSince, TestIssue2836CodexTurnTookInputFailsClosedPastScanWindow, TestIssue2836ReconcileClearsOnlyWithMidTurnInput and TestIssue2836MarkerWithoutTurnNeverAsksForInput (internal/session); a consumer that ran this fork's TestCodexTurnTookInputSince, TestCodexSubmissionMarker or TestCodexAcceptanceGuardReconcilesInputTheRunningTurnTookUp by name must switch to them.",
@@ -305,3 +305,4 @@ A Codex send that lands while a turn runs starts no turn: Codex records the inpu
   }
 ]
 #+end_src
+
