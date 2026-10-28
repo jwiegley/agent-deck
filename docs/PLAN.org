@@ -78,6 +78,25 @@ Fixed in dc163e96 (pushed in eba2e06d..ef8209d8, 2026-10-23).
 ]
 #+end_src
 
+* TODO [#D] Keep the web menu's pooled status pass ahead of the serial pass under -race
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-9zg
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-10-28 Wed 06:35]
+:MODIFIED: [2026-10-28 Wed 06:35]
+:CREATED_BY: johnw
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+Upstream's TestLoadMenuSnapshot_StatusPassIsPooled (internal/web, #2861) requires the pooled menu status pass to take under 2/3 of a serial pass over 40 sessions. On the v1.16.34 rebase (54b33c7c) it is flaky under -race only, which scripts/test.sh runs by default, so it can fail the pre-push gate. Measured 2026-10-28 in the golang:1.26 rebase container, best of three per run:
+- no -race, 5 runs each: rebase pooled 37-45 ms / serial 140-143 ms (ratio about 0.27); upstream v1.16.34 32-36 / 133-142 ms (about 0.25). Production behaviour matches upstream.
+- -race, alone, 6 runs: rebase pooled 179-192 ms / serial 267-294 ms (ratio 0.62-0.70, 2 of 6 failed); upstream v1.16.34 79-91 / 195-205 ms (about 0.40, all passed).
+- -race, inside the full suite (fullrace-1): rebase 255 / 311 ms (0.82), failed.
+The fork's per-instance UpdateStatus path loses most of the pool's gain under the race detector. Find which synchronized work the fork's status path adds there (runtime authority reads or writes per instance, a shared lock) and either remove the serialization or adapt the test's ratio for race builds (internal/testutil.RaceEnabled, as ThroughputFloor scales throughput floors). Found by review round 1's verification run of the v1.16.34 rebase.
+
 * TODO [#D] Pin the fork's stop against a racing status sample at the CLI or core level
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
