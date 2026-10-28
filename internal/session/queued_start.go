@@ -60,11 +60,20 @@ func (i *Instance) MarkQueued(message string) {
 // queuedSpawn starts a drained instance; tests swap it to observe the call
 // without spawning a real agent. StartQueued passes no message: the queued
 // message goes through the send queue, never a ready-wait under the lock.
-var queuedSpawn = func(i *Instance, message string) error {
+var queuedSpawn = spawnQueuedRuntime
+
+// spawnQueuedRuntime starts i through the result-carrying lifecycle. A start
+// whose pane came up but whose publication did not complete returns a
+// partial-success error, which StartQueued turns into a runtime warning
+// (ConsumePhysicalRuntimeResult); the error carries the runtime it adopts.
+func spawnQueuedRuntime(i *Instance, message string) error {
+	var err error
 	if message != "" {
-		return i.StartWithMessage(message)
+		_, err = i.StartWithMessageRuntime(message)
+	} else {
+		_, err = i.StartRuntime()
 	}
-	return i.Start()
+	return err
 }
 
 // SetQueuedSpawnForTest replaces the spawn StartQueued uses and returns a
@@ -86,6 +95,10 @@ type QueuedStart struct {
 	Warning string
 	// TrustWarning is set when the session's folder was not marked trusted.
 	TrustWarning *LaunchWarning
+	// RuntimeWarning is the runtime durability warning of a start whose pane
+	// came up but whose publication did not fully complete (a partial
+	// success, ConsumePhysicalRuntimeResult). The start still counts.
+	RuntimeWarning string
 }
 
 // queuedMessageSink puts a queued -m message on the durable send queue of the
@@ -240,9 +253,25 @@ func (s *Storage) StartQueued(inst *Instance) (QueuedStart, error) {
 		return QueuedStart{}, fmt.Errorf("claiming queued start of %s: %w", inst.Title, err)
 	}
 	if !claimed {
+		// Another drainer or a direct start took it first, or the row is
+		// gone, and the caller's copy is stale. It adopts the durable runtime
+		// the winner committed, or with none reads as starting, so a drain
+		// counts it against the group cap and does not offer it again. Status
+		// is runtime-owned, so the copy is only ever updated from the store.
+		if durable, found, readErr := db.ReadRuntimeState(inst.ID); readErr == nil && found && durable.Status != string(StatusQueued) {
+			inst.ApplyRuntimeState(durable)
+		} else {
+			inst.Status = StatusStarting
+		}
 		return QueuedStart{}, nil
 	}
 	inst.noteTakenOffQueue(status)
+	// The claim moved the durable runtime from queued to starting under a new
+	// status revision. Adopt it, so the start below and any error verdict
+	// after it act on the tuple the claim committed.
+	if durable, found, readErr := db.ReadRuntimeState(inst.ID); readErr == nil && found {
+		inst.ApplyRuntimeState(durable)
+	}
 	inst.Status = StatusStarting
 	inst.QueuedMessage = ""
 	out, queued := QueuedStart{}, false
@@ -259,14 +288,23 @@ func (s *Storage) StartQueued(inst *Instance) (QueuedStart, error) {
 		out.TrustWarning = w
 	}
 	spawnErr := queuedSpawn(inst, "")
+	_, spawnErr, out.RuntimeWarning = ConsumePhysicalRuntimeResult(inst, statedb.RuntimeState{}, spawnErr, nil)
+	var statusWarning string
 	if spawnErr != nil {
-		inst.Status = StatusError
+		// Status is runtime-owned: the save below cannot record it. Commit the
+		// error through the status authority, so later drains do not retry
+		// this session ahead of the rest of the queue. A concurrent status
+		// writer wins that CAS, and the lost verdict is a warning.
+		if statusErr := PersistSelectedStatus(s, inst, StatusError); statusErr != nil {
+			statusWarning = fmt.Sprintf("failed to save session error status: %v", statusErr)
+		}
 	}
 	saveErr := s.SaveWithGroups([]*Instance{inst}, nil)
 	if spawnErr != nil {
 		if queued {
 			out.Warning = fmt.Sprintf("queued -m message held for %s: delivered if it starts within %s, then dropped: %s", queuedMessageLabel(inst), queuedMessageHold, queuedMessagePreview(message))
 		}
+		out.Warning = MergeRestartWarnings(out.Warning, statusWarning)
 		return out, errors.Join(spawnErr, saveErr)
 	}
 	out.Started = true

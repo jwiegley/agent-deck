@@ -1082,16 +1082,17 @@ func (i *Instance) recordRecallLinkLocked(kind, value string) error {
 	if versioned && i.linkedBindings.has(kind, version) {
 		return nil
 	}
-	db := i.owningDB
-	if db == nil {
-		db = statedb.GetGlobal()
-	}
-	if db == nil {
-		return nil
-	}
+	owner, snapshot := i.owningDB, i.storageSnapshot
 	instanceID, incarnation := i.ID, i.persistenceIncarnation
 	i.mu.Unlock()
-	linked, err := linkRuntimeBindingFn(db, instanceID, incarnation, kind, value)
+	// The owning store, as the binding itself was published to
+	// (resolveOwningStateDB); none at all leaves nothing to link.
+	db, release, err := i.resolveOwningStateDB(owner, snapshot)
+	linked := false
+	if err == nil && db != nil {
+		linked, err = linkRuntimeBindingFn(db, instanceID, incarnation, kind, value)
+	}
+	release()
 	i.mu.Lock()
 	if err != nil || !linked {
 		return err

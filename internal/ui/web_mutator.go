@@ -537,7 +537,6 @@ func (m *WebMutator) UndoDelete() (string, error) {
 
 // restoreDeleted restarts a popped undo entry and re-persists it.
 func (m *WebMutator) restoreDeleted(entry webDeletedEntry) (string, error) {
-
 	// #1397: hydrate + serialize before reading/persisting the in-memory list so
 	// the restored row is appended to the CURRENT registry (in headless mode the
 	// list would otherwise be empty, dropping every other session) and so this

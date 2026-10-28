@@ -30,7 +30,7 @@ func TestTUISuccessfulUndoThenMoveReconcileSweepsNothing(t *testing.T) {
 	pending := seedChildInboxEvent(t, "gone")
 	recordUISessionClosed(t)
 
-	h.Update(sessionDeletedMsg{deletedID: "gone"})
+	h.Update(deleteAsTUI(t, h, inst))
 	h.undoStack = h.undoStack[:0] // ctrl+z popped it; its Restart succeeded
 	_, cmd := h.Update(sessionRestoredMsg{instance: inst})
 	runAllCmds(cmd)

@@ -31,7 +31,11 @@ command = "claude --model opus"
 	for _, row := range []*statedb.InstanceRow{
 		{ID: "s1", Title: "s1", Tool: "my-claude", ToolData: json.RawMessage(`{"claude_session_id":"abc"}`)},
 		// A non-Claude tool holding a stale native id must not count as an owner.
-		{ID: "s2", Title: "s2", Tool: "codex", ToolData: json.RawMessage(`{"claude_session_id":"abc"}`)},
+		// The fork keeps one owner per conversation id (instance_runtime_binding),
+		// so the stale id is only tool_data: an explicit runtime snapshot with no
+		// bindings keeps it from being imported as a second claude binding.
+		{ID: "s2", Title: "s2", Tool: "codex", ToolData: json.RawMessage(`{"claude_session_id":"abc"}`),
+			RuntimeBindings: map[string]statedb.RuntimeBinding{}},
 	} {
 		if err := db.SaveInstance(row); err != nil {
 			t.Fatalf("save %s: %v", row.ID, err)

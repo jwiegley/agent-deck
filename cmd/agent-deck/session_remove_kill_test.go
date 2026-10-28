@@ -164,8 +164,9 @@ func setSandboxRowStatus(t *testing.T, sb *harness.Sandbox, id, status string) {
 	if err != nil || row == nil {
 		t.Fatalf("load %s: %+v %v", id, row, err)
 	}
-	row.Status = status
-	if err := db.SaveInstance(row); err != nil {
+	// Status is runtime-owned in the fork: a row save drops it, so the
+	// status goes through the status authority.
+	if err := db.WriteStatus(id, status, row.Tool); err != nil {
 		t.Fatal(err)
 	}
 }

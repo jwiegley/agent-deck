@@ -204,10 +204,21 @@ func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *tes
 		"storages", "lastStatus", "initialized", "livePrior", "lastDone", "lastTurn",
 		"journaledRun", "lastSelfTurn", "lastDoneScan", "journalWriters", "lastJournaled", "pollState",
 		"ledgers", "ledgerLocks", "ledgerOpenFailed", "commsPrompts", "lastImportPrune",
+		"idleExitPending", "idleExitTold",
 	}
 	profilePipeKeyed := []string{"lastProbeStall", "lastDesktopNotify"}
+	// Not keyed by profile: passStatus lives for one pass (nil outside
+	// SyncOnce), and orphansEmitted is keyed by instance and pruned with the
+	// instance's status entry.
+	notProfileScoped := map[string]bool{"passStatus": true, "orphansEmitted": true}
 
 	d := NewTransitionDaemon()
+	if d.idleExitPending == nil {
+		d.idleExitPending = map[string]map[string]idleExitEntry{}
+	}
+	if d.idleExitTold == nil {
+		d.idleExitTold = map[string]map[string]bool{}
+	}
 	appenders := map[string]*slowJournalAppender{}
 	for _, profile := range []string{"kept", "deleted"} {
 		d.storages[profile] = nil
@@ -228,6 +239,8 @@ func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *tes
 		d.ledgerOpenFailed[profile] = time.Now()
 		d.commsPrompts[profile] = map[string]CommsSpoolEntry{"worker": {}}
 		d.lastImportPrune[profile] = time.Now()
+		d.idleExitPending[profile] = map[string]idleExitEntry{"worker": {}}
+		d.idleExitTold[profile] = map[string]bool{"worker": true}
 		d.lastProbeStall[profile+"|worker"] = time.Now()
 		d.lastDesktopNotify[profile+"|worker"] = "waiting"
 	}
@@ -252,6 +265,9 @@ func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *tes
 	for j := 0; j < daemon.NumField(); j++ {
 		field := daemon.Type().Field(j)
 		if field.Type.Kind() != reflect.Map {
+			continue
+		}
+		if notProfileScoped[field.Name] {
 			continue
 		}
 		suffix, ok := classified[field.Name]

@@ -397,11 +397,13 @@ func TestSessionStopDrainWarningIsSurfaced(t *testing.T) {
 	if out, res := Invoke[SessionStartOut](context.Background(), r, IDSessionStart, SessionStartIn{Profile: profile, Session: "busy", NoWait: true}); res.Err != nil || out.Status != StartStatusStarted {
 		t.Fatalf("start busy: %+v %v", out, res.Err)
 	}
-	reconcileSucceeds(t)
-	setStartRuntimeHook(t, func(inst *session.Instance, message string) (statedb.RuntimeState, error) {
+	// The drain spawns through session.Storage.StartQueued, which consumes the
+	// partial success itself (session.ConsumePhysicalRuntimeResult).
+	t.Cleanup(session.SetQueuedSpawnForTest(func(inst *session.Instance, _ string) error {
 		runtime, err := inst.StartRuntime()
-		return publicationFailed(inst, runtime, err)
-	})
+		_, err = publicationFailed(inst, runtime, err)
+		return err
+	}))
 
 	ctx, events := recordEvents(context.Background())
 	out, res := Invoke[SessionStopOut](ctx, r, IDSessionStop, SessionStopIn{Profile: profile, Session: "busy"})
@@ -442,15 +444,15 @@ func loadForDrain(t *testing.T, profile string) (*session.Storage, []*session.In
 }
 
 // F5: a queued session whose start fails is durably errored, so the next stop
-// does not retry it ahead of the rest of the queue.
+// does not retry it ahead of the rest of the queue. Two status revisions
+// follow the runtime the drain read: the claim that takes it off the queue
+// (starting) and the error verdict.
 func TestDrainGroupQueueFailurePersistsErrorStatus(t *testing.T) {
 	const profile = "_core_drain_failure"
 	storage, instances, groups, queued := loadForDrain(t, profile)
 	before := queued.RuntimeState()
 	startErr := errors.New("injected start failure")
-	setStartRuntimeHook(t, func(*session.Instance, string) (statedb.RuntimeState, error) {
-		return statedb.RuntimeState{}, startErr
-	})
+	t.Cleanup(session.SetQueuedSpawnForTest(func(*session.Instance, string) error { return startErr }))
 
 	res := &runState{}
 	ctx, events := recordEvents(withRunState(context.Background(), res))
@@ -464,7 +466,7 @@ func TestDrainGroupQueueFailurePersistsErrorStatus(t *testing.T) {
 	}
 	want := before
 	want.Status = string(session.StatusError)
-	want.StatusRevision++
+	want.StatusRevision += 2
 	if got := durableRuntime(t, profile, queued.ID); got != want {
 		t.Fatalf("durable runtime = %+v, want %+v", got, want)
 	}
@@ -473,30 +475,33 @@ func TestDrainGroupQueueFailurePersistsErrorStatus(t *testing.T) {
 	}
 }
 
-// The drain's error verdict is a CAS on the generation and revision it read:
-// a concurrent status writer wins, and the lost verdict is a warning.
+// The drain's error verdict is a CAS on the generation and revision its claim
+// left: a status writer that lands between the claim and the verdict wins, and
+// the lost verdict is a warning.
 func TestDrainGroupQueueFailureKeepsConcurrentStatus(t *testing.T) {
 	const profile = "_core_drain_failure_race"
 	storage, instances, groups, queued := loadForDrain(t, profile)
 	before := queued.RuntimeState()
-	applied, err := storage.GetDB().WriteStatusIfVersion(queued.ID, queued.PersistenceIncarnation(), before.Generation, before.StatusRevision, string(session.StatusStopped))
-	if err != nil || !applied {
-		t.Fatalf("concurrent status write: applied=%v err=%v", applied, err)
-	}
-	setStartRuntimeHook(t, func(*session.Instance, string) (statedb.RuntimeState, error) {
-		return statedb.RuntimeState{}, errors.New("injected start failure")
-	})
+	startErr := errors.New("injected start failure")
+	t.Cleanup(session.SetQueuedSpawnForTest(func(inst *session.Instance, _ string) error {
+		claimed := inst.RuntimeState()
+		applied, err := storage.GetDB().WriteStatusIfVersion(inst.ID, inst.PersistenceIncarnation(), claimed.Generation, claimed.StatusRevision, string(session.StatusStopped))
+		if err != nil || !applied {
+			t.Errorf("concurrent status write: applied=%v err=%v", applied, err)
+		}
+		return startErr
+	}))
 
 	res := &runState{}
 	ctx, events := recordEvents(withRunState(context.Background(), res))
 	if drained, _ := drainGroupQueue(ctx, storage, "g", instances, groups); drained != nil {
 		t.Fatalf("drained %s after a failed start", drained.Title)
 	}
-	if len(*events) != 1 || !strings.Contains((*events)[0].Message, "failed to save session error status") ||
-		!slices.Equal(res.warnings, []string{(*events)[0].Message}) {
+	if len(*events) != 1 || (*events)[0].Kind != EventQueueDrainFailed || !errors.Is((*events)[0].Err, startErr) ||
+		len(res.warnings) != 1 || !strings.Contains(res.warnings[0], "failed to save session error status") {
 		t.Fatalf("events = %+v, warnings = %q", *events, res.warnings)
 	}
-	if got := durableRuntime(t, profile, queued.ID); got.Status != string(session.StatusStopped) || got.StatusRevision != before.StatusRevision+1 {
+	if got := durableRuntime(t, profile, queued.ID); got.Status != string(session.StatusStopped) || got.StatusRevision != before.StatusRevision+2 {
 		t.Fatalf("durable runtime = %+v, want the concurrent stopped verdict kept", got)
 	}
 }

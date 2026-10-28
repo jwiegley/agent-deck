@@ -33,14 +33,25 @@ func newUndoSweepTUIHome(t *testing.T) (*Home, *session.Instance) {
 	return h, inst
 }
 
+// deleteAsTUI does what the fork's TUI delete does before it sends
+// sessionDeletedMsg (deleteSession): it records the pending sweep and removes
+// the row, which the captured delete does there, and names the incarnation
+// it removed. Upstream deletes the row in the message handler instead.
+func deleteAsTUI(t *testing.T, h *Home, inst *session.Instance) sessionDeletedMsg {
+	t.Helper()
+	require.NoError(t, h.storage.MarkPendingDeleteSweep(inst.ID))
+	require.NoError(t, h.storage.DeleteInstance(inst.ID))
+	return sessionDeletedMsg{deletedID: inst.ID, incarnation: inst.PersistenceIncarnation()}
+}
+
 // Quitting the TUI makes every delete on its undo stack final: the quit
 // sweeps them.
 func TestTUIQuitSweepsUndoableDeletes(t *testing.T) {
-	h, _ := newUndoSweepTUIHome(t)
+	h, inst := newUndoSweepTUIHome(t)
 	pending := seedChildInboxEvent(t, "gone")
 	recordUISessionClosed(t)
 
-	h.Update(sessionDeletedMsg{deletedID: "gone"})
+	h.Update(deleteAsTUI(t, h, inst))
 	require.True(t, pending(), "still undoable before the quit")
 
 	done := make(chan struct{})
@@ -61,7 +72,7 @@ func TestTUIFailedRestoreSweepsDelete(t *testing.T) {
 	pending := seedChildInboxEvent(t, "gone")
 	recordUISessionClosed(t)
 
-	h.Update(sessionDeletedMsg{deletedID: "gone"})
+	h.Update(deleteAsTUI(t, h, inst))
 	h.undoStack = h.undoStack[:0] // ctrl+z popped it; its Restart failed
 	_, cmd := h.Update(sessionRestoredMsg{instance: inst, err: errors.New("restart failed")})
 	require.True(t, pending(), "the sweep runs in a command, not in Update")

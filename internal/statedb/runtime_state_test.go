@@ -959,6 +959,107 @@ func TestRuntimeLifecycle_CurrentSchemaFastPathCreatesMissingRecallTables(t *tes
 	}
 }
 
+// Upstream also adds the trigger tables (whose triggers table gained
+// unit_kind after its first build), the watcher delivery refusals table and a
+// one-time fold of duplicate hook cost rows without a schema bump, so a
+// database a fork build stamped at the current version before they existed
+// lacks them. The current-schema fast path must apply all of them without
+// entering the migration body, and must write nothing once they are applied.
+func TestRuntimeLifecycle_CurrentSchemaFastPathAppliesUnversionedUpstreamAdditions(t *testing.T) {
+	db := newRuntimeTestDB(t)
+	for _, table := range []string{"trigger_fires", "triggers", "watcher_delivery_refusals"} {
+		if _, err := db.DB().Exec(`DROP TABLE ` + table); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.DB().Exec(`CREATE TABLE triggers (
+		id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL,
+		host TEXT NOT NULL DEFAULT '', config_path TEXT NOT NULL DEFAULT '', verb TEXT NOT NULL DEFAULT '',
+		target TEXT NOT NULL DEFAULT '', target_by TEXT NOT NULL DEFAULT '', target_profile TEXT NOT NULL DEFAULT '',
+		schedule TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL DEFAULT '',
+		pushed INTEGER NOT NULL DEFAULT 0, scanned INTEGER NOT NULL DEFAULT 0, inferred INTEGER NOT NULL DEFAULT 0,
+		muted_until INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().Exec(`DELETE FROM metadata WHERE key = ?`, costHookDedupeKey); err != nil {
+		t.Fatal(err)
+	}
+
+	// data_version on a pinned connection changes only when another
+	// connection commits, and Migrate writes through its own connection.
+	ctx := context.Background()
+	probe, err := db.DB().Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close()
+	dataVersion := func() int64 {
+		t.Helper()
+		var v int64
+		if err := probe.QueryRowContext(ctx, `PRAGMA data_version`).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	reachedDDL := false
+	db.testBeforeMigrationDDL = func() { reachedDDL = true }
+	defer func() { db.testBeforeMigrationDDL = nil }()
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate on current schema without upstream's additions: %v", err)
+	}
+	if reachedDDL {
+		t.Fatal("applying upstream's additions entered the migration body")
+	}
+	var objects int
+	if err := db.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name IN
+		('trigger_fires', 'idx_trigger_fires_trigger_ts', 'idx_trigger_fires_session_ts', 'watcher_delivery_refusals')`).Scan(&objects); err != nil {
+		t.Fatal(err)
+	}
+	if objects != 4 {
+		t.Fatalf("trigger fire and delivery refusal objects after Migrate = %d, want 4", objects)
+	}
+	var unitKind int
+	if err := db.DB().QueryRow(`SELECT COUNT(*) FROM pragma_table_info('triggers') WHERE name = 'unit_kind'`).Scan(&unitKind); err != nil {
+		t.Fatal(err)
+	}
+	if unitKind != 1 {
+		t.Fatal("Migrate did not add unit_kind to a first-build triggers table")
+	}
+	var folded string
+	if err := db.DB().QueryRow(`SELECT value FROM metadata WHERE key = ?`, costHookDedupeKey).Scan(&folded); err != nil || folded == "" {
+		t.Fatalf("hook cost fold not recorded: %q, %v", folded, err)
+	}
+	var version string
+	if err := db.DB().QueryRow(`SELECT value FROM metadata WHERE key = 'schema_version'`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != strconv.Itoa(SchemaVersion) {
+		t.Fatalf("schema_version = %q, want %d", version, SchemaVersion)
+	}
+
+	if err := db.ReplaceScannedTriggers([]TriggerRow{{ID: "systemd:poll", Kind: "systemd", Source: "poll", Unit: "poll", UnitKind: "systemd"}}); err != nil {
+		t.Fatalf("ReplaceScannedTriggers after repair: %v", err)
+	}
+	if rows, err := db.ListTriggers(); err != nil || len(rows) != 1 || rows[0].UnitKind != "systemd" {
+		t.Fatalf("triggers after repair = %+v err=%v", rows, err)
+	}
+	if n, err := db.RecordWatcherDeliveryRefusal("watcher", "conductor", time.Now()); err != nil || n != 1 {
+		t.Fatalf("RecordWatcherDeliveryRefusal after repair = %d, %v", n, err)
+	}
+
+	beforeRerun := dataVersion()
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("second Migrate: %v", err)
+	}
+	if reachedDDL {
+		t.Fatal("second Migrate entered the migration body")
+	}
+	if after := dataVersion(); after != beforeRerun {
+		t.Fatalf("second Migrate wrote to the database: data_version %d -> %d", beforeRerun, after)
+	}
+}
+
 func TestRuntimeLifecycle_ReadAllStatusesUsesAuthoritativeRuntime(t *testing.T) {
 	db := newRuntimeTestDB(t)
 	row := &InstanceRow{ID: "one", Title: "one", ProjectPath: "/tmp/one", GroupPath: "my-sessions", Tool: "pi", Status: "idle", CreatedAt: time.Unix(1, 0)}

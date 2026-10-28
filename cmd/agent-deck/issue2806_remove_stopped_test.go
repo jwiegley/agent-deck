@@ -72,21 +72,25 @@ func issue2806WorktreeSession(t *testing.T, home, title string, status session.S
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	found := false
+	tool := ""
 	for _, inst := range instances {
 		if inst.ID == id {
-			inst.Status = status
 			inst.WorktreePath = wt
 			inst.WorktreeRepoRoot = repo
 			inst.WorktreeBranch = "br-" + title
-			found = true
+			tool = inst.Tool
 		}
 	}
-	if !found {
+	if tool == "" {
 		t.Fatalf("instance %s not found", id)
 	}
 	if err := storage.SaveWithGroups(instances, session.NewGroupTreeWithGroups(instances, groups)); err != nil {
 		t.Fatalf("save: %v", err)
+	}
+	// Status is runtime-owned in the fork: a snapshot save drops it, so the
+	// saved status goes through the status authority.
+	if err := storage.GetDB().WriteStatus(id, string(status), tool); err != nil {
+		t.Fatalf("write status: %v", err)
 	}
 	return id
 }
@@ -176,8 +180,11 @@ func TestIssue2806_RemoveSavesStoppedBeforeWorktreeRemoval(t *testing.T) {
 			if r.err != nil || r.code != 0 {
 				t.Fatalf("remove: exit %d, %v\nstdout: %s\nstderr: %s", r.code, r.err, r.stdout, r.stderr)
 			}
-			if during != string(session.StatusStopped) {
-				t.Errorf("row status while the worktree was being removed = %q, want %q (the notify daemon would report an idle death)", during, session.StatusStopped)
+			// The fork's captured delete removes the row, with its runtime,
+			// before the worktree is pruned, so the row may already be gone
+			// (""); either way no live-looking row outlives its pane.
+			if during != string(session.StatusStopped) && during != "" {
+				t.Errorf("row status while the worktree was being removed = %q, want %q or the row gone (the notify daemon would report an idle death)", during, session.StatusStopped)
 			}
 			if after := issue2806RowStatus(t, id); after != "" {
 				t.Errorf("row still present after remove: status %q", after)

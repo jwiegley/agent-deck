@@ -238,11 +238,9 @@ func agentDeckTestEnv(home string, extraEnv []string) []string {
 		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
 		"XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),
 	)
-	// TestMain's private socket must reach every CLI subprocess. Without it,
-	// subprocesses silently probe the operator's default tmux server.
-	if tmuxTmpdir := os.Getenv("TMUX_TMPDIR"); tmuxTmpdir != "" {
-		env = append(env, "TMUX_TMPDIR="+tmuxTmpdir)
-	}
+	// TestMain's private socket (TMUX_TMPDIR, kept by the loop above) must
+	// reach every CLI subprocess exactly once; without it subprocesses
+	// silently probe the operator's default tmux server.
 	return append(env, extraEnv...)
 }
 

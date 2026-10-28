@@ -95,27 +95,16 @@ func (i *Instance) CaptureRuntimeBindingObservation(kind string) RuntimeBindingO
 	return observation
 }
 
-// A web mutator may close the Storage that last saved this Instance. Reopen
-// only that exact profile database; an unrelated process-global DB must never
-// receive its binding.
+// runtimeBindingDB resolves the store a binding publication writes to by the
+// owning-store rules of withOwningStateDB (resolveOwningStateDB). A web
+// mutator may close the Storage that last saved this Instance: only that
+// exact profile database is reopened, after its profile stamp is checked, and
+// never recreated; an unrelated process-global DB never receives its binding.
 func (i *Instance) runtimeBindingDB() (*statedb.StateDB, func(), error) {
 	i.mu.RLock()
-	db := i.owningDB
-	snapshot := i.storageSnapshot
+	owner, snapshot := i.owningDB, i.storageSnapshot
 	i.mu.RUnlock()
-	if db == nil {
-		return statedb.GetGlobal(), func() {}, nil
-	}
-	if err := db.DB().Ping(); err == nil {
-		return db, func() {}, nil
-	} else if snapshot == nil || snapshot.dbPath == "" {
-		return nil, nil, fmt.Errorf("owning profile database is closed: %w", err)
-	}
-	reopened, err := statedb.Open(snapshot.dbPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("reopen owning profile database: %w", err)
-	}
-	return reopened, func() { _ = reopened.Close() }, nil
+	return i.resolveOwningStateDB(owner, snapshot)
 }
 
 func (i *Instance) captureActiveRuntimeBindingObservation() RuntimeBindingObservation {

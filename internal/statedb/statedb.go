@@ -473,6 +473,33 @@ func (s *StateDB) Migrate() error {
 	return withBusyRetryAttempts(s.migrateOnce, 20)
 }
 
+// unitKindTriggersColumn is the triggers column the triggers view (#2702)
+// added after the first build of that table.
+const unitKindTriggersColumn = "ALTER TABLE triggers ADD COLUMN unit_kind TEXT NOT NULL DEFAULT ''"
+
+// migrateUnversionedAdditions applies everything upstream adds to state.db
+// without moving SchemaVersion: the recall tables, the one-time fold of
+// duplicate hook cost rows, the trigger tables with their later unit_kind
+// column, and the watcher delivery refusals table. Upstream runs them on
+// every Migrate. The fork's current-schema fast path skips the migration
+// body, so it runs them here; the full migration runs each in place. Every
+// step is idempotent and writes nothing once applied.
+func migrateUnversionedAdditions(tx *sql.Tx) error {
+	if err := migrateRecallTables(tx); err != nil {
+		return err
+	}
+	if err := foldLegacyHookCostRows(tx); err != nil {
+		return fmt.Errorf("statedb: fold legacy hook cost rows: %w", err)
+	}
+	if err := migrateTriggerTables(tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(unitKindTriggersColumn); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return fmt.Errorf("statedb: alter migration: %w", err)
+	}
+	return migrateWatcherDeliveryRefusals(tx)
+}
+
 func (s *StateDB) migrateOnce() error {
 	// Use an immediate transaction so the future-schema guard and every DDL
 	// statement share one writer reservation. A deferred transaction would let
@@ -516,11 +543,12 @@ func (s *StateDB) migrateOnce() error {
 			}
 			if version == SchemaVersion {
 				// The migration body stays skipped: its backfills and writer-epoch
-				// check belong to version transitions. Upstream adds the recall
-				// tables without a schema bump, so a database a pre-recall build
-				// stamped at this version never ran their DDL. It is additive and
-				// idempotent, and writes nothing once the tables exist.
-				if err := migrateRecallTables(tx); err != nil {
+				// check belong to version transitions. Upstream adds tables, a
+				// column and a one-time cost fold without a schema bump, so a
+				// database an earlier build stamped at this version never ran
+				// them (migrateUnversionedAdditions). They are additive and
+				// idempotent, and write nothing once applied.
+				if err := migrateUnversionedAdditions(tx); err != nil {
 					return err
 				}
 				return tx.Commit()
@@ -831,7 +859,7 @@ func (s *StateDB) migrateOnce() error {
 		"ALTER TABLE instances ADD COLUMN last_sent_at INTEGER NOT NULL DEFAULT 0",
 		// Triggers view (#2702): unit_kind arrived after the first build of the
 		// triggers table; a DB made by that build lacks it.
-		"ALTER TABLE triggers ADD COLUMN unit_kind TEXT NOT NULL DEFAULT ''",
+		unitKindTriggersColumn,
 		// v15: old writers omit this column and therefore register as epoch 0.
 		"ALTER TABLE instance_heartbeats ADD COLUMN writer_schema_version INTEGER NOT NULL DEFAULT 0",
 		// v16: an idempotent profile transfer gets a fresh destination identity
@@ -1877,25 +1905,64 @@ func (s *StateDB) WriteStatus(id, status, tool string) error {
 // WriteStatusIfCurrent applies a sampled verdict only while the stored status
 // still matches the value observed before sampling. A concurrent deliberate
 // stop must not be overwritten by an older daemon probe.
+//
+// Like WriteStatus, it compares and moves the authoritative runtime status
+// (instance_runtime_state, with a status revision of its own) together with
+// the legacy projection in one writer-fenced transaction, and never touches a
+// destruction sentinel. A verdict equal to the expected status writes
+// nothing.
 func (s *StateDB) WriteStatusIfCurrent(id, expected, status, tool string) (bool, error) {
+	if err := rejectRuntimeDestructionStatus(status); err != nil {
+		return false, err
+	}
 	observe := loadStatusChangeObserver()
-	var tmuxName string
+	var prior statusChangePrior
 	var applied bool
 	err := withBusyRetry(func() error {
 		applied = false
-		if observe != nil {
-			_ = s.db.QueryRow(`SELECT tmux_session FROM instances WHERE id = ?`, id).Scan(&tmuxName)
-		}
-		res, err := s.db.Exec(writeStatusSQL+` AND status = ?`, status, tool, status, id, expected)
-		if err != nil {
-			return err
-		}
-		n, err := res.RowsAffected()
-		applied = n > 0
-		return err
+		return s.withImmediateTransaction(func(tx *immediateTransaction) error {
+			if expected == status {
+				var current string
+				err := tx.QueryRow(`SELECT status FROM instance_runtime_state WHERE instance_id = ?`, id).Scan(&current)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				applied = err == nil && current == expected
+				return nil
+			}
+			if err := s.requireRuntimeWriterCompatibility(tx, time.Now()); err != nil {
+				return err
+			}
+			prior = statusChangePrior{}
+			if observe != nil {
+				var err error
+				if prior, err = readStatusChangePrior(tx.QueryRow(statusChangePriorSQL, id)); err != nil {
+					return err
+				}
+			}
+			result, err := tx.Exec(`
+			UPDATE instance_runtime_state
+			SET status = ?, status_revision = status_revision + 1
+			WHERE instance_id = ? AND status = ? AND status <> ?`,
+				status, id, expected, runtimeDestructionStatus)
+			if err != nil {
+				return err
+			}
+			if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+				return err
+			}
+			if _, err := tx.Exec(writeStatusSQL, status, tool, status, id); err != nil {
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			applied = true
+			return nil
+		})
 	})
 	if err == nil && applied && expected != status && observe != nil {
-		observe(StatusChange{DBPath: s.path, ID: id, TmuxSession: tmuxName, From: expected, To: status, Tool: tool, At: time.Now()})
+		prior.publish(observe, s.path, id, status, tool)
 	}
 	return applied, err
 }

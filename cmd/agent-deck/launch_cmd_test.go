@@ -14,7 +14,7 @@ func TestRuntimeLifecycle_LaunchPersistenceUsesOneCreationBoundary(t *testing.T)
 	if got := strings.Count(body, "InsertSessionAndVerify("); got != 1 {
 		t.Fatalf("handleLaunchCommand has %d insert-capable writes, want exactly the initial creation", got)
 	}
-	requireCallOrder(t, body, "newInstance.Status = session.StatusQueued", "InsertSessionAndVerify(")
+	requireCallOrder(t, body, "newInstance.MarkQueued(", "InsertSessionAndVerify(")
 	requireCallOrder(t, body, "InsertSessionAndVerify(", "newInstance.PostStartSync(")
 	requireCallOrder(t, body, "newInstance.PostStartSync(", "storage.SaveWithGroups([]*session.Instance{newInstance}, nil)")
 }

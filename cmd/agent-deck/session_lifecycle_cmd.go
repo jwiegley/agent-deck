@@ -786,10 +786,11 @@ func drainGroupQueue(storage *session.Storage, groupPath string, instances []*se
 			return nil, ""
 		}
 		if started.Started {
-			return next, ""
+			return next, started.RuntimeWarning
 		}
-		// Claimed by another drainer: this copy is stale.
-		next.Status = session.StatusStarting
+		// Claimed by another drainer: StartQueued updated this stale copy
+		// (to the winner's durable status), so the cap check and
+		// FindNextQueued move past it.
 	}
 	return nil, ""
 }

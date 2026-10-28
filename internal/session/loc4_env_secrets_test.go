@@ -2,7 +2,6 @@ package session
 
 import (
 	"bytes"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -11,8 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // LOC-4: inline env values from config / `restart --env` must not appear in
@@ -136,30 +133,32 @@ func TestLOC4_InvalidToolEnvKeyRejected(t *testing.T) {
 
 // TestLOC4_RestartLogsAndArgvOmitEnvValues drives a real restart (isolated
 // tmux from TestMain) and checks the restart log lines and the live pane's
-// start command for the secret.
+// start command for the secret. The fork restarts only a runtime its
+// authority recorded, so the session is stored and started through the
+// lifecycle first, where upstream reconnects to a bare tmux session.
 func TestLOC4_RestartLogsAndArgvOmitEnvValues(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 
 	projectDir := t.TempDir()
 	stubDir := t.TempDir()
 	seenLog := filepath.Join(t.TempDir(), "seen.log")
-	stub := "#!/bin/sh\nif [ \"$1\" = \"session\" ]; then printf '[]\\n'; exit 0; fi\nprintf '%s' \"$LOC4_SECRET_TOKEN\" > \"$LOC4_SEEN\"\nsleep 30\n"
+	stub := "#!/bin/sh\nif [ \"$1\" = \"session\" ]; then printf '[]\\n'; exit 0; fi\nif [ -n \"$LOC4_SEEN\" ]; then printf '%s' \"$LOC4_SECRET_TOKEN\" > \"$LOC4_SEEN\"; fi\nsleep 30\n"
 	if err := os.WriteFile(filepath.Join(stubDir, "opencode"), []byte(stub), 0o755); err != nil {
 		t.Fatalf("write stub: %v", err)
 	}
 	stubPATH := stubDir + string(os.PathListSeparator) + os.Getenv("PATH")
 	t.Setenv("PATH", stubPATH)
 
-	tmuxName := fmt.Sprintf("agentdeck-loc4-restart-%d", time.Now().UnixNano())
-	if out, err := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", projectDir, "sleep 30").CombinedOutput(); err != nil {
-		t.Fatalf("start isolated tmux session: %v (%s)", err, out)
-	}
-	t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", tmuxName).Run() })
-
+	storage := newTestStorage(t)
 	inst := NewInstanceWithTool("loc4-restart", projectDir, "opencode")
-	inst.ID = "loc4-restart-instance"
 	inst.OpenCodeSessionID = "ses_LOC4"
-	inst.tmuxSession = tmux.ReconnectSessionLazy(tmuxName, tmuxName, projectDir, "opencode", "waiting")
+	if err := storage.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := inst.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = inst.Kill() })
 
 	buf := loc4CaptureLogs(t)
 	const secret = "loc4-live-SECRET-token"
@@ -185,7 +184,16 @@ func TestLOC4_RestartLogsAndArgvOmitEnvValues(t *testing.T) {
 	if strings.Contains(buf.String(), secret) {
 		t.Errorf("restart logs leaked the env value:\n%s", buf.String())
 	}
-	paneCmd, err := exec.Command("tmux", "display-message", "-p", "-t", tmuxName+":", "#{pane_start_command}").Output()
+	live := inst.GetTmuxSession()
+	if live == nil {
+		t.Fatal("restarted session has no tmux session")
+	}
+	args := []string{}
+	if live.SocketName != "" {
+		args = append(args, "-L", live.SocketName)
+	}
+	args = append(args, "display-message", "-p", "-t", live.TmuxName()+":", "#{pane_start_command}")
+	paneCmd, err := exec.Command("tmux", args...).Output()
 	if err != nil {
 		t.Fatalf("read pane start command: %v", err)
 	}

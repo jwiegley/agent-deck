@@ -61,7 +61,7 @@ func TestTUIUndoableDeleteDefersInboxSweep(t *testing.T) {
 	pending := seedChildInboxEvent(t, "gone")
 	frames := recordUISessionClosed(t)
 
-	h.Update(sessionDeletedMsg{deletedID: "gone"})
+	h.Update(deleteAsTUI(t, h, inst))
 	require.Equal(t, []string{h.storage.Profile() + "/gone/removed"}, frames(), "the delete is announced at once")
 	require.True(t, pending(), "an undoable delete must keep the session's pending inbox events")
 	if _, cmd := h.Update(tea.KeyMsg{Type: tea.KeyCtrlZ}); cmd == nil {

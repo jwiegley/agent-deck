@@ -53,7 +53,10 @@ func TestIssue2853_StartAfterStopIgnoresPreviousSessionEnd(t *testing.T) {
 	child.ParentSessionID = parent.ID
 	child.TmuxSocketName = "issue2853-" + child.ID
 	child.tmuxSession.SocketName = child.TmuxSocketName
-	t.Cleanup(func() { _ = child.Kill() })
+	// The test drives the child's panes with raw tmux starts, which no runtime
+	// stamp claims, so it kills them the same way: the fork's Kill acts only
+	// on a runtime its authority recorded.
+	t.Cleanup(func() { _ = child.tmuxSession.Kill() })
 
 	const stubPane = `sh -c 'printf "Claude Code stub\n> "; exec sleep 3600'`
 	instances := []*Instance{parent, child}
@@ -111,7 +114,7 @@ func TestIssue2853_StartAfterStopIgnoresPreviousSessionEnd(t *testing.T) {
 		// Claude emits on exit. The report waits 6 s before the next cycle;
 		// the hook is dated that far back instead of sleeping.
 		pre := BeforeStopKill(storage, child.ID)
-		require.NoError(t, child.Kill())
+		require.NoError(t, child.tmuxSession.Kill())
 		WriteStoppedAfterKill(storage, child, pre)
 		save()
 		writeIssue2853Hook(t, child.ID, "dead", "SessionEnd", time.Now().Add(-6*time.Second))

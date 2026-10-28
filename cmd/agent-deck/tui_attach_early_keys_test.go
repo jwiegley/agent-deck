@@ -52,10 +52,14 @@ while True:
     sys.stdout.write("RX:" + data.hex() + "\r\n")
     sys.stdout.flush()
 `)
+	// TMUX_TMPDIR stays, as in agentDeckTestEnv: the fork's runtime inventory
+	// lists the native default socket beside the configured one, and only
+	// TestMain's isolated socket dir keeps that off the operator's server.
 	var env []string
 	for _, kv := range os.Environ() {
 		key := strings.SplitN(kv, "=", 2)[0]
-		if key == "HOME" || key == "TERM" || strings.HasPrefix(key, "XDG_") || strings.HasPrefix(key, "AGENTDECK_") || strings.HasPrefix(key, "TMUX") {
+		if key == "HOME" || key == "TERM" || strings.HasPrefix(key, "XDG_") || strings.HasPrefix(key, "AGENTDECK_") ||
+			(strings.HasPrefix(key, "TMUX") && key != "TMUX_TMPDIR") {
 			continue
 		}
 		env = append(env, kv)
@@ -78,6 +82,9 @@ while True:
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "tmux", append([]string{"-L", socket}, args...)...)
 		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home}
+		if dir := os.Getenv("TMUX_TMPDIR"); dir != "" {
+			cmd.Env = append(cmd.Env, "TMUX_TMPDIR="+dir)
+		}
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("tmux %v: %v %s", args, err, out)

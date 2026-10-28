@@ -406,7 +406,13 @@ func classifyTerminatedPane(exitCode int, haveExitCode bool, tool string, hookSt
 // on entry and return; a runtime replacement or cancellation while the tmux
 // query is in flight discards the result.
 func (i *Instance) probeTerminatedPaneStatus(ctx context.Context, observed statedb.RuntimeState, current Status) (Status, error) {
-	tmuxSession := i.tmuxSession
+	return i.probeTerminatedPaneStatusOf(ctx, observed, current, i.tmuxSession)
+}
+
+// probeTerminatedPaneStatusOf is probeTerminatedPaneStatus asking tmuxSession
+// for the pane's exit status; nil asks nothing, for a session a pass listing
+// proved gone (only the exit receipt and the hook status remain).
+func (i *Instance) probeTerminatedPaneStatusOf(ctx context.Context, observed statedb.RuntimeState, current Status, tmuxSession *tmux.Session) (Status, error) {
 	tool := i.Tool
 	hookStatus := i.hookStatus
 	paneDeadExitStatus := i.paneDeadExitStatusForTest
@@ -446,26 +452,36 @@ func (i *Instance) UpdateStatus() error {
 // A runtime replacement or cancellation while the query is in flight discards
 // the result, as in probeTerminatedPaneStatus.
 //
-// With a pass, the pass's listing of the session's socket can prove the
-// session absent without a has-session per row, but only for a row already
-// recorded dead (listingAloneProvesDead): a row observed in any other status
-// asks tmux itself.
-func (i *Instance) probeTmuxExists(ctx context.Context, observed statedb.RuntimeState) (bool, error) {
+// With usePass and a pass in ctx, the pass's listing of the session's socket
+// answers for the row, as upstream's #2880 has it: a listed session exists
+// without a has-session of its own. An absence the listing shows stands alone
+// only for a row already recorded dead (listingAloneProvesDead); a row
+// observed in any other status confirms it with its own probe before a
+// terminated status, since the listing may predate a restart. listedAbsent
+// reports an absence settled that way: no pane is left to ask for an exit
+// status. A failed listing leaves every row to its own probe.
+func (i *Instance) probeTmuxExists(ctx context.Context, observed statedb.RuntimeState, usePass bool) (exists, listedAbsent bool, err error) {
 	s := i.tmuxSession
-	pass := statusProbePass(ctx)
-	useListing := pass != nil && i.listingAloneProvesDead(Status(observed.Status))
+	var pass *StatusUpdatePass
+	if usePass {
+		pass = statusProbePass(ctx)
+	}
+	provesDead := i.listingAloneProvesDead(Status(observed.Status))
 	i.mu.Unlock()
-	var exists bool
-	if useListing {
-		exists, _ = s.ExistsListed(func() map[string]struct{} { return pass.listedSessions(s.SocketName) })
+	if pass != nil {
+		exists, listedAbsent = s.ExistsListed(func() map[string]struct{} { return pass.listedSessions(s.SocketName) })
+		if listedAbsent && !provesDead {
+			exists, _ = s.ExistsListed(func() map[string]struct{} { return nil })
+			listedAbsent = !exists
+		}
 	} else {
 		exists = s.Exists()
 	}
 	i.mu.Lock()
 	if err := i.statusProbeCurrentLocked(ctx, observed); err != nil {
-		return false, err
+		return false, false, err
 	}
-	return exists, nil
+	return exists, listedAbsent, nil
 }
 
 // listingAloneProvesDead reports whether a pass listing's absence may stand

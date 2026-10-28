@@ -32,8 +32,11 @@ config_dir = "~/acct"
 	if !claudeTrustAccepted(t, filepath.Join(tmpHome, "acct", ".claude.json"), real) {
 		t.Errorf("trust for %q not seeded in the session's config root acct/.claude.json", real)
 	}
-	if !claudeTrustAccepted(t, filepath.Join(tmpHome, ".claude.json"), real) {
-		t.Errorf("trust for %q no longer seeded in ~/.claude.json", real)
+	// The fork seeds only the file the session reads
+	// (ClaudeTrustConfigPathForInstance), as its launch seed does; the unused
+	// home root is left alone.
+	if claudeTrustAccepted(t, filepath.Join(tmpHome, ".claude.json"), real) {
+		t.Errorf("trust for %q seeded in the unused ~/.claude.json", real)
 	}
 }
 

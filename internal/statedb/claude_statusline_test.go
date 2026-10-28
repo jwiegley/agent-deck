@@ -101,8 +101,12 @@ func TestClaudeStatuslineCustomClaudeTool(t *testing.T) {
 	rec, err := db.ClaudeStatuslineForSession("s1")
 	require.NoError(t, err)
 	require.Equal(t, "abc", rec.ClaudeSessionID)
-	// A non-compatible tool carrying a stale id must not become an owner.
-	require.NoError(t, db.SaveInstance(&InstanceRow{ID: "s2", Title: "s2", Tool: "codex", ToolData: json.RawMessage(`{"claude_session_id":"abc"}`)}))
+	// A non-compatible tool carrying a stale id must not become an owner. The
+	// fork keeps one owner per conversation id (instance_runtime_binding), so
+	// the stale id is only tool_data: an explicit runtime snapshot with no
+	// bindings keeps it from being imported as a second claude binding.
+	require.NoError(t, db.SaveInstance(&InstanceRow{ID: "s2", Title: "s2", Tool: "codex", ToolData: json.RawMessage(`{"claude_session_id":"abc"}`),
+		RuntimeBindings: map[string]RuntimeBinding{}}))
 	owner, err = db.SaveClaudeStatusline(ClaudeStatusline{ClaudeSessionID: "abc"})
 	require.NoError(t, err)
 	require.Equal(t, "s1", owner)

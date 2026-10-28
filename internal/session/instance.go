@@ -2124,6 +2124,11 @@ func (i *Instance) startWithMessage(message string, result *statedb.RuntimeState
 	if err := i.ValidateAccount(); err != nil {
 		return err
 	}
+	// As in start: reconciliation can rebuild the wrapper from the durable
+	// runtime, so a start without one fails before it, not after.
+	if i.tmuxSession == nil {
+		return fmt.Errorf("tmux session not initialized")
+	}
 	if reconciled, err := i.ReconcileRuntime(); err != nil {
 		return err
 	} else if reconciled.Live {
@@ -2139,9 +2144,6 @@ func (i *Instance) startWithMessage(message string, result *statedb.RuntimeState
 		return nil
 	}
 	defer transition.close()
-	if i.tmuxSession == nil {
-		return fmt.Errorf("tmux session not initialized")
-	}
 
 	// Refuse a message this session has no way to receive, BEFORE spawning
 	// anything (PR #1942 review, P1a). The DeepSeek web profile is an HTTP
@@ -2567,7 +2569,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 			return candidate, ctx.Err()
 		}
 		var err error
-		exists, err = i.probeTmuxExists(ctx, observed)
+		exists, _, err = i.probeTmuxExists(ctx, observed, false)
 		if err != nil {
 			return candidate, err
 		}
@@ -2583,7 +2585,7 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 			return graceWindowStatus(ctx, candidate), ctx.Err()
 		}
 		var err error
-		if exists, err = i.probeTmuxExists(ctx, observed); err != nil {
+		if exists, _, err = i.probeTmuxExists(ctx, observed, false); err != nil {
 			return candidate, err
 		}
 		checkedExists = true
@@ -2638,11 +2640,12 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 		exists, checkedExists = false, true
 	}
 
-	// Check if tmux session exists. A pass's listing settles absence only for
-	// a row already recorded dead (probeTmuxExists).
+	// Check if tmux session exists, through the pass's listing when there is
+	// one (probeTmuxExists).
+	var listedAbsent bool
 	if !checkedExists {
 		var err error
-		if exists, err = i.probeTmuxExists(ctx, observed); err != nil {
+		if exists, listedAbsent, err = i.probeTmuxExists(ctx, observed, true); err != nil {
 			return candidate, err
 		}
 	}
@@ -2669,10 +2672,15 @@ func (i *Instance) probeStatusCandidate(ctx context.Context, observed statedb.Ru
 			candidate = StatusIdle
 		} else if candidate != StatusQueued {
 			// tmux session is non-nil here, so the exit-status probe can block;
-			// applyTerminatedPaneStatus drops i.mu for the query and keeps the
-			// stopped-state guard on write.
+			// probeTerminatedPaneStatus drops i.mu for the query and keeps the
+			// stopped-state guard on write. A session the pass listing proved
+			// gone has no pane to ask.
+			paneSession := i.tmuxSession
+			if listedAbsent {
+				paneSession = nil
+			}
 			var err error
-			candidate, err = i.probeTerminatedPaneStatus(ctx, observed, candidate)
+			candidate, err = i.probeTerminatedPaneStatusOf(ctx, observed, candidate, paneSession)
 			if err != nil {
 				return candidate, err
 			}
