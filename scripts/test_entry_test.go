@@ -31,7 +31,8 @@ if [[ $1 == env ]]; then
 fi
 [[ $1 == test && $GOENV == off ]]
 tmp_root=$(cd /tmp && pwd -P)
-[[ $HOME == "$tmp_root"/agent-deck-tests.*/home && -d $HOME ]]
+[[ $TMPDIR == "$tmp_root"/adt.?????? ]] || { echo "TMPDIR $TMPDIR is not the short sandbox root" >&2; exit 11; }
+[[ $HOME == "$TMPDIR/home" && -d $HOME && $TMUX_TMPDIR == "$TMPDIR/tmux" ]]
 [[ $HOME == "$(cd "$HOME" && pwd -P)" ]]
 [[ $USERPROFILE == "$HOME" && $TMP == "$TMPDIR" && $TEMP == "$TMPDIR" ]]
 [[ -d $TMPDIR && -d $TMUX_TMPDIR && $GOCACHE == "$GOMODCACHE" ]]
@@ -77,7 +78,7 @@ printf '%s\n' "$HOME" "$*" > "$GOCACHE/receipt"
 			if _, err := os.Stat(filepath.Dir(lines[0])); !os.IsNotExist(err) {
 				t.Fatalf("sandbox not removed: %v", err)
 			}
-			if !failure && lines[1] != "test -race -count=1 ./..." {
+			if !failure && lines[1] != "test -race -count=1 -timeout 20m ./..." {
 				t.Fatalf("default test args = %q", lines[1])
 			}
 			kept, err := filepath.Glob(filepath.Join(root, "agent-deck-test-artifacts.*", "visualcheck-artifacts", "contact-sheet.html"))
