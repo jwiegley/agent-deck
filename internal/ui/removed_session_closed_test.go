@@ -55,7 +55,11 @@ func TestTUIDeletePathsPublishSessionClosed(t *testing.T) {
 			h.rebuildFlatItems()
 			require.NoError(t, h.storage.SaveWithGroups(h.instances, h.groupTree))
 			frames := recordUISessionClosed(t)
-			h.Update(tc.msg)
+			msg := tc.msg
+			if _, ok := msg.(sessionDeletedMsg); ok {
+				msg = deleteAsTUI(t, h, inst)
+			}
+			h.Update(msg)
 			want := []string{h.storage.Profile() + "/gone/removed"}
 			if got := frames(); !reflect.DeepEqual(got, want) {
 				t.Fatalf("closed frames %v, want %v", got, want)

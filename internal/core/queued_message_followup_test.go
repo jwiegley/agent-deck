@@ -265,11 +265,21 @@ func TestRestartOfQueuedSessionDeliversTheBriefOnce(t *testing.T) {
 	inst.MarkQueued("brief")
 	seedStore(t, profile, []*session.GroupData{{Name: "serial", Path: "serial", MaxConcurrent: 1}}, inst)
 	stubSendWorkers(t)
-	t.Cleanup(func() {
-		if n := findByTitle(loadStore(t, profile), inst.Title); n != nil {
-			_ = n.Kill()
+	// The fork's kill commits through the runtime authority of the store the
+	// session was loaded from, so that store stays open across the kill.
+	kill := func() error {
+		storage := openStorage(t, profile)
+		defer storage.Close()
+		instances, _, err := storage.LoadWithGroups()
+		if err != nil {
+			return err
 		}
-	})
+		if n := findByTitle(instances, inst.Title); n != nil {
+			return n.Kill()
+		}
+		return nil
+	}
+	t.Cleanup(func() { _ = kill() })
 
 	if _, res := Invoke[SessionRestartOut](context.Background(), testRegistry(t, Deps{}), IDSessionRestart, SessionRestartIn{Profile: profile, Session: inst.Title, Force: true}); res.Err != nil {
 		t.Fatal(res.Err)
@@ -278,8 +288,8 @@ func TestRestartOfQueuedSessionDeliversTheBriefOnce(t *testing.T) {
 		t.Fatalf("row after restart = %+v, want the brief taken off", n)
 	}
 	// A later stop and start must not deliver it again.
-	if n := findByTitle(loadStore(t, profile), inst.Title); n != nil {
-		_ = n.Kill()
+	if err := kill(); err != nil {
+		t.Fatal(err)
 	}
 	if _, res := Invoke[SessionStartOut](context.Background(), testRegistry(t, Deps{}), IDSessionStart, SessionStartIn{Profile: profile, Session: inst.Title, NoWait: true}); res.Err != nil {
 		t.Fatal(res.Err)

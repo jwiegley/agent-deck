@@ -275,3 +275,33 @@ Athena tmux 3.6a blocked in readv on a stale Eternal Terminal PTY. CLI viewer qu
 ]
 #+end_src
 
+* DONE [#C] Reconcile a Codex submission that the running turn took up
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-pdt
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-10-22 Thu 10:25]
+:MODIFIED: [2026-10-27 Tue 21:50]
+:CREATED_BY: johnw
+:FINISHED: [2026-10-22 Thu 11:56]
+:CLOSE_REASON: Reconciliation accepts rollout proof that the unchanged turn took up input recorded after the marker, beyond its opening input; regression tests in internal/session and cmd/agent-deck
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+A Codex send that lands while a turn runs starts no turn: Codex records the input as one more UserMessage item of the running turn. The exact-acceptance marker for that send records the running turn as its prior generation, and ReconcileCodexSubmissionMarker cleared a marker only once a newer generation appeared, so every later send to the session failed closed until someone typed into the pane. On Hera the director conductor's heartbeat failed every 15 minutes for 22 hours (nix-config nix-lyqj): an inbox delivery at 2026-10-21 18:00:40Z reached Codex mid-turn at 18:00:54Z and that turn completed at 18:04:28Z. Fix: let reconciliation accept proof from the exact rollout that the unchanged turn took up user input recorded at or after the marker's creation, beyond the input that started the turn, reading only record types, turn ids and timestamps.
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 1,
+    "issue_id": "agent-deck-pdt",
+    "author": "johnw",
+    "text": "Upstream now carries this fix: c7aa23a2 (fix(codex): reconcile a send the running turn took up (#2836) (#2877)), first released in v1.16.33 and written from eba2e06d with John credited as co-author. The rebase onto v1.16.34 dropped eba2e06d as superseded. The regression tests are upstream's TestIssue2836CodexSendTakenUpMidTurnReconciles (cmd/agent-deck) and TestIssue2836CodexTurnTookInputSince, TestIssue2836CodexTurnTookInputFailsClosedPastScanWindow, TestIssue2836ReconcileClearsOnlyWithMidTurnInput and TestIssue2836MarkerWithoutTurnNeverAsksForInput (internal/session); a consumer that ran this fork's TestCodexTurnTookInputSince, TestCodexSubmissionMarker or TestCodexAcceptanceGuardReconcilesInputTheRunningTurnTookUp by name must switch to them.",
+    "created_at": "2026-10-28T04:50:16Z"
+  }
+]
+#+end_src

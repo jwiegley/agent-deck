@@ -3,8 +3,7 @@ package tmux
 import (
 	"bytes"
 	"log/slog"
-	"os"
-	"path/filepath"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -14,22 +13,24 @@ import (
 // carries the session's env prelude. It must keep the variable name and hide
 // the value.
 func TestLOC4_RespawnPaneLogRedactsEnvValues(t *testing.T) {
-	binDir := t.TempDir()
-	fakeTmux := filepath.Join(binDir, "tmux")
-	// Every tmux call (has-session, list-panes, respawn-pane, …) succeeds
-	// instantly, so the test needs no tmux server.
-	if err := os.WriteFile(fakeTmux, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write fake tmux: %v", err)
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
 	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
 	buf := &bytes.Buffer{}
 	orig := mcpLog
 	mcpLog = slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	t.Cleanup(func() { mcpLog = orig })
 
+	// The fork's respawn first captures the pane's stable identity and its
+	// processes, which a fake tmux that answers every call with nothing
+	// cannot supply, so it runs against a session on TestMain's isolated
+	// tmux server.
 	const secret = "loc4-respawn-SECRET-value"
 	s := NewSession("loc4-respawn-redact", t.TempDir())
+	if err := s.Start("sleep 300"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Kill() })
 	if err := s.RespawnPane("export LOC4_API_KEY='" + secret + "' && exec sleep 300"); err != nil {
 		t.Fatalf("RespawnPane: %v", err)
 	}

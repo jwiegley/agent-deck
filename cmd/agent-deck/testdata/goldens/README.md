@@ -121,7 +121,7 @@ committing.
 ## Fork deviations
 
 This fork keeps runtime state authoritative in `state.db` and differs from
-upstream v1.16.17 on purpose in the behaviours below. The goldens record the
+upstream v1.16.34 on purpose in the behaviours below. The goldens record the
 fork's behaviour; the goldens each deviation changes were regenerated with
 it, and nothing else was.
 

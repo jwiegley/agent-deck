@@ -378,7 +378,9 @@ func snapshotV13Payload(t *testing.T, db *sql.DB) string {
 		name  string
 		query string
 	}{
-		{"metadata", `SELECT key, value FROM metadata WHERE key <> 'schema_version' ORDER BY key`},
+		// The one-time hook cost fold (foldLegacyHookCostRows) records itself
+		// in metadata; that marker is migration bookkeeping, not v13 payload.
+		{"metadata", `SELECT key, value FROM metadata WHERE key NOT IN ('schema_version', '` + costHookDedupeKey + `') ORDER BY key`},
 		{"instances", `SELECT id, title, project_path, group_path, sort_order, command, wrapper, tool,
 			status, tmux_session, tmux_socket_name, created_at, last_accessed, parent_session_id,
 			is_conductor, no_transition_notify, title_locked, worktree_path, worktree_repo,
