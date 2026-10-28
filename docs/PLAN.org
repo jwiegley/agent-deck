@@ -85,7 +85,7 @@ Fixed in dc163e96 (pushed in eba2e06d..ef8209d8, 2026-10-23).
 :LABELS:   []
 :ISSUE_TYPE: bug
 :CREATED:  [2026-10-28 Wed 06:35]
-:MODIFIED: [2026-10-28 Wed 06:35]
+:MODIFIED: [2026-10-28 Wed 10:29]
 :CREATED_BY: johnw
 :SOURCE_REPO: .
 :ORIGINAL_SIZE: 0
@@ -96,6 +96,20 @@ Upstream's TestLoadMenuSnapshot_StatusPassIsPooled (internal/web, #2861) require
 - -race, alone, 6 runs: rebase pooled 179-192 ms / serial 267-294 ms (ratio 0.62-0.70, 2 of 6 failed); upstream v1.16.34 79-91 / 195-205 ms (about 0.40, all passed).
 - -race, inside the full suite (fullrace-1): rebase 255 / 311 ms (0.82), failed.
 The fork's per-instance UpdateStatus path loses most of the pool's gain under the race detector. Find which synchronized work the fork's status path adds there (runtime authority reads or writes per instance, a shared lock) and either remove the serialization or adapt the test's ratio for race builds (internal/testutil.RaceEnabled, as ThroughputFloor scales throughput floors). Found by review round 1's verification run of the v1.16.34 rebase.
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 5,
+    "issue_id": "agent-deck-9zg",
+    "author": "johnw",
+    "text": "Decision 2026-10-28 (John): loosen this test's ratio for race builds only, through testutil.RaceEnabled, and keep this issue open to investigate the fork's status path. The commit \"test(web): loosen the pooled menu status ratio to 9/10 under -race only\" makes a race build need under 9/10 of the serial pass; a non-race build keeps upstream's 2/3. Measured 2026-10-28 between 10:25 and 10:27 in the golang:1.26 rebase container, host load 46-58, best of three per run: under -race alone the fork took 0.60-0.70 of the serial pass (9 runs, 5 of them over 2/3) and upstream v1.16.34 0.39-0.42 (6 runs); without -race 0.28-0.32 and 0.26-0.27. With the status pass cut to one worker, so not pooled at all, the ratio was 0.88-1.06 under -race (9/10 failed it in 5 of 6 runs) and 0.99-1.01 without (2/3 failed it every time). Under -race the gate therefore separates a pooled pass from a serial one only loosely. Find and remove the serialization in the fork's per-instance UpdateStatus path, then return race builds to 2/3.",
+    "created_at": "2026-10-28T17:29:49Z"
+  }
+]
+#+end_src
 
 * TODO [#D] Pin the fork's stop against a racing status sample at the CLI or core level
 :PROPERTIES:
