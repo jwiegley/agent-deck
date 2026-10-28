@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/events"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
@@ -451,5 +452,124 @@ func TestRuntimeLifecycle_ConductorTeardownSuccessReportsComplete(t *testing.T) 
 				t.Fatalf("teardown --remove must remove the session row: exit=%d stdout=%q stderr=%q", code, listed, stderr)
 			}
 		})
+	}
+}
+
+// teardownTestRowIDs returns the ids of the profile's session rows titled
+// title, read straight from state.db.
+func teardownTestRowIDs(t *testing.T, home, title string) []string {
+	t.Helper()
+	db, err := statedb.Open(teardownTestStateDBPath(home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.DB().Query(`SELECT id FROM instances WHERE title = ? ORDER BY id`, title)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+// teardownTestClosedFrames counts the macapp.session.closed frames on the
+// default profile's events bus. A bus no writer ever created holds none.
+func teardownTestClosedFrames(t *testing.T) uint64 {
+	t.Helper()
+	bus, err := events.OpenReader("default")
+	if err != nil {
+		return 0
+	}
+	defer bus.Close()
+	kinds, err := bus.KindCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kinds[events.KindMacappSessionClosed]
+}
+
+// A teardown --remove whose later row fails skips the rest of the conductor,
+// and a rerun no longer sees the rows it already deleted. Each of those rows
+// must still get its inbox / notify-state sweep and macapp.session.closed, as
+// upstream sweeps every row right after its own removal: the cleanup cannot
+// wait until every row of the conductor is removed and verified.
+func TestConductorTeardownSweepsEachRemovedRowBeforeALaterFailure(t *testing.T) {
+	const name = "sweep-ops"
+	home := teardownTestConductor(t, name)
+	t.Setenv("AGENT_DECK_HOME", "")
+	title := session.ConductorSessionTitle(name)
+	duplicate := filepath.Join(home, "duplicate")
+	if err := os.MkdirAll(duplicate, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A second row titled conductor-<name> is removed with the conductor's own.
+	out, stderr, code := runAgentDeck(t, home, "-p", "default", "add", "-t", title, "-c", "claude", "--no-parent", "--json", duplicate)
+	if code != 0 {
+		t.Fatalf("add the duplicate conductor row: exit=%d stdout=%q stderr=%q", code, out, stderr)
+	}
+	ids := teardownTestRowIDs(t, home, title)
+	if len(ids) != 2 {
+		t.Fatalf("conductor rows = %v, want two", ids)
+	}
+
+	session.ResetInboxFingerprintCacheForTest()
+	t.Cleanup(session.ResetInboxFingerprintCacheForTest)
+	const parent = "teardown-sweep-parent"
+	for _, id := range ids {
+		if err := session.WriteInboxEvent(parent, session.TransitionNotificationEvent{
+			ChildSessionID:  id,
+			ChildTitle:      title,
+			Profile:         "default",
+			FromStatus:      "running",
+			ToStatus:        "waiting",
+			Timestamp:       time.Now(),
+			TargetSessionID: parent,
+			TargetKind:      "conductor",
+			DeliveryResult:  "deferred_target_busy",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Whichever row teardown deletes first commits; deleting the other one
+	// then fails, because only one row with the title is left.
+	execTeardownTestStateDB(t, home, `CREATE TRIGGER teardown_test_fail_second_delete BEFORE DELETE ON instances
+		WHEN (SELECT COUNT(*) FROM instances WHERE title = '`+title+`') < 2
+		BEGIN SELECT RAISE(ABORT, 'injected second delete failure'); END`)
+
+	out, stderr, code = runAgentDeck(t, home, "conductor", "teardown", name, "--remove", "--json")
+	if code != 1 || !strings.Contains(out, "runtime action aborted for "+title+": ") || !strings.Contains(out, "injected second delete failure") {
+		t.Fatalf("teardown must abort on the second row's delete: exit=%d stdout=%q stderr=%q", code, out, stderr)
+	}
+	remaining := teardownTestRowIDs(t, home, title)
+	if len(remaining) != 1 {
+		t.Fatalf("rows left = %v, want exactly the row whose delete failed", remaining)
+	}
+	survivor, deleted := remaining[0], ids[0]
+	if deleted == survivor {
+		deleted = ids[1]
+	}
+
+	inbox, err := os.ReadFile(session.InboxPathFor(parent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(inbox), deleted) {
+		t.Errorf("the deleted row %s kept its inbox event after the teardown aborted on a later row:\n%s", deleted, inbox)
+	}
+	if !strings.Contains(string(inbox), survivor) {
+		t.Errorf("the row %s whose delete failed lost its inbox event:\n%s", survivor, inbox)
+	}
+	if got := teardownTestClosedFrames(t); got != 1 {
+		t.Errorf("macapp.session.closed frames = %d, want 1 for the deleted row: the aborted exit must flush them", got)
 	}
 }
