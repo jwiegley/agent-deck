@@ -15,6 +15,14 @@ package session
 // modeled the way Start() does it: the tmux session is created under the
 // spawn lock and the spawn is stamped after, and the start's own save of the
 // row comes last. The daemon polls inside each of those windows.
+//
+// In this fork the stop is an emulation. The test stops the child the way
+// upstream's stopInstanceAndSave does (kill the pane, then
+// WriteStoppedAfterKill), which no stop path of the fork runs: `session stop`
+// goes through KillCaptured, which reserves the runtime's destruction before
+// the kill and commits stopped itself. The emulation still leaves what the
+// daemon has to classify, a stopped row and a fresh dead hook from the
+// previous process, and the daemon's handling of that is what the test pins.
 
 import (
 	"fmt"
