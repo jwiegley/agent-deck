@@ -16,6 +16,7 @@ import (
 
 	"al.essio.dev/pkg/shellescape"
 
+	"github.com/asheshgoplani/agent-deck/internal/events"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
@@ -1061,6 +1062,14 @@ conductorLoop:
 				abort(meta, fmt.Sprintf("runtime action aborted for %s: %v", sessionTitle, actionErr))
 				continue conductorLoop
 			}
+			if *removeAll {
+				// Inbox / notify-state sweep and macapp.session.closed right
+				// after each row's own delete, as upstream sweeps each row
+				// right after its removal: a later row's failure skips the
+				// rest of this conductor, and a rerun no longer sees the rows
+				// already deleted.
+				session.CleanupRemovedSession(storage.Profile(), inst.ID)
+			}
 		}
 		if len(matching) > 0 && !*jsonOutput {
 			fmt.Printf("  [ok] %s stopped\n", sessionTitle)
@@ -1090,11 +1099,6 @@ conductorLoop:
 					abort(meta, reason)
 					continue conductorLoop
 				}
-			}
-			for id := range removedIDs {
-				// Inbox / notify-state sweep and macapp.session.closed, once
-				// the removal is verified: a rerun no longer sees these rows.
-				session.CleanupRemovedSession(storage.Profile(), id)
 			}
 			if saveErr != nil {
 				_ = storage.Close()
@@ -1154,7 +1158,7 @@ conductorLoop:
 		output, _ := json.MarshalIndent(result, "", "  ")
 		fmt.Println(string(output))
 		if len(aborted) > 0 {
-			os.Exit(1)
+			exitIncompleteTeardown()
 		}
 		return
 	}
@@ -1169,7 +1173,7 @@ conductorLoop:
 			}
 			fmt.Fprintf(os.Stderr, "  %s (profile: %s): %s%s\n", skipped.Name, skipped.Profile, skipped.Reason, heartbeat)
 		}
-		os.Exit(1)
+		exitIncompleteTeardown()
 	}
 
 	fmt.Println()
@@ -1183,6 +1187,14 @@ conductorLoop:
 			fmt.Printf("  agent-deck conductor teardown %s --remove\n", name)
 		}
 	}
+}
+
+// exitIncompleteTeardown fails a teardown that skipped a conductor. os.Exit
+// skips main's deferred events drain, so the macapp.session.closed frames of
+// the rows this teardown already removed are flushed first.
+func exitIncompleteTeardown() {
+	_ = events.CloseDefault()
+	os.Exit(1)
 }
 
 // conductorRowIDsToRemove returns the state.db rows `conductor teardown
