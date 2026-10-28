@@ -18,7 +18,17 @@ import (
 // .agent-deck/config.toml is world-writable, so it is skipped as untrusted.
 func untrustedDirLocalRepo(t *testing.T) (home, repo string) {
 	t.Helper()
-	home = t.TempDir()
+	// The footer cuts a warning at setupWarningMaxLen characters, and the
+	// notice names the config path twice before it says why. Under
+	// t.TempDir(), which repeats the test's name, that path is long enough
+	// that any TMPDIR much longer than /tmp (a sandboxed run, macOS's
+	// per-user TMPDIR) pushed the reason past the cut, so the home is a
+	// short temporary directory of its own.
+	home, err := os.MkdirTemp("", "dl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	session.ClearUserConfigCache()
