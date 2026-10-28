@@ -708,9 +708,10 @@ func handleSessionSend(profile string, args []string) {
 		acceptanceGuard = nil
 	}
 	if acceptanceGuard != nil && !retainCodexAcceptanceGuardForCompletion(*wait, acceptedTurn) {
-		// The unresolved marker survives this process. A later sender either
-		// reconciles the exact new generation or refuses with the operator
-		// recovery path; it can never claim this attempt's turn.
+		// The unresolved marker survives this process. A later sender
+		// reconciles the exact new generation or input the running turn took
+		// up after this attempt began, or refuses with the operator recovery
+		// path; it can never claim this attempt's turn.
 		acceptanceGuard.Release()
 		acceptanceGuard = nil
 	}
