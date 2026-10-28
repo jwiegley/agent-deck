@@ -94,3 +94,75 @@ printf '%s\n' "$HOME" "$*" > "$GOCACHE/receipt"
 		})
 	}
 }
+
+// TestTestEntryGivesTheFullSuiteCIsPerfBudgetMultiplier pins the timing
+// allowance of a run: with no arguments (lefthook's pre-push, make test) go
+// test gets upstream CI's PERF_BUDGET_MULTIPLIER=2.0 unless the caller set a
+// value, and a targeted run gets only what the caller set.
+func TestTestEntryGivesTheFullSuiteCIsPerfBudgetMultiplier(t *testing.T) {
+	const unset = "<unset>"
+	targeted := []string{"-count=1", "-run", "^TestX$", "./internal/web"}
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		caller string // unset: not in the runner's environment
+		want   string
+	}{
+		{"full suite unset", nil, unset, "2.0"},
+		{"full suite empty", nil, "", "2.0"},
+		{"full suite caller value", nil, "1.0", "1.0"},
+		{"targeted unset", targeted, unset, unset},
+		{"targeted caller value", targeted, "2.5", "2.5"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			bin := filepath.Join(root, "bin")
+			cache := filepath.Join(root, "cache")
+			for _, dir := range []string{bin, cache} {
+				if err := os.Mkdir(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fakeGo := `#!/usr/bin/env bash
+set -eu
+if [[ $1 == env ]]; then
+    printf '%s\n' "$HOME/cache"
+    exit
+fi
+printf '%s\n' "${PERF_BUDGET_MULTIPLIER-<unset>}" "$*" > "$GOCACHE/receipt"
+`
+			if err := os.WriteFile(filepath.Join(bin, "go"), []byte(fakeGo), 0700); err != nil {
+				t.Fatal(err)
+			}
+			// A full run of this suite goes through the runner too, so this
+			// process may carry the default itself: start from the case's value.
+			var env []string
+			for _, kv := range os.Environ() {
+				if !strings.HasPrefix(kv, "PERF_BUDGET_MULTIPLIER=") {
+					env = append(env, kv)
+				}
+			}
+			env = append(env, "PATH="+bin+":"+os.Getenv("PATH"), "HOME="+root, "TMPDIR="+root)
+			if tc.caller != unset {
+				env = append(env, "PERF_BUDGET_MULTIPLIER="+tc.caller)
+			}
+			cmd := exec.Command("bash", append([]string{"test.sh"}, tc.args...)...)
+			cmd.Env = env
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("test entry: %v: %s", err, output)
+			}
+			receipt, err := os.ReadFile(filepath.Join(cache, "receipt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantArgs := "test -race -count=1 -timeout 20m ./..."
+			if tc.args != nil {
+				wantArgs = "test " + strings.Join(tc.args, " ")
+			}
+			lines := strings.Split(strings.TrimSuffix(string(receipt), "\n"), "\n")
+			if len(lines) != 2 || lines[0] != tc.want || lines[1] != wantArgs {
+				t.Fatalf("go test got PERF_BUDGET_MULTIPLIER %q and args %q, want %q and %q", lines[0], lines[1:], tc.want, wantArgs)
+			}
+		})
+	}
+}
