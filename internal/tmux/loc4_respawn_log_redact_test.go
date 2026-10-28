@@ -16,7 +16,7 @@ import (
 func TestLOC4_RespawnPaneLogRedactsEnvValues(t *testing.T) {
 	binDir := t.TempDir()
 	fakeTmux := filepath.Join(binDir, "tmux")
-	// Every tmux call (the conditional respawn, the new tree's list-panes, …)
+	// Every tmux call (the conditional respawn, the new pane's pid probe, …)
 	// succeeds instantly, so the test needs no tmux server.
 	if err := os.WriteFile(fakeTmux, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write fake tmux: %v", err)
