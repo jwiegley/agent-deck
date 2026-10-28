@@ -21,6 +21,20 @@ mkdir -p "$sandbox/home" "$sandbox/tmux"
 # are written against.
 bash_path=$(command -v bash)
 
+# Upstream's pre-push command plus upstream CI's per-package budget
+# (.github/workflows/go-test.yml: -race -timeout 20m). go test's default of
+# 10 minutes is shorter than internal/session takes on its own.
+if [[ $# -eq 0 ]]; then
+    set -- -race -count=1 -timeout 20m ./...
+    # The full suite also gets the timing allowance upstream CI gives it
+    # (.github/workflows/go-test.yml, step "Run tests": PERF_BUDGET_MULTIPLIER
+    # '2.0'). TestPerf_* budgets are small multiples of a local -race median,
+    # and with the whole suite competing for the CPUs they can fail on load
+    # alone. A value the caller sets wins; an empty one counts as unset, as it
+    # does in testutil. A targeted run keeps the strict 1.0.
+    : "${PERF_BUDGET_MULTIPLIER:=2.0}"
+fi
+
 # Leave XDG unset so tests that replace HOME also isolate their XDG paths.
 test_env=(
     "PATH=$PATH"
@@ -36,20 +50,15 @@ test_env=(
     "LANG=en_US.UTF-8"
     "SHELL=$bash_path"
 )
-# Toolchain settings and the test knobs a caller sets on purpose (CI's
-# PERF_BUDGET_MULTIPLIER, tools/visualcheck's binary and sandbox switches).
+# Toolchain settings and the test knobs: PERF_BUDGET_MULTIPLIER (the
+# caller's, or the full suite's default above) and tools/visualcheck's binary
+# and sandbox switches.
 for name in GOTOOLCHAIN GOFLAGS CGO_ENABLED CC CXX SDKROOT DEVELOPER_DIR MACOSX_DEPLOYMENT_TARGET CI GITHUB_ACTIONS \
     PERF_BUDGET_MULTIPLIER VISUALCHECK_BINARY VISUALCHECK_KEEP_SANDBOX; do
     if [[ ${!name+x} ]]; then
         test_env+=("$name=${!name}")
     fi
 done
-# Upstream's pre-push command plus upstream CI's per-package budget
-# (.github/workflows/go-test.yml: -race -timeout 20m). go test's default of
-# 10 minutes is shorter than internal/session takes on its own.
-if [[ $# -eq 0 ]]; then
-    set -- -race -count=1 -timeout 20m ./...
-fi
 status=0
 env -i "${test_env[@]}" go test "$@" || status=$?
 # tools/visualcheck leaves its contact sheet, report and redraw frames in
