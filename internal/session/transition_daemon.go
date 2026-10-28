@@ -287,11 +287,10 @@ func (d *TransitionDaemon) SyncOnce(_ context.Context) time.Duration {
 	// staleness window rather than flipping to "absent" the moment it stalls.
 	WriteNotifyHeartbeat()
 
-	// Match the TUI, web, and CLI status paths: warm each shared tmux cache
-	// once for the whole pass, not once per profile or instance.
-	tmux.RefreshExistingSessions()
-	tmux.RefreshPaneInfoCache()
-
+	// syncProfile warms the shared tmux caches for each profile that has
+	// sessions (#2770). The session cache answers for only 2 s
+	// (sessionCacheTTL), so a single warm-up here would not cover a later
+	// profile in a pass that runs longer than that.
 	d.passStatus = map[string]*HookStatus{}
 	defer func() { d.passStatus = nil }()
 	nextInterval := notifyPollSlow
