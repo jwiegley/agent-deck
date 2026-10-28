@@ -207,10 +207,13 @@ func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *tes
 		"idleExitPending", "idleExitTold",
 	}
 	profilePipeKeyed := []string{"lastProbeStall", "lastDesktopNotify"}
+	// Keyed by instance: a deleted profile's instances (as lastStatus lists
+	// them) lose their entries, and an instance an active profile also lists
+	// keeps its own.
+	instanceKeyed := map[string]bool{"orphansEmitted": true}
 	// Not keyed by profile: passStatus lives for one pass (nil outside
-	// SyncOnce), and orphansEmitted is keyed by instance and pruned with the
-	// instance's status entry.
-	notProfileScoped := map[string]bool{"passStatus": true, "orphansEmitted": true}
+	// SyncOnce).
+	notProfileScoped := map[string]bool{"passStatus": true}
 
 	d := NewTransitionDaemon()
 	if d.idleExitPending == nil {
@@ -219,10 +222,15 @@ func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *tes
 	if d.idleExitTold == nil {
 		d.idleExitTold = map[string]map[string]bool{}
 	}
+	if d.orphansEmitted == nil {
+		d.orphansEmitted = map[string]map[string]bool{}
+	}
+	d.orphansEmitted["worker"] = map[string]bool{"pi-run:shared": true}
 	appenders := map[string]*slowJournalAppender{}
 	for _, profile := range []string{"kept", "deleted"} {
 		d.storages[profile] = nil
-		d.lastStatus[profile] = map[string]string{"worker": "running"}
+		d.lastStatus[profile] = map[string]string{"worker": "running", profile + "-worker": "running"}
+		d.orphansEmitted[profile+"-worker"] = map[string]bool{"pi-run:" + profile: true}
 		d.initialized[profile] = true
 		d.livePrior[profile] = map[string]liveStatusPrior{"worker": {status: StatusRunning, flipPending: true}}
 		d.lastDone[profile] = map[string]DoneSignal{"worker": {Status: "ok"}}
@@ -268,6 +276,18 @@ func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *tes
 			continue
 		}
 		if notProfileScoped[field.Name] {
+			continue
+		}
+		if instanceKeyed[field.Name] {
+			entries := daemon.Field(j)
+			if entries.MapIndex(reflect.ValueOf("deleted-worker")).IsValid() {
+				t.Errorf("deleted profile's instance kept its %s entry", field.Name)
+			}
+			for _, id := range []string{"kept-worker", "worker"} {
+				if !entries.MapIndex(reflect.ValueOf(id)).IsValid() {
+					t.Errorf("%s lost the entry of %s, which the active profile lists", field.Name, id)
+				}
+			}
 			continue
 		}
 		suffix, ok := classified[field.Name]

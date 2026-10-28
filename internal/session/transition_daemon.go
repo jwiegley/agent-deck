@@ -576,6 +576,7 @@ func (d *TransitionDaemon) pruneDeletedProfiles(profiles []string) {
 			_ = storage.Close()
 		}
 	})
+	d.retireDeletedProfileOrphans(active)
 	retireProfiles(d.lastStatus, active, nil)
 	retireProfiles(d.initialized, active, nil)
 	retireProfiles(d.livePrior, active, nil)
@@ -610,6 +611,36 @@ func (d *TransitionDaemon) pruneDeletedProfiles(profiles []string) {
 	retireProfileKeys(d.lastDesktopNotify, active)
 	if d.selfheal != nil {
 		d.selfheal.pruneProfiles(active)
+	}
+}
+
+// retireDeletedProfileOrphans drops the orphansEmitted entries of a deleted
+// profile's instances. The map is keyed by instance, not profile, and only a
+// later pass of the instance's own profile prunes an entry (journalStatusChanges
+// and recordOrphanedPiRuns), which a deleted profile never gets. lastStatus
+// still lists the profile's instances here, so this runs before it is retired.
+// An instance an active profile also lists (moved there) keeps its entry.
+func (d *TransitionDaemon) retireDeletedProfileOrphans(active map[string]bool) {
+	if len(d.orphansEmitted) == 0 {
+		return
+	}
+	retired := map[string]bool{}
+	for profile, statuses := range d.lastStatus {
+		if !active[profile] {
+			for id := range statuses {
+				retired[id] = true
+			}
+		}
+	}
+	for profile, statuses := range d.lastStatus {
+		if active[profile] {
+			for id := range statuses {
+				delete(retired, id)
+			}
+		}
+	}
+	for id := range retired {
+		delete(d.orphansEmitted, id)
 	}
 }
 
