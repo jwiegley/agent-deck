@@ -145,8 +145,15 @@ func (i *Instance) owningStore() (profile, dir string) {
 }
 
 // leftQueue reports whether the instance is queued or still holds a queued
-// message: a start or restart then takes it off the queue.
+// message: a start or restart then takes it off the queue. Its callers (start,
+// startWithMessage and restartRecorded, none of which holds i.mu) ask before
+// they hold transition authority, while another goroutine may write either
+// field: a stop or a status publication writes Status under i.mu, and a start
+// or restart that just finished clears QueuedMessage (takeOffQueueAfterStart).
+// So both are read under i.mu.
 func (i *Instance) leftQueue() bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
 	return i.Status == StatusQueued || i.QueuedMessage != ""
 }
 
@@ -184,7 +191,11 @@ func (i *Instance) takeOffQueueAfterStart() {
 	if !taken {
 		return // no row (yet), or nothing left to take: keep what we have
 	}
+	// Under i.mu: another start or restart of this instance may be reading
+	// it in leftQueue.
+	i.mu.Lock()
 	i.QueuedMessage = ""
+	i.mu.Unlock()
 	if message == "" {
 		return
 	}
