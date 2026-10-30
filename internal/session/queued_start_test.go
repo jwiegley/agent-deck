@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -238,5 +239,71 @@ func TestNoteTakenOffQueueDoesNotEditTheBaselineInPlace(t *testing.T) {
 	}
 	if got := inst.storageSnapshot.original; got.Status != string(StatusStarting) || ReadQueuedMessageFromToolData(got.ToolData) != "" {
 		t.Fatalf("new baseline = status %q, message %q; want starting, none", got.Status, ReadQueuedMessageFromToolData(got.ToolData))
+	}
+}
+
+// A start or restart asks leftQueue before it holds transition authority, so
+// another goroutine can write the queue state meanwhile: a stop that holds the
+// authority writes Status under i.mu (killInternalLocked, which the external
+// restart of TestRuntimeLifecycle_SwitchAccountRuntime_BlocksRestartBetweenKillAndNewAccountSpawn
+// raced on Darwin), and a start that has spawned clears QueuedMessage
+// (takeOffQueueAfterStart). Both sides must hold i.mu. Nothing else orders the
+// two goroutines here, so under -race an unlocked side is reported whichever
+// runs first.
+func TestRuntimeLifecycle_QueueStateIsReadAndClearedUnderTheInstanceLock(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status      Status          // when the two goroutines start
+		write       func(*Instance) // runs concurrently with leftQueue
+		wantStatus  Status
+		wantMessage string
+		wantSent    int
+	}{
+		// killInternalLocked's stopped write. The status is still queued, so
+		// leftQueue may not need the message.
+		"a stop writes status": {
+			status:      StatusQueued,
+			write:       func(i *Instance) { i.SetStatusThreadSafe(StatusStopped) },
+			wantStatus:  StatusStopped,
+			wantMessage: "brief",
+			wantSent:    0,
+		},
+		// The status already reads starting, so leftQueue reads the message.
+		"a spawned start takes it off the queue": {
+			status:      StatusStarting,
+			write:       (*Instance).takeOffQueueAfterStart,
+			wantStatus:  StatusStarting,
+			wantMessage: "",
+			wantSent:    1,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			sent := sinkQueuedMessages(t)
+			inst := NewInstanceWithGroup("worker", t.TempDir(), "workers")
+			inst.MarkQueued("brief")
+			if err := newTestStorage(t).SaveWithGroups([]*Instance{inst}, nil); err != nil {
+				t.Fatal(err)
+			}
+			inst.SetStatusThreadSafe(tc.status)
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				tc.write(inst)
+			}()
+			go func() {
+				defer wg.Done()
+				inst.leftQueue()
+			}()
+			wg.Wait()
+
+			if got := inst.GetStatusThreadSafe(); got != tc.wantStatus {
+				t.Errorf("status = %q, want %q", got, tc.wantStatus)
+			}
+			if inst.QueuedMessage != tc.wantMessage || len(*sent) != tc.wantSent {
+				t.Errorf("queued message %q, sent %q; want %q and %d sent", inst.QueuedMessage, *sent, tc.wantMessage, tc.wantSent)
+			}
+		})
 	}
 }
