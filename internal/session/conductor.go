@@ -1,7 +1,9 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -1771,36 +1773,117 @@ func createFileIfAbsent(path string, content []byte, perm os.FileMode) (bool, er
 // caller validate and retain the exact file it replaced for recovery.
 var exchangeGeneratedFiles = exchangeGeneratedFile
 
-// writeGeneratedFileOrMigrate creates a generated file when absent and upgrades
-// it only when its contents exactly match one of the prior generated-template
-// generations (newest first; see conductorInstructionsGenerations). Edited
-// files and existing symlinks remain user-owned. Migration retains the
-// displaced inode so an editor with an open descriptor cannot lose its writes.
-func writeGeneratedFileOrMigrate(path string, previousGenerations []string, current string, perm os.FileMode) error {
-	info, err := os.Lstat(path)
+// generatedFileOutcome reports what replaceGeneratedFile did. It is 0 whenever
+// replaceGeneratedFile returns an error.
+type generatedFileOutcome int
+
+const (
+	// generatedFileCreated: the path was absent and this call created it.
+	generatedFileCreated generatedFileOutcome = iota + 1
+	// generatedFileUnchanged: the path already held exactly the current bytes.
+	generatedFileUnchanged
+	// generatedFileReplaced: the path held replaceable bytes and now holds the
+	// current ones; the displaced file was retained.
+	generatedFileReplaced
+	// generatedFileKept: a regular file whose bytes Replaceable refused. It is
+	// the user's and was left alone.
+	generatedFileKept
+	// generatedFileSymlink: the path is a symlink, dangling or not. It is the
+	// user's and was left alone.
+	generatedFileSymlink
+)
+
+// generatedFileSpec describes one generated file for replaceGeneratedFile.
+type generatedFileSpec struct {
+	// Path is the generated file.
+	Path string
+	// Current is the content the file should hold.
+	Current []byte
+	// Perm is the mode of a file this call creates, before the umask applies.
+	// A replacement keeps the mode bits of the file it replaces.
+	Perm os.FileMode
+	// Replaceable reports whether the bytes of an existing regular file are an
+	// earlier generation rather than the user's edits. It is asked about the
+	// bytes first read (never when they already equal Current), again about the
+	// bytes seen just before the exchange, and once more about the displaced
+	// file.
+	Replaceable func(existing []byte) bool
+	// DisplacedTo, when not empty, is the name the verified displaced file is
+	// renamed to, replacing any file already there. Empty leaves it at its
+	// temporary .<base>.previous-<random> name.
+	DisplacedTo string
+}
+
+// createGeneratedFile creates path with O_EXCL (the umask applies to perm) and
+// reports whether this call created it; an existing path is left alone. It is
+// the create seam of replaceGeneratedFile: tests swap it to make a file appear,
+// or the write fail, at that point.
+var createGeneratedFile = createFileIfAbsent
+
+// replaceGeneratedFile brings the generated file at spec.Path to spec.Current
+// without taking what the user owns, and reports what it did.
+//
+// A missing path is created, and a create whose write fails removes its partial
+// file; if the removal fails too, its error is joined to the create error. A
+// file that appears during that create is classified like any existing one,
+// once. A symlink, dangling or not, a regular file that Replaceable
+// refuses and a regular file already equal to Current are left alone; any other
+// file type is an error. A replaceable regular file is replaced by an atomic
+// exchange with a fully written temporary file that has the old file's mode
+// bits, so a reader never sees partial content. The displaced file is verified
+// and retained, never unlinked: an editor may still be writing through an open
+// descriptor. A concurrent edit found in it is reported with the name of the
+// temporary copy that holds it, which is not moved to spec.DisplacedTo. If that
+// move fails, the new bytes are already published and the verified copy stays at
+// its temporary name. A filesystem without atomic exchange fails the
+// replacement; there is no fallback.
+func replaceGeneratedFile(spec generatedFileSpec) (generatedFileOutcome, error) {
+	info, err := os.Lstat(spec.Path)
 	if os.IsNotExist(err) {
-		return writeFileIfAbsent(path, []byte(current), perm)
+		created, createErr := createGeneratedFile(spec.Path, spec.Current, spec.Perm)
+		if createErr != nil {
+			if created {
+				// This call created the file and then failed to fill it. Left
+				// behind, the partial file would read as the user's on every
+				// later run, so a removal that fails is reported with the
+				// create error, not dropped.
+				if rmErr := os.Remove(spec.Path); rmErr != nil && !os.IsNotExist(rmErr) {
+					return 0, errors.Join(createErr, fmt.Errorf("removing partial generated file %q: %w", spec.Path, rmErr))
+				}
+			}
+			return 0, createErr
+		}
+		if created {
+			return generatedFileCreated, nil
+		}
+		// A file appeared between the Lstat and the exclusive create. Classify
+		// it below, once: this is one more look, not a retry loop, and if it
+		// vanished again that error is the answer.
+		info, err = os.Lstat(spec.Path)
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return nil
+		return generatedFileSymlink, nil
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("refusing to replace unsafe generated-file target %q (%s)", path, info.Mode().Type())
+		return 0, fmt.Errorf("refusing to replace unsafe generated-file target %q (%s)", spec.Path, info.Mode().Type())
 	}
-	content, err := os.ReadFile(path)
+	existing, err := os.ReadFile(spec.Path)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if !matchesAnyTemplateContent(string(content), previousGenerations) {
-		return nil
+	if bytes.Equal(existing, spec.Current) {
+		return generatedFileUnchanged, nil
 	}
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".previous-*")
+	if !spec.Replaceable(existing) {
+		return generatedFileKept, nil
+	}
+	dir := filepath.Dir(spec.Path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(spec.Path)+".previous-*")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	tmpPath := tmp.Name()
 	exchanged := false
@@ -1814,37 +1897,37 @@ func writeGeneratedFileOrMigrate(path string, previousGenerations []string, curr
 		return fmt.Errorf("%s generated replacement: %w", op, opErr)
 	}
 	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
-		return fail("chmod", err)
+		return 0, fail("chmod", err)
 	}
-	if _, err := tmp.Write([]byte(current)); err != nil {
-		return fail("write", err)
+	if _, err := tmp.Write(spec.Current); err != nil {
+		return 0, fail("write", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		return fail("sync", err)
+		return 0, fail("sync", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close generated replacement: %w", err)
+		return 0, fmt.Errorf("close generated replacement: %w", err)
 	}
 
 	// Avoid needless exchanges when a change is already visible. This recheck is
 	// only an optimization: correctness comes from validating the file displaced
 	// by the atomic exchange below.
-	latestInfo, err := os.Lstat(path)
+	latestInfo, err := os.Lstat(spec.Path)
 	if err != nil {
-		return fmt.Errorf("recheck generated target: %w", err)
+		return 0, fmt.Errorf("recheck generated target: %w", err)
 	}
 	if !latestInfo.Mode().IsRegular() || !os.SameFile(info, latestInfo) {
-		return fmt.Errorf("generated target changed during migration: %s", path)
+		return 0, fmt.Errorf("generated target changed during migration: %s", spec.Path)
 	}
-	latest, err := os.ReadFile(path)
+	latest, err := os.ReadFile(spec.Path)
 	if err != nil {
-		return fmt.Errorf("recheck generated content: %w", err)
+		return 0, fmt.Errorf("recheck generated content: %w", err)
 	}
-	if !matchesAnyTemplateContent(string(latest), previousGenerations) {
-		return fmt.Errorf("generated target was edited during migration: %s", path)
+	if !spec.Replaceable(latest) {
+		return 0, fmt.Errorf("generated target was edited during migration: %s", spec.Path)
 	}
-	if err := exchangeGeneratedFiles(tmpPath, path); err != nil {
-		return fmt.Errorf("replace generated target: %w", err)
+	if err := exchangeGeneratedFiles(tmpPath, spec.Path); err != nil {
+		return 0, fmt.Errorf("replace generated target: %w", err)
 	}
 	// From this point tmpPath belongs to the displaced inode, which may still
 	// have an editor writing through an open descriptor. Never unlink it.
@@ -1857,13 +1940,41 @@ func writeGeneratedFileOrMigrate(path string, previousGenerations []string, curr
 		displaced, readErr = os.ReadFile(tmpPath)
 	}
 	if statErr != nil || !displacedInfo.Mode().IsRegular() || readErr != nil ||
-		!os.SameFile(info, displacedInfo) || !matchesAnyTemplateContent(string(displaced), previousGenerations) {
+		!os.SameFile(info, displacedInfo) || !spec.Replaceable(displaced) {
 		// A second exchange could overwrite a newer visible edit. Keep both
 		// paths and make the publication conflict actionable instead.
-		return fmt.Errorf("generated target %q changed during publication; publication occurred, displaced file retained at %q for reconciliation", path, tmpPath)
+		return 0, fmt.Errorf("generated target %q changed during publication; publication occurred, displaced file retained at %q for reconciliation", spec.Path, tmpPath)
 	}
-	sessionLog.Info("generated_instructions_migrated", slog.String("path", path), slog.String("previous_path", tmpPath))
-	return nil
+	previousPath := tmpPath
+	if spec.DisplacedTo != "" {
+		// The new bytes are already published. A rename keeps the inode, so an
+		// editor still writing through an open descriptor lands in the retained
+		// copy, and a failure leaves the verified copy at tmpPath.
+		if err := os.Rename(tmpPath, spec.DisplacedTo); err != nil {
+			return 0, fmt.Errorf("moving displaced file %q to %q after replacing %q: %w", tmpPath, spec.DisplacedTo, spec.Path, err)
+		}
+		fsyncDir(filepath.Dir(spec.DisplacedTo))
+		previousPath = spec.DisplacedTo
+	}
+	sessionLog.Info("generated_instructions_migrated", slog.String("path", spec.Path), slog.String("previous_path", previousPath))
+	return generatedFileReplaced, nil
+}
+
+// writeGeneratedFileOrMigrate creates a generated file when absent and upgrades
+// it only when its contents exactly match one of the prior generated-template
+// generations (newest first; see conductorInstructionsGenerations). Edited
+// files and existing symlinks remain user-owned. Migration retains the
+// displaced inode so an editor with an open descriptor cannot lose its writes.
+func writeGeneratedFileOrMigrate(path string, previousGenerations []string, current string, perm os.FileMode) error {
+	_, err := replaceGeneratedFile(generatedFileSpec{
+		Path:    path,
+		Current: []byte(current),
+		Perm:    perm,
+		Replaceable: func(existing []byte) bool {
+			return matchesAnyTemplateContent(string(existing), previousGenerations)
+		},
+	})
+	return err
 }
 
 // InstallSharedConductorInstructions writes the shared instructions file for the given conductor agent,
