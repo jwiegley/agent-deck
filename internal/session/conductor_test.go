@@ -241,6 +241,7 @@ func TestHeartbeatPlistLabel(t *testing.T) {
 // --- InstallBridgeDaemon platform dispatch test ---
 
 func TestBridgeDaemonHint(t *testing.T) {
+	installServiceManagerFake(t)
 	// BridgeDaemonHint should return a non-empty string on any platform
 	hint := BridgeDaemonHint()
 	if hint == "" {
