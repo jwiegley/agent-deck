@@ -5,9 +5,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/platform"
 )
 
 // Issue #2348: a delivered heartbeat is a turn that re-reads the conductor's
@@ -352,6 +355,7 @@ esac
 // the raw agent and unknown fields survive, only heartbeat_enabled changes.
 func TestUninstallHeartbeatDaemon_UnknownAgentDisablesAndPreservesMeta(t *testing.T) {
 	setupHeartbeatTickTest(t, "future")
+	fake := installServiceManagerFake(t)
 	dir, err := ConductorNameDir("future")
 	if err != nil {
 		t.Fatal(err)
@@ -363,6 +367,13 @@ func TestUninstallHeartbeatDaemon_UnknownAgentDisablesAndPreservesMeta(t *testin
 	}
 	if err := UninstallHeartbeatDaemon("future"); err != nil {
 		t.Fatalf("unknown agent must not block disabling the heartbeat: %v", err)
+	}
+	var wantCalls []string // launchd: no plist, no call
+	if p := platform.Detect(); p == platform.PlatformLinux || p == platform.PlatformWSL2 {
+		wantCalls = []string{"systemctl --user daemon-reload"}
+	}
+	if got := fake.MutatingCalls(); !slices.Equal(got, wantCalls) {
+		t.Fatalf("mutating service-manager calls = %q, want %q", got, wantCalls)
 	}
 	meta, err := LoadConductorMeta("future")
 	if err != nil {
