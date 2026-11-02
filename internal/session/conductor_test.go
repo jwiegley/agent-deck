@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/asheshgoplani/agent-deck/internal/platform"
 )
 
 // --- Systemd template generation tests ---
@@ -246,6 +248,88 @@ func TestBridgeDaemonHint(t *testing.T) {
 	hint := BridgeDaemonHint()
 	if hint == "" {
 		t.Error("BridgeDaemonHint() should return a non-empty hint")
+	}
+}
+
+// The hints send the user to `conductor setup` when no daemon file is installed,
+// and tell them how to start the daemon when one is. A dangling symlink is
+// neither: another manager owns it, setup refuses it, and os.Stat follows the
+// dead link and finds no file. The hint then names the daemon and sends the user
+// to its manager. The rows are the host's: launchd's plists on macOS, systemd's
+// units on Linux and WSL2.
+func TestDaemonHints_HostPlatform(t *testing.T) {
+	type hintRow struct {
+		name    string
+		hint    func() string
+		label   string
+		path    func() (string, error)
+		started func(path string) string // the hint for an installed daemon
+		setup   string                   // the hint when no file is installed
+	}
+	const (
+		bridgeSetup   = "Run 'agent-deck conductor setup <name>' to install the daemon"
+		notifierSetup = "Run 'agent-deck conductor setup <name>' to install notifier daemon"
+	)
+	var rows []hintRow
+	switch plat := platform.Detect(); plat {
+	case platform.PlatformMacOS:
+		rows = []hintRow{
+			{"bridge", BridgeDaemonHint, LaunchdPlistName, LaunchdPlistPath,
+				func(path string) string { return "Start daemon with: launchctl load " + path }, bridgeSetup},
+			{"notifier", TransitionNotifierDaemonHint, TransitionNotifierLaunchdPlistName, TransitionNotifierLaunchdPlistPath,
+				func(path string) string { return "Start notifier daemon with: launchctl load " + path }, notifierSetup},
+		}
+	case platform.PlatformLinux, platform.PlatformWSL2:
+		rows = []hintRow{
+			{"bridge", BridgeDaemonHint, systemdBridgeServiceName, SystemdBridgeServicePath,
+				func(string) string { return "Start daemon with: systemctl --user start agent-deck-conductor-bridge" }, bridgeSetup},
+			{"notifier", TransitionNotifierDaemonHint, systemdTransitionNotifierServiceName, SystemdTransitionNotifierServicePath,
+				func(string) string {
+					return "Start notifier daemon with: systemctl --user start agent-deck-transition-notifier"
+				}, notifierSetup},
+		}
+	default:
+		t.Skipf("no launchd or systemd hint on %s", plat)
+	}
+	states := []struct {
+		name string
+		put  func(t *testing.T, path string) // nil leaves nothing at path
+		want func(r hintRow, path string) string
+	}{
+		{"missing", nil, func(r hintRow, _ string) string { return r.setup }},
+		{"owned file", func(t *testing.T, path string) { writeServiceFixture(t, path, "owned", 0o644) },
+			func(r hintRow, path string) string { return r.started(path) }},
+		// Another manager's file that os.Stat can see keeps the hint it has always had.
+		{"read-only file", func(t *testing.T, path string) { writeServiceFixture(t, path, "kept", 0o444) },
+			func(r hintRow, path string) string { return r.started(path) }},
+		{"dangling symlink", func(t *testing.T, path string) { linkUnit(t, filepath.Join(t.TempDir(), "gone"), path) },
+			func(r hintRow, _ string) string {
+				return r.label + ": managed externally (symlink); start or fix it through its manager"
+			}},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			for _, state := range states {
+				t.Run(state.name, func(t *testing.T) {
+					useTempConductorHome(t)
+					installServiceManagerFake(t)
+					// The Linux hints ask whether a systemd user session exists. With
+					// no loginctl on PATH, that is the fake's answer to daemon-reload.
+					t.Setenv("PATH", t.TempDir())
+					t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+					path, err := r.path()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if state.put != nil {
+						state.put(t, path)
+					}
+					if got, want := r.hint(), state.want(r, path); got != want {
+						t.Errorf("hint = %q, want %q", got, want)
+					}
+				})
+			}
+		})
 	}
 }
 
