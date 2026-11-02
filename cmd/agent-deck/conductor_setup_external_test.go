@@ -71,17 +71,26 @@ func newSetupCLIFixture(t *testing.T, config string) *setupCLIFixture {
 		t.Fatal(err)
 	}
 
-	pathDir, serviceLog := installRecordingServiceFakes(t, false)
 	fx := &setupCLIFixture{
-		home:       home,
-		condDir:    filepath.Join(dataDir, "conductor"),
-		pythonLog:  filepath.Join(t.TempDir(), "python.log"),
-		serviceLog: serviceLog,
-		env:        []string{"PATH=" + pathDir + string(os.PathListSeparator) + os.Getenv("PATH")},
-		want:       map[string]string{},
+		home:      home,
+		condDir:   filepath.Join(dataDir, "conductor"),
+		pythonLog: filepath.Join(t.TempDir(), "python.log"),
+		want:      map[string]string{},
 	}
+	fx.useServiceFakes(t, false)
 	fx.writeVenvPython(t, 1)
 	return fx
+}
+
+// useServiceFakes puts the recording launchctl and systemctl that
+// installRecordingServiceFakes(t, listLoaded, failVerbs...) makes first on the
+// fixture's PATH, in place of the ones it has, and logs their calls to a new
+// serviceLog.
+func (fx *setupCLIFixture) useServiceFakes(t *testing.T, listLoaded bool, failVerbs ...string) {
+	t.Helper()
+	var pathDir string
+	pathDir, fx.serviceLog = installRecordingServiceFakes(t, listLoaded, failVerbs...)
+	fx.env = []string{"PATH=" + pathDir + string(os.PathListSeparator) + os.Getenv("PATH")}
 }
 
 // writeVenvPython writes the venv python3, which findPython3 prefers to the
@@ -514,5 +523,84 @@ func TestConductorSetupCLI_OwnedBridgeAgentInstalled(t *testing.T) {
 		if load := "launchctl load " + agentFile; !slices.Contains(mutatingServiceCalls(t, fx.serviceLog), load) {
 			t.Errorf("service calls lack %q: %q", load, serviceCallLines(t, fx.serviceLog))
 		}
+	}
+}
+
+// A bridge agent that setup cannot install may still have its previous agent
+// running: the new plist is written to a temp file before anything is unloaded,
+// so a failed write, rename or load leaves the old one loaded, and a systemd unit
+// is never stopped. The bridge takes no instance lock, so "Run manually" would
+// start a second one on the same tokens. The line is advice for a bridge that is
+// not running. The fakes refuse load and enable, the verbs that install an
+// agent, and report the agent as loaded or not.
+func TestConductorSetupCLI_FailedBridgeInstallAdvisesRunManuallyOnlyWhenNotRunning(t *testing.T) {
+	bridgeLabel, _ := setupCLIServiceLabels()
+	rows := []struct {
+		name         string
+		loaded       bool // what launchctl list and systemctl is-active report
+		wantManually bool
+	}{
+		{"previous agent still loaded", true, false},
+		{"no agent loaded", false, true},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			fx := newSetupCLIFixture(t, setupCLIDiscordConfig)
+			fx.writeVenvPython(t, 0)
+			fx.useServiceFakes(t, row.loaded, "load", "enable")
+			// An owned agent: 0644, as agent-deck writes it, is not another manager's.
+			writeReadOnlyServiceFixtures(t, fx.home, 0o644, bridgeLabel)
+
+			_, stderr := fx.run(t, "conductor", "setup", "failing", "--no-heartbeat")
+
+			if !strings.Contains(stderr, "Warning: failed to install bridge daemon") {
+				t.Errorf("stderr lacks the install warning:\n%s", stderr)
+			}
+			// The line, whole: the warning may carry a "run manually" of its own.
+			manually := "Run manually: python3 " + filepath.Join(fx.condDir, "bridge.py")
+			if got := slices.Contains(strings.Split(stderr, "\n"), manually); got != row.wantManually {
+				t.Errorf("stderr has the line %q = %v, want %v\nstderr:\n%s", manually, got, row.wantManually, stderr)
+			}
+		})
+	}
+}
+
+// `conductor list` writes a heartbeat.sh that is missing again, and says so when
+// the heartbeat agent still bakes another path. Setup reinstalls an agent that
+// Agent Deck owns, so for that one the remedy is to run it. Setup leaves an agent
+// that another manager owns alone (read-only here, as home-manager leaves it), so
+// for that one the line names the agent and sends the user to its manager.
+func TestConductorListCLI_StaleHeartbeatRemedyNamesWhoReloadsIt(t *testing.T) {
+	const name = "hb-stale"
+	hbLabel := session.SystemdHeartbeatTimerName(name)
+	if runtime.GOOS == "darwin" {
+		hbLabel = session.HeartbeatPlistLabel(name)
+	}
+	const refreshed = "  [migrated] Refreshed heartbeat script: " + name
+	rows := []struct {
+		name string
+		mode os.FileMode // of the heartbeat agent's files
+		want string      // the whole stdout line
+	}{
+		{"external agent", 0o444, refreshed + " (heartbeat daemon may be stale — " + hbLabel + ": managed externally (read-only); reload it through its manager)"},
+		{"owned agent", 0o644, refreshed + " (heartbeat daemon may be stale — run 'agent-deck conductor setup " + name + "' to reload)"},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			fx := newSetupCLIFixture(t, "")
+			// TestMain's failing stubs stand in for the service managers on this run.
+			runConductorSetupCLI(t, fx.home, name)
+			script := filepath.Join(cliConductorDir(t, fx.home, name), "heartbeat.sh")
+			if err := os.Remove(script); err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			// The fixtures hold no path of the conductor's heartbeat.sh, so the agent is stale.
+			writeReadOnlyServiceFixtures(t, fx.home, row.mode,
+				session.HeartbeatPlistLabel(name), session.SystemdHeartbeatServiceName(name), session.SystemdHeartbeatTimerName(name))
+
+			stdout, _ := fx.run(t, "conductor", "list")
+
+			assertStdoutHasLine(t, stdout, row.want)
+		})
 	}
 }

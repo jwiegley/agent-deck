@@ -3193,7 +3193,17 @@ func IsTransitionNotifierDaemonRunning() bool {
 	}
 }
 
+// externalDaemonHint is the hint for a daemon whose service file another manager
+// owns. Setup refuses such a file, so the hint names it and sends the user to
+// that manager.
+func externalDaemonHint(ext *ExternalServiceError) string {
+	return ext.Error() + "; start or fix it through its manager"
+}
+
 // BridgeDaemonHint returns a platform-appropriate hint for starting the bridge daemon.
+// A service file that os.Stat cannot find may still be another manager's: a
+// symlink whose target is gone. The hint then names it, and sends the user to
+// that manager, not to setup, which refuses the file.
 func BridgeDaemonHint() string {
 	plat := platform.Detect()
 	switch plat {
@@ -3203,6 +3213,9 @@ func BridgeDaemonHint() string {
 			if _, err := os.Stat(plistPath); err == nil {
 				return fmt.Sprintf("Start daemon with: launchctl load %s", plistPath)
 			}
+		}
+		if ext := BridgeDaemonExternal(); ext != nil {
+			return externalDaemonHint(ext)
 		}
 		return "Run 'agent-deck conductor setup <name>' to install the daemon"
 	case platform.PlatformLinux, platform.PlatformWSL2:
@@ -3216,6 +3229,9 @@ func BridgeDaemonHint() string {
 				return "Start daemon with: systemctl --user start agent-deck-conductor-bridge"
 			}
 		}
+		if ext := BridgeDaemonExternal(); ext != nil {
+			return externalDaemonHint(ext)
+		}
 		return "Run 'agent-deck conductor setup <name>' to install the daemon"
 	default:
 		condDir, _ := ConductorDir()
@@ -3224,6 +3240,8 @@ func BridgeDaemonHint() string {
 }
 
 // TransitionNotifierDaemonHint returns how to start transition notifier daemon.
+// Like BridgeDaemonHint, it names a service file that os.Stat cannot find but
+// another manager owns, and sends the user to that manager, not to setup.
 func TransitionNotifierDaemonHint() string {
 	plat := platform.Detect()
 	switch plat {
@@ -3232,6 +3250,9 @@ func TransitionNotifierDaemonHint() string {
 		if err == nil {
 			if _, err := os.Stat(plistPath); err == nil {
 				return fmt.Sprintf("Start notifier daemon with: launchctl load %s", plistPath)
+			}
+			if ext := probeExternal(TransitionNotifierLaunchdPlistName, plistPath); ext != nil {
+				return externalDaemonHint(ext)
 			}
 		}
 		return "Run 'agent-deck conductor setup <name>' to install notifier daemon"
@@ -3243,6 +3264,9 @@ func TransitionNotifierDaemonHint() string {
 		if err == nil {
 			if _, err := os.Stat(unitPath); err == nil {
 				return "Start notifier daemon with: systemctl --user start agent-deck-transition-notifier"
+			}
+			if ext := probeExternal(systemdTransitionNotifierServiceName, unitPath); ext != nil {
+				return externalDaemonHint(ext)
 			}
 		}
 		return "Run 'agent-deck conductor setup <name>' to install notifier daemon"
