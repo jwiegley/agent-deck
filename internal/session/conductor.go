@@ -2693,6 +2693,24 @@ func SystemdHeartbeatTimerPath(name string) (string, error) {
 	return filepath.Join(dir, SystemdHeartbeatTimerName(name)), nil
 }
 
+// systemdHeartbeatUnits returns a conductor heartbeat's service and timer, in
+// that order and without content: the pair that is installed and removed
+// together.
+func systemdHeartbeatUnits(name string) ([]systemdUnitFile, error) {
+	svcPath, err := SystemdHeartbeatServicePath(name)
+	if err != nil {
+		return nil, err
+	}
+	timerPath, err := SystemdHeartbeatTimerPath(name)
+	if err != nil {
+		return nil, err
+	}
+	return []systemdUnitFile{
+		{Name: SystemdHeartbeatServiceName(name), Path: svcPath},
+		{Name: SystemdHeartbeatTimerName(name), Path: timerPath},
+	}, nil
+}
+
 // --- Systemd unit generators ---
 
 // GenerateSystemdBridgeService returns a systemd unit for the bridge daemon
@@ -2839,6 +2857,11 @@ func systemdUserAvailable() bool {
 	return true
 }
 
+// systemdUserAvailableCheck is what the install paths call, so a test decides
+// availability without XDG_RUNTIME_DIR or loginctl. BridgeDaemonHint and
+// TransitionNotifierDaemonHint keep calling systemdUserAvailable.
+var systemdUserAvailableCheck = systemdUserAvailable
+
 // InstallBridgeDaemon installs and starts the bridge daemon.
 // macOS: launchd plist; Linux: systemd user service.
 // Returns the unit/plist file path on success.
@@ -2880,13 +2903,19 @@ func installBridgeDaemonLaunchd() (string, error) {
 }
 
 func installBridgeDaemonSystemd() (string, error) {
-	unitContent, err := GenerateSystemdBridgeService()
-	if err != nil {
-		return "", fmt.Errorf("failed to generate systemd unit: %w", err)
-	}
 	unitPath, err := SystemdBridgeServicePath()
 	if err != nil {
 		return "", fmt.Errorf("failed to get systemd unit path: %w", err)
+	}
+	// Checked before the unit is generated or any directory is made: a unit that
+	// another manager owns is never replaced, and generating one needs python3.
+	units := []systemdUnitFile{{Name: systemdBridgeServiceName, Path: unitPath}}
+	if err := requireOwnedSystemdUnits(systemdBridgeServiceName, units); err != nil {
+		return "", err
+	}
+	unitContent, err := GenerateSystemdBridgeService()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate systemd unit: %w", err)
 	}
 	dir, err := SystemdUserDir()
 	if err != nil {
@@ -2903,17 +2932,12 @@ func installBridgeDaemonSystemd() (string, error) {
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return "", fmt.Errorf("failed to create bridge log dir: %w", err)
 	}
-	if err := os.WriteFile(unitPath, []byte(unitContent), 0o644); err != nil {
-		return "", fmt.Errorf("failed to write systemd unit: %w", err)
+	units[0].Content = []byte(unitContent)
+	err = replaceSystemdUnits(systemdBridgeServiceName, units, systemdBridgeServiceName)
+	if errors.Is(err, errSystemdUserUnavailable) {
+		return "", fmt.Errorf("%w (common in containers/VMs without lingering); run manually: python3 %s/bridge.py", err, logDir)
 	}
-	if !systemdUserAvailable() {
-		condDir, _ := ConductorDir()
-		return "", fmt.Errorf("systemd user session not available (common in containers/VMs without lingering); run manually: python3 %s/bridge.py", condDir)
-	}
-	if err := runSystemctl("--user", "enable", "--now", systemdBridgeServiceName); err != nil {
-		return unitPath, fmt.Errorf("unit written but enable failed: %w", err)
-	}
-	return unitPath, nil
+	return unitPath, err
 }
 
 // InstallTransitionNotifierDaemon installs and starts the transition notifier daemon.
@@ -3001,13 +3025,19 @@ func installTransitionNotifierLaunchd() (string, error) {
 }
 
 func installTransitionNotifierSystemd() (string, error) {
-	unitContent, err := GenerateSystemdTransitionNotifierService()
-	if err != nil {
-		return "", fmt.Errorf("failed to generate notifier unit: %w", err)
-	}
 	unitPath, err := SystemdTransitionNotifierServicePath()
 	if err != nil {
 		return "", fmt.Errorf("failed to get notifier unit path: %w", err)
+	}
+	// Checked before the unit is generated or any directory is made: a unit that
+	// another manager owns is never replaced.
+	units := []systemdUnitFile{{Name: systemdTransitionNotifierServiceName, Path: unitPath}}
+	if err := requireOwnedSystemdUnits(systemdTransitionNotifierServiceName, units); err != nil {
+		return "", err
+	}
+	unitContent, err := GenerateSystemdTransitionNotifierService()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate notifier unit: %w", err)
 	}
 	dir, err := SystemdUserDir()
 	if err != nil {
@@ -3024,16 +3054,12 @@ func installTransitionNotifierSystemd() (string, error) {
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
 		return "", fmt.Errorf("failed to create notifier log dir: %w", err)
 	}
-	if err := os.WriteFile(unitPath, []byte(unitContent), 0o644); err != nil {
-		return "", fmt.Errorf("failed to write notifier unit: %w", err)
+	units[0].Content = []byte(unitContent)
+	err = replaceSystemdUnits(systemdTransitionNotifierServiceName, units, systemdTransitionNotifierServiceName)
+	if errors.Is(err, errSystemdUserUnavailable) {
+		return "", fmt.Errorf("%w; run manually: agent-deck notify-daemon", err)
 	}
-	if !systemdUserAvailable() {
-		return "", fmt.Errorf("systemd user session not available; run manually: agent-deck notify-daemon")
-	}
-	if err := runSystemctl("--user", "enable", "--now", systemdTransitionNotifierServiceName); err != nil {
-		return unitPath, fmt.Errorf("unit written but enable failed: %w", err)
-	}
-	return unitPath, nil
+	return unitPath, err
 }
 
 // UninstallBridgeDaemon stops and removes the bridge daemon.
@@ -3058,19 +3084,12 @@ func uninstallBridgeDaemonLaunchd() error {
 }
 
 func uninstallBridgeDaemonSystemd() error {
-	_ = runSystemctl("--user", "disable", "--now", systemdBridgeServiceName)
 	unitPath, err := SystemdBridgeServicePath()
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(unitPath); os.IsNotExist(err) {
-		return nil
-	}
-	if err := os.Remove(unitPath); err != nil {
-		return err
-	}
-	_ = runSystemctl("--user", "daemon-reload")
-	return nil
+	// Lenient, as it always was: a failed disable does not keep the unit file.
+	return removeSystemdUnits(systemdBridgeServiceName, []systemdUnitFile{{Name: systemdBridgeServiceName, Path: unitPath}}, systemdBridgeServiceName, false)
 }
 
 // UninstallTransitionNotifierDaemon stops and removes the transition notifier daemon.
@@ -3095,19 +3114,12 @@ func uninstallTransitionNotifierLaunchd() error {
 }
 
 func uninstallTransitionNotifierSystemd() error {
-	_ = runSystemctl("--user", "disable", "--now", systemdTransitionNotifierServiceName)
 	unitPath, err := SystemdTransitionNotifierServicePath()
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(unitPath); os.IsNotExist(err) {
-		return nil
-	}
-	if err := os.Remove(unitPath); err != nil {
-		return err
-	}
-	_ = runSystemctl("--user", "daemon-reload")
-	return nil
+	// Lenient, like the bridge's.
+	return removeSystemdUnits(systemdTransitionNotifierServiceName, []systemdUnitFile{{Name: systemdTransitionNotifierServiceName, Path: unitPath}}, systemdTransitionNotifierServiceName, false)
 }
 
 // IsBridgeDaemonRunning checks if the bridge daemon is currently running.
@@ -3238,6 +3250,17 @@ func installHeartbeatDaemonLaunchd(name string, intervalMinutes int) error {
 }
 
 func installHeartbeatDaemonSystemd(name string, intervalMinutes int) error {
+	units, err := systemdHeartbeatUnits(name)
+	if err != nil {
+		return err
+	}
+	// The pair is named, and enabled, by its timer. It is checked before anything
+	// is generated or created: one external unit keeps the pair, so neither of
+	// them is replaced.
+	timer := SystemdHeartbeatTimerName(name)
+	if err := requireOwnedSystemdUnits(timer, units); err != nil {
+		return err
+	}
 	dir, err := SystemdUserDir()
 	if err != nil {
 		return err
@@ -3250,32 +3273,15 @@ func installHeartbeatDaemonSystemd(name string, intervalMinutes int) error {
 	if err != nil {
 		return fmt.Errorf("failed to generate heartbeat service: %w", err)
 	}
-	svcPath, err := SystemdHeartbeatServicePath(name)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(svcPath, []byte(svcContent), 0o644); err != nil {
-		return fmt.Errorf("failed to write heartbeat service: %w", err)
-	}
+	units[0].Content = []byte(svcContent)
+	units[1].Content = []byte(GenerateSystemdHeartbeatTimer(name, intervalMinutes))
 
-	timerContent := GenerateSystemdHeartbeatTimer(name, intervalMinutes)
-	timerPath, err := SystemdHeartbeatTimerPath(name)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(timerPath, []byte(timerContent), 0o644); err != nil {
-		return fmt.Errorf("failed to write heartbeat timer: %w", err)
-	}
-
-	if !systemdUserAvailable() {
+	err = replaceSystemdUnits(timer, units, timer)
+	if errors.Is(err, errSystemdUserUnavailable) {
 		condDir, _ := ConductorNameDir(name)
-		return fmt.Errorf("systemd user session not available; run heartbeat manually via cron or: bash %s/heartbeat.sh", condDir)
+		return fmt.Errorf("%w; run heartbeat manually via cron or: bash %s/heartbeat.sh", err, condDir)
 	}
-	timerName := SystemdHeartbeatTimerName(name)
-	if err := runSystemctl("--user", "enable", "--now", timerName); err != nil {
-		return fmt.Errorf("failed to enable heartbeat timer: %w", err)
-	}
-	return nil
+	return err
 }
 
 // UninstallHeartbeatDaemon stops and removes the heartbeat timer for a conductor.
@@ -3353,27 +3359,12 @@ func uninstallHeartbeatDaemonLaunchd(name string) error {
 }
 
 func uninstallHeartbeatDaemonSystemd(name string) error {
-	timerPath, err := SystemdHeartbeatTimerPath(name)
+	units, err := systemdHeartbeatUnits(name)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(timerPath); err == nil {
-		if err := runSystemctl("--user", "disable", "--now", SystemdHeartbeatTimerName(name)); err != nil {
-			return fmt.Errorf("stop systemd heartbeat: %w", err)
-		}
-		if err := os.Remove(timerPath); err != nil {
-			return err
-		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	svcPath, err := SystemdHeartbeatServicePath(name)
-	if err != nil {
-		return err
-	}
-	if err := os.Remove(svcPath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	_ = runSystemctl("--user", "daemon-reload")
-	return nil
+	// Strict, unlike the bridge and notifier: when the disable fails the timer
+	// may still be running, so the unit files stay and the failure is returned.
+	timer := SystemdHeartbeatTimerName(name)
+	return removeSystemdUnits(timer, units, timer, true)
 }
