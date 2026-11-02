@@ -177,8 +177,10 @@ func InstallBridgeScript() error {
 //   - anything else, such as a directory: an error.
 //
 // The stamp is written after bridge.py, so a crash between the two heals on the
-// next run, when the file equals embedded. A replacement is stamped only once
-// it is clean: a concurrent edit found in the displaced file is an error, and
+// next run of the same agent-deck version, when the file equals embedded. A
+// newer version finds a file that differs from its embedded bridge and has no
+// stamp that matches it, and keeps it. A replacement is stamped only once it is
+// clean: a concurrent edit found in the displaced file is an error, and
 // the stamp stays as it was. Without atomic exchange (an NFS home) a stamped
 // bridge is not replaced, and the error says to move bridge.py aside.
 func installBridgeScriptAt(dir string, embedded []byte) (BridgeScriptResult, error) {
