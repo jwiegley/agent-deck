@@ -19,8 +19,11 @@ since agent-deck stamped it: the sha256 of each copy written goes to
 `.bridge.py.sha256` beside it, and the copy it replaces is kept as
 `.bridge.py.previous`. A customized or symlinked `bridge.py` is kept, as is an
 unedited copy from a release that predates the stamp; move it aside and re-run
-`agent-deck conductor setup <name>` to take the shipped bridge. The runtime copy
-lives at:
+`agent-deck conductor setup <name>` to take the shipped bridge.
+`conductor/setup.sh` applies the same rule to the copy it writes under
+`~/.agent-deck/conductor` (its kept line names `conductor/setup.sh` as the
+remedy), and `conductor/teardown.sh` removes only a bridge that rule would
+replace. The copy agent-deck writes lives at:
 
 ```
 <data-dir>/conductor/bridge.py        # e.g. ~/.local/share/agent-deck/conductor/bridge.py

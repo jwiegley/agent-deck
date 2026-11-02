@@ -73,6 +73,208 @@ except Exception:
     return 0
 }
 
+# sha256_of FILE
+#
+# Prints FILE's sha256 as 64 lower-case hex digits and a newline: the format of
+# the .bridge.py.sha256 stamp that agent-deck keeps beside a bridge it wrote.
+# FILE goes in on stdin, so that the line the tool prints carries no file name:
+# GNU sha256sum and shasum start that line with a backslash when the name holds
+# a backslash or a newline, and the hash would no longer be the first field.
+# teardown.sh carries an identical copy; keep the two the same.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum < "$1" | awk '{print $1}'
+    else
+        shasum -a 256 < "$1" | awk '{print $1}'
+    fi
+}
+
+# service_file_external PATH
+#
+# Exits 0, printing "symlink" or "read-only", when the launchd plist or systemd
+# unit at PATH belongs to another manager: home-manager links its files into
+# place, or installs them without a write bit. Exits 1, printing nothing, when
+# the file is missing or ours to write. Like the Go installer it looks at the
+# mode bits before access(2): root can write a 0444 file, but a file that grants
+# no write bit to anyone was made to be left alone. find reads the bits because
+# BSD and GNU stat differ. teardown.sh carries an identical copy.
+service_file_external() {
+    if [[ -L "$1" ]]; then
+        echo symlink
+        return 0
+    fi
+    if [[ -e "$1" ]] && [[ -n "$(find "$1" -prune ! -perm -0200 ! -perm -0020 ! -perm -0002 -print)" ]]; then
+        echo read-only
+        return 0
+    fi
+    if [[ -e "$1" && ! -w "$1" ]]; then
+        echo read-only
+        return 0
+    fi
+    return 1
+}
+
+# install_bridge_script
+#
+# Installs the canonical bridge, internal/session/conductor_bridge.py, as
+# ${CONDUCTOR_DIR}/bridge.py, by the rule the Go installer (InstallBridgeScript)
+# follows: bridge.py is replaced only while it is missing, identical to the
+# canonical file, or still the file agent-deck stamped. The stamp,
+# .bridge.py.sha256, holds the sha256 of the bridge agent-deck last wrote, in the
+# format the Go installer reads, and a replaced bridge is kept as
+# .bridge.py.previous. Any other bridge.py is the user's: one edited since, one
+# written before the stamp existed, or a symlink. It is left alone. The new
+# bridge is staged in a temp file beside bridge.py, and a step that fails stops
+# the script (fail) and removes the temp file.
+install_bridge_script() {
+    local src="${SCRIPT_DIR}/../internal/session/conductor_bridge.py"
+    local dest="${CONDUCTOR_DIR}/bridge.py"
+    local stamp="${CONDUCTOR_DIR}/.bridge.py.sha256"
+    local outcome tmp
+
+    if [[ -L "${dest}" ]]; then
+        echo "[skip] bridge.py is a symlink; left unchanged."
+        return 0
+    fi
+    if [[ -e "${dest}" && ! -f "${dest}" ]]; then
+        fail "refusing to replace ${dest}: not a regular file"
+    fi
+    # Without the canonical file the comparisons below would read "different",
+    # and a bridge that is not stamped would be reported as local changes.
+    [[ -f "${src}" ]] || fail "canonical bridge not found: ${src}"
+
+    # The stamp matches when it is a regular file whose bytes, newline included,
+    # are the sha256 of bridge.py, as the Go installer compares them.
+    if [[ -e "${dest}" ]] && cmp -s "${src}" "${dest}"; then
+        outcome="unchanged"
+    elif [[ ! -e "${dest}" ]]; then
+        outcome="installed"
+    elif [[ -f "${stamp}" && ! -L "${stamp}" ]] && sha256_of "${dest}" | cmp -s - "${stamp}"; then
+        outcome="updated"
+    else
+        echo "[skip] bridge.py has local changes; left unchanged. To take the shipped bridge, move it aside and re-run conductor/setup.sh."
+        return 0
+    fi
+
+    if [[ "${outcome}" != "unchanged" ]]; then
+        tmp="$(mktemp "${CONDUCTOR_DIR}/.bridge.py.new-XXXXXX")"
+        if ! { cp "${src}" "${tmp}" && chmod 755 "${tmp}"; }; then
+            rm -f "${tmp}"
+            fail "could not stage ${tmp}"
+        fi
+        if [[ "${outcome}" == "updated" ]]; then
+            # A hard link keeps the displaced inode, so an editor that still has
+            # the old bridge open writes into the kept copy.
+            if ! ln -f "${dest}" "${CONDUCTOR_DIR}/.bridge.py.previous"; then
+                rm -f "${tmp}"
+                fail "could not keep ${dest} as .bridge.py.previous"
+            fi
+        fi
+        if ! mv -f "${tmp}" "${dest}"; then
+            rm -f "${tmp}"
+            fail "could not replace ${dest}"
+        fi
+    fi
+
+    # Remove the stamp first, so that a symlinked one is replaced, not written
+    # through. A crash before the write heals on the next run, as "unchanged".
+    rm -f "${stamp}"
+    sha256_of "${dest}" > "${stamp}"
+    ok "bridge.py ${outcome}"
+}
+
+# render_bridge_plist
+#
+# Prints the bridge's launchd plist: the template in the checkout, with the
+# python3 path, the bridge and log paths and HOME filled in.
+render_bridge_plist() {
+    sed \
+        -e "s|__PYTHON3__|${PYTHON3_PATH}|g" \
+        -e "s|__BRIDGE_PATH__|${CONDUCTOR_DIR}/bridge.py|g" \
+        -e "s|__LOG_PATH__|${CONDUCTOR_DIR}/bridge.log|g" \
+        -e "s|__HOME__|${HOME}|g" \
+        "${SCRIPT_DIR}/${PLIST_NAME}.plist"
+}
+
+# render_ghw_plist
+#
+# Prints the GitHub watcher's launchd plist: the template in the checkout, with
+# the tick script, watcher home, log path, interval and HOME filled in.
+render_ghw_plist() {
+    sed \
+        -e "s|__TICK_PATH__|${GHW_HOME}/scripts/tick.sh|g" \
+        -e "s|__WATCHER_HOME__|${GHW_HOME}|g" \
+        -e "s|__LOG_PATH__|${GHW_HOME}/launchd.log|g" \
+        -e "s|__INTERVAL__|${GHW_INTERVAL}|g" \
+        -e "s|__HOME__|${HOME}|g" \
+        "${GHW_SRC}/${GHW_PLIST_NAME}.plist"
+}
+
+# install_launch_agent LABEL TEMPLATE_CMD PLIST
+#
+# Writes what TEMPLATE_CMD (render_bridge_plist or render_ghw_plist) prints to
+# PLIST, then loads the launchd agent LABEL, unloading it first when it is
+# already loaded. A PLIST that is a symlink or read-only belongs to another
+# manager, home-manager say: it is left alone, with no write and no launchctl
+# call, and the agent keeps running as that manager configured it. Otherwise the
+# steps are the ones the script always had, in the same order, so that a failed
+# write stops the script (set -e) before any launchctl call.
+install_launch_agent() {
+    local label="$1" template_cmd="$2" plist="$3"
+    local reason
+
+    if reason="$(service_file_external "${plist}")"; then
+        echo "[skip] ${label}: managed externally (${reason})"
+        return 0
+    fi
+
+    "${template_cmd}" > "${plist}"
+    ok "Plist installed at ${plist}"
+
+    # grep reads to the end of the list, with no -q: one that quit at its first
+    # match would leave launchctl to die of SIGPIPE when the list outgrows the
+    # pipe, pipefail would then read the job as not loaded, and the unload would
+    # be skipped.
+    if launchctl list 2>/dev/null | grep -F -- "${label}" >/dev/null; then
+        info "Reloading existing daemon..."
+        launchctl unload "${plist}" 2>/dev/null || true
+    fi
+    launchctl load "${plist}"
+    ok "${label} loaded"
+}
+
+# install_ghw_systemd_units UNIT_DIR
+#
+# Writes the GitHub watcher's systemd service and timer into UNIT_DIR from the
+# templates in the checkout. The two files are one service, so when either is a
+# symlink or read-only, and so belongs to another manager, each such file is
+# reported and neither is written. Enabling the timer is left to the user.
+install_ghw_systemd_units() {
+    local unit reason
+    local external=0
+
+    for unit in agent-deck-gh-watcher.service agent-deck-gh-watcher.timer; do
+        if reason="$(service_file_external "$1/${unit}")"; then
+            echo "[skip] ${unit}: managed externally (${reason})"
+            external=1
+        fi
+    done
+    if [[ "${external}" -eq 1 ]]; then
+        return 0
+    fi
+
+    for unit in agent-deck-gh-watcher.service agent-deck-gh-watcher.timer; do
+        sed \
+            -e "s|__TICK_PATH__|${GHW_HOME}/scripts/tick.sh|g" \
+            -e "s|__WATCHER_HOME__|${GHW_HOME}|g" \
+            -e "s|__LOG_PATH__|${GHW_HOME}/systemd.log|g" \
+            -e "s|__INTERVAL__|${GHW_INTERVAL}|g" \
+            "${GHW_SRC}/systemd/${unit}" > "$1/${unit}"
+    done
+    ok "gh-watcher systemd units written to $1"
+    echo "  Enable with: systemctl --user daemon-reload && systemctl --user enable --now agent-deck-gh-watcher.timer"
+}
+
 # --------------------------------------------------------------------------
 # Preflight checks
 # --------------------------------------------------------------------------
@@ -88,13 +290,9 @@ command -v tmux >/dev/null 2>&1 || fail "tmux not found in PATH"
 info "Creating conductor directory: ${CONDUCTOR_DIR}"
 mkdir -p "${CONDUCTOR_DIR}"
 
-# Copy bridge script to base conductor directory. The canonical source is the
-# single embedded copy at internal/session/conductor_bridge.py (see
-# conductor/README.md); the Go installer (InstallBridgeScript) materializes the
-# same bytes. This shell installer copies that canonical file directly.
-cp "${SCRIPT_DIR}/../internal/session/conductor_bridge.py" "${CONDUCTOR_DIR}/bridge.py"
-chmod +x "${CONDUCTOR_DIR}/bridge.py"
-ok "bridge.py installed"
+# Canonical source: internal/session/conductor_bridge.py (see conductor/README.md).
+# Installed only while bridge.py is missing, identical, or matches .bridge.py.sha256.
+install_bridge_script
 
 # Copy default heartbeat rules (profiles can override with their own)
 cp "${SCRIPT_DIR}/HEARTBEAT_RULES.md" "${CONDUCTOR_DIR}/HEARTBEAT_RULES.md"
@@ -222,23 +420,7 @@ mkdir -p "${PLIST_DIR}"
 # Resolve python3 path for plist
 PYTHON3_PATH="$(command -v python3)"
 
-# Generate plist from template with variable substitution
-sed \
-    -e "s|__PYTHON3__|${PYTHON3_PATH}|g" \
-    -e "s|__BRIDGE_PATH__|${CONDUCTOR_DIR}/bridge.py|g" \
-    -e "s|__LOG_PATH__|${CONDUCTOR_DIR}/bridge.log|g" \
-    -e "s|__HOME__|${HOME}|g" \
-    "${SCRIPT_DIR}/${PLIST_NAME}.plist" > "${PLIST_PATH}"
-
-ok "Plist installed at ${PLIST_PATH}"
-
-# Load the daemon
-if launchctl list | grep -q "${PLIST_NAME}" 2>/dev/null; then
-    info "Reloading existing daemon..."
-    launchctl unload "${PLIST_PATH}" 2>/dev/null || true
-fi
-launchctl load "${PLIST_PATH}"
-ok "Daemon loaded and running"
+install_launch_agent "${PLIST_NAME}" render_bridge_plist "${PLIST_PATH}"
 
 # --------------------------------------------------------------------------
 # Step 6: GitHub event watcher (opt-in, issue #2134)
@@ -269,31 +451,11 @@ print(int(toml.load('${GHW_HOME}/watcher.toml').get('cadence', {}).get('events_s
 " 2>/dev/null || echo 30)
 
     if [[ "$(uname -s)" == "Darwin" ]]; then
-        sed \
-            -e "s|__TICK_PATH__|${GHW_HOME}/scripts/tick.sh|g" \
-            -e "s|__WATCHER_HOME__|${GHW_HOME}|g" \
-            -e "s|__LOG_PATH__|${GHW_HOME}/launchd.log|g" \
-            -e "s|__INTERVAL__|${GHW_INTERVAL}|g" \
-            -e "s|__HOME__|${HOME}|g" \
-            "${GHW_SRC}/${GHW_PLIST_NAME}.plist" > "${GHW_PLIST_PATH}"
-        if launchctl list | grep -q "${GHW_PLIST_NAME}" 2>/dev/null; then
-            launchctl unload "${GHW_PLIST_PATH}" 2>/dev/null || true
-        fi
-        launchctl load "${GHW_PLIST_PATH}"
-        ok "gh-watcher launchd unit loaded (every ${GHW_INTERVAL}s): ${GHW_PLIST_PATH}"
+        install_launch_agent "${GHW_PLIST_NAME}" render_ghw_plist "${GHW_PLIST_PATH}"
     else
         GHW_UNIT_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
         mkdir -p "${GHW_UNIT_DIR}"
-        for unit in agent-deck-gh-watcher.service agent-deck-gh-watcher.timer; do
-            sed \
-                -e "s|__TICK_PATH__|${GHW_HOME}/scripts/tick.sh|g" \
-                -e "s|__WATCHER_HOME__|${GHW_HOME}|g" \
-                -e "s|__LOG_PATH__|${GHW_HOME}/systemd.log|g" \
-                -e "s|__INTERVAL__|${GHW_INTERVAL}|g" \
-                "${GHW_SRC}/systemd/${unit}" > "${GHW_UNIT_DIR}/${unit}"
-        done
-        ok "gh-watcher systemd units written to ${GHW_UNIT_DIR}"
-        echo "  Enable with: systemctl --user daemon-reload && systemctl --user enable --now agent-deck-gh-watcher.timer"
+        install_ghw_systemd_units "${GHW_UNIT_DIR}"
     fi
     echo "  Mode and liveness: ${GHW_HOME}/scripts/status.sh (see ${GHW_HOME}/README.md)"
 else
