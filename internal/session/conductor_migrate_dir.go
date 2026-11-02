@@ -287,7 +287,7 @@ func MigrateConductorDir(opts ConductorDirMigrateOptions) (*ConductorDirMigrateR
 		res.Actions = actionsOf(plan)
 		res.Blockers = planBlockers(plan)
 		if !noop {
-			res.Blockers = append(res.Blockers, externalServiceBlockers(source, plan)...)
+			res.Blockers = append(res.Blockers, externalServiceBlockers(target, plan)...)
 		}
 		res.Refused = len(res.Blockers) > 0
 		res.Conductors = plannedTargetConductors(target, res.Actions)
@@ -321,7 +321,7 @@ func MigrateConductorDir(opts ConductorDirMigrateOptions) (*ConductorDirMigrateR
 	// at the old base; a no-op moves nothing, so it strands nothing.
 	blockers := planBlockers(plan)
 	if !noop {
-		blockers = append(blockers, externalServiceBlockers(source, plan)...)
+		blockers = append(blockers, externalServiceBlockers(target, plan)...)
 	}
 	if len(blockers) > 0 {
 		res.Refused = true
@@ -693,22 +693,27 @@ func planBlockers(plan []migratePlanEntry) []string {
 // manager owns it, then one for every conductor home in plan, whatever its
 // action, whose heartbeat agent another manager owns. Those plists and units
 // hard-code the current paths, and agent-deck may not rewrite them, so a move
-// would leave them pointing at source. The transition notifier references no
+// would leave them pointing at source. The function reads no plist or unit, so
+// it blocks whatever they point at. The transition notifier references no
 // conductor path, so it never blocks.
-func externalServiceBlockers(source string, plan []migratePlanEntry) []string {
+//
+// A blocker says what clears it, and the remedy follows what the apply does
+// next. handleConductorMigrateDir installs agent-deck's own heartbeat agent for
+// every conductor whose heartbeat is enabled, so a heartbeat agent removed from
+// its manager comes back as agent-deck's; it reloads the bridge only when one
+// is installed, so a bridge removed from its manager is added back by the user,
+// pointing at target.
+func externalServiceBlockers(target string, plan []migratePlanEntry) []string {
 	var blockers []string
-	blocker := func(ext *ExternalServiceError) string {
-		return fmt.Sprintf("%s is managed externally and points at %s; change its manager's configuration first", ext.Label, source)
-	}
 	if ext := BridgeDaemonExternal(); ext != nil {
-		blockers = append(blockers, blocker(ext))
+		blockers = append(blockers, fmt.Sprintf("%s; migrate-dir cannot repoint it, so it moves nothing while it is installed: remove it from its manager, re-run migrate-dir, then add it back pointing at %s", ext.Error(), target))
 	}
 	for _, e := range plan {
 		if !e.action.IsHome {
 			continue
 		}
 		if ext := HeartbeatDaemonExternal(e.action.Name); ext != nil {
-			blockers = append(blockers, blocker(ext))
+			blockers = append(blockers, fmt.Sprintf("%s; migrate-dir cannot repoint it, so it moves nothing while it is installed: remove it from its manager and re-run migrate-dir, which installs agent-deck's own heartbeat agent for %s if its heartbeat is enabled", ext.Error(), e.action.Name))
 		}
 	}
 	return blockers
