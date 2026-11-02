@@ -507,7 +507,8 @@ func TestBridgeScript_KeptErrorAndWrappers(t *testing.T) {
 	if _, ok := err.(*BridgeKeptError); !ok {
 		t.Fatalf("InstallBridgeScript over a customized bridge = %T (%v), want *BridgeKeptError itself", err, err)
 	}
-	// update.UpdateBridgePy wraps whatever the installer returns.
+	// A caller that wraps the error, as UpdateBridgePy does for any error that
+	// is not a kept bridge, must still find the kept bridge with errors.As.
 	var kept *BridgeKeptError
 	if !errors.As(fmt.Errorf("failed to install bridge.py: %w", err), &kept) {
 		t.Fatal("errors.As found no *BridgeKeptError in the wrapped error")
