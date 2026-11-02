@@ -150,10 +150,11 @@ func runAutoMigration(jsonOutput bool) {
 		for _, name := range migratedHeartbeatScripts {
 			// The rendered script self-heals here, but the launchd plist /
 			// systemd unit bakes the old absolute paths until 'conductor setup'
-			// or 'conductor migrate-dir --apply' regenerates it, and both leave
-			// a plist or unit that another manager owns alone. Warn instead of
-			// implying full reconciliation. Detection is side-effect-free (no
-			// launchctl).
+			// or 'conductor migrate-dir --apply' regenerates it. Both leave a
+			// plist or unit that another manager owns alone, and migrate-dir
+			// refuses a move that would leave one pointing at the old paths.
+			// Warn instead of implying full reconciliation. Detection is
+			// side-effect-free (no launchctl).
 			if session.HeartbeatDaemonStale(name) {
 				fmt.Printf("  [migrated] Refreshed heartbeat script: %s (heartbeat daemon may be stale — run 'agent-deck conductor setup %s' to reload)\n", name, name)
 			} else {
@@ -1943,15 +1944,17 @@ func printConductorSplitBrainWarning(jsonOutput bool) {
 }
 
 // bridgeDaemonInstalled reports whether a conductor bridge daemon is currently
-// installed (launchd plist or systemd unit present on disk).
+// installed (launchd plist or systemd unit present on disk). A symlink counts,
+// a dangling one included: it is another manager's plist or unit, and the
+// reload says so instead of skipping it without a word.
 func bridgeDaemonInstalled() bool {
 	if p, err := session.LaunchdPlistPath(); err == nil {
-		if _, err := os.Stat(p); err == nil {
+		if _, err := os.Lstat(p); err == nil {
 			return true
 		}
 	}
 	if p, err := session.SystemdBridgeServicePath(); err == nil {
-		if _, err := os.Stat(p); err == nil {
+		if _, err := os.Lstat(p); err == nil {
 			return true
 		}
 	}
@@ -1964,6 +1967,12 @@ func bridgeDaemonInstalled() bool {
 // so launchd/systemd invoke the new paths. Defaults to a dry-run; --apply
 // performs the move. This is the deliberate, destructive path the declarative
 // [conductor].dir override intentionally avoids.
+//
+// A bridge or heartbeat agent that another manager owns (a read-only or
+// symlinked plist or unit) is never rewritten, and a move would leave it
+// pointing at the old paths, so the plan refuses the move while one would be
+// stranded. The reload that follows a committed apply reports any such agent it
+// meets as a [skip] line, not a warning.
 func handleConductorMigrateDir(_ string, args []string) {
 	fs := flag.NewFlagSet("conductor migrate-dir", flag.ContinueOnError)
 	apply := fs.Bool("apply", false, "Perform the relocation (default is a dry-run that changes nothing)")
@@ -2021,9 +2030,15 @@ func handleConductorMigrateDir(_ string, args []string) {
 	// committed — a refused migration mutated nothing, so there is nothing to
 	// reload). This is the one place the launchctl/systemctl reload belongs — an
 	// explicit user command, not routine list/status. Each installer is
-	// idempotent (unload/write/load).
+	// idempotent (unload/write/load), and leaves an agent another manager owns
+	// alone: that is reported as a [skip] line, on stderr under --json so stdout
+	// stays one JSON document, and the agent does not count as reloaded.
 	var reloadedHeartbeats []string
 	bridgeReloaded := false
+	skipOut := os.Stdout
+	if *jsonOutput {
+		skipOut = os.Stderr
+	}
 	if *apply && !res.Refused {
 		globalInterval := 0
 		if cfg, cerr := session.LoadUserConfig(); cerr == nil {
@@ -2042,7 +2057,12 @@ func handleConductorMigrateDir(_ string, args []string) {
 				continue
 			}
 			if derr := session.InstallHeartbeatDaemon(name, meta.Profile, interval); derr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to reload heartbeat daemon for %s: %v\n", name, derr)
+				var ext *session.ExternalServiceError
+				if errors.As(derr, &ext) {
+					fmt.Fprintln(skipOut, "[skip] "+ext.Error())
+				} else {
+					fmt.Fprintf(os.Stderr, "Warning: failed to reload heartbeat daemon for %s: %v\n", name, derr)
+				}
 				continue
 			}
 			reloadedHeartbeats = append(reloadedHeartbeats, name)
@@ -2050,7 +2070,12 @@ func handleConductorMigrateDir(_ string, args []string) {
 		// Reload the bridge daemon only if one is already installed.
 		if bridgeDaemonInstalled() {
 			if _, derr := session.InstallBridgeDaemon(); derr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to reload bridge daemon: %v\n", derr)
+				var ext *session.ExternalServiceError
+				if errors.As(derr, &ext) {
+					fmt.Fprintln(skipOut, "[skip] "+ext.Error())
+				} else {
+					fmt.Fprintf(os.Stderr, "Warning: failed to reload bridge daemon: %v\n", derr)
+				}
 			} else {
 				bridgeReloaded = true
 			}
@@ -2064,6 +2089,7 @@ func handleConductorMigrateDir(_ string, args []string) {
 			"target":                  res.Target,
 			"config_written":          res.ConfigWritten,
 			"bridge_reinstalled":      res.BridgeReinstalled,
+			"bridge_script":           res.BridgeScript,
 			"conductors":              res.Conductors,
 			"actions":                 res.Actions,
 			"refused":                 res.Refused,
@@ -2105,12 +2131,11 @@ func printMigrateDirSummary(res *session.ConductorDirMigrateResult, reloadedHear
 	fmt.Printf("  Target: %s\n", res.Target)
 	fmt.Println()
 
-	anySkipped := false
-	anyReject := false
+	var skipped int
 	if len(res.Actions) == 0 {
 		fmt.Println("  (nothing to move — source and target match or source is empty)")
 	} else {
-		var moved, merged, skipped, rejected, transient int
+		var moved, merged, rejected, transient int
 		for _, a := range res.Actions {
 			label := a.Name
 			if a.IsHome {
@@ -2129,11 +2154,9 @@ func printMigrateDirSummary(res *session.ConductorDirMigrateResult, reloadedHear
 				fmt.Printf("  [merge]  %s%s\n", label, note)
 			case "skip-exists":
 				skipped++
-				anySkipped = true
 				fmt.Printf("  [skip]   %s — destination exists (use --force to merge)\n", label)
 			case "reject-conflict":
 				rejected++
-				anyReject = true
 				fmt.Printf("  [reject] %s — %s\n", label, a.Reason)
 			case "skip-transient":
 				transient++
@@ -2161,6 +2184,11 @@ func printMigrateDirSummary(res *session.ConductorDirMigrateResult, reloadedHear
 		if res.BridgeReinstalled {
 			fmt.Println("  [ok] bridge.py reinstalled at new base")
 		}
+		// A kept bridge leaves BridgeReinstalled false, so its notice is not part
+		// of the block above.
+		if res.BridgeNotice != "" {
+			fmt.Println("  " + res.BridgeNotice)
+		}
 		if len(reloadedHeartbeats) > 0 {
 			fmt.Printf("  [ok] heartbeat daemons reloaded: %s\n", strings.Join(reloadedHeartbeats, ", "))
 		}
@@ -2177,9 +2205,11 @@ func printMigrateDirSummary(res *session.ConductorDirMigrateResult, reloadedHear
 		}
 	}
 
-	if res.DryRun && (anySkipped || anyReject) {
+	// Only skip-exists blockers have the --force remedy. A reject-conflict, or an
+	// agent another manager owns, is a blocker too, and --force does not clear it.
+	if res.DryRun && len(res.Blockers) > 0 {
 		fmt.Println()
-		if anySkipped && !anyReject {
+		if len(res.Blockers) == skipped {
 			fmt.Println("  Note: some destinations already exist; re-run with --apply --force to merge them.")
 		} else {
 			fmt.Println("  Note: this plan would be REFUSED as-is — resolve the blockers above first.")
