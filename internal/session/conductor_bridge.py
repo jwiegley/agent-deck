@@ -2634,6 +2634,135 @@ async def send_discord_output(channel, text: str, name_tag: str = ""):
             await channel.send(_apply_prefix(f"[Failed to upload image: {image_path}]"))
 
 
+# Discord question router. agent-deck does not ship it: the director conductor
+# installs it at <CONDUCTOR_DIR>/director/discord_qna.py, and only then do
+# question buttons and replies reach it.
+#
+# The bridge runs [sys.executable, <that path>] with ONE JSON event on stdin.
+# Every value in the event is a string:
+#   button  reference (id of the message carrying the button), message (the
+#           interaction's id), author, channel, text (the choice digits) and
+#           custom_id ("qna:<question id>:<choice>")
+#   reply   the same keys without custom_id; reference is the id of the message
+#           replied to and text the raw content, mentions included
+# The router prints {"handled": bool, "response": str} on stdout. A handled
+# result must carry a str response, which the bridge shows; "handled": false
+# means the router does not know the message. A non-zero exit, a timeout, or
+# stdout that is not such a result is a failure.
+#
+# With no router file the reply route does nothing (the message goes on to the
+# normal handling) and a button fails closed: buttons exist only on posts the
+# router published, so a missing router is a routing failure.
+
+# Seconds route_question waits for the router before it raises
+# subprocess.TimeoutExpired; the handlers treat that as a failure.
+QNA_ROUTER_TIMEOUT = 90
+
+# A question button's custom id: qna:<12 lowercase hex digits>:<choice, 1-2 digits>.
+QNA_CUSTOM_ID_RE = re.compile(r"qna:([a-f0-9]{12}):([0-9]{1,2})")
+
+
+def qna_router_path() -> Path:
+    """Where the director's router lives, looked up on every call."""
+    return CONDUCTOR_DIR / "director" / "discord_qna.py"
+
+
+def route_question(event: dict, timeout: float = QNA_ROUTER_TIMEOUT) -> dict:
+    """Run the router on one event and return its result.
+
+    Raises RuntimeError for a non-zero exit, subprocess.TimeoutExpired when the
+    router outlasts timeout, and ValueError (json.JSONDecodeError included) for
+    stdout that is not a JSON object with a bool "handled". It blocks, so call
+    it through run_in_executor.
+    """
+    proc = subprocess.run([sys.executable, str(qna_router_path())], input=json.dumps(event),
+                          text=True, capture_output=True, timeout=timeout)
+    if proc.returncode:
+        raise RuntimeError("Question router failed")
+    result = json.loads(proc.stdout)
+    if not isinstance(result, dict) or not isinstance(result.get("handled"), bool):
+        raise ValueError("Question router returned an invalid result")
+    return result
+
+
+async def qna_handle_interaction(interaction, target_channel_id: int, is_authorized) -> bool:
+    """Answer a question button. True once anything has been sent, False for any
+    other interaction (slash commands reach the same event).
+
+    It does not check that the router exists: a missing router is a routing
+    failure, and the button shows "Answer outcome unconfirmed".
+    """
+    if interaction.type != discord.InteractionType.component:
+        return False
+    custom_id = (interaction.data or {}).get("custom_id", "")
+    if not isinstance(custom_id, str) or not custom_id.startswith("qna:"):
+        return False
+    if interaction.channel_id != target_channel_id or not is_authorized(interaction.user.id):
+        await interaction.response.send_message("Not authorized to answer this question.", ephemeral=True)
+        return True
+    match = QNA_CUSTOM_ID_RE.fullmatch(custom_id)
+    if not match or interaction.message is None:
+        await interaction.response.send_message("Invalid question button. No input sent.", ephemeral=True)
+        return True
+    # Acknowledge before routing, which can be slow: an interaction expires in seconds.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    event = {"reference": str(interaction.message.id), "message": str(interaction.id),
+             "author": str(interaction.user.id), "channel": str(interaction.channel_id),
+             "text": match[2], "custom_id": custom_id}
+    loop = asyncio.get_running_loop()
+    try:
+        routed = await loop.run_in_executor(None, route_question, event)
+        if routed["handled"]:
+            response = routed.get("response")
+            if not isinstance(response, str):
+                raise ValueError("Question router handled the button without a str response")
+        else:
+            response = "Question record unavailable. No input sent."
+    except Exception:
+        log.exception("Discord question button routing failed")
+        response = "Answer outcome unconfirmed. Check the session locally; do not retry automatically."
+    await interaction.edit_original_response(
+        content=response, allowed_mentions=discord.AllowedMentions.none(),
+    )
+    return True
+
+
+async def qna_handle_reply(message, target_channel_id: int, is_authorized) -> bool:
+    """Route a reply to the question router. True when the message is consumed.
+
+    False, with nothing sent or logged, when the message is not ours to route:
+    another channel, an unauthorized author (on_message's own filters deal
+    with both), not a reply, or no router file. False too when the router does
+    not handle it. A failed route is answered with a notice and consumed, so it
+    is never forwarded to a conductor.
+    """
+    if message.channel.id != target_channel_id or not is_authorized(message.author.id):
+        return False
+    if not message.reference or not message.reference.message_id:
+        return False
+    if not qna_router_path().is_file():
+        return False
+    event = {"reference": str(message.reference.message_id), "message": str(message.id),
+             "author": str(message.author.id), "channel": str(message.channel.id),
+             "text": message.content}
+    loop = asyncio.get_running_loop()
+    try:
+        routed = await loop.run_in_executor(None, route_question, event)
+        if routed["handled"] and not isinstance(routed.get("response"), str):
+            raise ValueError("Question router handled the reply without a str response")
+    except Exception:
+        log.exception("Discord question reply routing failed")
+        await message.reply("Reply routing unavailable; nothing forwarded. Please check the session locally.",
+                            mention_author=False)
+        return True
+    if not routed["handled"]:
+        return False
+    # Outside the try: a send that fails after the router acted must not claim "nothing forwarded".
+    await message.reply(routed["response"], mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none())
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Telegram bot setup
 # ---------------------------------------------------------------------------
@@ -3947,12 +4076,21 @@ def create_discord_bot(config: dict):
         )
 
     @bot.event
+    async def on_interaction(interaction):
+        await qna_handle_interaction(interaction, bot.target_channel_id, is_authorized)
+
+    @bot.event
     async def on_message(message):
         # Ignore bot's own messages
         if message.author == bot.user:
             return
         # Ignore messages from other bots
         if message.author.bot:
+            return
+        # Question replies go to the Q&A router first, so they work in every
+        # listen mode. qna_handle_reply checks the channel and authorization
+        # itself, and a failed route is never forwarded to a conductor.
+        if await qna_handle_reply(message, bot.target_channel_id, is_authorized):
             return
         # Channel scope, then mention — decided before the auth check so
         # mentions_all_channels doesn't log "unauthorized" for every channel.
