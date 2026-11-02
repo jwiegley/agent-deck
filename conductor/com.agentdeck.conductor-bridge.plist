@@ -38,8 +38,8 @@
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
-    <!-- Don't run when system resources are low -->
-    <key>LowPriorityIO</key>
-    <true/>
+    <!-- Run like an app: agent sessions inherit the limits of the job that starts their tmux server -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
 </dict>
 </plist>
