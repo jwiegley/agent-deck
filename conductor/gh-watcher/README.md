@@ -102,7 +102,7 @@ table in `config.toml` carries a `mode` key as well so the Go binary and
 
 Run a tick by hand at any time: `AD_GH_WATCHER_HOME=<conductor dir>/gh-watcher scripts/tick.sh`.
 
-`conductor/teardown.sh` unloads and removes the launchd unit.
+`conductor/teardown.sh` unloads and removes the launchd unit. Both scripts leave a plist or unit file that is a symlink or read-only alone (`[skip] <label>: managed externally`): something else, such as home-manager, owns it.
 
 ## Liveness
 
