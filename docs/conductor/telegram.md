@@ -88,7 +88,7 @@ pgrep -af "bun.*telegram" | wc -l
 
 Two pieces do the work:
 
-1. **`bridge.py`** — a Python daemon installed by `setup`. It runs as a systemd/launchd service, polls Telegram, and feeds messages into the right tmux pane.
+1. **`bridge.py`** — a Python daemon installed by `setup` (a `bridge.py` you changed, or a symlink, is kept as is). It runs as a systemd/launchd service, polls Telegram, and feeds messages into the right tmux pane.
 2. **The `telegram@claude-plugins-official` plugin**, loaded per-session via the session's `channels` field. This is what lets Claude send messages back.
 
 ## Configuration
