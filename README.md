@@ -659,7 +659,7 @@ agent-deck conductor list --profile work     # Filter by profile
 agent-deck conductor status                  # Health check (all)
 agent-deck conductor status ops              # Health check (specific)
 agent-deck conductor teardown ops            # Stop a conductor
-agent-deck conductor teardown --all --remove # Remove everything
+agent-deck conductor teardown --all --remove # Remove every conductor; keeps a customized bridge.py and agents managed externally
 ```
 
 **Telegram bridge** (optional): Connect a Telegram bot for mobile monitoring. The bridge routes messages to specific conductors using a `name: message` prefix:

@@ -134,7 +134,7 @@ agent-deck session output <name>
 # Tear down
 agent-deck conductor teardown <name>              # stop, keep files
 agent-deck conductor teardown <name> --remove     # stop and delete dir
-agent-deck conductor teardown --all --remove      # nuke every conductor on this host
+agent-deck conductor teardown --all --remove      # remove every conductor; keeps a customized bridge.py and agents managed externally
 ```
 
 `session output` is safe to feed back into an agent by default: it strips ANSI

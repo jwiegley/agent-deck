@@ -13,10 +13,11 @@ import (
 )
 
 // ExternalServiceError reports a service definition file that another manager
-// owns: it is a symlink, or this user cannot write it (home-manager installs
-// its launch agents as 0444 files). Agent Deck leaves such a file alone: it
-// does not write or remove it, and it makes no service-manager call for it, so
-// the other manager's service keeps running as configured.
+// owns: it is a symlink, or it is read-only, with no write bit set or not
+// writable by this user (home-manager installs its launch agents as 0444
+// files). Agent Deck leaves such a file alone: it does not write or remove it,
+// and it makes no service-manager call for it, so the other manager's service
+// keeps running as configured.
 type ExternalServiceError struct {
 	Label  string // names the service, as the service manager does
 	Path   string // the service definition file
@@ -32,11 +33,12 @@ func (e *ExternalServiceError) Error() string {
 var serviceFileWritable = func(path string) bool { return unix.Access(path, unix.W_OK) == nil }
 
 // serviceFileExternal reports whether the service definition at path belongs
-// to another manager. A missing file and a regular file this user can write
-// are Agent Deck's: it returns (nil, nil). The path is judged by Lstat, so a
-// symlink is external whatever it points at, a dangling one included. A path
-// that cannot be examined, and anything that is neither a symlink nor a regular
-// file, is an error.
+// to another manager. A missing file and a regular file with a write bit that
+// this user can write (access(2) W_OK) are Agent Deck's: it returns (nil, nil).
+// The file's owner is not compared with this user. The path is judged by Lstat,
+// so a symlink is external whatever it points at, a dangling one included. A
+// path that cannot be examined, and anything that is neither a symlink nor a
+// regular file, is an error.
 func serviceFileExternal(label, path string) (*ExternalServiceError, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -62,8 +64,9 @@ func serviceFileExternal(label, path string) (*ExternalServiceError, error) {
 }
 
 // requireOwnedServiceFile returns nil when path is missing or a regular file
-// this user owns and can write, the *ExternalServiceError itself when another
-// manager owns it, and any other failure as serviceFileExternal reports it.
+// with a write bit that this user can write (access(2) W_OK; the file's owner
+// is not checked), the *ExternalServiceError itself when another manager owns
+// it, and any other failure as serviceFileExternal reports it.
 // Callers return the result as it is. That spares each of them the nil check
 // that returning serviceFileExternal's pointer as an error needs: a nil
 // *ExternalServiceError stored in an error is not == nil.
@@ -237,12 +240,13 @@ func systemdUnitsExternal(label string, units []systemdUnitFile) (*ExternalServi
 }
 
 // requireOwnedSystemdUnits returns nil when every unit is missing or a regular
-// file this user owns and can write, the *ExternalServiceError itself when
-// another manager owns one, and any other failure as systemdUnitsExternal
-// reports it. It does for a set of units what requireOwnedServiceFile does for
-// one file: callers return the result as it is, without the nil check that
-// returning systemdUnitsExternal's pointer as an error needs (a nil
-// *ExternalServiceError stored in an error is not == nil).
+// file with a write bit that this user can write (access(2) W_OK; the file's
+// owner is not checked), the *ExternalServiceError itself when another manager
+// owns one, and any other failure as systemdUnitsExternal reports it. It does
+// for a set of units what requireOwnedServiceFile does for one file: callers
+// return the result as it is, without the nil check that returning
+// systemdUnitsExternal's pointer as an error needs (a nil *ExternalServiceError
+// stored in an error is not == nil).
 func requireOwnedSystemdUnits(label string, units []systemdUnitFile) error {
 	ext, err := systemdUnitsExternal(label, units)
 	if err != nil {
