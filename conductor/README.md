@@ -12,9 +12,15 @@ internal/session/conductor_bridge.py
 ```
 
 It is embedded into the agent-deck binary (`//go:embed`, see
-`internal/session/conductor_bridge_embed.go`). `agent-deck conductor setup`
-(`InstallBridgeScript`) and `agent-deck update` (`update.UpdateBridgePy`)
-materialize the user-facing runtime copy at:
+`internal/session/conductor_bridge_embed.go`). `agent-deck conductor setup`,
+`agent-deck update` and `agent-deck conductor migrate-dir` write it only while
+the runtime copy is missing, byte-identical to the embedded bridge, or unchanged
+since agent-deck stamped it: the sha256 of each copy written goes to
+`.bridge.py.sha256` beside it, and the copy it replaces is kept as
+`.bridge.py.previous`. A customized or symlinked `bridge.py` is kept, as is an
+unedited copy from a release that predates the stamp; move it aside and re-run
+`agent-deck conductor setup <name>` to take the shipped bridge. The runtime copy
+lives at:
 
 ```
 <data-dir>/conductor/bridge.py        # e.g. ~/.local/share/agent-deck/conductor/bridge.py
