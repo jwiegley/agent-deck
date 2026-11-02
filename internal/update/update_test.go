@@ -1,7 +1,10 @@
 package update
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -231,7 +234,7 @@ func TestUpdateBridgePy_NoConductorDir(t *testing.T) {
 	assert.True(t, os.IsNotExist(xdgErr), "XDG conductor dir should not be created when not installed")
 }
 
-func TestUpdateBridgePy_UsesInjectedInstallerAndBacksUpExistingFile(t *testing.T) {
+func TestUpdateBridgePy_UsesInjectedInstallerAndWritesNoBackup(t *testing.T) {
 	tmpHome := isolateUpdatePaths(t)
 
 	condDir := filepath.Join(tmpHome, ".agent-deck", "conductor")
@@ -251,10 +254,7 @@ func TestUpdateBridgePy_UsesInjectedInstallerAndBacksUpExistingFile(t *testing.T
 	err := UpdateBridgePy()
 	require.NoError(t, err)
 
-	backupPath := bridgePath + ".backup"
-	backupContent, err := os.ReadFile(backupPath)
-	require.NoError(t, err)
-	assert.Equal(t, legacyContent, string(backupContent))
+	assert.NoFileExists(t, bridgePath+".backup", "update must not write bridge.py.backup")
 
 	newContent, err := os.ReadFile(bridgePath)
 	require.NoError(t, err)
@@ -329,8 +329,8 @@ func TestUpdateBridgePy_NoOpLeavesExistingBackupUntouched(t *testing.T) {
 // routes through the injected conductorDirResolver (session.ConductorDir).
 //
 // This test pins the behavior WITHOUT importing internal/session: it injects a
-// resolver returning a custom override dir and asserts the backup + refresh land
-// there, not under the default conductor root.
+// resolver returning a custom override dir and asserts the refresh lands there,
+// not under the default conductor root, and that no bridge.py.backup is written.
 func TestUpdateBridgePy_HonorsConductorDirOverride(t *testing.T) {
 	tmpHome := isolateUpdatePaths(t)
 
@@ -353,10 +353,8 @@ func TestUpdateBridgePy_HonorsConductorDirOverride(t *testing.T) {
 
 	require.NoError(t, UpdateBridgePy())
 
-	// Backup + refresh must land under the OVERRIDE dir.
-	backup, err := os.ReadFile(overrideBridge + ".backup")
-	require.NoError(t, err)
-	assert.Equal(t, legacyContent, string(backup), "backup must be written under the override dir")
+	// The refresh lands under the OVERRIDE dir, with no .backup beside it.
+	assert.NoFileExists(t, overrideBridge+".backup", "update must not write bridge.py.backup")
 
 	refreshed, err := os.ReadFile(overrideBridge)
 	require.NoError(t, err)
@@ -400,6 +398,103 @@ func TestUpdateBridgePy_OverrideGuardSkipsWhenOverrideMissing(t *testing.T) {
 
 	require.NoError(t, UpdateBridgePy())
 	assert.False(t, installerCalled, "installer must not run when the override dir is missing (guard must key off the override, not the default)")
+}
+
+// TestUpdateBridgePy_LeavesExistingBackupUntouched pins the safety rule behind
+// dropping the backup: a bridge.py.backup left by a pre-fix update may hold the
+// user's own bridge, so a refresh must not rewrite it.
+func TestUpdateBridgePy_LeavesExistingBackupUntouched(t *testing.T) {
+	tmpHome := isolateUpdatePaths(t)
+
+	condDir := filepath.Join(tmpHome, ".agent-deck", "conductor")
+	require.NoError(t, os.MkdirAll(condDir, 0o755))
+
+	bridgePath := filepath.Join(condDir, "bridge.py")
+	backupPath := bridgePath + ".backup"
+	userBridge := "# custom bridge saved by a pre-fix update\nprint('keep me')\n"
+	require.NoError(t, os.WriteFile(bridgePath, []byte("# shipped bridge\n"), 0o755))
+	require.NoError(t, os.WriteFile(backupPath, []byte(userBridge), 0o644))
+
+	SetBridgeScriptInstaller(func() error {
+		return os.WriteFile(bridgePath, []byte("# newer shipped bridge\n"), 0o755)
+	})
+	t.Cleanup(func() { SetBridgeScriptInstaller(nil) })
+
+	require.NoError(t, UpdateBridgePy())
+
+	gotBackup, err := os.ReadFile(backupPath)
+	require.NoError(t, err)
+	assert.Equal(t, userBridge, string(gotBackup), "update must never touch an existing bridge.py.backup")
+
+	gotBridge, err := os.ReadFile(bridgePath)
+	require.NoError(t, err)
+	assert.Equal(t, "# newer shipped bridge\n", string(gotBridge), "the installer must have run")
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+
+	// Read on a separate goroutine while fn runs, rather than after it
+	// returns: the OS pipe buffer is bounded (~64KB), so a sequential
+	// "run fn, then read" would deadlock if fn ever printed more than that
+	// in one call (fn blocks on the full pipe with nobody draining it yet).
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(r)
+		done <- buf.String()
+	}()
+	// Close w even if fn panics, so the reader goroutine always sees EOF
+	// and this helper never leaks it (avoids the fd leak on a panicking fn).
+	defer func() { _ = w.Close() }()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	return <-done
+}
+
+// keptBridgeError stands in for session.BridgeKeptError, which this package
+// cannot import (internal/session imports internal/update).
+type keptBridgeError struct{ notice string }
+
+func (e *keptBridgeError) Error() string { return "bridge.py has local changes; left unchanged" }
+
+func (e *keptBridgeError) BridgeKeptNotice() string { return e.notice }
+
+func TestUpdateBridgePy_KeptBridgePrintsNoticeAndSucceeds(t *testing.T) {
+	condDir := filepath.Join(isolateUpdatePaths(t), ".agent-deck", "conductor")
+	require.NoError(t, os.MkdirAll(condDir, 0o755))
+	bridgePath := filepath.Join(condDir, "bridge.py")
+	custom := "# customized bridge\nprint('qna hook')\n"
+	require.NoError(t, os.WriteFile(bridgePath, []byte(custom), 0o755))
+	const notice = "[skip] bridge.py has local changes; left unchanged. To take the shipped bridge, move it aside and re-run 'agent-deck conductor setup <name>'."
+	// Wrapped once: a bare type assertion misses it, errors.As finds it.
+	SetBridgeScriptInstaller(func() error { return fmt.Errorf("wrapped: %w", &keptBridgeError{notice: notice}) })
+	t.Cleanup(func() { SetBridgeScriptInstaller(nil) })
+
+	var err error
+	out := captureStdout(t, func() { err = UpdateBridgePy() })
+	require.NoError(t, err, "a kept bridge is not an update failure")
+	assert.Contains(t, out, notice+"\n")
+	assert.NotContains(t, out, "✓ bridge.py updated!")
+	assert.NoFileExists(t, bridgePath+".backup")
+	got, readErr := os.ReadFile(bridgePath)
+	require.NoError(t, readErr)
+	assert.Equal(t, custom, string(got))
+
+	// Only a kept bridge becomes a notice; any other installer error still fails.
+	SetBridgeScriptInstaller(func() error { return errors.New("disk full") })
+	assert.EqualError(t, UpdateBridgePy(), "failed to install bridge.py: disk full")
 }
 
 func TestNormalizeReleaseTag(t *testing.T) {
