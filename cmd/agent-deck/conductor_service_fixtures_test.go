@@ -70,8 +70,9 @@ func writeReadOnlyServiceFixtures(t *testing.T, home string, mode os.FileMode, l
 }
 
 // serviceFakeTemplate is the /bin/sh script of one fake service manager. It
-// takes the tool name, the log path (already shell-quoted) and what to do for a
-// query that asks whether a service is loaded or active.
+// takes the tool name, the log path (already shell-quoted), what to do for a
+// query that asks whether a service is loaded or active, and the case arm, empty
+// or ending in a newline, that makes some verbs fail.
 const serviceFakeTemplate = `#!/bin/sh
 printf '%%s\n' "%[1]s $*" >> %[2]s
 verb=
@@ -82,7 +83,7 @@ for arg in "$@"; do
 	esac
 done
 case "$verb" in
-list | is-active)
+%[4]slist | is-active)
 	%[3]s
 	;;
 esac
@@ -92,9 +93,12 @@ exit 0
 // installRecordingServiceFakes writes a launchctl and a systemctl to a new temp
 // dir, pathDir, and returns it with the log they append to. Each call is one
 // line, "<tool> <arguments>". A call whose verb (its first argument that does
-// not start with "-") is list or is-active prints its arguments and exits 0 when
-// listLoaded, else exits 1, as the tools do for a service that is or is not
-// loaded; any other verb exits 0.
+// not start with "-") is one of failVerbs exits 1, as the tools do when they
+// refuse it. Otherwise a call whose verb is list or is-active prints its
+// arguments and exits 0 when listLoaded, else exits 1, as the tools do for a
+// service that is or is not loaded; any other verb exits 0. With listLoaded and
+// the failVerbs "load" and "enable", a service is running that cannot be
+// installed again.
 //
 // Callers put pathDir first on the PATH of the binary they run:
 //
@@ -103,7 +107,7 @@ exit 0
 // agentDeckTestEnv appends extraEnv last and os/exec keeps the last duplicate
 // key, so the fakes shadow the failing stubs TestMain puts on PATH
 // (stubServiceManagers). Behind the fakes are those stubs, never a real tool.
-func installRecordingServiceFakes(t *testing.T, listLoaded bool) (pathDir, logPath string) {
+func installRecordingServiceFakes(t *testing.T, listLoaded bool, failVerbs ...string) (pathDir, logPath string) {
 	t.Helper()
 	pathDir = t.TempDir()
 	logPath = filepath.Join(t.TempDir(), "service.log")
@@ -111,8 +115,12 @@ func installRecordingServiceFakes(t *testing.T, listLoaded bool) (pathDir, logPa
 	if listLoaded {
 		loaded = `printf '%s\n' "$*"; exit 0`
 	}
+	failing := ""
+	if len(failVerbs) > 0 {
+		failing = strings.Join(failVerbs, " | ") + ")\n\texit 1\n\t;;\n"
+	}
 	for _, tool := range serviceManagerCommands {
-		script := fmt.Sprintf(serviceFakeTemplate, tool, shellescape.Quote(logPath), loaded)
+		script := fmt.Sprintf(serviceFakeTemplate, tool, shellescape.Quote(logPath), loaded, failing)
 		if err := os.WriteFile(filepath.Join(pathDir, tool), []byte(script), 0o755); err != nil {
 			t.Fatalf("writing the %s fake: %v", tool, err)
 		}

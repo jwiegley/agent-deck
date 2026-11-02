@@ -153,10 +153,18 @@ func runAutoMigration(jsonOutput bool) {
 			// or 'conductor migrate-dir --apply' regenerates it. Both leave a
 			// plist or unit that another manager owns alone, and migrate-dir
 			// refuses a move that would leave one pointing at the old paths.
-			// Warn instead of implying full reconciliation. Detection is
-			// side-effect-free (no launchctl).
+			// Warn instead of implying full reconciliation. Setup is the remedy
+			// only for a daemon Agent Deck owns: for one another manager owns,
+			// the warning names it and sends the user to that manager.
+			// Detection is side-effect-free (no launchctl).
 			if session.HeartbeatDaemonStale(name) {
-				fmt.Printf("  [migrated] Refreshed heartbeat script: %s (heartbeat daemon may be stale — run 'agent-deck conductor setup %s' to reload)\n", name, name)
+				// HeartbeatDaemonExternal returns a pointer, nil unless another
+				// manager owns the daemon.
+				if ext := session.HeartbeatDaemonExternal(name); ext != nil {
+					fmt.Printf("  [migrated] Refreshed heartbeat script: %s (heartbeat daemon may be stale — %s; reload it through its manager)\n", name, ext.Error())
+				} else {
+					fmt.Printf("  [migrated] Refreshed heartbeat script: %s (heartbeat daemon may be stale — run 'agent-deck conductor setup %s' to reload)\n", name, name)
+				}
 			} else {
 				fmt.Printf("  [migrated] Refreshed heartbeat script: %s\n", name)
 			}
@@ -806,8 +814,16 @@ func handleConductorSetup(profile string, args []string) {
 				// A plist or unit that became external after the probe.
 				if !skipExternal("", err) {
 					fmt.Fprintf(os.Stderr, "Warning: failed to install bridge daemon: %v\n", err)
-					condDir, _ := session.ConductorDir()
-					fmt.Fprintf(os.Stderr, "Run manually: python3 %s/bridge.py\n", condDir)
+					// A failed install can leave the previous agent running: the new
+					// plist is written to a temp file before anything is unloaded,
+					// and a unit is never stopped. The bridge takes no instance
+					// lock, so one started by hand beside it would poll with the
+					// same tokens twice. Only a bridge that is not running is
+					// told to run by hand.
+					if !session.IsBridgeDaemonRunning() {
+						condDir, _ := session.ConductorDir()
+						fmt.Fprintf(os.Stderr, "Run manually: python3 %s/bridge.py\n", condDir)
+					}
 				}
 			} else {
 				plistPath = daemonPath
