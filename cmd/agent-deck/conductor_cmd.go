@@ -1029,18 +1029,18 @@ func handleConductorTeardown(_ string, args []string) {
 			if !*jsonOutput {
 				fmt.Println("Stopping bridge daemon...")
 			}
-			_ = session.UninstallBridgeDaemon()
+			stopErr := session.UninstallBridgeDaemon()
 			if !*jsonOutput {
-				fmt.Println("[ok] Daemon stopped and removed")
+				reportTeardownStop(stopErr, "bridge", "[ok] Daemon stopped and removed")
 			}
 		}
 		if session.IsTransitionNotifierDaemonRunning() {
 			if !*jsonOutput {
 				fmt.Println("Stopping transition notifier daemon...")
 			}
-			_ = session.UninstallTransitionNotifierDaemon()
+			stopErr := session.UninstallTransitionNotifierDaemon()
 			if !*jsonOutput {
-				fmt.Println("[ok] Transition notifier daemon stopped and removed")
+				reportTeardownStop(stopErr, "transition notifier", "[ok] Transition notifier daemon stopped and removed")
 			}
 		}
 	}
@@ -1060,8 +1060,16 @@ func handleConductorTeardown(_ string, args []string) {
 	// abort reports the heartbeat as off.
 	disableHeartbeat := func(conductor *session.ConductorMeta) {
 		if err := session.UninstallHeartbeatDaemon(conductor.Name); err != nil {
-			fmt.Fprintf(os.Stderr, "Error disabling heartbeat for %s: %v\n", conductor.Name, err)
-			exitCLI(1)
+			// An agent another manager owns stays as it is, with the heartbeat
+			// already off in meta.json: a skip, not a failure.
+			var ext *session.ExternalServiceError
+			if !errors.As(err, &ext) {
+				fmt.Fprintf(os.Stderr, "Error disabling heartbeat for %s: %v\n", conductor.Name, err)
+				exitCLI(1)
+			}
+			if !*jsonOutput {
+				fmt.Printf("  [skip] %s; heartbeat turned off in meta.json\n", ext.Error())
+			}
 		}
 		conductor.HeartbeatEnabled = false
 	}
@@ -1191,7 +1199,25 @@ conductorLoop:
 	if *allConductors && *removeAll && len(removed) == len(targets) {
 		condDir, _ := session.ConductorDir()
 		if condDir != "" {
-			_ = os.Remove(filepath.Join(condDir, "bridge.py"))
+			// bridge.py goes, with its stamp and .bridge.py.previous, only when
+			// agent-deck owns it. bridgeRemoved is not named removed: that is the
+			// slice the JSON below reads.
+			bridgeRemoved, bridgeErr := session.RemoveBridgeScript()
+			if !*jsonOutput {
+				switch {
+				case bridgeErr != nil:
+					fmt.Fprintf(os.Stderr, "Warning: failed to remove bridge.py: %v\n", bridgeErr)
+				case !bridgeRemoved:
+					// (false, nil) also means there was no bridge.py: then nothing is said.
+					if info, err := os.Lstat(filepath.Join(condDir, "bridge.py")); err == nil {
+						if info.Mode()&os.ModeSymlink != 0 {
+							fmt.Println("[skip] bridge.py is a symlink; kept")
+						} else {
+							fmt.Println("[skip] bridge.py has local changes; kept")
+						}
+					}
+				}
+			}
 			_ = os.Remove(filepath.Join(condDir, "bridge.log"))
 			_ = os.Remove(filepath.Join(condDir, "CLAUDE.md"))
 			_ = os.Remove(filepath.Join(condDir, "AGENTS.md"))
@@ -1250,6 +1276,22 @@ conductorLoop:
 func exitIncompleteTeardown() {
 	_ = events.CloseDefault()
 	os.Exit(1)
+}
+
+// reportTeardownStop prints how stopping a daemon went, for `conductor teardown
+// --all`: okLine when it stopped, a [skip] line on stdout when its plist or unit
+// belongs to another manager and was left alone, and a warning on stderr, naming
+// daemon, when the stop failed. The callers print it only for text output.
+func reportTeardownStop(err error, daemon, okLine string) {
+	var ext *session.ExternalServiceError
+	switch {
+	case errors.As(err, &ext):
+		fmt.Println("[skip] " + ext.Error())
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "Warning: failed to stop %s daemon: %v\n", daemon, err)
+	default:
+		fmt.Println(okLine)
+	}
 }
 
 // conductorRowIDsToRemove returns the state.db rows `conductor teardown

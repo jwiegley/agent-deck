@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -214,6 +215,87 @@ func TestLaunchdHeartbeatUninstallRefusesFailedUnload(t *testing.T) {
 	if _, err := os.Stat(plist); err != nil {
 		t.Fatalf("failed unload must preserve plist: %v", err)
 	}
+}
+
+// A heartbeat agent that another manager owns (home-manager installs its
+// launch agents 0444) is left where it is. The heartbeat is still turned off in
+// meta.json, which is Agent Deck's own state, and the error that says why the
+// agent stayed is returned for the caller to report.
+func TestUninstallHeartbeatDaemon_ExternalTurnsOffMetaAndReturnsError(t *testing.T) {
+	var label string
+	switch runtime.GOOS {
+	case "darwin":
+		label = HeartbeatPlistLabel("ops")
+	case "linux":
+		label = SystemdHeartbeatTimerName("ops")
+	default:
+		t.Skipf("no heartbeat service manager on %s", runtime.GOOS)
+	}
+	setupHeartbeatTickTest(t, "ops")
+	fake := installServiceManagerFake(t)
+	if err := SaveConductorMeta(&ConductorMeta{Name: "ops", Profile: "default", HeartbeatEnabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	// Each platform's files are written, so either branch sees an external agent.
+	var fixtures []string
+	for _, pathOf := range []func(string) (string, error){HeartbeatPlistPath, SystemdHeartbeatServicePath, SystemdHeartbeatTimerPath} {
+		p, err := pathOf("ops")
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeServiceFixture(t, p, "external\n", 0o444)
+		fixtures = append(fixtures, p)
+	}
+
+	err := UninstallHeartbeatDaemon("ops")
+
+	var ext *ExternalServiceError
+	if !errors.As(err, &ext) || ext == nil || ext.Label != label || ext.Reason != "read-only" {
+		t.Fatalf("UninstallHeartbeatDaemon = %v, want %s: managed externally (read-only)", err, label)
+	}
+	meta, err := LoadConductorMeta("ops")
+	if err != nil || meta.HeartbeatEnabled {
+		t.Fatalf("an external heartbeat must still be turned off in meta.json: meta=%+v err=%v", meta, err)
+	}
+	for _, p := range fixtures {
+		wantFileBytes(t, p, "external\n")
+	}
+	wantCalls(t, fake.MutatingCalls())
+}
+
+// The launchd twin of StopFailureKeepsEnabled, which runs on Linux only. The
+// unload of an owned heartbeat plist fails, so the agent may still be loaded:
+// the uninstall returns that failure, which is no *ExternalServiceError, before
+// it touches meta.json, and the plist stays. Of the platform errors, only an
+// *ExternalServiceError goes on to turn the heartbeat off.
+func TestUninstallHeartbeatDaemon_LaunchdStopFailureKeepsEnabled(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd stop failure fixture; Linux pins this with StopFailureKeepsEnabled")
+	}
+	setupHeartbeatTickTest(t, "ops")
+	fake := installServiceManagerFake(t)
+	fake.FailOn("launchctl", "unload", errors.New("unload refused"))
+	if err := SaveConductorMeta(&ConductorMeta{Name: "ops", Profile: "default", HeartbeatEnabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	plist, err := HeartbeatPlistPath("ops")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeServiceFixture(t, plist, "owned\n", 0o644)
+
+	err = UninstallHeartbeatDaemon("ops")
+
+	var ext *ExternalServiceError
+	if err == nil || errors.As(err, &ext) {
+		t.Fatalf("UninstallHeartbeatDaemon = %v, want the failed unload, which is no *ExternalServiceError", err)
+	}
+	meta, err := LoadConductorMeta("ops")
+	if err != nil || !meta.HeartbeatEnabled {
+		t.Fatalf("a failed unload must keep the heartbeat enabled in meta.json: meta=%+v err=%v", meta, err)
+	}
+	wantFileBytes(t, plist, "owned\n")
+	wantCalls(t, fake.MutatingCalls(), "launchctl unload "+plist)
 }
 
 func TestHeartbeatScriptChecksNamedConductorFlag(t *testing.T) {
