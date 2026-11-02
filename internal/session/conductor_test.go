@@ -2806,6 +2806,26 @@ func TestBridgeTemplate_DiscordImageUploadSupport(t *testing.T) {
 	}
 }
 
+// TestBridgeTemplate_DiscordQnaHook pins the Discord Q&A hook (design 5.3).
+func TestBridgeTemplate_DiscordQnaHook(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		"def route_question(",
+		`r"qna:([a-f0-9]{12}):([0-9]{1,2})"`,
+		`CONDUCTOR_DIR / "director" / "discord_qna.py"`,
+		"async def on_interaction(",
+		"await qna_handle_reply(",
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord Q&A hook pattern: %q", pattern)
+		}
+	}
+	if strings.Contains(template, "asyncio.to_thread") {
+		t.Error("template must not use asyncio.to_thread (Python 3.9+); use loop.run_in_executor")
+	}
+}
+
 func TestConductorClearOnCompact(t *testing.T) {
 	// Override HOME/XDG data so LoadConductorMeta reads from our temp dir
 	tmpHome := t.TempDir()
