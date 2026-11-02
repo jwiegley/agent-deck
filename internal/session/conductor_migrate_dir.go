@@ -189,16 +189,28 @@ type ConductorDirMigrateResult struct {
 	Conductors    []string // conductor homes present in target afterward
 	ConfigWritten bool
 	// Refused is true when the migration was aborted because the plan was not
-	// clean — a home whose destination exists without --force, or a conductor
-	// whose durable record would be clobbered. When Refused, nothing was mutated
-	// and [conductor].dir was NOT repointed (the flip is all-or-nothing).
+	// clean — a home whose destination exists without --force, a conductor
+	// whose durable record would be clobbered, or an agent another manager owns
+	// (the bridge's, or the heartbeat's of a conductor in the source) that the
+	// move would leave pointing at the old base. When Refused, nothing was
+	// mutated and [conductor].dir was NOT repointed (the flip is all-or-nothing).
 	Refused  bool
 	Blockers []string // human-readable reasons the migration was refused
 	// SourceRemovalWarnings records sources that could not be removed AFTER the
 	// config was already committed (non-fatal: the durable record exists at the
 	// committed target; the leftover is a harmless duplicate at the old base).
 	SourceRemovalWarnings []string
-	BridgeReinstalled     bool
+	// BridgeReinstalled is true when the bridge.py reinstall at the new base
+	// installed, updated or found the shipped bridge unchanged, so bridge.py is
+	// current. It is false when the reinstall kept bridge.py (see BridgeNotice),
+	// failed or did not run.
+	BridgeReinstalled bool
+	// BridgeScript is what that reinstall did to bridge.py; "" when it did not
+	// run or failed.
+	BridgeScript BridgeScriptOutcome
+	// BridgeNotice is the line to show when the reinstall kept bridge.py:
+	// BridgeKeptNotice or BridgeSymlinkNotice. It is empty otherwise.
+	BridgeNotice string
 }
 
 // migratePlanEntry is the internal, mutation-free classification of one
@@ -221,14 +233,18 @@ type migratePlanEntry struct {
 //  1. Plan: classify every base-level entry (move/merge/skip/reject) with NO
 //     mutation. If any home cannot move cleanly (destination exists without
 //     --force, or a --force merge would clobber the source's durable meta.json),
-//     refuse the WHOLE migration and mutate nothing — the [conductor].dir flip is
-//     all-or-nothing.
+//     or the bridge agent, or the heartbeat agent of a conductor home in the
+//     source, is managed externally (its plist or unit hard-codes the current
+//     paths, and agent-deck may not rewrite it), refuse the WHOLE migration and
+//     mutate nothing — the [conductor].dir flip is all-or-nothing. A no-op (source
+//     equal to target) moves nothing, so it strands nothing.
 //  2. Copy every entry source→target (non-destructive, no source removal yet).
 //  3. Verify each migrated home's meta.json landed readable at the target.
 //  4. Commit [conductor].dir = target.
 //  5. Remove the migrated sources.
 //  6. Reconcile path-baked artifacts: re-render each conductor's managed
-//     heartbeat.sh (a custom one is kept) and reinstall base bridge.py.
+//     heartbeat.sh (a custom one is kept) and reinstall base bridge.py unless it
+//     has local changes.
 //
 // Daemon reloads (launchctl/systemctl) are deliberately NOT done here — they
 // belong to the CLI handler so this function stays unit-testable without a
@@ -270,6 +286,9 @@ func MigrateConductorDir(opts ConductorDirMigrateOptions) (*ConductorDirMigrateR
 		}
 		res.Actions = actionsOf(plan)
 		res.Blockers = planBlockers(plan)
+		if !noop {
+			res.Blockers = append(res.Blockers, externalServiceBlockers(source, plan)...)
+		}
 		res.Refused = len(res.Blockers) > 0
 		res.Conductors = plannedTargetConductors(target, res.Actions)
 		return res, nil
@@ -298,7 +317,13 @@ func MigrateConductorDir(opts ConductorDirMigrateOptions) (*ConductorDirMigrateR
 	// Findings #1 + #2: refuse the WHOLE migration (mutate nothing) if any entry
 	// can't move cleanly. We never repoint [conductor].dir while a home is left
 	// behind, and we never merge-then-delete a source whose durable record differs.
-	if blockers := planBlockers(plan); len(blockers) > 0 {
+	// Nor do we move while an agent another manager owns would be left pointing
+	// at the old base; a no-op moves nothing, so it strands nothing.
+	blockers := planBlockers(plan)
+	if !noop {
+		blockers = append(blockers, externalServiceBlockers(source, plan)...)
+	}
+	if len(blockers) > 0 {
 		res.Refused = true
 		res.Blockers = blockers
 		return res, nil
@@ -368,11 +393,17 @@ func MigrateConductorDir(opts ConductorDirMigrateOptions) (*ConductorDirMigrateR
 			return res, fmt.Errorf("re-render heartbeat.sh for %q: %w", name, err)
 		}
 	}
-	// bridge.py is fully regenerable; a failure here must not abort the move.
-	if err := InstallBridgeScript(); err != nil {
+	// bridge.py is replaced only when it is missing or still matches its stamp,
+	// which moved with it; one with local changes is kept and reported. A failure
+	// here must not abort the move, which is already committed. It runs under
+	// acquireConductorBaseLock, so the installer must not take that lock
+	// (InstallBridgeScriptOutcome does not).
+	if r, err := InstallBridgeScriptOutcome(); err != nil {
 		sessionLog.Warn("conductor_migrate_dir_bridge_reinstall_failed", slog.String("error", err.Error()))
 	} else {
-		res.BridgeReinstalled = true
+		res.BridgeScript = r.Outcome
+		res.BridgeNotice = r.Notice
+		res.BridgeReinstalled = r.Outcome != BridgeScriptKept
 	}
 
 	return res, nil
@@ -653,6 +684,31 @@ func planBlockers(plan []migratePlanEntry) []string {
 		case "reject-conflict":
 			blockers = append(blockers, fmt.Sprintf(
 				"%s: %s — refusing to overwrite the source's durable record; reconcile the two homes manually", label, e.action.Reason))
+		}
+	}
+	return blockers
+}
+
+// externalServiceBlockers returns a blocker for the bridge agent when another
+// manager owns it, then one for every conductor home in plan, whatever its
+// action, whose heartbeat agent another manager owns. Those plists and units
+// hard-code the current paths, and agent-deck may not rewrite them, so a move
+// would leave them pointing at source. The transition notifier references no
+// conductor path, so it never blocks.
+func externalServiceBlockers(source string, plan []migratePlanEntry) []string {
+	var blockers []string
+	blocker := func(ext *ExternalServiceError) string {
+		return fmt.Sprintf("%s is managed externally and points at %s; change its manager's configuration first", ext.Label, source)
+	}
+	if ext := BridgeDaemonExternal(); ext != nil {
+		blockers = append(blockers, blocker(ext))
+	}
+	for _, e := range plan {
+		if !e.action.IsHome {
+			continue
+		}
+		if ext := HeartbeatDaemonExternal(e.action.Name); ext != nil {
+			blockers = append(blockers, blocker(ext))
 		}
 	}
 	return blockers

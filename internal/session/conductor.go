@@ -139,10 +139,11 @@ type ConductorSettings struct {
 	// the Linux systemd heartbeat service that of heartbeat.sh. Both
 	// 'conductor setup' and 'conductor migrate-dir --apply' regenerate it,
 	// through InstallHeartbeatDaemon, which leaves a plist or unit that another
-	// manager owns (an ExternalServiceError) alone. After changing dir, re-run
-	// 'conductor setup' per conductor to regenerate + reload the daemon (or use
-	// 'conductor migrate-dir'). The bridge daemon similarly freezes
-	// AGENT_DECK_CONDUCTOR_DIR at install time.
+	// manager owns (an ExternalServiceError) alone; migrate-dir also refuses a
+	// move that would leave such a plist or unit pointing at the old paths.
+	// After changing dir, re-run 'conductor setup' per conductor to regenerate +
+	// reload the daemon (or use 'conductor migrate-dir'). The bridge daemon
+	// similarly freezes AGENT_DECK_CONDUCTOR_DIR at install time.
 	Dir string `toml:"dir,omitempty"`
 
 	// PermissionAsk controls whether setup writes the mutating agent-deck
@@ -1340,9 +1341,10 @@ func SetupConductorWithAgent(name, profile, agent string, heartbeatEnabled bool,
 // when the daemon is installed. Both 'conductor setup' and
 // 'conductor migrate-dir --apply' regenerate it, through
 // InstallHeartbeatDaemon, which leaves a plist or unit that another manager
-// owns (an ExternalServiceError) alone; so re-run 'conductor setup' per
-// conductor after a dir change to reload the daemon (or use
-// 'conductor migrate-dir').
+// owns (an ExternalServiceError) alone, and migrate-dir also refuses a move
+// that would leave such a plist or unit pointing at the old paths. So re-run
+// 'conductor setup' per conductor after a dir change to reload the daemon (or
+// use 'conductor migrate-dir').
 func InstallHeartbeatScriptOutcome(name, profile string) (kept bool, err error) {
 	dir, err := ConductorNameDir(name)
 	if err != nil {
@@ -1461,7 +1463,8 @@ func HeartbeatPlistPath(name string) (string, error) {
 // MigrateConductorHeartbeatScripts refreshes the rendered script content, but
 // the daemon still invokes the old absolute path until 'conductor setup' or
 // 'conductor migrate-dir --apply' regenerates it. Both leave a plist or unit
-// that another manager owns (an ExternalServiceError) alone.
+// that another manager owns (an ExternalServiceError) alone, and migrate-dir
+// refuses a move that would leave one pointing at the old path.
 //
 // Detection is side-effect-free (it reads the installed unit and makes no
 // launchctl/systemctl calls) and best-effort: a missing or unreadable daemon

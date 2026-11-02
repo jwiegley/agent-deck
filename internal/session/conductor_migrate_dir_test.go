@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -785,5 +786,186 @@ func TestDetectConductorDirSplitBrain(t *testing.T) {
 	})
 	if _, ok := DetectConductorDirSplitBrain(); ok {
 		t.Fatal("populated override should not report split-brain")
+	}
+}
+
+// A move would leave the bridge agent, or the heartbeat agent of a conductor in
+// the source, pointing at the old base: their plists and units hard-code the
+// current paths. When another manager owns one (read-only here, as home-manager
+// leaves it), agent-deck may not rewrite it, so the plan refuses the move. The
+// dry-run reports the blocker, --apply refuses it, and neither changes anything.
+func TestMigrateConductorDir_ExternalAgentBlocksMove(t *testing.T) {
+	rows := []struct {
+		name  string
+		units []string                     // HOME-relative paths of the 0444 units
+		probe func() *ExternalServiceError // what the probe reports for them on this host
+	}{
+		{
+			name: "bridge",
+			units: []string{
+				"Library/LaunchAgents/" + LaunchdPlistName + ".plist",
+				".config/systemd/user/" + systemdBridgeServiceName,
+			},
+			probe: BridgeDaemonExternal,
+		},
+		{
+			name: "heartbeat",
+			units: []string{
+				"Library/LaunchAgents/" + HeartbeatPlistLabel("alpha") + ".plist",
+				".config/systemd/user/" + SystemdHeartbeatServiceName("alpha"),
+				".config/systemd/user/" + SystemdHeartbeatTimerName("alpha"),
+			},
+			probe: func() *ExternalServiceError { return HeartbeatDaemonExternal("alpha") },
+		},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			home, xdgConfigHome, xdgDataHome := setupSessionXDGPathEnv(t)
+			defaultBase := filepath.Join(xdgDataHome, "agent-deck", "conductor")
+			writeConductorDirConfig(t, xdgConfigHome, defaultBase)
+			configPath := filepath.Join(xdgConfigHome, "agent-deck", "config.toml")
+			config, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeConductorHome(t, defaultBase, "alpha", map[string]string{"meta.json": `{"name":"alpha","profile":"default"}`})
+			writeTestFile(t, filepath.Join(defaultBase, "bridge.py"), "# hand-edited bridge\n")
+
+			// Both platforms' files are written; the probe reads this host's.
+			for _, rel := range row.units {
+				writeServiceFixture(t, filepath.Join(home, filepath.FromSlash(rel)), "managed elsewhere\n", 0o444)
+			}
+			ext := row.probe()
+			if ext == nil {
+				t.Fatal("probe reports no external unit for the 0444 fixture")
+			}
+			want := ext.Label + " is managed externally and points at " + defaultBase + "; change its manager's configuration first"
+			target := filepath.Join(t.TempDir(), "vault-conductors")
+
+			for _, apply := range []bool{false, true} {
+				res, err := MigrateConductorDir(ConductorDirMigrateOptions{Target: target, Apply: apply})
+				if err != nil || res == nil || !res.Refused || res.ConfigWritten || len(res.Blockers) != 1 || res.Blockers[0] != want {
+					t.Fatalf("apply=%v: err=%v res=%+v, want the one blocker %q", apply, err, res, want)
+				}
+			}
+
+			assertFileContains(t, filepath.Join(defaultBase, "bridge.py"), "# hand-edited bridge")
+			assertFileContains(t, filepath.Join(defaultBase, "alpha", "meta.json"), `"alpha"`)
+			if got, err := os.ReadFile(configPath); err != nil || !bytes.Equal(got, config) {
+				t.Errorf("config.toml = %q (err=%v), want it unchanged: %q", got, err, config)
+			}
+			assertNotExist(t, target)
+		})
+	}
+}
+
+// The files that decide whether agent-deck may rewrite the bridge move with it:
+// bridge.py's stamp and .bridge.py.previous are base-level entries, so the
+// reinstall at the new base still finds a bridge agent-deck wrote and replaces
+// it, keeping the old one as .bridge.py.previous. A heartbeat.sh that is the
+// user's own arrives as it was.
+func TestMigrateConductorDir_ApplyCarriesBridgeStampAndCustomHeartbeat(t *testing.T) {
+	_, _, xdgDataHome := setupSessionXDGPathEnv(t)
+	defaultBase := filepath.Join(xdgDataHome, "agent-deck", "conductor")
+	const custom = "#!/bin/sh\n# my own heartbeat\n"
+	writeConductorHome(t, defaultBase, "alpha", map[string]string{
+		"meta.json":    `{"name":"alpha","profile":"default"}`,
+		"heartbeat.sh": custom,
+	})
+	const older = "# a bridge an earlier agent-deck wrote\n"
+	writeTestFile(t, filepath.Join(defaultBase, "bridge.py"), older)
+	writeTestFile(t, filepath.Join(defaultBase, bridgeStampName), bridgeStampOf(older))
+	writeTestFile(t, filepath.Join(defaultBase, bridgePreviousName), "# two releases ago\n")
+	target := filepath.Join(t.TempDir(), "vault-conductors")
+
+	res, err := MigrateConductorDir(ConductorDirMigrateOptions{Target: target, Apply: true})
+	if err != nil {
+		t.Fatalf("MigrateConductorDir: %v", err)
+	}
+
+	// The stamp moved with the bridge, so the reinstall may replace it.
+	if res.BridgeScript != BridgeScriptUpdated || !res.BridgeReinstalled || res.BridgeNotice != "" {
+		t.Errorf("BridgeScript=%q BridgeReinstalled=%v BridgeNotice=%q, want %q, true and no notice",
+			res.BridgeScript, res.BridgeReinstalled, res.BridgeNotice, BridgeScriptUpdated)
+	}
+	previous := filepath.Join(target, bridgePreviousName)
+	copies, err := filepath.Glob(filepath.Join(target, bridgePreviousName+"*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(copies) != 1 || copies[0] != previous {
+		t.Errorf("copies of the replaced bridge = %q, want only %q", copies, previous)
+	} else if got := readFileString(t, previous); got != older {
+		t.Errorf("%s holds %q, want the replaced bridge %q", previous, got, older)
+	}
+	for _, name := range []string{bridgeStampName, bridgePreviousName} {
+		assertNotExist(t, filepath.Join(defaultBase, name))
+	}
+	// The bridge now at the target is stamped as agent-deck's own, so another
+	// install leaves it unchanged instead of keeping it as the user's.
+	if again, err := installBridgeScriptAt(target, []byte(conductorBridgePy)); err != nil || again.Outcome != BridgeScriptUnchanged {
+		t.Errorf("installBridgeScriptAt at the target = %+v, %v, want outcome %q", again, err, BridgeScriptUnchanged)
+	}
+	if got := readFileString(t, filepath.Join(target, "alpha", "heartbeat.sh")); got != custom {
+		t.Errorf("heartbeat.sh at the target = %q, want the custom script %q", got, custom)
+	}
+}
+
+// A --force merge of a home into a destination that already holds it removes
+// the source afterwards, so it strands a heartbeat agent that another manager
+// owns as surely as a move does: the plan refuses it whatever the home's action.
+// The dry-run reports the blocker, --apply refuses it, and neither changes
+// anything. alpha's meta.json is identical at both ends, so its action is merge.
+func TestMigrateConductorDir_ExternalHeartbeatBlocksForcedMerge(t *testing.T) {
+	home, xdgConfigHome, xdgDataHome := setupSessionXDGPathEnv(t)
+	defaultBase := filepath.Join(xdgDataHome, "agent-deck", "conductor")
+	writeConductorDirConfig(t, xdgConfigHome, defaultBase)
+	configPath := filepath.Join(xdgConfigHome, "agent-deck", "config.toml")
+	config, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const meta = `{"name":"alpha","profile":"default"}`
+	writeConductorHome(t, defaultBase, "alpha", map[string]string{"meta.json": meta, "state.json": "source state"})
+	target := filepath.Join(t.TempDir(), "vault-conductors")
+	writeConductorHome(t, target, "alpha", map[string]string{"meta.json": meta})
+
+	// Both platforms' files are written; the probe reads this host's.
+	for _, rel := range []string{
+		"Library/LaunchAgents/" + HeartbeatPlistLabel("alpha") + ".plist",
+		".config/systemd/user/" + SystemdHeartbeatServiceName("alpha"),
+		".config/systemd/user/" + SystemdHeartbeatTimerName("alpha"),
+	} {
+		writeServiceFixture(t, filepath.Join(home, filepath.FromSlash(rel)), "managed elsewhere\n", 0o444)
+	}
+	ext := HeartbeatDaemonExternal("alpha")
+	if ext == nil {
+		t.Fatal("probe reports no external unit for the 0444 fixture")
+	}
+	want := ext.Label + " is managed externally and points at " + defaultBase + "; change its manager's configuration first"
+
+	for _, apply := range []bool{false, true} {
+		res, err := MigrateConductorDir(ConductorDirMigrateOptions{Target: target, Apply: apply, Force: true})
+		if err != nil || res == nil || !res.Refused || res.ConfigWritten || len(res.Blockers) != 1 || res.Blockers[0] != want {
+			t.Fatalf("apply=%v: err=%v res=%+v, want the one blocker %q", apply, err, res, want)
+		}
+		// The premise of the test: alpha is a merge, not a move.
+		var action string
+		for _, a := range res.Actions {
+			if a.Name == "alpha" {
+				action = a.Action
+			}
+		}
+		if action != "merge" {
+			t.Fatalf("apply=%v: alpha's action = %q, want merge", apply, action)
+		}
+	}
+
+	// Nothing moved: the source keeps the state a merge would have copied, then
+	// removed with the source.
+	assertFileContains(t, filepath.Join(defaultBase, "alpha", "state.json"), "source state")
+	assertNotExist(t, filepath.Join(target, "alpha", "state.json"))
+	if got, err := os.ReadFile(configPath); err != nil || !bytes.Equal(got, config) {
+		t.Errorf("config.toml = %q (err=%v), want it unchanged: %q", got, err, config)
 	}
 }
