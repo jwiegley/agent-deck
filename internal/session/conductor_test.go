@@ -700,6 +700,164 @@ func TestRenderConductorHeartbeatScript_ReplacesHeartbeatPrefix(t *testing.T) {
 	}
 }
 
+// customHeartbeatScript has neither managed marker, so it is the user's own script.
+const customHeartbeatScript = "#!/bin/bash\n# director's own heartbeat\nexec /usr/local/bin/director-heartbeat\n"
+
+// olderHeartbeatScript is a managed heartbeat.sh from an earlier template
+// generation, rendered against an old conductor root.
+func olderHeartbeatScript(name string) string {
+	return "#!/bin/bash\n# Heartbeat for conductor: " + name + " (profile: default)\n" +
+		"SESSION=\"conductor-" + name + "\"\nCONDUCTOR_ROOT=\"/old/path/conductor\"\n"
+}
+
+// TestMigrateConductorHeartbeatScripts_RefreshesOnlyManaged pins what
+// MigrateConductorHeartbeatScripts does with each kind of heartbeat.sh: it
+// writes a missing one, re-renders a managed one from an older template, and
+// leaves a current one and the user's own script alone.
+func TestMigrateConductorHeartbeatScripts_RefreshesOnlyManaged(t *testing.T) {
+	_, _, xdgDataHome := setupSessionXDGPathEnv(t)
+	base := filepath.Join(xdgDataHome, "agent-deck", "conductor")
+
+	tests := []struct {
+		name   string
+		before string // heartbeat.sh on disk; "" means none
+		after  string
+	}{
+		{"current", renderConductorHeartbeatScript("current", "default"), renderConductorHeartbeatScript("current", "default")},
+		{"custom", customHeartbeatScript, customHeartbeatScript},
+		{"missing", "", renderConductorHeartbeatScript("missing", "default")},
+		{"stale", olderHeartbeatScript("stale"), renderConductorHeartbeatScript("stale", "default")},
+	}
+	for _, tt := range tests {
+		files := map[string]string{"meta.json": `{"name":"` + tt.name + `","profile":"default"}`}
+		if tt.before != "" {
+			files["heartbeat.sh"] = tt.before
+		}
+		writeConductorHome(t, base, tt.name, files)
+	}
+
+	migrated, err := MigrateConductorHeartbeatScripts()
+	if err != nil {
+		t.Fatalf("MigrateConductorHeartbeatScripts: %v", err)
+	}
+	// ListConductors reads the base directory sorted by name.
+	if want := []string{"missing", "stale"}; !slices.Equal(migrated, want) {
+		t.Fatalf("migrated = %v, want %v", migrated, want)
+	}
+	for _, tt := range tests {
+		got, err := os.ReadFile(filepath.Join(base, tt.name, "heartbeat.sh"))
+		if err != nil || string(got) != tt.after {
+			t.Fatalf("%s/heartbeat.sh = %q (err %v), want %q", tt.name, string(got), err, tt.after)
+		}
+	}
+}
+
+// TestIsManagedHeartbeatScript verifies a heartbeat.sh counts as agent-deck's
+// only when it carries both markers of the template: either one alone is not
+// enough, so a user's own script that mentions one stays theirs.
+func TestIsManagedHeartbeatScript(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"current render", renderConductorHeartbeatScript("alpha", "work"), true},
+		{"older generation", olderHeartbeatScript("alpha"), true},
+		{"custom", customHeartbeatScript, false},
+		{"header marker only", "# Heartbeat for conductor: alpha\nexec my-heartbeat\n", false},
+		{"session marker only", "SESSION=\"conductor-alpha\"\nexec my-heartbeat\n", false},
+		{"empty", "", false},
+	}
+	for _, tt := range tests {
+		if got := isManagedHeartbeatScript(tt.content); got != tt.want {
+			t.Errorf("isManagedHeartbeatScript(%s) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+// TestInstallHeartbeatScriptOutcome verifies InstallHeartbeatScriptOutcome
+// writes a missing heartbeat.sh and re-renders a managed one, leaves a script
+// that lacks the managed markers untouched, reporting it as kept, and returns
+// an error without writing for a script it cannot read.
+func TestInstallHeartbeatScriptOutcome(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing string // heartbeat.sh on disk; "" means none
+		wantKept bool
+	}{
+		{"missing is written", "", false},
+		{"older managed script is rewritten", olderHeartbeatScript("alpha"), false},
+		{"custom script is kept", customHeartbeatScript, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setupSessionXDGPathEnv(t)
+			dir, err := ConductorNameDir("alpha")
+			if err != nil {
+				t.Fatalf("ConductorNameDir: %v", err)
+			}
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatalf("MkdirAll(%q): %v", dir, err)
+			}
+			script := filepath.Join(dir, "heartbeat.sh")
+			if tt.existing != "" {
+				if err := os.WriteFile(script, []byte(tt.existing), 0o755); err != nil {
+					t.Fatalf("WriteFile(%q): %v", script, err)
+				}
+			}
+
+			kept, err := InstallHeartbeatScriptOutcome("alpha", "work")
+			if err != nil {
+				t.Fatalf("InstallHeartbeatScriptOutcome: %v", err)
+			}
+			if kept != tt.wantKept {
+				t.Errorf("kept = %v, want %v", kept, tt.wantKept)
+			}
+			want := renderConductorHeartbeatScript("alpha", "work")
+			if tt.wantKept {
+				want = tt.existing
+			}
+			got, err := os.ReadFile(script)
+			if err != nil || string(got) != want {
+				t.Errorf("heartbeat.sh = %q (err %v), want %q", string(got), err, want)
+			}
+		})
+	}
+
+	t.Run("unreadable script is not written", func(t *testing.T) {
+		setupSessionXDGPathEnv(t)
+		dir, err := ConductorNameDir("alpha")
+		if err != nil {
+			t.Fatalf("ConductorNameDir: %v", err)
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", dir, err)
+		}
+		// Reading a directory fails with EISDIR for every uid, root included,
+		// so this needs no permission setup and no root skip.
+		script := filepath.Join(dir, "heartbeat.sh")
+		if err := os.Mkdir(script, 0o755); err != nil {
+			t.Fatalf("Mkdir(%q): %v", script, err)
+		}
+
+		kept, err := InstallHeartbeatScriptOutcome("alpha", "work")
+		if kept {
+			t.Error("kept = true, want false")
+		}
+		const want = `reading existing heartbeat.sh for "alpha"`
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want one containing %q", err, want)
+		}
+		info, statErr := os.Stat(script)
+		if statErr != nil {
+			t.Fatalf("Stat(%q): %v", script, statErr)
+		}
+		if !info.IsDir() {
+			t.Errorf("%q is %v after the call, want a directory", script, info.Mode())
+		}
+	})
+}
+
 // TestConductorStatusJSON_ZeroActivityOmitted verifies that when
 // GetConductorLastActivity returns zero time (no managed sessions), the
 // conductor status JSON omits last_activity_at entirely rather than emitting

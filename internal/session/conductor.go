@@ -1321,8 +1321,10 @@ func SetupConductorWithAgent(name, profile, agent string, heartbeatEnabled bool,
 	return nil
 }
 
-// InstallHeartbeatScript writes the heartbeat.sh script for a conductor.
-// This is a standalone heartbeat that works without Telegram.
+// InstallHeartbeatScriptOutcome writes the heartbeat.sh script for a conductor.
+// This is a standalone heartbeat that works without Telegram. A script without
+// the managed markers (see isManagedHeartbeatScript) belongs to the user, so it
+// is left untouched and reported as kept.
 //
 // The script embeds the conductor root (renderConductorHeartbeatScript's
 // {CONDUCTOR_ROOT} substitution, which honors [conductor].dir) as a literal.
@@ -1333,13 +1335,42 @@ func SetupConductorWithAgent(name, profile, agent string, heartbeatEnabled bool,
 // script/log paths into the launchd plist (and systemd unit) at setup time and
 // is regenerated only by 'conductor setup', so re-run 'conductor setup' per
 // conductor after a dir change to reload the daemon.
-func InstallHeartbeatScript(name, profile string) error {
+func InstallHeartbeatScriptOutcome(name, profile string) (kept bool, err error) {
 	dir, err := ConductorNameDir(name)
 	if err != nil {
-		return err
+		return false, err
 	}
 	scriptPath := filepath.Join(dir, "heartbeat.sh")
-	return os.WriteFile(scriptPath, []byte(renderConductorHeartbeatScript(name, profile)), 0o755)
+	existing, err := os.ReadFile(scriptPath)
+	switch {
+	case err == nil:
+		if !isManagedHeartbeatScript(string(existing)) {
+			return true, nil
+		}
+	case !os.IsNotExist(err):
+		// A script that cannot be read cannot be classified as managed, so it
+		// is not overwritten.
+		return false, fmt.Errorf("reading existing heartbeat.sh for %q: %w", name, err)
+	}
+	return false, os.WriteFile(scriptPath, []byte(renderConductorHeartbeatScript(name, profile)), 0o755)
+}
+
+// InstallHeartbeatScript is InstallHeartbeatScriptOutcome for callers that do
+// not report a kept script: leaving the user's own script alone is not an error.
+func InstallHeartbeatScript(name, profile string) error {
+	_, err := InstallHeartbeatScriptOutcome(name, profile)
+	return err
+}
+
+// isManagedHeartbeatScript reports whether content is a heartbeat.sh that
+// agent-deck wrote: one carrying both markers of conductorHeartbeatScript, its
+// "# Heartbeat for conductor:" header and its SESSION="conductor-... line.
+// MigrateConductorHeartbeatScripts and InstallHeartbeatScriptOutcome check it
+// before replacing an existing heartbeat.sh: a script without the markers is
+// the user's own and is left alone.
+func isManagedHeartbeatScript(content string) bool {
+	return strings.Contains(content, "# Heartbeat for conductor:") &&
+		strings.Contains(content, `SESSION="conductor-`)
 }
 
 func renderConductorHeartbeatScript(name, profile string) string {
@@ -2303,9 +2334,7 @@ func MigrateConductorHeartbeatScripts() ([]string, error) {
 		}
 
 		existingStr := string(existing)
-		managedScript := strings.Contains(existingStr, "# Heartbeat for conductor:") &&
-			strings.Contains(existingStr, `SESSION="conductor-`)
-		if !managedScript {
+		if !isManagedHeartbeatScript(existingStr) {
 			continue
 		}
 

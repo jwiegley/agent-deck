@@ -54,7 +54,7 @@ func TestMigrateConductorDir_MovesHomesAndPreservesUserState(t *testing.T) {
 		"CLAUDE.md":    "edited claude",
 		"LEARNINGS.md": "my learnings",
 		"state.json":   `{"x":1}`,
-		"heartbeat.sh": "OLD_ROOT=/old/path/conductor",
+		"heartbeat.sh": olderHeartbeatScript("alpha"),
 	})
 	// A base-level user-state file must move too.
 	if err := os.WriteFile(filepath.Join(defaultBase, "LEARNINGS.md"), []byte("shared learnings"), 0o644); err != nil {
@@ -108,6 +108,31 @@ func TestMigrateConductorDir_MovesHomesAndPreservesUserState(t *testing.T) {
 	// The reconcile set is reported for daemon reload.
 	if len(res.Conductors) != 1 || res.Conductors[0] != "alpha" {
 		t.Fatalf("res.Conductors = %v, want [alpha]", res.Conductors)
+	}
+}
+
+// TestMigrateConductorDir_KeepsCustomHeartbeatScript pins that the reconcile
+// step re-renders a managed heartbeat.sh only: one without the managed markers
+// is the user's own, and the move leaves it byte for byte as it was.
+func TestMigrateConductorDir_KeepsCustomHeartbeatScript(t *testing.T) {
+	_, _, xdgDataHome := setupSessionXDGPathEnv(t)
+	writeConductorHome(t, filepath.Join(xdgDataHome, "agent-deck", "conductor"), "alpha", map[string]string{
+		"meta.json":    `{"name":"alpha","profile":"default"}`,
+		"heartbeat.sh": customHeartbeatScript,
+	})
+	target := filepath.Join(t.TempDir(), "vault-conductors")
+
+	if _, err := MigrateConductorDir(ConductorDirMigrateOptions{Target: target, Apply: true}); err != nil {
+		t.Fatalf("MigrateConductorDir: %v", err)
+	}
+
+	script := filepath.Join(target, "alpha", "heartbeat.sh")
+	got, err := os.ReadFile(script)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", script, err)
+	}
+	if string(got) != customHeartbeatScript {
+		t.Fatalf("migrate-dir rewrote a custom heartbeat.sh:\n%s", got)
 	}
 }
 
