@@ -3323,6 +3323,8 @@ func installHeartbeatDaemonSystemd(name string, intervalMinutes int) error {
 }
 
 // UninstallHeartbeatDaemon stops and removes the heartbeat timer for a conductor.
+// A timer managed externally is left in place: the heartbeat is still turned off
+// in meta.json and its *ExternalServiceError is returned for the caller to report.
 func UninstallHeartbeatDaemon(name string) error {
 	plat := platform.Detect()
 	var err error
@@ -3332,7 +3334,11 @@ func UninstallHeartbeatDaemon(name string) error {
 	case platform.PlatformLinux, platform.PlatformWSL2:
 		err = uninstallHeartbeatDaemonSystemd(name)
 	}
-	if err != nil {
+	// An external timer is held, not returned yet: it was left untouched, and
+	// meta.json is Agent Deck's own. Any other failure may have left the timer
+	// running, so it returns before the meta is touched.
+	var external *ExternalServiceError
+	if err != nil && !errors.As(err, &external) {
 		return err
 	}
 	meta, err := LoadConductorMeta(name)
@@ -3343,10 +3349,17 @@ func UninstallHeartbeatDaemon(name string) error {
 		// Older binary, newer data (#2354): SaveConductorMeta would reject
 		// the unrecognized agent and drop fields this build doesn't know.
 		// Turning the heartbeat off must never be blocked by that.
-		return disableConductorHeartbeatRaw(name)
+		err = disableConductorHeartbeatRaw(name)
+	} else {
+		meta.HeartbeatEnabled = false
+		err = SaveConductorMeta(meta)
 	}
-	meta.HeartbeatEnabled = false
-	return SaveConductorMeta(meta)
+	// With nothing held, external is a nil *ExternalServiceError, and a nil
+	// pointer stored in an error is not nil: return the meta update's result.
+	if err != nil || external == nil {
+		return err
+	}
+	return external
 }
 
 // disableConductorHeartbeatRaw sets heartbeat_enabled=false in meta.json
