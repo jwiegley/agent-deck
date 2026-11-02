@@ -227,8 +227,8 @@ type migratePlanEntry struct {
 //  3. Verify each migrated home's meta.json landed readable at the target.
 //  4. Commit [conductor].dir = target.
 //  5. Remove the migrated sources.
-//  6. Reconcile path-baked artifacts: re-render heartbeat.sh per conductor and
-//     reinstall base bridge.py.
+//  6. Reconcile path-baked artifacts: re-render each conductor's managed
+//     heartbeat.sh (a custom one is kept) and reinstall base bridge.py.
 //
 // Daemon reloads (launchctl/systemctl) are deliberately NOT done here — they
 // belong to the CLI handler so this function stays unit-testable without a
