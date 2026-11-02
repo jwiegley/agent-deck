@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -1849,6 +1850,51 @@ func TestGenerateLaunchdPlist_IncludesAgentDeckDir(t *testing.T) {
 	agentDeckDir := filepath.Dir(agentDeck)
 	if !strings.Contains(plist, agentDeckDir) {
 		t.Errorf("plist PATH should contain agent-deck dir %q, plist:\n%s", agentDeckDir, plist)
+	}
+}
+
+// The launchd plists of the conductor's bridge and heartbeat jobs run them as
+// ProcessType Interactive and set no LowPriorityIO. Agent sessions inherit the
+// launchd limits of whichever job starts the default tmux server, so a job that
+// sets LowPriorityIO, or no ProcessType, makes every session it starts run
+// clamped. The generators look for python3 and agent-deck on PATH, and the
+// tests above skip without them; this one puts fakes of both first on PATH, so
+// it always runs.
+func TestConductorPlists_InteractiveWithoutLowPriorityIO(t *testing.T) {
+	bin := t.TempDir()
+	for _, name := range []string{"python3", "agent-deck"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("failed to create fake %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	rows := []struct {
+		name   string
+		render func() (string, error)
+	}{
+		{"heartbeat", func() (string, error) { return GenerateHeartbeatPlist("qos-probe", 15) }},
+		{"bridge", GenerateLaunchdPlist},
+	}
+	interactive := regexp.MustCompile(`<key>ProcessType</key>\s*<string>Interactive</string>`)
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			plist, err := row.render()
+			if err != nil {
+				t.Fatalf("rendering the %s plist: %v", row.name, err)
+			}
+			if n := len(interactive.FindAllString(plist, -1)); n != 1 {
+				t.Errorf("the %s plist has %d ProcessType Interactive entries, want 1:\n%s", row.name, n, plist)
+			}
+			if n := strings.Count(plist, "<key>ProcessType</key>"); n != 1 {
+				t.Errorf("the %s plist has %d ProcessType keys, want 1", row.name, n)
+			}
+			// The key, not the bare word: the plist's PATH starts with the fake bin,
+			// and t.TempDir() names that directory after this test.
+			if strings.Contains(plist, "<key>LowPriorityIO</key>") {
+				t.Errorf("the %s plist sets LowPriorityIO, want it absent:\n%s", row.name, plist)
+			}
+		})
 	}
 }
 

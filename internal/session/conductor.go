@@ -1732,8 +1732,8 @@ const conductorHeartbeatPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
         <string>__HOME__</string>
     </dict>
 
-    <key>LowPriorityIO</key>
-    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
 </dict>
 </plist>
 `
@@ -2548,8 +2548,8 @@ const conductorPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
-    <key>LowPriorityIO</key>
-    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
 </dict>
 </plist>
 `
