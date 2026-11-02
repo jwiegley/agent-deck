@@ -177,7 +177,9 @@ install_bridge_script() {
     fi
 
     # Remove the stamp first, so that a symlinked one is replaced, not written
-    # through. A crash before the write heals on the next run, as "unchanged".
+    # through. A crash before the write heals on the next run of the same
+    # checkout, as "unchanged". A newer checkout finds a bridge.py that differs
+    # from its canonical file and has no stamp that matches it, and keeps it.
     rm -f "${stamp}"
     sha256_of "${dest}" > "${stamp}"
     ok "bridge.py ${outcome}"
