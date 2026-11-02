@@ -1073,11 +1073,17 @@ func extractBinaryFromTarGzReader(r io.Reader) ([]byte, error) {
 
 // UpdateBridgePy refreshes the installed bridge.py from the embedded runtime template.
 // This keeps bridge behavior in sync with the currently running binary.
+//
+// When the installer keeps the bridge instead of replacing it, UpdateBridgePy
+// prints the installer's notice and returns no error.
+//
+// It never reads, writes or removes bridge.py.backup, because a .backup left by
+// an older update may hold the user's own bridge.
 func UpdateBridgePy() error {
 	// Resolve the conductor dir via the injected resolver so the existence
-	// guard, the .backup, and the refresh all target the [conductor].dir
-	// override when set. Fall back to the default XDG/legacy path only for
-	// non-CLI callers that never injected a resolver.
+	// guard and the refresh both target the [conductor].dir override when
+	// set. Fall back to the default XDG/legacy path only for non-CLI callers
+	// that never injected a resolver.
 	var conductorDir string
 	var err error
 	if conductorDirResolver != nil {
@@ -1088,7 +1094,6 @@ func UpdateBridgePy() error {
 	if err != nil {
 		return fmt.Errorf("failed to resolve conductor directory: %w", err)
 	}
-	bridgePath := filepath.Join(conductorDir, "bridge.py")
 
 	// Check if conductor directory exists
 	if _, err := os.Stat(conductorDir); os.IsNotExist(err) {
@@ -1111,20 +1116,15 @@ func UpdateBridgePy() error {
 	}
 
 	fmt.Println("Updating bridge.py...")
-	// Backup existing bridge.py if present
-	if _, err := os.Stat(bridgePath); err == nil {
-		content, readErr := os.ReadFile(bridgePath)
-		if readErr != nil {
-			return fmt.Errorf("failed to read existing bridge.py: %w", readErr)
-		}
-		backupPath := bridgePath + ".backup"
-		if err := os.WriteFile(backupPath, content, 0644); err != nil {
-			return fmt.Errorf("failed to backup bridge.py: %w", err)
-		}
-	}
 
 	// Install latest bridge template from embedded runtime.
 	if err := bridgeScriptInstaller(); err != nil {
+		// Matched by method: internal/update cannot import internal/session.
+		var kept interface{ BridgeKeptNotice() string }
+		if errors.As(err, &kept) {
+			fmt.Println(kept.BridgeKeptNotice())
+			return nil
+		}
 		return fmt.Errorf("failed to install bridge.py: %w", err)
 	}
 
