@@ -205,7 +205,7 @@ The `agent-deck conductor setup` wizard walks you through channel pairing during
 
 Heartbeat is enabled by default for all conductors.
 Pass `--no-heartbeat` at setup to disable it.
-When enabled, agent-deck installs a `systemd --user` timer (Linux) or launchd agent (macOS) that pings the conductor on a schedule.
+When enabled, agent-deck installs a `systemd --user` timer (Linux) or launchd agent (macOS) that pings the conductor on a schedule. A heartbeat plist or unit that is read-only or a symlink is managed externally: setup leaves it alone. Setup also keeps a `heartbeat.sh` you wrote.
 
 Each ping is a simple message:
 
