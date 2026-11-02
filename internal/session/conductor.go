@@ -1415,18 +1415,6 @@ func HeartbeatPlistPath(name string) (string, error) {
 	return filepath.Join(homeDir, "Library", "LaunchAgents", HeartbeatPlistLabel(name)+".plist"), nil
 }
 
-// RemoveHeartbeatPlist removes the launchd plist for a conductor's heartbeat
-func RemoveHeartbeatPlist(name string) error {
-	path, err := HeartbeatPlistPath(name)
-	if err != nil {
-		return err
-	}
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return nil
-	}
-	return os.Remove(path)
-}
-
 // HeartbeatDaemonStale reports whether an installed heartbeat daemon (launchd
 // plist on macOS, systemd service on Linux) references a script path other than
 // the conductor's currently-resolved <ConductorNameDir>/heartbeat.sh. This is
@@ -2868,13 +2856,18 @@ func InstallBridgeDaemon() (string, error) {
 }
 
 func installBridgeDaemonLaunchd() (string, error) {
-	plistContent, err := GenerateLaunchdPlist()
-	if err != nil {
-		return "", fmt.Errorf("failed to generate plist: %w", err)
-	}
 	plistPath, err := LaunchdPlistPath()
 	if err != nil {
 		return "", fmt.Errorf("failed to get plist path: %w", err)
+	}
+	// Checked before the plist is generated: an external plist is never
+	// replaced, and generating one needs python3.
+	if err := requireOwnedServiceFile(LaunchdPlistName, plistPath); err != nil {
+		return "", err
+	}
+	plistContent, err := GenerateLaunchdPlist()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate plist: %w", err)
 	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -2883,14 +2876,7 @@ func installBridgeDaemonLaunchd() (string, error) {
 	if err := os.MkdirAll(filepath.Join(homeDir, "Library", "LaunchAgents"), 0o755); err != nil {
 		return "", fmt.Errorf("failed to create LaunchAgents dir: %w", err)
 	}
-	_ = runLaunchctl("unload", plistPath)
-	if err := os.WriteFile(plistPath, []byte(plistContent), 0o644); err != nil {
-		return "", fmt.Errorf("failed to write plist: %w", err)
-	}
-	if err := runLaunchctl("load", plistPath); err != nil {
-		return plistPath, fmt.Errorf("plist written but failed to load daemon: %w", err)
-	}
-	return plistPath, nil
+	return plistPath, replaceLaunchAgent(LaunchdPlistName, plistPath, []byte(plistContent))
 }
 
 func installBridgeDaemonSystemd() (string, error) {
@@ -2980,6 +2966,13 @@ func installTransitionNotifierLaunchd() (string, error) {
 		return "", fmt.Errorf("failed to get notifier plist path: %w", err)
 	}
 
+	// An external plist is reported before anything else: the Background-domain
+	// guard below returns nil and would hide it, and generating a replacement
+	// is pointless.
+	if err := requireOwnedServiceFile(TransitionNotifierLaunchdPlistName, plistPath); err != nil {
+		return "", err
+	}
+
 	// Background-domain eviction guard. `conductor setup` run from inside a
 	// conductor pane executes in the launchd "Background" domain. The unload
 	// below would reach the live notify-daemon cross-domain and evict it, and the
@@ -3004,14 +2997,7 @@ func installTransitionNotifierLaunchd() (string, error) {
 	if err := os.MkdirAll(filepath.Join(homeDir, "Library", "LaunchAgents"), 0o755); err != nil {
 		return "", fmt.Errorf("failed to create LaunchAgents dir: %w", err)
 	}
-	_ = runLaunchctl("unload", plistPath)
-	if err := os.WriteFile(plistPath, []byte(plistContent), 0o644); err != nil {
-		return "", fmt.Errorf("failed to write notifier plist: %w", err)
-	}
-	if err := runLaunchctl("load", plistPath); err != nil {
-		return plistPath, fmt.Errorf("plist written but failed to load notifier daemon: %w", err)
-	}
-	return plistPath, nil
+	return plistPath, replaceLaunchAgent(TransitionNotifierLaunchdPlistName, plistPath, []byte(plistContent))
 }
 
 func installTransitionNotifierSystemd() (string, error) {
@@ -3068,11 +3054,7 @@ func uninstallBridgeDaemonLaunchd() error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(plistPath); os.IsNotExist(err) {
-		return nil
-	}
-	_ = runLaunchctl("unload", plistPath)
-	return os.Remove(plistPath)
+	return removeLaunchAgent(LaunchdPlistName, plistPath, false)
 }
 
 func uninstallBridgeDaemonSystemd() error {
@@ -3109,11 +3091,7 @@ func uninstallTransitionNotifierLaunchd() error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(plistPath); os.IsNotExist(err) {
-		return nil
-	}
-	_ = runLaunchctl("unload", plistPath)
-	return os.Remove(plistPath)
+	return removeLaunchAgent(TransitionNotifierLaunchdPlistName, plistPath, false)
 }
 
 func uninstallTransitionNotifierSystemd() error {
@@ -3235,27 +3213,28 @@ func InstallHeartbeatDaemon(name, profile string, intervalMinutes int) error {
 }
 
 func installHeartbeatDaemonLaunchd(name string, intervalMinutes int) error {
-	plistContent, err := GenerateHeartbeatPlist(name, intervalMinutes)
-	if err != nil {
-		return fmt.Errorf("failed to generate heartbeat plist: %w", err)
-	}
 	hbPlistPath, err := HeartbeatPlistPath(name)
 	if err != nil {
 		return err
+	}
+	// Checked before the plist is generated: an external plist is never
+	// replaced, and generating one needs agent-deck.
+	label := HeartbeatPlistLabel(name)
+	if err := requireOwnedServiceFile(label, hbPlistPath); err != nil {
+		return err
+	}
+	plistContent, err := GenerateHeartbeatPlist(name, intervalMinutes)
+	if err != nil {
+		return fmt.Errorf("failed to generate heartbeat plist: %w", err)
 	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return err
 	}
-	_ = os.MkdirAll(filepath.Join(homeDir, "Library", "LaunchAgents"), 0o755)
-	_ = runLaunchctl("unload", hbPlistPath)
-	if err := os.WriteFile(hbPlistPath, []byte(plistContent), 0o644); err != nil {
-		return fmt.Errorf("failed to write heartbeat plist: %w", err)
+	if err := os.MkdirAll(filepath.Join(homeDir, "Library", "LaunchAgents"), 0o755); err != nil {
+		return fmt.Errorf("failed to create LaunchAgents dir: %w", err)
 	}
-	if err := runLaunchctl("load", hbPlistPath); err != nil {
-		return fmt.Errorf("plist written but failed to load: %w", err)
-	}
-	return nil
+	return replaceLaunchAgent(label, hbPlistPath, []byte(plistContent))
 }
 
 func installHeartbeatDaemonSystemd(name string, intervalMinutes int) error {
@@ -3368,15 +3347,9 @@ func uninstallHeartbeatDaemonLaunchd(name string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(hbPlistPath); os.IsNotExist(err) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	if err := runLaunchctl("unload", hbPlistPath); err != nil {
-		return fmt.Errorf("stop launchd heartbeat: %w", err)
-	}
-	return RemoveHeartbeatPlist(name)
+	// Strict, unlike the bridge and notifier: when the unload fails the heartbeat
+	// may still be running, so its plist stays and the failure is returned.
+	return removeLaunchAgent(HeartbeatPlistLabel(name), hbPlistPath, true)
 }
 
 func uninstallHeartbeatDaemonSystemd(name string) error {
