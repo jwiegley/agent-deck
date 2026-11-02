@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/asheshgoplani/agent-deck/internal/update"
 )
 
 // bridge.py is written from the bridge embedded in the binary, but people edit
@@ -71,7 +73,7 @@ const BridgeSymlinkNotice = "[skip] bridge.py is a symlink; left unchanged."
 // BridgeKeptError is the error InstallBridgeScript returns when it left
 // bridge.py unchanged. A caller that only has an error value tells it from a
 // failed write with errors.As, and a caller that cannot import this package
-// matches the interface{ BridgeKeptNotice() string } it satisfies.
+// matches the update.BridgeKeptNotifier it implements.
 type BridgeKeptError struct {
 	// Notice is BridgeKeptNotice or BridgeSymlinkNotice.
 	Notice string
@@ -89,7 +91,10 @@ func (e *BridgeKeptError) Error() string {
 // BridgeKeptNotice returns the line to show the user.
 func (e *BridgeKeptError) BridgeKeptNotice() string { return e.Notice }
 
-var _ interface{ BridgeKeptNotice() string } = (*BridgeKeptError)(nil)
+// The assertion is the contract: update.UpdateBridgePy finds this error through
+// update.BridgeKeptNotifier, and internal/update cannot import this package to
+// check it. A rename of BridgeKeptNotice on either side stops the build here.
+var _ update.BridgeKeptNotifier = (*BridgeKeptError)(nil)
 
 // bridgeStamp is the stamp for a bridge.py that holds content: its sha256 as 64
 // lower-case hex digits, then a newline. Stamps are compared exactly, byte for

@@ -471,6 +471,8 @@ func (e *keptBridgeError) Error() string { return "bridge.py has local changes; 
 
 func (e *keptBridgeError) BridgeKeptNotice() string { return e.notice }
 
+var _ BridgeKeptNotifier = (*keptBridgeError)(nil)
+
 func TestUpdateBridgePy_KeptBridgePrintsNoticeAndSucceeds(t *testing.T) {
 	condDir := filepath.Join(isolateUpdatePaths(t), ".agent-deck", "conductor")
 	require.NoError(t, os.MkdirAll(condDir, 0o755))

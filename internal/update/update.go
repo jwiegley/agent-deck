@@ -62,6 +62,19 @@ var detectHomebrewManagedInstall = DetectHomebrewManagedInstall
 // by the CLI layer so this package stays independent of internal/session.
 var bridgeScriptInstaller func() error
 
+// BridgeKeptNotifier is implemented by the error that the bridge installer, the
+// func given to SetBridgeScriptInstaller, returns when it left bridge.py
+// unchanged because the file is the user's. UpdateBridgePy finds it with
+// errors.As and prints its notice, where any other error fails the update.
+// internal/session defines that error, *session.BridgeKeptError, which this
+// package cannot import. internal/session asserts at compile time that the error
+// implements this interface, so renaming BridgeKeptNotice on either side stops
+// the build.
+type BridgeKeptNotifier interface {
+	// BridgeKeptNotice returns the line to show the user.
+	BridgeKeptNotice() string
+}
+
 // conductorDirResolver resolves the base conductor directory, honoring the
 // [conductor].dir config override. It is injected by the CLI layer (same
 // pattern as bridgeScriptInstaller) so this package stays independent of
@@ -1142,8 +1155,9 @@ func UpdateBridgePy() error {
 
 	// Install latest bridge template from embedded runtime.
 	if err := bridgeScriptInstaller(); err != nil {
-		// Matched by method: internal/update cannot import internal/session.
-		var kept interface{ BridgeKeptNotice() string }
+		// Matched by BridgeKeptNotifier: internal/update cannot import
+		// internal/session, which asserts that its *BridgeKeptError implements it.
+		var kept BridgeKeptNotifier
 		if errors.As(err, &kept) {
 			fmt.Println(kept.BridgeKeptNotice())
 			return nil
