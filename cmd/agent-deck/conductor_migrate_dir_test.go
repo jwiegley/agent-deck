@@ -55,7 +55,7 @@ func TestConductorMigrateDir_ExternalBridgeAgentRefuses(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("dry-run: exit=%d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
-	assertStdoutHasLine(t, stdout, "    - "+br.Label+" is managed externally and points at "+from+"; change its manager's configuration first")
+	assertStdoutHasLine(t, stdout, "    - "+br.Error()+"; migrate-dir cannot repoint it, so it moves nothing while it is installed: remove it from its manager, re-run migrate-dir, then add it back pointing at "+to)
 	assertStdoutHasLine(t, stdout, "  Note: this plan would be REFUSED as-is — resolve the blockers above first.")
 
 	stdout, stderr, code = runMigrateDirWithFakes(t, home, pathDir, to, "--from="+from, "--apply")
@@ -134,7 +134,7 @@ func TestConductorMigrateDir_NoOpApplyReportsKeptBridgeAndExternalAgents(t *test
 			if code != 0 {
 				t.Fatalf("dry-run: exit=%d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
 			}
-			for _, banned := range []string{"is managed externally and points at", "would be REFUSED"} {
+			for _, banned := range []string{"migrate-dir cannot repoint it", "would be REFUSED"} {
 				if strings.Contains(stdout, banned) {
 					t.Errorf("dry-run stdout contains %q for a no-op:\n%s", banned, stdout)
 				}
@@ -229,7 +229,7 @@ func TestConductorMigrateDir_SkipAndExternalDryRunSaysRefused(t *testing.T) {
 	}
 	for _, line := range []string{
 		"    - alpha (conductor): destination already exists — re-run with --force to merge, or move the destination aside",
-		"    - " + hb.Label + " is managed externally and points at " + from + "; change its manager's configuration first",
+		"    - " + hb.Error() + "; migrate-dir cannot repoint it, so it moves nothing while it is installed: remove it from its manager and re-run migrate-dir, which installs agent-deck's own heartbeat agent for alpha if its heartbeat is enabled",
 		"  Note: this plan would be REFUSED as-is — resolve the blockers above first.",
 	} {
 		assertStdoutHasLine(t, stdout, line)

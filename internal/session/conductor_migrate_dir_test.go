@@ -794,11 +794,15 @@ func TestDetectConductorDirSplitBrain(t *testing.T) {
 // current paths. When another manager owns one (read-only here, as home-manager
 // leaves it), agent-deck may not rewrite it, so the plan refuses the move. The
 // dry-run reports the blocker, --apply refuses it, and neither changes anything.
+// The blocker says what clears it, and that differs by agent: a bridge removed
+// from its manager is added back by hand, pointing at the target, while a
+// heartbeat agent removed from its manager comes back as agent-deck's own.
 func TestMigrateConductorDir_ExternalAgentBlocksMove(t *testing.T) {
 	rows := []struct {
-		name  string
-		units []string                     // HOME-relative paths of the 0444 units
-		probe func() *ExternalServiceError // what the probe reports for them on this host
+		name   string
+		units  []string                     // HOME-relative paths of the 0444 units
+		probe  func() *ExternalServiceError // what the probe reports for them on this host
+		remedy func(target string) string   // what the blocker says after the agent's own error, for a move to target
 	}{
 		{
 			name: "bridge",
@@ -807,6 +811,9 @@ func TestMigrateConductorDir_ExternalAgentBlocksMove(t *testing.T) {
 				".config/systemd/user/" + systemdBridgeServiceName,
 			},
 			probe: BridgeDaemonExternal,
+			remedy: func(target string) string {
+				return "; migrate-dir cannot repoint it, so it moves nothing while it is installed: remove it from its manager, re-run migrate-dir, then add it back pointing at " + target
+			},
 		},
 		{
 			name: "heartbeat",
@@ -816,6 +823,9 @@ func TestMigrateConductorDir_ExternalAgentBlocksMove(t *testing.T) {
 				".config/systemd/user/" + SystemdHeartbeatTimerName("alpha"),
 			},
 			probe: func() *ExternalServiceError { return HeartbeatDaemonExternal("alpha") },
+			remedy: func(string) string {
+				return "; migrate-dir cannot repoint it, so it moves nothing while it is installed: remove it from its manager and re-run migrate-dir, which installs agent-deck's own heartbeat agent for alpha if its heartbeat is enabled"
+			},
 		},
 	}
 	for _, row := range rows {
@@ -839,8 +849,8 @@ func TestMigrateConductorDir_ExternalAgentBlocksMove(t *testing.T) {
 			if ext == nil {
 				t.Fatal("probe reports no external unit for the 0444 fixture")
 			}
-			want := ext.Label + " is managed externally and points at " + defaultBase + "; change its manager's configuration first"
 			target := filepath.Join(t.TempDir(), "vault-conductors")
+			want := ext.Error() + row.remedy(target)
 
 			for _, apply := range []bool{false, true} {
 				res, err := MigrateConductorDir(ConductorDirMigrateOptions{Target: target, Apply: apply})
@@ -942,7 +952,7 @@ func TestMigrateConductorDir_ExternalHeartbeatBlocksForcedMerge(t *testing.T) {
 	if ext == nil {
 		t.Fatal("probe reports no external unit for the 0444 fixture")
 	}
-	want := ext.Label + " is managed externally and points at " + defaultBase + "; change its manager's configuration first"
+	want := ext.Error() + "; migrate-dir cannot repoint it, so it moves nothing while it is installed: remove it from its manager and re-run migrate-dir, which installs agent-deck's own heartbeat agent for alpha if its heartbeat is enabled"
 
 	for _, apply := range []bool{false, true} {
 		res, err := MigrateConductorDir(ConductorDirMigrateOptions{Target: target, Apply: apply, Force: true})
