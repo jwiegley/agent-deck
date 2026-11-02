@@ -1157,10 +1157,12 @@ agent-deck conductor list [--profile <name>]
 - `setup` creates `<conductor dir>/<name>/` plus `meta.json` (conductor dir: `[conductor].dir`, else `~/.local/share/agent-deck/conductor`, with legacy `~/.agent-deck/conductor` as a fallback) and registers `conductor-<name>` session in the selected profile.
 - Re-running `setup <name>` without `--agent` keeps the conductor's existing agent (new conductors default to `claude`); pass `--agent` explicitly to switch. On a switch, the previous agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `HERMES.md`) is deleted only if it still matches the generated template; an edited file is renamed to `<file>.bak-<timestamp>`.
 - `setup` also installs shared `<conductor dir>/CLAUDE.md` (or symlink via `--shared-claude-md`).
-- Heartbeat timers run per conductor (default every 15 minutes) and can be disabled with `--no-heartbeat`.
+- Heartbeat timers run per conductor (default every 15 minutes) and can be disabled with `--no-heartbeat`. Setup keeps a `heartbeat.sh` that is not agent-deck's generated script, printing `[skip] heartbeat.sh has local changes; left unchanged`.
 - Heartbeat sends use non-blocking `session send --no-wait -q` to avoid timeout churn when sessions are busy.
-- Bridge daemon is installed only when Telegram and/or Slack is configured in `[conductor]`.
+- With a chat channel configured (Telegram, Slack, Discord or Mattermost), setup installs `bridge.py` and the bridge daemon. It writes `bridge.py` only when the file is missing, equals the shipped bridge, or is unchanged since agent-deck wrote it (agent-deck records its sha256 in `.bridge.py.sha256` and keeps the copy it replaces as `.bridge.py.previous`). Any other `bridge.py`, including one written before the stamp existed, or a symlink, is left as is, with a `[skip] bridge.py ...` line.
 - Transition notifier daemon (`agent-deck notify-daemon`) is installed by setup and sends event nudges on `running -> waiting|error|idle` transitions (parent first, then conductor fallback).
+- A bridge, transition-notifier or heartbeat plist or unit that is read-only or a symlink is managed externally: setup never unloads, rewrites or reloads it, and prints `[skip] <label>: managed externally (read-only)` (or `(symlink)`). With an external bridge agent, setup also leaves the Python dependencies to that agent's manager.
+- `setup --json` adds `bridge_script` (`installed`, `updated`, `unchanged` or `kept`; with a chat channel) and `external` (the labels of the agents left alone; `[]` when none).
 
 ### notify / outbox / tier-filter - What reaches the human (#2469)
 

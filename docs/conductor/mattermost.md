@@ -36,7 +36,7 @@ Answer **y** at the Mattermost prompt and provide:
 - **Your username** — the only person the bot obeys
 - **Channel ID** — leave blank to use a DM between you and the bot
 
-Setup installs `aiohttp` for the bridge; the bridge needs nothing else for Mattermost.
+Setup installs `aiohttp` for the bridge (unless the bridge agent is managed externally, with a read-only or symlinked plist or unit: its manager then provides it); the bridge needs nothing else for Mattermost.
 
 ### 3. Restart the conductor
 

@@ -702,7 +702,7 @@ ops: check the frontend session      → routes to conductor-ops (reply in threa
 
 Both Telegram and Slack can run simultaneously — the bridge daemon handles both concurrently and relays responses on-demand, plus periodic heartbeat alerts to configured platforms.
 
-**Built-in status-driven notifications**: conductor setup also installs a transition notifier daemon (`agent-deck notify-daemon`) that watches status transitions and sends parent nudges when child sessions move `running -> waiting|error|idle`.
+**Built-in status-driven notifications**: conductor setup also installs a transition notifier daemon (`agent-deck notify-daemon`) that watches status transitions and sends parent nudges when child sessions move `running -> waiting|error|idle`. A notifier plist or unit that is read-only or a symlink is managed externally: setup leaves it alone and prints `[skip] <label>: managed externally (...)`.
 
 Dispatch can be suppressed at two scopes (PR #580, v1.7.34):
 
