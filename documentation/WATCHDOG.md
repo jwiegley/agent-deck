@@ -130,6 +130,8 @@ cat > ~/Library/LaunchAgents/com.agentdeck.watchdog.plist <<'EOF'
   </array>
   <key>RunAtLoad</key>            <true/>
   <key>KeepAlive</key>            <true/>
+  <!-- Run like an app: sessions inherit the limits of the job that starts their tmux server -->
+  <key>ProcessType</key>          <string>Interactive</string>
   <key>StandardOutPath</key>      <string>/tmp/agent-deck-watchdog.stdout.log</string>
   <key>StandardErrorPath</key>    <string>/tmp/agent-deck-watchdog.stderr.log</string>
 </dict>
