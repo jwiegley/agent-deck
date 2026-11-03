@@ -131,11 +131,6 @@ func runRestartAllSelfHandoffHelper(t *testing.T, handler, scenario string) {
 	self.Status = session.StatusStopped
 	if scenario == "inactive" {
 		self.Status = session.StatusRunning
-	} else {
-		if err := self.GetTmuxSession().Start("sleep 60"); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = self.GetTmuxSession().Kill() })
 	}
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
@@ -144,6 +139,17 @@ func runRestartAllSelfHandoffHelper(t *testing.T, handler, scenario string) {
 	if err := storage.SaveWithGroups([]*session.Instance{stale, self}, nil); err != nil {
 		_ = storage.Close()
 		t.Fatal(err)
+	}
+	if scenario != "inactive" {
+		// This fork's runtime authority restarts only a live session whose
+		// ownership stamp proves it is the row's runtime generation, so the
+		// pane is spawned through the runtime path rather than by raw tmux.
+		self.Command = "sleep 60"
+		if err := self.Start(); err != nil {
+			_ = storage.Close()
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = self.GetTmuxSession().Kill() })
 	}
 	if err := storage.Close(); err != nil {
 		t.Fatal(err)

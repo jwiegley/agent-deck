@@ -555,38 +555,63 @@ func TestIssue2954_FailedSpawnLeavesNoToken(t *testing.T) {
 func TestIssue2954_RestartLeavesNoToken(t *testing.T) {
 	t.Run("resuming a conversation", func(t *testing.T) { restartLeavesNoToken(t, "--resume") })
 	t.Run("never interacted", func(t *testing.T) { restartLeavesNoToken(t, "--session-id") })
-	// A failed restart started nothing: the start's token stays. A restart
-	// that lost the spawn lock to a concurrent Start spawned nothing either:
-	// that Start keeps its token, written after the restart read the token
-	// (won) or before (startFirst, Start already holding the lock).
-	for name, c := range map[string]struct {
-		account         string
-		won, startFirst bool
-	}{"a failed restart": {account: "no-such-slot"}, "lost the spawn lock to a concurrent start": {won: true},
-		"lost the spawn lock to a start that wrote its token first": {startFirst: true}} {
+	// A failed restart started nothing: the start's token stays.
+	t.Run("a failed restart", func(t *testing.T) {
+		home := isolatedHomeDir(t)
+		inst := newGuardInstance(t, home)
+		inst.Account = "no-such-slot"
+		old := time.Now().Add(-time.Minute)
+		writeTokenFile(freshStartDir, inst.ID, ".json", freshStartToken{At: old})
+		if err := inst.Restart(); err == nil {
+			t.Fatal("precondition: the restart must fail")
+		}
+		if tok, ok := readFreshStartToken(inst.ID); !ok || !tok.At.Equal(old) {
+			t.Fatalf("token %+v (%v), want the one at %v", tok, ok, old)
+		}
+	})
+	// This fork has no spawn-lock loser: a restart that waited out a
+	// concurrent start adopts the runtime generation that start committed
+	// (beginRuntimeTransition) and spawns nothing. That start keeps its
+	// token, written after the restart read the token (won) or before.
+	for name, won := range map[string]bool{
+		"lost the spawn lock to a concurrent start":                 true,
+		"lost the spawn lock to a start that wrote its token first": false,
+	} {
 		t.Run(name, func(t *testing.T) {
-			home := isolatedHomeDir(t)
-			inst := newGuardInstance(t, home)
-			inst.Account = c.account
+			isolatedHomeDir(t)
+			installRuntimeLifecycleTestSeams(t)
+			db, inst := runtimeLifecycleTestDB(t, "pi", nil)
 			old := time.Now().Add(-time.Minute)
 			writeTokenFile(freshStartDir, inst.ID, ".json", freshStartToken{At: old})
 			newer := time.Now()
-			prevLock := instanceSpawnLockAcquireFn
-			t.Cleanup(func() { instanceSpawnLockAcquireFn = prevLock })
-			instanceSpawnLockAcquireFn = func(id string) (func(), error) {
-				if c.won { // the concurrent Start, done while this restart waited
-					writeTokenFile(freshStartDir, id, ".json", freshStartToken{At: newer})
-				}
-				if c.won || c.startFirst {
-					recordInstanceSpawn(id)
-				}
-				return prevLock(id)
+			initial, found, err := db.ReadRuntimeState(inst.ID)
+			if err != nil || !found {
+				t.Fatalf("read runtime: found=%v err=%v", found, err)
 			}
-			if err := inst.Restart(); (err != nil) != (c.account != "") {
-				t.Fatalf("precondition: restart error %v", err)
+			winner := initial
+			winner.Generation++
+			winner.TmuxSession = "runtime-concurrent-start"
+			published := false
+			runtimeTransitionObservedFn = func() {
+				if published {
+					return
+				}
+				published = true
+				if won { // the concurrent start, done while this restart waited
+					writeTokenFile(freshStartDir, inst.ID, ".json", freshStartToken{At: newer})
+				}
+				if err := db.CommitRuntimeTransition(initial.Generation, inst.PersistenceIncarnation(), winner); err != nil {
+					t.Errorf("commit the concurrent start: %v", err)
+				}
+			}
+			if err := inst.Restart(); err != nil {
+				t.Fatalf("restart: %v", err)
+			}
+			if got := inst.RuntimeState().Generation; got != winner.Generation {
+				t.Fatalf("precondition: the restart adopted generation %d, want the start's %d", got, winner.Generation)
 			}
 			want := old
-			if c.won {
+			if won {
 				want = newer
 			}
 			if tok, ok := readFreshStartToken(inst.ID); !ok || !tok.At.Equal(want) {

@@ -204,7 +204,7 @@ func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *tes
 		"storages", "lastStatus", "initialized", "livePrior", "lastDone", "lastTurn",
 		"journaledRun", "lastSelfTurn", "lastDoneScan", "journalWriters", "lastJournaled", "pollState",
 		"ledgers", "ledgerLocks", "ledgerOpenFailed", "commsPrompts", "lastImportPrune",
-		"idleExitPending", "idleExitTold",
+		"idleExitPending", "idleExitTold", "codexTurns",
 	}
 	profilePipeKeyed := []string{"lastProbeStall", "lastDesktopNotify"}
 	// Keyed by instance: a deleted profile's instances (as lastStatus lists
@@ -221,6 +221,9 @@ func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *tes
 	}
 	if d.idleExitTold == nil {
 		d.idleExitTold = map[string]map[string]bool{}
+	}
+	if d.codexTurns == nil {
+		d.codexTurns = map[string]map[string]*codexTurnTrack{}
 	}
 	if d.orphansEmitted == nil {
 		d.orphansEmitted = map[string]map[string]bool{}
@@ -249,6 +252,7 @@ func TestRuntimeLifecycle_DaemonPruneDeletedProfileRetiresEveryProfileMap(t *tes
 		d.lastImportPrune[profile] = time.Now()
 		d.idleExitPending[profile] = map[string]idleExitEntry{"worker": {}}
 		d.idleExitTold[profile] = map[string]bool{"worker": true}
+		d.codexTurns[profile] = map[string]*codexTurnTrack{"worker": {}}
 		d.lastProbeStall[profile+"|worker"] = time.Now()
 		d.lastDesktopNotify[profile+"|worker"] = "waiting"
 	}

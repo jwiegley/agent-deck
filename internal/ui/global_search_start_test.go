@@ -32,6 +32,10 @@ func TestGlobalSearchStart_RunsConfiguredClaudeWithConversationID(t *testing.T) 
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed")
 	}
+	// An instance no storage seeded falls back to the process-global state
+	// database for its runtime record. Keep that fallback empty here, as
+	// TestIssue2199_QuickCreatePreservesCustomTool does.
+	detachGlobalStateDB(t)
 
 	cases := []struct {
 		name       string

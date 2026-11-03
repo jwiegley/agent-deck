@@ -126,9 +126,13 @@ func TestFullSave_OwnAckChangeWins(t *testing.T) {
 	}
 }
 
-// A full save that writes status "running" is a running write: like
-// WriteStatus it clears the seen mark and its visit time together.
-func TestFullSave_RunningStatusClearsSeenMark(t *testing.T) {
+// Upstream treats a full save that writes status "running" as a running
+// write. In this fork status is runtime-owned (instance_runtime_state): a full
+// save never writes it, and every runtime write to running clears the seen
+// mark and its visit time together (TestRunningWrite_ClearsAcknowledgedAt).
+// So a full save carrying "running" is not a running write: it leaves the
+// stored status and the seen mark alone, as every other full save does.
+func TestFullSave_RunningStatusKeepsRuntimeStatusAndSeenMark(t *testing.T) {
 	for _, upsert := range []bool{false, true} {
 		a, b := openSharedPair(t)
 		if err := a.SaveInstance(ackTestRow("waiting")); err != nil {
@@ -146,8 +150,8 @@ func TestFullSave_RunningStatusClearsSeenMark(t *testing.T) {
 		if err != nil {
 			t.Fatalf("save: %v", err)
 		}
-		if got := readAck(t, a); got.Acknowledged || !got.AcknowledgedAt.IsZero() {
-			t.Fatalf("upsert=%v: running full save kept the seen mark: %+v", upsert, got)
+		if got := readAck(t, a); got.Status != "waiting" || !got.Acknowledged || got.AcknowledgedAt.IsZero() {
+			t.Fatalf("upsert=%v: a full save carrying running changed the runtime status or the seen mark: %+v", upsert, got)
 		}
 	}
 }
