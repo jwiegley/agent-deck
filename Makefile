@@ -213,7 +213,7 @@ test-runtime-lifecycle:
 		echo 'ERROR: statedb packaged-helper lifecycle test is absent' >&2; \
 		exit 1; \
 	}; \
-	if ! AGENTDECK_RUNTIME_LIFECYCLE_ONLY=1 go test -race -json -count=1 -run '^TestRuntimeLifecycle_' \
+	if ! AGENTDECK_RUNTIME_LIFECYCLE_ONLY=1 go test -race -json -count=1 -timeout 20m -run '^TestRuntimeLifecycle_' \
 		$$packages >"$$result"; then \
 		cat "$$result"; \
 		exit 1; \

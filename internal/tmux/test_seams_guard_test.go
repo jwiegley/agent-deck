@@ -29,6 +29,11 @@ var crossPackageTestSeams = map[string]bool{
 	"SetServerAliveForTest":          true,
 	"SetStartupAtForTest":            true,
 	"StaleSocketForTest":             true,
+	// This fork's runtime lifecycle tests in internal/session drive the
+	// foreign-server guard and the session-presence cache through these.
+	"SeedSessionPresenceForTest":        true,
+	"SessionPresenceCachedForTest":      true,
+	"StageDefaultServerSessionsForTest": true,
 }
 
 // TestNoNewExportedTestSeamsInProductionFiles parses every non-test .go file

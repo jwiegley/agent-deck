@@ -90,21 +90,6 @@ func ExpireStartupWindowForTest(t testing.TB, s *Session) {
 	s.mu.Unlock()
 }
 
-// ResetDefaultServerSessionsForTest drops the foreign-server guard's cached
-// default-server listing (foreign_server.go), now and at cleanup, so a test
-// that stages a default server is not answered from a listing up to
-// defaultServerSessionsTTL old.
-func ResetDefaultServerSessionsForTest(t testing.TB) {
-	t.Helper()
-	reset := func() {
-		defaultServerSessions.Lock()
-		defaultServerSessions.names, defaultServerSessions.err, defaultServerSessions.at = nil, nil, time.Time{}
-		defaultServerSessions.Unlock()
-	}
-	reset()
-	t.Cleanup(reset)
-}
-
 // StageDefaultServerSessionsForTest makes the foreign-server guard see a
 // default server that lists exactly names or, with a non-nil err, one this
 // process cannot list. It drops the cached listing now and restores the real
