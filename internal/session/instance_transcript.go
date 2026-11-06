@@ -956,10 +956,9 @@ func (i *Instance) GetJSONLPath() string {
 // for a session id under a specific config dir, or "" when none exists.
 // Optional additional working directories are exact candidates before the glob.
 //
-// It is exported for callers that must resolve a transcript against a
-// PER-INSTANCE config dir. GetJSONLPath resolves against the process-wide
-// GetClaudeConfigDir(), which agent-deck's account/conductor/group scoping and
-// per-session scratch homes make frequently wrong for a given instance.
+// It is exported for callers that must resolve a transcript against a config
+// dir of their own choosing, such as a per-session scratch home. GetJSONLPath
+// resolves against the instance's own config dir and then the process-wide one.
 func ResolveClaudeTranscriptPath(configDir, projectPath, sessionID string, additionalPaths ...string) string {
 	if configDir == "" || sessionID == "" {
 		return ""
@@ -980,7 +979,13 @@ func (i *Instance) getClaudeLastResponse() (*ResponseOutput, error) {
 		return nil, fmt.Errorf("instance %s runs on %s; its Claude transcript is not on this machine", i.ID, i.SSHHost)
 	}
 
-	sessionFile := resolveClaudeTranscriptPath(GetClaudeConfigDir(), i.ProjectPath, i.ClaudeSessionID, i.EffectiveWorkingDir())
+	// The transcript is under the config dir THIS instance resolves to
+	// (account, conductor, group, then env, profile and global), which need not
+	// be the dir the calling process resolves to: `session output` from a
+	// launchd job without CLAUDE_CONFIG_DIR must still find a group-scoped
+	// session's reply, as `session send --wait` already does. GetJSONLPath walks
+	// that chain and keeps the process-wide dir as the fallback (#2769).
+	sessionFile := i.GetJSONLPath()
 	if sessionFile == "" {
 		return nil, fmt.Errorf("session file not found for claude_session_id %s", i.ClaudeSessionID)
 	}
@@ -1020,8 +1025,24 @@ func (i *Instance) findLatestClaudeTranscriptOnDisk() (string, *ResponseOutput) 
 		return "", nil
 	}
 
-	configDir := GetClaudeConfigDir()
+	// The instance's own config dir first, then the process-wide dir when it
+	// differs: the same two roots, in the same order, as GetJSONLPath (#2769).
+	// A rollover written by an account-, conductor- or group-scoped session is
+	// under the former, and a caller whose environment lacks that scope (the
+	// conductor bridge's launchd job) must still find it there.
+	instanceDir := GetClaudeConfigDirForInstance(i)
+	if id, resp := i.findLatestClaudeTranscriptIn(instanceDir); resp != nil {
+		return id, resp
+	}
+	if globalDir := GetClaudeConfigDir(); globalDir != instanceDir {
+		return i.findLatestClaudeTranscriptIn(globalDir)
+	}
+	return "", nil
+}
 
+// findLatestClaudeTranscriptIn is findLatestClaudeTranscriptOnDisk's scan of
+// this instance's project directory under one Claude config dir.
+func (i *Instance) findLatestClaudeTranscriptIn(configDir string) (string, *ResponseOutput) {
 	resolvedPath := i.ProjectPath
 	if resolved, err := filepath.EvalSymlinks(i.ProjectPath); err == nil {
 		resolvedPath = resolved
