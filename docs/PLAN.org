@@ -295,6 +295,23 @@ Race suite on macOS/Nix reproduces these failures on unchanged HEAD in an isolat
 ]
 #+end_src
 
+* DONE [#C] Read a session's last response from its own Claude config dir
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-knr
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-05 Thu 21:30]
+:MODIFIED: [2026-11-05 Thu 21:30]
+:CREATED_BY: johnw
+:FINISHED: [2026-11-05 Thu 21:30]
+:CLOSE_REASON: Both readers resolve the instance's config dir first, then the process-wide dir, as GetJSONLPath does; four regression tests in internal/session
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+A session's last response was read from the Claude config dir the calling process resolves to, not the one the session resolves to. getClaudeLastResponse resolved the transcript under the process-wide GetClaudeConfigDir(), and findLatestClaudeTranscriptOnDisk, the rollover scan behind it, scanned the same dir; both ignored the account, conductor and group levels that GetJSONLPath has walked since #2769 and that `session send --wait` uses. The conductor bridge runs under launchd without CLAUDE_CONFIG_DIR, so on Hera (2026-11-05) its `session output --json` of a steward in the conductor group, whose transcripts live under the Positron config dir, found no transcript, GetLastResponseBestEffort fell through to the pane capture, and the steward's status line was relayed as its reply. Fix: both readers resolve the instance's own config dir first and keep the process-wide dir as the fallback, exactly as GetJSONLPath does. Regression tests: TestGetClaudeLastResponse_ReadsTheInstanceConfigDir, TestGetClaudeLastResponse_KeepsTheProcessWideFallback, TestFindLatestClaudeTranscriptOnDisk_ScansTheInstanceConfigDir and TestFindLatestClaudeTranscriptOnDisk_KeepsTheProcessWideFallback (internal/session). nix-config's agent-deck runtime-lifecycle check runs them by name.
+
 * DONE [#B] Bound tmux viewer queries and status mouse bindings
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
