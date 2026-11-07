@@ -284,7 +284,7 @@ func ParsePromptFromComposerBlock(lines []string) (string, bool) {
 		}
 
 		markerLen := 0
-		for _, marker := range []string{"❯", "›"} {
+		for _, marker := range composerMarkers {
 			if strings.HasPrefix(trimmed, marker) {
 				markerLen = len(marker)
 				break
@@ -336,7 +336,7 @@ func CurrentComposerPrompt(content string) (string, bool) {
 		if strings.TrimSpace(trimmed) == "" {
 			continue
 		}
-		for _, marker := range []string{"❯", "›"} {
+		for _, marker := range composerMarkers {
 			if strings.HasPrefix(trimmed, marker) {
 				return NormalizePromptText(strings.TrimSpace(trimmed[len(marker):])), true
 			}

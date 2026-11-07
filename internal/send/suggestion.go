@@ -44,8 +44,9 @@ import (
 // attributes off the RAW pane capture (tmux capture-pane -e, which
 // CapturePaneFresh already requests) before it is stripped.
 
-// composerMarkers are the prompt glyphs Claude renders at the composer.
-var composerMarkers = []string{"❯", "›"}
+// composerMarkers are the prompt glyphs Claude renders at the composer, and
+// the "»" Codex 0.167 and later draw at theirs (see codexComposerRow).
+var composerMarkers = []string{"❯", "›", "»"}
 
 // composerMarkerBody returns the remainder of line following the composer
 // marker, and whether a marker was present.

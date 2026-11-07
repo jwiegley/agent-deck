@@ -195,7 +195,7 @@ func isFooterLine(line string, i int, lines []string) bool {
 		return true
 	}
 	if strings.Contains(line, " · ") && (strings.Contains(line, "% left") || strings.Contains(line, "% used")) {
-		return i > 0 && strings.HasPrefix(strings.TrimSpace(lines[i-1]), "›")
+		return i > 0 && (strings.HasPrefix(strings.TrimSpace(lines[i-1]), "›") || strings.HasPrefix(strings.TrimSpace(lines[i-1]), "»"))
 	}
 	return false
 }

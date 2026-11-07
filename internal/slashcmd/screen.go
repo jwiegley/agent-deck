@@ -36,7 +36,7 @@ func composerInput(raw string) string {
 		b.WriteString(s.text)
 	}
 	body := b.String()
-	for _, marker := range []string{"❯", "›"} {
+	for _, marker := range []string{"❯", "›", "»"} {
 		if idx := strings.Index(body, marker); idx >= 0 {
 			body = body[idx+len(marker):]
 			break

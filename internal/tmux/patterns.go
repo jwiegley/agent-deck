@@ -83,7 +83,7 @@ func DefaultRawPatterns(toolName string) *RawPatterns {
 				"esc to interrupt",
 				"press esc to interrupt",
 			},
-			PromptPatterns: []string{"How can I help", "codex>", "Continue?", `re:(?m)^\s*›\s`},
+			PromptPatterns: []string{"How can I help", "codex>", "Continue?", `re:(?m)^\s*›\s`, `re:(?m)^\s*»\s`},
 		}
 	case "codewhale":
 		// codewhale CLI (deepseek-v4-pro TUI, #1577). The codex preset's
@@ -297,8 +297,9 @@ func DefaultRawPatterns(toolName string) *RawPatterns {
 
 // Codex error banners (status-light audit 2026-09-17, defect A). Codex renders
 // a terminal error as a line led by "■" and then redraws its composer
-// ("› Ask Codex to do anything") underneath, so prompt detection alone reads
-// the pane as an ordinary idle prompt. Captured live:
+// ("› Ask Codex to do anything", "» Ask Codex to do anything" from Codex
+// 0.167) underneath, so prompt detection alone reads the pane as an ordinary
+// idle prompt. Captured live:
 //
 //	■ You've hit your usage limit. To continue using Codex and get access to GPT-5.3-Codex, start a free
 //	trial of Plus today (https://chatgpt.com/explore/plus), or try again at Oct 10th, 2026 8:03 AM.
@@ -342,12 +343,25 @@ const (
 const codexComposerPlaceholder = "Ask Codex to do anything"
 
 // codexTurnGlyphs lead the lines that prove the session moved on after a
-// banner: "›" the echoed submitted prompt (and the composer), "•" an
-// assistant reply or tool call.
+// banner: "›" the echoed submitted prompt (and, before Codex 0.167, the
+// composer), "»" the composer from Codex 0.167, "•" an assistant reply or
+// tool call.
 const (
 	codexPromptGlyph    = "›"
+	codexComposerGlyph  = "»"
 	codexAssistantGlyph = "•"
 )
+
+// codexPromptCell reports whether line opens a user cell, the echoed prompt
+// or the composer, and returns its text without the glyph.
+func codexPromptCell(line string) (string, bool) {
+	for _, glyph := range []string{codexPromptGlyph, codexComposerGlyph} {
+		if strings.HasPrefix(line, glyph) {
+			return strings.TrimSpace(strings.TrimPrefix(line, glyph)), true
+		}
+	}
+	return "", false
+}
 
 // codexBusyCues are the codex busy patterns (see DefaultRawPatterns "codex"):
 // while one is on screen the session is visibly working, so no banner above
@@ -375,7 +389,7 @@ type codexLine struct {
 // Newest signal wins (review P1-2, the same rule the Claude scans apply): the
 // walk goes up from the bottom and stops at the first line that proves the
 // session continued after any banner above it — a submitted prompt ("› text"
-// above the composer, which is always the bottom-most "›" line), an
+// above the composer, which is always the bottom-most "›" or "»" line), an
 // assistant/tool line ("• …"), or a live busy cue anywhere in the tail. A
 // banner sitting directly above the composer is still an error.
 //
@@ -398,9 +412,9 @@ func scanCodexErrorBanner(content string) (kind, detail string) {
 	seenComposer := false
 	for i := len(recent) - 1; i >= 0; i-- {
 		line := recent[i].text
+		text, prompt := codexPromptCell(line)
 		switch {
-		case strings.HasPrefix(line, codexPromptGlyph):
-			text := strings.TrimSpace(strings.TrimPrefix(line, codexPromptGlyph))
+		case prompt:
 			if seenComposer && text != "" && !strings.HasPrefix(text, codexComposerPlaceholder) {
 				return "", "" // a later turn was submitted; anything above is history
 			}
@@ -416,7 +430,7 @@ func scanCodexErrorBanner(content string) (kind, detail string) {
 		case containsAny(lower, codexUsageLimitBannerPatterns):
 			banner := line
 			for j := i + 1; j < len(recent); j++ {
-				if strings.HasPrefix(recent[j].text, codexErrorBannerPrefix) || strings.HasPrefix(recent[j].text, codexPromptGlyph) {
+				if _, prompt := codexPromptCell(recent[j].text); prompt || strings.HasPrefix(recent[j].text, codexErrorBannerPrefix) {
 					break
 				}
 				banner += " " + recent[j].text

@@ -596,7 +596,9 @@ func (d *PromptDetector) hasCodexPromptMarker(content string) bool {
 	for _, line := range lastLines {
 		clean := strings.TrimSpace(StripANSI(line))
 		if clean == "›" || clean == "› " ||
-			strings.HasPrefix(clean, "› ") {
+			strings.HasPrefix(clean, "› ") ||
+			clean == "»" || clean == "» " ||
+			strings.HasPrefix(clean, "» ") {
 			return true
 		}
 	}

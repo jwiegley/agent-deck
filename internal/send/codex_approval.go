@@ -201,7 +201,7 @@ func detectCodexApprovalPrompt(content string) *codexApprovalPrompt {
 	var fingerprintLines []string
 	for i := contextStart; i <= lastOptionLine; i++ {
 		line := strings.TrimSpace(lines[i])
-		line = strings.TrimSpace(strings.TrimPrefix(line, "›"))
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "›"), "»"))
 		normalized := strings.Join(strings.Fields(line), " ")
 		if normalized != "" {
 			fingerprintLines = append(fingerprintLines, normalized)
