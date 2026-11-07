@@ -407,7 +407,7 @@ func composerHoldsWrappedBody(content, message string) bool {
 	last := -1
 	for i, line := range lines {
 		trimmed := strings.TrimLeft(line, " \t")
-		if strings.HasPrefix(trimmed, "❯") || strings.HasPrefix(trimmed, "›") {
+		if strings.HasPrefix(trimmed, "❯") || strings.HasPrefix(trimmed, "›") || strings.HasPrefix(trimmed, "»") {
 			last = i
 		}
 	}

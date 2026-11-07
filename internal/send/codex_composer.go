@@ -5,10 +5,13 @@ import "strings"
 // Codex composer introspection for the composer-draft guard (issues #1409,
 // #2536).
 //
-// Codex 0.15x and later draws its composer as the last column-0 "›" cell of
-// the frame (see codexCells). Wrapped and multi-line input continues on rows
-// indented two columns, and the model/context footer under the composer is
-// indented the same way, so the cell's final row is the footer, never input.
+// Codex 0.15x draws its composer as the last column-0 "›" cell of the frame
+// (see codexCells); Codex 0.167 and later draw the live composer with "»" and
+// keep "›" for the echoed messages above it, so the composer is the last "»"
+// row when one is drawn and the last "›" row otherwise. Wrapped and
+// multi-line input continues on rows indented two columns, and the
+// model/context footer under the composer is indented the same way, so the
+// cell's final row is the footer, never input.
 //
 // An empty composer shows a placeholder in the input row, rendered with the
 // SGR dim attribute ("Ask Codex to do anything", or one of the rotating
@@ -31,18 +34,12 @@ func CodexComposerDraft(raw string, strip func(string) string) (draft string, co
 	rawRows := strings.Split(raw, "\n")
 	rows := strings.Split(strip(raw), "\n")
 
-	start := -1
-	for i := len(rows) - 1; i >= 0; i-- {
-		if strings.HasPrefix(rows[i], codexPromptGlyph) {
-			start = i
-			break
-		}
-	}
+	start, glyph := codexComposerRow(rows)
 	if start < 0 {
 		return "", false
 	}
 
-	first := NormalizePromptText(strings.TrimPrefix(rows[start], codexPromptGlyph))
+	first := NormalizePromptText(strings.TrimPrefix(rows[start], glyph))
 	if first != "" {
 		if first == codexDefaultPlaceholder {
 			return "", true
@@ -81,4 +78,20 @@ func CodexComposerDraft(raw string, strip func(string) string) (draft string, co
 
 	parts := append([]string{first}, cont...)
 	return NormalizePromptText(strings.Join(parts, " ")), true
+}
+
+// codexComposerRow finds the composer's input row in ANSI-stripped rows and
+// the glyph that opens it: the last column-0 "»" row (Codex 0.167 and later),
+// else the last "›" row (Codex 0.15x, where the echoed messages and the
+// composer share the glyph and the composer is the bottom-most). On 0.167 the
+// last "›" row is the newest echoed message, which must never read as a draft.
+func codexComposerRow(rows []string) (int, string) {
+	for _, glyph := range []string{codexComposerGlyph, codexPromptGlyph} {
+		for i := len(rows) - 1; i >= 0; i-- {
+			if strings.HasPrefix(rows[i], glyph) {
+				return i, glyph
+			}
+		}
+	}
+	return -1, ""
 }
