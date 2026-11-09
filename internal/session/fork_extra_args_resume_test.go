@@ -19,6 +19,7 @@ package session
 //   - a stale pair already persisted in state.db is removed on load.
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -287,4 +288,45 @@ func TestExtraArgForkRepairViaSessionSetExtraArgs(t *testing.T) {
 	got.ClaudeDetectedAt = time.Now()
 	writeTranscript1349(t, got, forkOwnID, 3)
 	assertOwnResumeOnly(t, got.buildClaudeResumeCommand(), forkOwnID)
+}
+
+// The load-time repair is committed by the next save. The snapshot save
+// writes a tool_data key only when the caller changed it from the load
+// baseline, so a baseline taken after the repair kept the stale fork pair in
+// state.db: a later load without the session's own id (for example after
+// `session set <id> claude-session-id ""`) could no longer repair it, and
+// the next start re-forked the parent.
+func TestExtraArgForkSelfHealOnLoadIsPersistedByTheNextSave(t *testing.T) {
+	extraArgsTestEnv(t)
+	s := newTestStorage(t)
+
+	inst := newExtraArgFork(t)
+	inst.ID = "extra-arg-fork-persist"
+	inst.ClaudeSessionID = forkOwnID
+	inst.CreatedAt = time.Now()
+	if err := s.SaveWithGroups([]*Instance{inst}, nil); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	loaded, groups, err := s.LoadWithGroups()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := s.SaveWithGroups(loaded, NewGroupTreeWithGroups(loaded, groups)); err != nil {
+		t.Fatalf("save loaded: %v", err)
+	}
+
+	row, err := s.GetDB().LoadInstanceByID(inst.ID)
+	if err != nil || row == nil {
+		t.Fatalf("stored row = %v, err = %v", row, err)
+	}
+	var data struct {
+		ExtraArgs []string `json:"extra_args"`
+	}
+	if err := json.Unmarshal(row.ToolData, &data); err != nil {
+		t.Fatalf("tool_data: %v", err)
+	}
+	if got := strings.Join(data.ExtraArgs, " "); got != "--verbose" {
+		t.Fatalf("stored extra_args after load and save = %q, want the repaired \"--verbose\"", got)
+	}
 }

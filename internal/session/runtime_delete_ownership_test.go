@@ -514,4 +514,13 @@ func TestRuntimeLifecycle_TmuxKillSessionCommandTargetsTheExactSession(t *testin
 			t.Fatalf("kill command for %q/%q = %q, want %q", tc.socket, tc.session, got, tc.want)
 		}
 	}
+
+	// A socket served by a [tmux.binaries] tmux needs that client: another
+	// version's client gets "server exited unexpectedly" from its server.
+	tmux.SetSocketBinaries(map[string]string{"deck36": "/opt/tmux 3.6a/bin/tmux"})
+	t.Cleanup(func() { tmux.SetSocketBinaries(nil) })
+	got := tmuxKillSessionCommand(statedb.RuntimeState{TmuxSocketName: "deck36", TmuxSession: "agentdeck_w"})
+	if want := "'/opt/tmux 3.6a/bin/tmux' -L deck36 kill-session -t =agentdeck_w"; got != want {
+		t.Fatalf("kill command on a configured socket = %q, want %q", got, want)
+	}
 }

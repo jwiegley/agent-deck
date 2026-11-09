@@ -4030,8 +4030,9 @@ type TmuxSettings struct {
 	// server, run the "tmux" on PATH. A tmux client only talks to a server
 	// of its own version, so this lets a newer tmux (e.g. 3.6 for
 	// indic_zero_width_marks) serve one socket while older servers keep
-	// running, without changing PATH. Move a session onto that socket with
-	// `agent-deck session set <id> tmux-socket <name>` while it is stopped.
+	// running, without changing PATH. Start a session on that socket with
+	// `agent-deck add --tmux-socket <name>` (or launch); this build refuses
+	// `session set <id> tmux-socket`, since the socket is runtime-owned.
 	// Example:
 	//   [tmux]
 	//   socket_name = "deck36"

@@ -280,6 +280,17 @@ func TestConductorRecoveryComposerIsBodyWrapped(t *testing.T) {
 	if got := classifyConductorRecoveryComposer(pane+"\noperator line", nil, message); got != recoveryComposerOther {
 		t.Fatalf("body with trailing text classified %v", got)
 	}
+
+	// Codex 0.167 and later draw the live composer with "»" and keep "›" for
+	// the messages echoed above it, so the composer is the » row, not the
+	// nearest › above the wrapped body.
+	codexPane := "› an earlier prompt echoed in the transcript\n\n" + strings.Replace(pane, "❯ ", "» ", 1)
+	if got := classifyConductorRecoveryComposer(codexPane, nil, message); got != recoveryComposerHoldsBody {
+		t.Fatalf("Codex 0.167 wrapped body classified %v", got)
+	}
+	if got := classifyConductorRecoveryComposer(codexPane+"\noperator line", nil, message); got != recoveryComposerOther {
+		t.Fatalf("Codex 0.167 body with trailing text classified %v", got)
+	}
 }
 
 func TestConductorRecoveryMenuNeverReceivesInput(t *testing.T) {

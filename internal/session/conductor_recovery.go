@@ -219,7 +219,9 @@ func conductorRecoveryComposerIsBody(content, draft, message string) bool {
 	lines := strings.Split(content, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		trimmed := strings.TrimLeft(lines[i], " \t")
-		for _, marker := range []string{"❯", "›"} {
+		// Codex 0.167 and later draw the live composer with "»" and keep "›"
+		// for the messages echoed above it (send's composerMarkers).
+		for _, marker := range []string{"❯", "›", "»"} {
 			if strings.HasPrefix(trimmed, marker) {
 				tail := trimmed[len(marker):] + "\n" + strings.Join(lines[i+1:], "\n")
 				return compact(tail) == want

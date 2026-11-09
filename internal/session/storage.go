@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -1878,10 +1879,28 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 		for _, row := range dbRows {
 			byID[row.ID] = row
 		}
+		// The load-time extra_args repair (healStaleClaudeSelectorExtraArgs)
+		// is migration intent, like the legacy group path below. The
+		// snapshot merge writes a tool_data key only when the caller changed
+		// it from this baseline, so the baseline keeps the stored list and
+		// the next save commits the repair.
+		storedExtraArgs := make(map[string][]string, len(data.Instances))
+		for _, d := range data.Instances {
+			storedExtraArgs[d.ID] = d.ExtraArgs
+		}
 		for _, inst := range instances {
 			original, convertErr := instanceToRow(inst)
 			if convertErr != nil {
 				return nil, nil, nil, convertErr
+			}
+			if storedArgs, ok := storedExtraArgs[inst.ID]; ok && !slices.Equal(storedArgs, inst.ExtraArgs) {
+				repaired := inst.ExtraArgs
+				inst.ExtraArgs = storedArgs
+				original, convertErr = instanceToRow(inst)
+				inst.ExtraArgs = repaired
+				if convertErr != nil {
+					return nil, nil, nil, convertErr
+				}
 			}
 			stored := byID[inst.ID]
 			if stored != nil && stored.GroupPath == DefaultGroupName {

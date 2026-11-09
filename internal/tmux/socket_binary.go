@@ -24,7 +24,8 @@ import (
 // systemd-run), attach, control-mode pipes, and the version probe that
 // gates features such as codepoint-widths. Sockets not in the map, and the
 // default server, keep the bare "tmux" from PATH, so sessions move to a new
-// server one at a time (see `session set <id> tmux-socket <name>`).
+// server one at a time (new sessions take --tmux-socket; this build refuses
+// `session set <id> tmux-socket`, whose socket is runtime-owned).
 var (
 	socketBinariesMu sync.RWMutex
 	socketBinaries   map[string]string

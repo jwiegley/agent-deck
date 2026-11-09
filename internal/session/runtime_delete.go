@@ -152,12 +152,18 @@ func requireSelectedRuntimeGone(db *statedb.StateDB, operation string, expected 
 // tmuxKillSessionCommand is the command that ends the selected session by
 // hand: its own socket ("" is tmux's native default socket, which tmux names
 // "default") and an exact "=" target that no similarly named session answers.
+// A socket served by a [tmux.binaries] tmux is named with that client, since
+// another version's client cannot talk to its server.
 func tmuxKillSessionCommand(state statedb.RuntimeState) string {
+	client := "tmux"
+	if configured, ok := tmux.ConfiguredBinary(state.TmuxSocketName); ok {
+		client = shellescape.Quote(configured)
+	}
 	socket := state.TmuxSocketName
 	if socket == "" {
 		socket = "default"
 	}
-	return "tmux -L " + shellescape.Quote(socket) + " kill-session -t " + shellescape.Quote("="+state.TmuxSession)
+	return client + " -L " + shellescape.Quote(socket) + " kill-session -t " + shellescape.Quote("="+state.TmuxSession)
 }
 
 // legacyRuntimeAdoptionOffered reports whether `session adopt-runtime` can

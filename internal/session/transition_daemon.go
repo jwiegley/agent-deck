@@ -631,6 +631,7 @@ func (d *TransitionDaemon) pruneDeletedProfiles(profiles []string) {
 	retireProfiles(d.initialized, active, nil)
 	retireProfiles(d.livePrior, active, nil)
 	retireProfiles(d.lastDone, active, nil)
+	retireProfiles(d.lastSuppressedDone, active, nil)
 	retireProfiles(d.lastTurn, active, nil)
 	retireProfiles(d.journaledRun, active, nil)
 	retireProfiles(d.lastSelfTurn, active, nil)
@@ -660,6 +661,9 @@ func (d *TransitionDaemon) pruneDeletedProfiles(profiles []string) {
 	retireProfiles(d.codexTurns, active, nil)
 	retireProfileKeys(d.lastProbeStall, active)
 	retireProfileKeys(d.lastDesktopNotify, active)
+	// SyncOnce's pruneDormantProfiles also forgets them, but only after the
+	// pass; retire them with the rest of the deleted profile's state.
+	retireProfiles(d.dormant, active, nil)
 	if d.selfheal != nil {
 		d.selfheal.pruneProfiles(active)
 	}

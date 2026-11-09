@@ -89,11 +89,28 @@ func TestRuntimeLifecycle_ClaudeCanForkAfterRepeatedObservationPastWindow(t *tes
 	}
 
 	// Once that runtime has stopped, the binding is as stale as upstream's
-	// detection time: nothing confirmed it within the last five minutes.
+	// detection time: nothing confirmed it within the last five minutes, and
+	// with no transcript on disk nothing else lets it fork.
 	claudeForkStop(t, storage, inst)
 	if inst.CanFork() {
 		t.Fatal("CanFork() = true for a binding whose runtime stopped after its last confirmation aged out")
 	}
+	// Upstream's #3032 fallback: `claude --resume <id> --fork-session` needs
+	// the transcript, not a recent detection.
+	claudeForkTranscript(t, inst)
+	if !inst.CanFork() {
+		t.Fatal("CanFork() = false for a stopped binding whose transcript is on disk (#3032)")
+	}
+}
+
+// claudeForkTranscript writes inst's Claude transcript where CanFork's #3032
+// fallback looks for it, under a Claude config dir private to the test.
+func claudeForkTranscript(t *testing.T, inst *Instance) {
+	t.Helper()
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+	writeIssue3032Transcript(t, GetClaudeConfigDirForInstance(inst), inst.ProjectPath, inst.ClaudeSessionID)
 }
 
 func TestRuntimeLifecycle_ClaudeCanForkFreshLoadFromDB(t *testing.T) {
@@ -110,7 +127,7 @@ func TestRuntimeLifecycle_ClaudeCanForkFreshLoadFromDB(t *testing.T) {
 	want := map[string]bool{
 		"fork-load-live":         true,  // live runtime, current binding
 		"fork-load-just-stopped": true,  // upstream forks a session detected within 5 minutes
-		"fork-load-long-stopped": false, // upstream refuses once detection is 5 minutes old
+		"fork-load-long-stopped": false, // past 5 minutes, and no transcript on disk (#3032 would fork one)
 	}
 	for _, inst := range loaded {
 		wantFork, ok := want[inst.ID]
@@ -148,5 +165,13 @@ func TestRuntimeLifecycle_ClaudeCanForkSupersededBindingKeepsDetectionWindow(t *
 	inst.RuntimeGeneration = binding.Generation + 1
 	if inst.CanFork() {
 		t.Fatal("CanFork() = true for a binding superseded by a newer runtime generation")
+	}
+
+	// With its transcript on disk it forks, as an unconfirmed upstream id
+	// does since #3032: the fork resumes that conversation, whatever the
+	// newer generation runs.
+	claudeForkTranscript(t, inst)
+	if !inst.CanFork() {
+		t.Fatal("CanFork() = false for a superseded binding whose transcript is on disk (#3032)")
 	}
 }

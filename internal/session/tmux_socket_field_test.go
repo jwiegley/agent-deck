@@ -2,59 +2,42 @@ package session
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
-func stubTmuxSessionRunning(t *testing.T, running bool) {
-	t.Helper()
-	prev := tmuxSessionRunning
-	tmuxSessionRunning = func(*Instance) bool { return running }
-	t.Cleanup(func() { tmuxSessionRunning = prev })
-}
-
-// A stopped session moves to another tmux socket: the stored socket and the
-// tmux handle both change, so the next start creates it there.
-func TestSetField_TmuxSocket_MovesStoppedSession(t *testing.T) {
-	stubTmuxSessionRunning(t, false)
-	inst := &Instance{ID: "w1", tmuxSession: &tmux.Session{Name: "agentdeck_w1"}}
-
-	old, _, err := SetField(inst, FieldTmuxSocket, " deck36 ", nil)
-	if err != nil {
-		t.Fatalf("SetField: %v", err)
-	}
-	if old != "" || inst.TmuxSocketName != "deck36" || inst.GetTmuxSession().SocketName != "deck36" {
-		t.Fatalf("old=%q stored=%q handle=%q, want \"\" deck36 deck36", old, inst.TmuxSocketName, inst.GetTmuxSession().SocketName)
-	}
-
-	// '' moves it back to the default server.
-	if _, _, err := SetField(inst, FieldTmuxSocket, "", nil); err != nil || inst.TmuxSocketName != "" || inst.GetTmuxSession().SocketName != "" {
-		t.Fatalf("back to default: err=%v stored=%q", err, inst.TmuxSocketName)
+// Moving an existing session to another tmux socket is refused, stopped or
+// not. Upstream changes the stored socket and the tmux handle in memory, and
+// the CLI then saves with SaveWithGroups. Here the socket is part of the
+// durable runtime (instance_runtime_state.tmux_socket_name): the snapshot save
+// never writes it and the next start re-adopts the stored socket, so a
+// "moved" session would start on the old server after the CLI said
+// "Updated".
+func TestSetField_TmuxSocket_RefusesMovingAnExistingSession(t *testing.T) {
+	for _, target := range []string{"deck36", ""} {
+		inst := &Instance{ID: "w1", TmuxSocketName: "old", tmuxSession: &tmux.Session{Name: "agentdeck_w1", SocketName: "old"}}
+		_, _, err := SetField(inst, FieldTmuxSocket, " "+target+" ", nil)
+		var me *MutationError
+		if !errors.As(err, &me) || !strings.Contains(me.Msg, "--tmux-socket") {
+			t.Fatalf("move to %q: want a MutationError pointing at --tmux-socket, got %v", target, err)
+		}
+		if inst.TmuxSocketName != "old" || inst.GetTmuxSession().SocketName != "old" {
+			t.Fatalf("move to %q changed the socket on refusal: %q / %q", target, inst.TmuxSocketName, inst.GetTmuxSession().SocketName)
+		}
 	}
 }
 
-// A running session is refused: its pane would be stranded on the old server.
-func TestSetField_TmuxSocket_RefusedWhileRunning(t *testing.T) {
-	stubTmuxSessionRunning(t, true)
+// Setting the socket a session already has is a no-op, not a refusal.
+func TestSetField_TmuxSocket_SameSocketIsANoOp(t *testing.T) {
 	inst := &Instance{ID: "w2", TmuxSocketName: "old", tmuxSession: &tmux.Session{Name: "agentdeck_w2", SocketName: "old"}}
-
-	_, _, err := SetField(inst, FieldTmuxSocket, "deck36", nil)
-	var me *MutationError
-	if !errors.As(err, &me) {
-		t.Fatalf("want MutationError, got %v", err)
-	}
-	if inst.TmuxSocketName != "old" || inst.GetTmuxSession().SocketName != "old" {
-		t.Fatalf("socket changed on refusal: %q / %q", inst.TmuxSocketName, inst.GetTmuxSession().SocketName)
-	}
-	// Setting the socket it already has is a no-op, not a refusal.
-	if _, _, err := SetField(inst, FieldTmuxSocket, "old", nil); err != nil {
-		t.Fatalf("same socket: %v", err)
+	if old, _, err := SetField(inst, FieldTmuxSocket, "old", nil); err != nil || old != "old" {
+		t.Fatalf("same socket: old=%q err=%v", old, err)
 	}
 }
 
 func TestSetField_TmuxSocket_RejectsPathsAndJunk(t *testing.T) {
-	stubTmuxSessionRunning(t, false)
 	for _, bad := range []string{"../x", "/tmp/sock", "a b", "-L", "x;y"} {
 		inst := &Instance{ID: "w3"}
 		if _, _, err := SetField(inst, FieldTmuxSocket, bad, nil); err == nil {

@@ -69,11 +69,13 @@ const (
 	// switched on purpose (value = reason) for DefaultIntendedSwitchTTL, for a
 	// switch made in the TUI. Empty clears. Live. See intended_switch.go.
 	FieldIntendedSwitch = "intended-switch"
-	// FieldTmuxSocket moves a STOPPED session to another tmux -L socket
-	// ("" = the default server). The next start creates its tmux session
-	// there, with that socket's [tmux.binaries] binary, and resumes the
-	// conversation as any start does. Refused while the tmux session runs:
-	// the old pane would be stranded on the old server.
+	// FieldTmuxSocket is the session's tmux -L socket ("" = the default
+	// server). Upstream moves a stopped session to another socket here. In
+	// this build the socket is part of the session's durable runtime
+	// (instance_runtime_state), which a metadata save never writes and the
+	// next start adopts, so a move is refused until it can be made as a
+	// runtime transition; setting the socket the session already has is a
+	// no-op. A new session takes its socket from --tmux-socket.
 	FieldTmuxSocket = "tmux-socket"
 )
 
@@ -113,10 +115,6 @@ var ValidMutableFields = []string{
 // tmuxSocketNamePattern is what `tmux -L` accepts as a plain socket name here:
 // no path separators, so the socket stays in tmux's own socket directory.
 var tmuxSocketNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
-
-// tmuxSessionRunning reports whether inst's tmux session exists on its
-// current socket. A var so tests can stand in for tmux.
-var tmuxSessionRunning = func(inst *Instance) bool { return inst.Exists() }
 
 type FieldRestartPolicy int
 
@@ -612,13 +610,10 @@ func SetField(inst *Instance, field, value string, extraArgsTokens []string) (ol
 		if name == oldValue {
 			break
 		}
-		if tmuxSessionRunning(inst) {
-			return oldValue, nil, &MutationError{Field: field, Msg: "session is running: stop it first (agent-deck session stop <id>), then set tmux-socket and start it"}
-		}
-		inst.TmuxSocketName = name
-		if ts := inst.GetTmuxSession(); ts != nil {
-			ts.SocketName = name
-		}
+		// The socket belongs to the durable runtime: SaveWithGroups never
+		// writes it and the next start re-adopts the stored one, so changing
+		// it here would report a move that never happens.
+		return oldValue, nil, &MutationError{Field: field, Msg: "moving an existing session to another tmux socket is not supported in this build: the socket is part of the session's durable runtime; create a new session with --tmux-socket instead"}
 
 	case FieldFavorite:
 		oldValue = strconv.FormatBool(inst.Favorite)
