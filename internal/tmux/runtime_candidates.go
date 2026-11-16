@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// RuntimeCandidate is one live tmux pane that claims an Agent Deck logical
+// RuntimeCandidate is one tmux pane that claims an Agent Deck logical
 // instance. GenerationKnown is deliberately separate from Generation: zero is
 // a valid legacy value, but an absent or malformed stamp is not ownership
 // evidence and must never authorize adoption or cleanup.
@@ -26,6 +26,7 @@ type RuntimeCandidate struct {
 	BindingValue        string
 	BindingKnown        bool
 	PanePID             int
+	PaneDead            bool
 	ProofError          string
 }
 
@@ -44,6 +45,21 @@ var runtimeCandidateSnapshotOutputFn = runBoundedOutput
 
 const runtimeCandidateFormatFields = 12
 
+// tmux 3.8 clears pane_pid after exit; retain an explicit death observation instead.
+const runtimePanePIDFormat = "#{?pane_dead,dead,#{pane_pid}}"
+
+func parseRuntimePanePID(raw string) (int, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "dead" {
+		return 0, true, nil
+	}
+	pid, err := strconv.Atoi(raw)
+	if err != nil || pid <= 0 {
+		return 0, false, fmt.Errorf("invalid pane pid %q", raw)
+	}
+	return pid, false, nil
+}
+
 func runtimeCandidateFormat() string {
 	// The binding value is deliberately last: it is the only free-text field,
 	// so SplitN preserves an embedded tmuxFieldSep byte. The effective
@@ -59,7 +75,7 @@ func runtimeCandidateFormat() string {
 		"#{E:AGENTDECK_RUNTIME_STATUS}",
 		"#{E:AGENTDECK_RUNTIME_STARTED_UNIX_NANO}",
 		"#{E:AGENTDECK_RUNTIME_BINDING_KIND}",
-		"#{pane_pid}",
+		runtimePanePIDFormat,
 		"#{"+runtimeCleanupInstanceOption+"}",
 		"#{E:AGENTDECK_RUNTIME_BINDING_VALUE}",
 	)
@@ -238,10 +254,10 @@ func runtimeCandidateFromFields(socketName string, fields []string) RuntimeCandi
 	// revalidated with show-environment before adoption, which recovers that
 	// distinction for tools without a durable conversation binding.
 	candidate.BindingKnown = candidate.BindingKind != ""
-	if pid, err := strconv.Atoi(strings.TrimSpace(fields[9])); err != nil || pid <= 0 {
+	if pid, dead, err := parseRuntimePanePID(fields[9]); err != nil {
 		candidate.ProofError = appendRuntimeProofError(candidate.ProofError, "invalid pane pid")
 	} else {
-		candidate.PanePID = pid
+		candidate.PanePID, candidate.PaneDead = pid, dead
 	}
 	return candidate
 }
@@ -309,20 +325,20 @@ func RevalidateRuntimeCandidate(candidate RuntimeCandidate) (RuntimeCandidate, e
 		identityTarget = candidate.PaneID
 	}
 	pidOut, pidErr := runBoundedOutput(candidate.SocketName, "display-message", "-t", identityTarget, "-p",
-		tmuxFmt("#{session_id}", "#{session_name}", "#{pane_id}", "#{pane_pid}"))
+		tmuxFmt("#{session_id}", "#{session_name}", "#{pane_id}", runtimePanePIDFormat))
 	if pidErr != nil {
 		verified.ProofError = appendRuntimeProofError(verified.ProofError, "pane pid unavailable")
 	} else {
 		fields := strings.Split(strings.TrimSpace(string(pidOut)), tmuxFieldSep)
 		if len(fields) != 4 || !validTmuxStableID(fields[0], '$') || !validTmuxStableID(fields[2], '%') {
 			verified.ProofError = appendRuntimeProofError(verified.ProofError, "invalid stable tmux identity")
-		} else if pid, parseErr := strconv.Atoi(strings.TrimSpace(fields[3])); parseErr != nil || pid <= 0 {
+		} else if pid, dead, parseErr := parseRuntimePanePID(fields[3]); parseErr != nil {
 			verified.ProofError = appendRuntimeProofError(verified.ProofError, "invalid pane pid")
 		} else {
 			verified.SessionID = fields[0]
 			verified.SessionName = fields[1]
 			verified.PaneID = fields[2]
-			verified.PanePID = pid
+			verified.PanePID, verified.PaneDead = pid, dead
 		}
 	}
 	return verified, nil

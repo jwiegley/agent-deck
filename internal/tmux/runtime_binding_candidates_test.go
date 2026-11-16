@@ -2106,3 +2106,87 @@ func TestRuntimeLifecycle_KillRuntimeGenerationCandidateForgetsKilledSessionPres
 		})
 	}
 }
+
+func TestRuntimeLifecycle_DeadPaneSnapshotDoesNotInventAPID(t *testing.T) {
+	fields := []string{"$1", "agentdeck_dead_one", "%1", "one", "2", "0", "running", "100", "", "dead", "one", ""}
+	candidate := runtimeCandidateFromFields("isolated", fields)
+	if candidate.ProofError != "" || !candidate.PaneDead || candidate.PanePID != 0 {
+		t.Fatalf("dead pane observation = %+v", candidate)
+	}
+	for _, invalid := range []string{"", "0", "-1", "unknown"} {
+		fields[9] = invalid
+		if got := runtimeCandidateFromFields("isolated", fields); got.ProofError == "" || got.PaneDead {
+			t.Fatalf("missing or malformed live PID %q acquired death proof: %+v", invalid, got)
+		}
+	}
+	live := runtimeGenerationCandidateFromBinding(runtimeBindingCandidateForTest())
+	live.PanePID = 0
+	if _, err := runtimeGenerationCandidateCondition(live); err == nil {
+		t.Fatal("live cleanup accepted no process identity")
+	}
+}
+
+func TestDeadPaneCleanupRechecksDeathWithoutSignalAuthority(t *testing.T) {
+	requireTmux(t)
+	for _, replace := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replacement=%v", replace), func(t *testing.T) {
+			socket, _ := makeIsolatedServer(t)
+			ctl := tmuxCtl(t, socket)
+			ctl("set-option", "-g", "remain-on-exit", "on")
+			sess := NewSession("dead-cleanup", t.TempDir())
+			sess.SocketName, sess.InstanceID = socket, "dead-owner"
+			sess.RunCommandAsInitialProcess = true
+			if err := sess.Start("exit 7"); err != nil {
+				t.Fatal(err)
+			}
+			ctl("set-environment", "-t", sess.Name, "AGENTDECK_RUNTIME_GENERATION", "1")
+			if err := StampRuntimeCleanupIdentity(sess, sess.InstanceID, 1, "", ""); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for !sess.IsPaneDead() {
+				if time.Now().After(deadline) {
+					t.Fatal("fixture pane did not exit")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			candidates, err := ListRuntimeGenerationCandidates(socket, sess.InstanceID)
+			if err != nil || len(candidates) != 1 {
+				t.Fatalf("dead inventory = %+v, err=%v", candidates, err)
+			}
+			candidate := candidates[0]
+			if !candidate.PaneDead || candidate.PanePID != 0 {
+				t.Fatalf("dead candidate acquired a PID: %+v", candidate)
+			}
+			oldTree, oldEnsure := runtimeGenerationProcessTreeFn, runtimeGenerationEnsurePIDsDeadFn
+			runtimeGenerationProcessTreeFn = func(string, string) ([]int, error) {
+				t.Fatal("dead pane requested process signal authority")
+				return nil, nil
+			}
+			runtimeGenerationEnsurePIDsDeadFn = func([]ProcessIdentity, time.Duration) error {
+				t.Fatal("dead pane attempted process reaping")
+				return nil
+			}
+			t.Cleanup(func() { runtimeGenerationProcessTreeFn, runtimeGenerationEnsurePIDsDeadFn = oldTree, oldEnsure })
+			if replace {
+				ctl("respawn-pane", "-k", "-t", candidate.PaneID, "bash", "-c", "exec sleep 300")
+			}
+			err = KillRuntimeGenerationCandidate(candidate, true)
+			if replace {
+				if !errors.Is(err, ErrRuntimeGenerationCandidateChanged) {
+					t.Fatalf("live replacement kill = %v, want changed identity", err)
+				}
+				if exists, err := ProbeExactSession(socket, candidate.SessionName); err != nil || !exists {
+					t.Fatalf("live replacement was not preserved: exists=%v err=%v", exists, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if exists, err := ProbeExactSession(socket, candidate.SessionName); err != nil || exists {
+					t.Fatalf("owned dead pane remains: exists=%v err=%v", exists, err)
+				}
+			}
+		})
+	}
+}

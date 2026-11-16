@@ -21,6 +21,7 @@ type RuntimeGenerationCandidate struct {
 	SocketName      string
 	PaneID          string
 	PanePID         int
+	PaneDead        bool
 	InstanceID      string
 	Generation      uint64
 	GenerationKnown bool
@@ -36,6 +37,7 @@ type RuntimeBindingCandidate struct {
 	SocketName      string
 	PaneID          string
 	PanePID         int
+	PaneDead        bool
 	InstanceID      string
 	InstanceKnown   bool
 	Generation      uint64
@@ -126,7 +128,7 @@ func runtimeCleanupCandidateFormat() string {
 		"#{session_id}",
 		"#{session_name}",
 		"#{pane_id}",
-		"#{pane_pid}",
+		runtimePanePIDFormat,
 		"#{"+runtimeCleanupInstanceOption+"}",
 	)
 }
@@ -462,13 +464,13 @@ func listRuntimeCleanupIdentities(socketName string) ([]RuntimeBindingCandidate,
 		if !validTmuxStableID(paneID, '%') {
 			return nil, fmt.Errorf("tmux: malformed binding candidate pane %q", paneID)
 		}
-		panePID, parseErr := strconv.Atoi(strings.TrimSpace(fields[3]))
-		if parseErr != nil || panePID <= 0 {
+		panePID, paneDead, parseErr := parseRuntimePanePID(fields[3])
+		if parseErr != nil {
 			return nil, fmt.Errorf("tmux: invalid binding candidate pane pid %q", fields[3])
 		}
 		identities = append(identities, RuntimeBindingCandidate{
 			SessionName: name, SessionID: sessionID, SocketName: socketName,
-			PaneID: paneID, PanePID: panePID,
+			PaneID: paneID, PanePID: panePID, PaneDead: paneDead,
 		})
 	}
 	return identities, nil
@@ -591,9 +593,9 @@ func KillRuntimeGenerationCandidate(candidate RuntimeGenerationCandidate, wait b
 	); err != nil {
 		return err
 	}
-	identities, err := captureStableProcessTree(func() ([]int, error) {
+	identities, err := captureRuntimeCandidateProcessTree(candidate, func() ([]int, error) {
 		return runtimeGenerationProcessTreeFn(candidate.SocketName, candidate.PaneID)
-	}, candidate.PanePID, ErrRuntimeGenerationCandidateChanged)
+	}, ErrRuntimeGenerationCandidateChanged)
 	if err != nil {
 		return fmt.Errorf("tmux: capture runtime generation candidate process tree: %w", err)
 	}
@@ -609,6 +611,9 @@ func KillRuntimeGenerationCandidate(candidate RuntimeGenerationCandidate, wait b
 		ErrRuntimeGenerationCandidateChanged,
 	); err != nil {
 		return err
+	}
+	if candidate.PaneDead {
+		return nil
 	}
 	ensureDead := runtimeGenerationEnsurePIDsDeadFn
 	if wait {
@@ -645,9 +650,9 @@ func KillRuntimeBindingCandidate(candidate RuntimeBindingCandidate) error {
 	); err != nil {
 		return err
 	}
-	identities, err := captureStableProcessTree(func() ([]int, error) {
+	identities, err := captureRuntimeCandidateProcessTree(generation, func() ([]int, error) {
 		return runtimeGenerationProcessTreeFn(candidate.SocketName, candidate.PaneID)
-	}, candidate.PanePID, ErrRuntimeBindingCandidateChanged)
+	}, ErrRuntimeBindingCandidateChanged)
 	if err != nil {
 		return fmt.Errorf("tmux: capture runtime binding candidate process tree: %w", err)
 	}
@@ -663,6 +668,9 @@ func KillRuntimeBindingCandidate(candidate RuntimeBindingCandidate) error {
 		ErrRuntimeBindingCandidateChanged,
 	); err != nil {
 		return err
+	}
+	if candidate.PaneDead {
+		return nil
 	}
 	ensureDead := runtimeGenerationEnsurePIDsDeadFn
 	owned = false
@@ -741,7 +749,7 @@ func RespawnRuntimeGenerationCandidate(session *Session, candidate RuntimeGenera
 	probeTree := func() ([]int, error) {
 		return runtimeGenerationProcessTreeFn(candidate.SocketName, candidate.PaneID)
 	}
-	oldIdentities, err := captureStableProcessTree(probeTree, candidate.PanePID, ErrRuntimeGenerationCandidateChanged)
+	oldIdentities, err := captureRuntimeCandidateProcessTree(candidate, probeTree, ErrRuntimeGenerationCandidateChanged)
 	if err != nil {
 		return fmt.Errorf("tmux: capture stable process tree before respawn: %w", err)
 	}
@@ -782,6 +790,9 @@ func RespawnRuntimeGenerationCandidate(session *Session, candidate RuntimeGenera
 		respawnLog.Info("cleared_scrollback", slog.String("session", candidate.SessionName))
 	}
 
+	if candidate.PaneDead {
+		return nil
+	}
 	newPIDs, newTreeErr := probeTree()
 	identitiesOwned = false
 	// As in Session.RespawnPane, a failed probe is retried with the same
@@ -940,10 +951,17 @@ func validateRuntimeCleanupLocalIdentity(
 func runtimeGenerationCandidateFromBinding(candidate RuntimeBindingCandidate) RuntimeGenerationCandidate {
 	return RuntimeGenerationCandidate{
 		SessionName: candidate.SessionName, SessionID: candidate.SessionID,
-		SocketName: candidate.SocketName, PaneID: candidate.PaneID, PanePID: candidate.PanePID,
+		SocketName: candidate.SocketName, PaneID: candidate.PaneID, PanePID: candidate.PanePID, PaneDead: candidate.PaneDead,
 		InstanceID: candidate.InstanceID, Generation: candidate.Generation,
 		GenerationKnown: candidate.GenerationKnown,
 	}
+}
+
+func captureRuntimeCandidateProcessTree(candidate RuntimeGenerationCandidate, probeTree func() ([]int, error), mismatchErr error) ([]ProcessIdentity, error) {
+	if candidate.PaneDead {
+		return nil, nil
+	}
+	return captureStableProcessTree(probeTree, candidate.PanePID, mismatchErr)
 }
 
 func runtimeGenerationCandidateCondition(candidate RuntimeGenerationCandidate) (string, error) {
@@ -960,18 +978,23 @@ func runtimeGenerationCandidateChecks(candidate RuntimeGenerationCandidate) ([][
 	if candidate.SessionName == "" {
 		return nil, fmt.Errorf("tmux: invalid runtime cleanup target %q", candidate.SessionName)
 	}
-	if !validTmuxStableID(candidate.SessionID, '$') || !validTmuxStableID(candidate.PaneID, '%') || candidate.PanePID <= 0 {
+	if !validTmuxStableID(candidate.SessionID, '$') || !validTmuxStableID(candidate.PaneID, '%') ||
+		(candidate.PaneDead && candidate.PanePID != 0) || (!candidate.PaneDead && candidate.PanePID <= 0) {
 		return nil, fmt.Errorf("tmux: invalid stable runtime cleanup identity")
 	}
 	if candidate.InstanceID == "" || !candidate.GenerationKnown {
 		return nil, fmt.Errorf("tmux: incomplete runtime cleanup identity")
+	}
+	paneKey, paneValue := "pane_pid", strconv.Itoa(candidate.PanePID)
+	if candidate.PaneDead {
+		paneKey, paneValue = "pane_dead", "1"
 	}
 	generation := strconv.FormatUint(candidate.Generation, 10)
 	return [][2]string{
 		{"session_id", candidate.SessionID},
 		{"session_name", candidate.SessionName},
 		{"pane_id", candidate.PaneID},
-		{"pane_pid", strconv.Itoa(candidate.PanePID)},
+		{paneKey, paneValue},
 		{runtimeCleanupInstanceOption, candidate.InstanceID},
 		{runtimeCleanupGenerationOption, generation},
 		{runtimeGenerationEnvironment, generation},

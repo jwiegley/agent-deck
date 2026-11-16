@@ -152,7 +152,7 @@ exec ` + shQuote(s.realTmux) + " -S " + shQuote(s.socket) + " -f /dev/null \"$@\
 		return err
 	}
 	cfg := "[telemetry]\ndisabled = true\n[tmux]\nlaunch_in_user_scope = false\n" +
-		"[health]\nenabled = false\n" +
+		"[health]\nenabled = false\n[notifications]\nenabled = false\n" +
 		"[ui.header]\nfields = [\"version\", \"sessions_by_status\"]\n" +
 		"[hotkeys]\nswitch_session = \"ctrl+s\"\n" +
 		"[updates]\nauto_update = false\nauto_restart = false\nstartup_check = false\n[worktree]\nbranch_prefix = \"\"\n" +

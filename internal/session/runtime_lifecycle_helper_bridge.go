@@ -265,7 +265,7 @@ func RunRuntimeLifecycleCrashHelper(config RuntimeLifecycleHelperConfig) error {
 			}
 			matching = append(matching, tmux.RuntimeGenerationCandidate{
 				SessionID: candidate.SessionID, SessionName: candidate.SessionName,
-				SocketName: candidate.SocketName, PaneID: candidate.PaneID, PanePID: candidate.PanePID,
+				SocketName: candidate.SocketName, PaneID: candidate.PaneID, PanePID: candidate.PanePID, PaneDead: candidate.PaneDead,
 				InstanceID: candidate.InstanceID, Generation: candidate.Generation,
 				GenerationKnown: candidate.GenerationKnown,
 			})

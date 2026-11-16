@@ -555,10 +555,7 @@ func stepUpdateBanner(w *widthRun) error {
 	}, 15*time.Second); err != nil {
 		return fmt.Errorf("restart into installed build: %w", err)
 	}
-	return w.waitFor(func() (bool, error) {
-		pane, err := w.pane()
-		return !strings.Contains(pane, "restarted into"), err
-	}, 10*time.Second)
+	return nil
 }
 
 func stepAttachShell(w *widthRun) error {
@@ -647,6 +644,12 @@ func stepDetachShell(w *widthRun) error {
 }
 
 func stepFork(w *widthRun) error {
+	if err := w.waitFor(func() (bool, error) {
+		pane, err := w.pane()
+		return !strings.Contains(pane, "restarted into"), err
+	}, 10*time.Second); err != nil {
+		return err
+	}
 	if err := w.moveCursorToText("claude-waiting", 40); err != nil {
 		return err
 	}

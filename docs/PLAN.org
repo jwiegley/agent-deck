@@ -382,10 +382,10 @@ A Codex send that lands while a turn runs starts no turn: Codex records the inpu
 :LABELS:   []
 :ISSUE_TYPE: task
 :CREATED:  [2026-11-16 Mon 10:39]
-:MODIFIED: [2026-11-16 Mon 13:50]
+:MODIFIED: [2026-11-16 Mon 15:36]
 :CREATED_BY: johnw
-:FINISHED: [2026-11-16 Mon 13:50]
-:CLOSE_REASON: Integrated v1.16.39; focused regressions and pre-commit verified. Signed publication follows through the goal and mandatory pre-push gate.
+:FINISHED: [2026-11-16 Mon 15:36]
+:CLOSE_REASON: Upgrade and authorized tmux 3.8 compatibility verified by focused race regressions, visual check, guard review and pre-commit; protected publication follows mandatory hook.
 :SOURCE_REPO: agent-deck
 :SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
 :ORIGINAL_SIZE: 0
@@ -424,6 +424,20 @@ Integrate upstream v1.16.39 while preserving fork runtime authority and service 
     "author": "johnw",
     "text": "Upgrade integration verified. Pre-commit-6 passes. Fork launch metadata is verified through the real CLI (three repeats); visual check passes with unchanged goldens after waiting for restarted version and toast dismissal. Bare tmux 3.3a reproduced the retention defect without agent-deck (2/40); user authorized comparison with Hera tmux 3.8, which passes unchanged retention assertions across ten repeats. No application workaround added. Required full pre-push will run during authorized publication; no extra manual full-suite run. Publication and subsequent Nix/Hera work remain tracked by goal mwjljk76-ntvtiz.",
     "created_at": "2026-11-16T21:50:42Z"
+  },
+  {
+    "id": 51,
+    "issue_id": "agent-deck-r3e",
+    "author": "johnw",
+    "text": "Refocus 2026-11-16T22:43:00Z: user explicitly authorized narrow tmux 3.8 compatibility repair after comparison. Mandatory Docker push gate rejected publication (69 checks, mainly dead-pane empty PID); remote remains e144460d. Signed merge 4cb2c421 is local only; no Nix edits or activation. Scope now only this compatibility blocker and directly related checks; no broad audit or unrelated redesign. Keep live-process ownership proof strict. Correct hook routing is to set LEFTHOOK_BIN inside direnv exec; the earlier prefix is cleared by direnv. Next: repair dead-pane parsing/proof at existing seam with focused regressions, then required publication hook. Next refocus due 2026-11-16T23:43:00Z.",
+    "created_at": "2026-11-16T22:44:47Z"
+  },
+  {
+    "id": 52,
+    "issue_id": "agent-deck-r3e",
+    "author": "johnw",
+    "text": "Refocus 2026-11-16T23:36:42Z: user-authorized scope remains v1.16.39 plus narrow tmux 3.8 compatibility. Dead panes use explicit no-process observations; exact identity/generation/death is rechecked before mutation, live PID/birth guards unchanged. Real replacement-preservation tests and prior-failure/runtime guard checks pass; visual check passes with unchanged goldens. Related fixtures use live fake Claude, grace expiry/eventual observation, isolated Go telemetry and deterministic visual transient state. Scoped guard review found no blockers; pre-commit-7 passes. Signed merge 4cb2c421 remains unpublished; remote still original lease. No Nix edits/activation. Next: signed follow-up and mandatory Docker pre-push, with LEFTHOOK_BIN set inside direnv exec. Next refocus due 2026-11-17T00:36:42Z.",
+    "created_at": "2026-11-16T23:36:42Z"
   }
 ]
 #+end_src

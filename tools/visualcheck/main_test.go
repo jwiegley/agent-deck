@@ -42,6 +42,14 @@ func TestScrubRemotePollKeepsDividerFixed(t *testing.T) {
 
 var regenerateGoldens = flag.Bool("visualcheck.regenerate", false, "regenerate visual check goldens")
 
+func TestScrubFramePreviewAgeIsStable(t *testing.T) {
+	for _, input := range []string{"⏱ just now", "⏱ 3m ago"} {
+		if got := scrubFrame(input); got != "⏱ <age>" {
+			t.Fatalf("preview age %q = %q", input, got)
+		}
+	}
+}
+
 func TestScrubFrameRedactsVolatileText(t *testing.T) {
 	cases := []struct {
 		name, in, wantContains string

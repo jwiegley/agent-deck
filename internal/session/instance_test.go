@@ -770,6 +770,15 @@ func TestInstance_UpdateClaudeSession_PreservesExistingID(t *testing.T) {
 	}
 }
 
+func fakeClaudeForInstanceTest(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "claude")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 2.0.0; exit 0; fi\nexec sleep 300\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // TestInstance_UpdateClaudeSession_RejectZombie verifies that when the tmux env
 // contains a zombie session ID (no conversation data) and the current session has
 // real data, the zombie is rejected and the current session is preserved.
@@ -817,6 +826,7 @@ func TestInstance_UpdateClaudeSession_RejectZombie(t *testing.T) {
 	}
 
 	inst := NewInstanceWithTool("reject-zombie-test", projectPath, "claude")
+	inst.Command = fakeClaudeForInstanceTest(t)
 	inst.ClaudeSessionID = currentID
 	inst.ClaudeDetectedAt = time.Now().Add(-1 * time.Minute)
 
@@ -1216,7 +1226,7 @@ func TestInstance_Restart_ResumesClaudeSession(t *testing.T) {
 
 	// Create instance with known session ID (simulating previous session)
 	inst := NewInstanceWithTool("restart-test", "/tmp", "claude")
-	inst.Command = "claude"
+	inst.Command = fakeClaudeForInstanceTest(t)
 	inst.ClaudeSessionID = "known-session-id-xyz"
 	inst.ClaudeDetectedAt = time.Now()
 

@@ -99,13 +99,12 @@ phase5:
 
 	// Kill externally via tmux command
 	require.NoError(t, killTmuxSession(newTmuxName))
-	time.Sleep(500 * time.Millisecond)
+	tmux.ExpireStartupWindowForTest(t, inst.GetTmuxSession())
 
-	// Clear stale cache so UpdateStatus actually checks tmux
-	inst.ForceNextStatusCheck()
-	_ = inst.UpdateStatus()
-	assert.Equal(t, StatusError, inst.GetStatusThreadSafe(),
-		"externally killed session should show error")
+	require.Eventually(t, func() bool {
+		inst.ForceNextStatusCheck()
+		return inst.UpdateStatus() == nil && inst.GetStatusThreadSafe() == StatusError
+	}, 5*time.Second, 25*time.Millisecond, "externally killed session should show error")
 }
 
 // TestDedup_ThreeSessionsPreservesUnprovenClaims verifies that CreatedAt order

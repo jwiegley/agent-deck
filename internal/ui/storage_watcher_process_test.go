@@ -111,12 +111,16 @@ func TestStorageWatcherBuildCacheDefaultsSurviveHomeIsolation(t *testing.T) {
 	for _, value := range os.Environ() {
 		key, _, _ := strings.Cut(value, "=")
 		switch key {
-		case "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "XDG_CACHE_HOME":
+		case "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "XDG_CACHE_HOME", "XDG_CONFIG_HOME":
 			continue
 		}
 		env = append(env, value)
 	}
-	env = append(env, "HOME="+harness, "GOPATH="+filepath.Join(harness, "go"))
+	env = append(env, "HOME="+harness, "GOPATH="+filepath.Join(harness, "go"), "XDG_CONFIG_HOME="+filepath.Join(harness, ".config"))
+	telemetry := exec.Command("go", "telemetry", "off")
+	telemetry.Env = env
+	output, telemetryErr := telemetry.CombinedOutput()
+	require.NoError(t, telemetryErr, "%s", output)
 	caches, err := resolveWatcherBuildCaches(env)
 	require.NoError(t, err)
 	require.Equal(t, filepath.Join(harness, "go", "pkg", "mod"), caches["GOMODCACHE"])

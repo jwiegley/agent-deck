@@ -641,7 +641,7 @@ func (i *Instance) selectNonDurableRuntimeCandidate(state statedb.RuntimeState) 
 		return nil, i.runtimeAmbiguity("non-durable runtime has competing physical candidates", candidates)
 	}
 	selected := runtimeCandidateForState(candidates, state)
-	if selected == nil || selected.PanePID <= 0 || selected.ProofError != "" {
+	if selected == nil || (selected.PanePID <= 0 && !selected.PaneDead) || selected.ProofError != "" {
 		return nil, i.runtimeAmbiguity("non-durable runtime lacks an exact generation and process proof", candidates)
 	}
 	verified, verifyErr := runtimeCandidateRevalidateFn(*selected)
@@ -1184,7 +1184,7 @@ func (i *Instance) respawnRuntimePane(authority *runtimeTransitionAuthority, com
 	}
 	candidate := tmux.RuntimeGenerationCandidate{
 		SessionName: verified.SessionName, SessionID: verified.SessionID,
-		SocketName: verified.SocketName, PaneID: verified.PaneID, PanePID: verified.PanePID,
+		SocketName: verified.SocketName, PaneID: verified.PaneID, PanePID: verified.PanePID, PaneDead: verified.PaneDead,
 		InstanceID: verified.InstanceID, Generation: verified.Generation,
 		GenerationKnown: verified.GenerationKnown,
 	}
@@ -1403,7 +1403,7 @@ func (i *Instance) reconcileRuntimeCandidatesLocked(db *statedb.StateDB, durable
 	var lower []tmux.RuntimeCandidate
 	for idx := range candidates {
 		candidate := &candidates[idx]
-		if !candidate.GenerationKnown || candidate.PanePID <= 0 || candidate.ProofError != "" {
+		if !candidate.GenerationKnown || (candidate.PanePID <= 0 && !candidate.PaneDead) || candidate.ProofError != "" {
 			return result, i.runtimeAmbiguity("candidate lacks exact generation or process proof", candidates)
 		}
 		switch {
@@ -1512,7 +1512,7 @@ func (i *Instance) reconcileRuntimeCandidatesLocked(db *statedb.StateDB, durable
 	for _, candidate := range lower {
 		generation := tmux.RuntimeGenerationCandidate{
 			SessionName: candidate.SessionName, SessionID: candidate.SessionID,
-			SocketName: candidate.SocketName, PaneID: candidate.PaneID, PanePID: candidate.PanePID,
+			SocketName: candidate.SocketName, PaneID: candidate.PaneID, PanePID: candidate.PanePID, PaneDead: candidate.PaneDead,
 			InstanceID: candidate.InstanceID, Generation: candidate.Generation,
 			GenerationKnown: candidate.GenerationKnown,
 		}
@@ -1558,7 +1558,7 @@ func sameRuntimeCandidateSnapshot(snapshot, verified tmux.RuntimeCandidate) bool
 		snapshot.BindingKind == verified.BindingKind &&
 		snapshot.BindingValue == verified.BindingValue &&
 		(!snapshot.BindingKnown || verified.BindingKnown) &&
-		snapshot.PanePID == verified.PanePID &&
+		snapshot.PanePID == verified.PanePID && snapshot.PaneDead == verified.PaneDead &&
 		snapshot.ProofError == verified.ProofError
 }
 
@@ -1747,7 +1747,7 @@ func (i *Instance) validatePartialRuntimeCandidate(durable, expected statedb.Run
 	var selected *tmux.RuntimeCandidate
 	for index := range candidates {
 		candidate := &candidates[index]
-		if candidate.InstanceID != i.ID || !candidate.GenerationKnown || candidate.PanePID <= 0 || candidate.ProofError != "" {
+		if candidate.InstanceID != i.ID || !candidate.GenerationKnown || (candidate.PanePID <= 0 && !candidate.PaneDead) || candidate.ProofError != "" {
 			return i.runtimeAmbiguity("partial-success inventory contains incomplete identity or process proof", candidates)
 		}
 		switch {

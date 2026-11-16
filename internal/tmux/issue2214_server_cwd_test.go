@@ -107,16 +107,19 @@ func TestGroundTruth_PoisonedServerIgnoresDashCForNewPanes(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	var reported string
+	var wrote bool
 	for time.Now().Before(deadline) {
 		data, readErr := os.ReadFile(marker)
-		if readErr == nil && strings.TrimSpace(string(data)) != "" {
+		if readErr == nil && len(data) != 0 {
 			reported = strings.TrimSpace(string(data))
+			wrote = true
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	require.NotEmpty(t, reported, "pane never wrote its pwd")
+	// An empty pwd line is itself evidence of the unlinked-cwd failure on tmux 3.8.
+	require.True(t, wrote, "pane never wrote its pwd")
 	if reported == good {
 		// Documented finding (see RESULTS.md): on Linux tmux 3.5a-3 (this
 		// container's build), a new pane's `-c <absolute existing dir>` DOES

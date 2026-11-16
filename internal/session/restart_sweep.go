@@ -209,7 +209,7 @@ func (i *Instance) sweepCrossInstanceToolBinding(db *statedb.StateDB, selection 
 		}
 		if !candidate.InstanceKnown || candidate.InstanceID == "" ||
 			!candidate.GenerationKnown || candidate.Generation == 0 ||
-			candidate.SessionID == "" || candidate.PaneID == "" || candidate.PanePID <= 0 ||
+			candidate.SessionID == "" || candidate.PaneID == "" || (candidate.PanePID <= 0 && !candidate.PaneDead) ||
 			candidate.BindingKey != envKey || candidate.BindingValue != value {
 			runtimeBindingSweepReportFn(i.ID, kind, "binding candidate identity, generation, or binding is ambiguous", nil)
 			return true
@@ -311,7 +311,7 @@ func (i *Instance) killLowerGenerationCandidates(db *statedb.StateDB, selection 
 		}
 		lower = append(lower, tmux.RuntimeGenerationCandidate{
 			SessionName: candidate.SessionName, SessionID: candidate.SessionID,
-			SocketName: candidate.SocketName, PaneID: candidate.PaneID, PanePID: candidate.PanePID,
+			SocketName: candidate.SocketName, PaneID: candidate.PaneID, PanePID: candidate.PanePID, PaneDead: candidate.PaneDead,
 			InstanceID: candidate.InstanceID, Generation: candidate.Generation,
 			GenerationKnown: candidate.GenerationKnown,
 		})
