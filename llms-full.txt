@@ -22,7 +22,7 @@ repo are right. Run `agent-deck --version` for the installed version.
 **Your AI agent command center**
 
 [![GitHub Stars](https://img.shields.io/github/stars/asheshgoplani/agent-deck?style=for-the-badge&logo=github&color=yellow&labelColor=1a1b26)](https://github.com/asheshgoplani/agent-deck/stargazers)
-[![Go Version](https://img.shields.io/badge/Go-1.26.10-00ADD8?style=for-the-badge&logo=go&labelColor=1a1b26)](https://go.dev)
+[![Go Version](https://img.shields.io/badge/Go-1.26.11-00ADD8?style=for-the-badge&logo=go&labelColor=1a1b26)](https://go.dev)
 [![License](https://img.shields.io/badge/License-MIT-9ece6a?style=for-the-badge&labelColor=1a1b26)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20WSL-7aa2f7?style=for-the-badge&labelColor=1a1b26)](https://github.com/asheshgoplani/agent-deck)
 [![Latest Release](https://img.shields.io/github/v/release/asheshgoplani/agent-deck?style=for-the-badge&color=e0af68&labelColor=1a1b26)](https://github.com/asheshgoplani/agent-deck/releases)
@@ -59,7 +59,7 @@ OpenCode will auto-discover the skill from `~/.claude/skills/`.
 
 **Option 3: Any LLM** (ChatGPT, Claude, Gemini, etc.)
 ```
-Read https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/README.md
+Read https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/llms-full.txt
 and answer: How do I fork a session?
 ```
 
@@ -709,9 +709,11 @@ agent-deck add -t "Research" -c claude --mcp exa --mcp firecrawl /tmp/r
 ### list - List sessions
 
 ```bash
-agent-deck list [--json] [--all]
+agent-deck list [--json] [--all] [--no-archived]
 agent-deck ls  # Alias
 ```
+
+`--no-archived` leaves archived sessions out before any status work (for pollers that only need live sessions). When the batched pane capture of a live `list --json` times out, the listing does not capture each pane on its own: those rows carry `status_source: "stale"` (status is the last observation or the default, substate may be absent), and `--stats` reports `captures_skipped`.
 
 ### remove - Remove session
 

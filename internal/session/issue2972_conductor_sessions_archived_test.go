@@ -37,17 +37,16 @@ func TestConductorSharedTemplate_SessionsSkipsArchivedRows(t *testing.T) {
 			}
 
 			// The shared file the previous release wrote is recognised as
-			// generated and migrated, not left behind as user-edited. This
-			// fork lists every generation first as upstream wrote it (without
-			// the fork's queued count), newest first, then as a fork build
-			// wrote it (conductorInstructionsGenerations), so the newest is
-			// upstream's pre-#2972 file and the fork's own is listed too.
-			upstreamCurrent := renderConductorInstructionsTemplate(preQueuedCountConductorInstructionsTemplate(conductorSharedClaudeMDTemplate), "", DefaultProfile, spec)
+			// generated and migrated, not left behind as user-edited. Both
+			// upstream and fork generations predate Standing Orders.
+			noOrders := preStandingOrdersConductorInstructionsTemplate(conductorSharedClaudeMDTemplate)
+			upstreamCurrent := renderConductorInstructionsTemplate(preQueuedCountConductorInstructionsTemplate(noOrders), "", DefaultProfile, spec)
 			upstreamBefore := strings.Replace(upstreamCurrent, row, conductorSessionsRowBefore2972, 1)
-			forkBefore := strings.Replace(current, row, conductorSessionsRowBefore2972, 1)
+			forkCurrent := renderConductorInstructionsTemplate(noOrders, "", DefaultProfile, spec)
+			forkBefore := strings.Replace(forkCurrent, row, conductorSessionsRowBefore2972, 1)
 			gens := renderConductorInstructionsGenerations(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
-			if len(gens) == 0 || gens[0] != upstreamBefore {
-				t.Fatal("upstream's pre-#2972 shared file is not the newest reconstructed generation")
+			if len(gens) < 2 || gens[1] != upstreamBefore {
+				t.Fatal("upstream's pre-#2972 shared file is not the generation after pre-Standing-Orders")
 			}
 			forkListed := false
 			for _, gen := range gens {

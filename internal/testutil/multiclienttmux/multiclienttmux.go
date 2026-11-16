@@ -19,6 +19,7 @@
 package multiclienttmux
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"math"
@@ -165,13 +166,38 @@ func (h *Harness) AddControlClient(cols, rows int) error {
 	if err != nil {
 		return fmt.Errorf("multiclienttmux: control stdin: %w", err)
 	}
-	cmd.Stdout = io.Discard
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("multiclienttmux: control stdout: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("multiclienttmux: start control client: %w", err)
 	}
+	attached := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		ready := false
+		for scanner.Scan() {
+			if !ready && strings.HasPrefix(scanner.Text(), "%session-changed ") {
+				attached <- nil
+				ready = true
+			}
+		}
+		if !ready {
+			attached <- fmt.Errorf("control attachment ended before confirmation: %v", scanner.Err())
+		}
+	}()
 	h.mu.Lock()
 	h.clients = append(h.clients, &clientProc{cmd: cmd, stdin: stdin})
 	h.mu.Unlock()
+	select {
+	case err := <-attached:
+		if err != nil {
+			return err
+		}
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("multiclienttmux: control attachment confirmation timed out")
+	}
 	if _, err := fmt.Fprintf(stdin, "refresh-client -C %dx%d\n", cols, rows); err != nil {
 		return fmt.Errorf("multiclienttmux: refresh-client -C: %w", err)
 	}

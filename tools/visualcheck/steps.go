@@ -548,10 +548,17 @@ func stepUpdateBanner(w *widthRun) error {
 	if err := w.send("C-t"); err != nil {
 		return err
 	}
-	if err := w.waitContains("99.0.0", 15*time.Second); err != nil {
+	if err := w.waitFor(func() (bool, error) {
+		pane, err := w.pane()
+		header, _, _ := strings.Cut(pane, "\n")
+		return strings.Contains(header, "99.0.0"), err
+	}, 15*time.Second); err != nil {
 		return fmt.Errorf("restart into installed build: %w", err)
 	}
-	return nil
+	return w.waitFor(func() (bool, error) {
+		pane, err := w.pane()
+		return !strings.Contains(pane, "restarted into"), err
+	}, 10*time.Second)
 }
 
 func stepAttachShell(w *widthRun) error {

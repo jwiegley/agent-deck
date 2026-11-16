@@ -75,14 +75,20 @@ func (g *codexAcceptanceGuard) Prepare(instanceID string, now time.Time) error {
 	return nil
 }
 
-func (g *codexAcceptanceGuard) RecordTransportOutcome(delivery string, now time.Time) error {
+// RecordTransportOutcome settles the submission marker from the send's
+// delivery. untyped reports that the input-prompt guard refused before any
+// keystroke reached the pane: a menu_open refusal is then as definitive a
+// non-delivery as composer_blocked. A menu_open seen after typing stays
+// ambiguous.
+func (g *codexAcceptanceGuard) RecordTransportOutcome(delivery string, untyped bool, now time.Time) error {
 	if g == nil || g.marker == nil {
 		return fmt.Errorf("Codex submission marker is unavailable")
 	}
-	switch delivery {
-	case deliveryLineTooLong, deliveryComposerBlocked, deliveryTargetBusy:
+	switch {
+	case delivery == deliveryLineTooLong, delivery == deliveryComposerBlocked, delivery == deliveryTargetBusy,
+		delivery == deliveryMenuOpen && untyped:
 		return session.ClearCodexSubmissionMarker(g.marker)
-	case deliverySubmitted:
+	case delivery == deliverySubmitted:
 		return g.marker.MarkSubmitted(now)
 	default:
 		return g.marker.MarkTransportAmbiguous(now)
@@ -158,7 +164,7 @@ func hydrateLegacyCodexIdentity(
 		}
 	}
 
-	generation, err := inst.LatestCodexTurnGeneration()
+	generation, err := codexAcceptanceGeneration(inst)
 	if err != nil {
 		restore()
 		return fmt.Errorf("live Codex session identity has no unique current rollout: %w", err)
@@ -282,7 +288,7 @@ func acquireCodexAcceptanceGuard(inst *session.Instance, timeout time.Duration) 
 		return nil, errCodexGenerationUnavailable
 	}
 	if _, err := session.ReconcileCodexSubmissionMarker(
-		inst.ID, inst.CodexSessionID, fence.priorTurnGeneration, inst.CodexTurnTookInputSince,
+		inst.ID, inst.CodexSessionID, fence.priorTurnGeneration, codexAcceptanceTookInputSince(inst),
 	); err != nil {
 		lock.Release()
 		return nil, err
@@ -351,11 +357,68 @@ func acquireCodexAcceptanceWhenReady(
 	}
 }
 
+// acquireCodexAcceptanceForSend is acquireCodexAcceptanceWhenReady wired to
+// one instance. The readiness baseline must come from the same reader as the
+// fence (codexAcceptanceGeneration): with the 8 MiB default reader, a turn
+// start between 8 and 64 MiB from EOF read as "" for the baseline but as the
+// real turn for the fence, so every pass looked like a turn that began after
+// the baseline and the send was refused at the deadline.
+func acquireCodexAcceptanceForSend(
+	inst *session.Instance,
+	deadline time.Time,
+	lockWait time.Duration,
+	waitReady func(time.Duration) error,
+) (guard *codexAcceptanceGuard, readyErr, guardErr error) {
+	return acquireCodexAcceptanceWhenReady(deadline, lockWait, waitReady,
+		func() (string, error) { return codexAcceptanceGeneration(inst) },
+		func(d time.Duration) (*codexAcceptanceGuard, error) { return acquireCodexAcceptanceGuard(inst, d) },
+	)
+}
+
+// codexAcceptanceGenerationScanBytes is the backward budget the acceptance
+// path allows when it locates the newest turn start in a rollout.
+//
+// The general lookup stops at codexTurnGenerationScanMaxBytes (8 MiB), which is
+// ample for an idle thread whose last turn start is a few records from EOF. A
+// turn that has been emitting output for a long time is different: measured
+// 2026-11-12 on a coordinator session whose single turn had been running for
+// ~55 minutes in a 293 MiB rollout, its OWN turn_started record was 9,437,184
+// bytes from EOF — past the 8 MiB ceiling — so the general lookup reported "no
+// turn", the acceptance fence validated that as an invalid generation, and
+// every send was refused as "invalid Codex submission marker turn generation"
+// while the persisted marker was in fact intact. 64 MiB covers a multi-hour
+// turn on a large rollout and stays a finite read.
+const codexAcceptanceGenerationScanBytes = int64(64 << 20)
+
+// codexAcceptanceGeneration reads the instance's current accepted-turn
+// generation with the acceptance path's wider backward budget. Every
+// acceptance decision (the fence, the fence re-validation and the turn-advanced
+// probe) must use this one reader, so the three cannot disagree about which
+// turn is newest.
+func codexAcceptanceGeneration(inst *session.Instance) (string, error) {
+	if inst == nil {
+		return "", fmt.Errorf("no Codex instance")
+	}
+	return inst.LatestCodexTurnGenerationWithBudget(codexAcceptanceGenerationScanBytes)
+}
+
+// codexAcceptanceTookInputSince is the running-turn input check the
+// acceptance path hands to ReconcileCodexSubmissionMarker. It scans with the
+// same budget as codexAcceptanceGeneration: the fence can name a running turn
+// whose start is beyond the 8 MiB default ceiling, and the default-budget
+// check then never reaches that start, reports no input, and keeps refusing
+// the send until an operator removes the marker by hand.
+func codexAcceptanceTookInputSince(inst *session.Instance) func(string, time.Time) (bool, error) {
+	return func(generation string, since time.Time) (bool, error) {
+		return inst.CodexTurnTookInputSinceWithBudget(generation, since, codexAcceptanceGenerationScanBytes)
+	}
+}
+
 func validateCodexAcceptanceFence(inst *session.Instance, fence codexAcceptanceFence) error {
 	if inst == nil || !fence.available || inst.CodexSessionID != fence.codexSessionID {
 		return fmt.Errorf("acceptance fence is unavailable")
 	}
-	current, err := inst.LatestCodexTurnGeneration()
+	current, err := codexAcceptanceGeneration(inst)
 	if err != nil {
 		return err
 	}
@@ -399,7 +462,7 @@ func codexTurnAdvancedPastFence(inst *session.Instance, fence codexAcceptanceFen
 	if inst == nil || !fence.available || inst.CodexSessionID != fence.codexSessionID {
 		return false
 	}
-	generation, err := inst.LatestCodexTurnGeneration()
+	generation, err := codexAcceptanceGeneration(inst)
 	return err == nil && generation != "" && generation != fence.priorTurnGeneration
 }
 
@@ -410,7 +473,7 @@ func captureCodexAcceptanceFence(inst *session.Instance) codexAcceptanceFence {
 	if inst.CodexSessionID == "" {
 		return codexAcceptanceFence{}
 	}
-	generation, err := inst.LatestCodexTurnGeneration()
+	generation, err := codexAcceptanceGeneration(inst)
 	if err != nil {
 		return codexAcceptanceFence{}
 	}
@@ -480,12 +543,45 @@ func waitForAcceptedCodexTurn(
 	if delivery != deliverySubmitted || !fence.available {
 		return nil
 	}
+	rolloutVersion := func() string {
+		if inst == nil {
+			return ""
+		}
+		return inst.ResponseContentVersion(nil)
+	}
+	return pollAcceptedCodexTurn(inst, delivery, acceptedAt, fence, rolloutVersion,
+		func() (string, error) { return codexAcceptanceGeneration(inst) })
+}
+
+// pollAcceptedCodexTurn polls generation until it names a turn newer than the
+// fence or codexAcceptedTurnPollTimeout passes. A rollout whose newest turn
+// start is far back costs a wide backward scan (up to
+// codexAcceptanceGenerationScanBytes) on every read, so a poll is skipped
+// while rolloutVersion (path, size and mtime of the append-only rollout) is
+// unchanged since the last read: the newest turn start cannot have moved. The
+// version is taken before the read, so a write racing the read only changes
+// the next version and forces one more read; it never hides a new turn. An
+// unavailable version ("") or a failed read always reads again.
+func pollAcceptedCodexTurn(
+	inst *session.Instance,
+	delivery string,
+	acceptedAt time.Time,
+	fence codexAcceptanceFence,
+	rolloutVersion func() string,
+	generation func() (string, error),
+) *codexAcceptedTurnReceipt {
 	deadline := time.Now().Add(codexAcceptedTurnPollTimeout)
+	readAt := ""
 	for {
-		generation, err := inst.LatestCodexTurnGeneration()
-		if err == nil {
-			if receipt := newCodexAcceptedTurnReceipt(inst, delivery, acceptedAt, fence, generation); receipt != nil {
-				return receipt
+		version := rolloutVersion()
+		if version == "" || version != readAt {
+			readAt = ""
+			current, err := generation()
+			if err == nil {
+				if receipt := newCodexAcceptedTurnReceipt(inst, delivery, acceptedAt, fence, current); receipt != nil {
+					return receipt
+				}
+				readAt = version
 			}
 		}
 		if !time.Now().Before(deadline) {

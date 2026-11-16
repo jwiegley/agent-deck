@@ -1223,6 +1223,16 @@ func completeForkRuntime(
 	// Apply sandbox config to forked instance.
 	if toggles.Sandbox {
 		inst.Sandbox = session.NewSandboxConfig("")
+		if inst.Tool == "pi" {
+			// The fork's command was built before it had a sandbox: a sandboxed pi
+			// never exports the host socket.
+			if err := source.RebuildPiForkCommand(inst); err != nil {
+				if withStateWorktreeCreated {
+					deps.rollback(opts.WorktreeRepoRoot, opts.WorktreePath, opts.WorktreeBranch)
+				}
+				return forkCompletion{}, fmt.Errorf("cannot rebuild the forked pi command: %w", err)
+			}
+		}
 	}
 
 	if err := deps.createMultiRepoDir(inst, source); err != nil {

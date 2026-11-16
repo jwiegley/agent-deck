@@ -180,7 +180,8 @@ func TestShippedV11628SharedTemplateMigratesToHarnessControl(t *testing.T) {
 			}
 			oldGenerations := renderConductorInstructionsGenerations(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
 			shipped := -1
-			for i, g := range oldGenerations[:4] {
+			// Five: the Standing Orders section added one generation on top.
+			for i, g := range oldGenerations[:5] {
 				if fmtHash(g) == v11628Shared {
 					shipped = i
 				}
@@ -261,12 +262,13 @@ func TestNoOpRuleOnlySharedTemplateMigratesToHarnessControl(t *testing.T) {
 			}
 			current := renderConductorInstructionsTemplate(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
 			// Upstream's release wrote it without the fork's queued count.
-			ruleOnly := renderConductorInstructionsTemplate(preHarnessControlConductorInstructionsTemplate(preArchivedSessionsConductorInstructionsTemplate(preQueuedCountConductorInstructionsTemplate(conductorSharedClaudeMDTemplate))), "", DefaultProfile, spec)
+			ruleOnly := renderConductorInstructionsTemplate(preHarnessControlConductorInstructionsTemplate(preArchivedSessionsConductorInstructionsTemplate(preStandingOrdersConductorInstructionsTemplate(preQueuedCountConductorInstructionsTemplate(conductorSharedClaudeMDTemplate)))), "", DefaultProfile, spec)
 			if ruleOnly == current || !strings.Contains(ruleOnly, "**No-op notices get no reply.**") || strings.Contains(ruleOnly, "/cmd <session>") {
 				t.Fatal("the rule-only generation must carry the no-op rule and no /cmd row")
 			}
 			oldGenerations := renderConductorInstructionsGenerations(conductorSharedClaudeMDTemplate, "", DefaultProfile, spec)
-			if len(oldGenerations) < 2 || oldGenerations[1] != ruleOnly {
+			// [0] is pre-Standing-Orders, [1] pre-#2972, [2] the rule-only release.
+			if len(oldGenerations) < 3 || oldGenerations[2] != ruleOnly {
 				t.Fatal("the rule-only release is not the generation after the pre-#2972 one")
 			}
 			path := filepath.Join(t.TempDir(), spec.InstructionsFileName)

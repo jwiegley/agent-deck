@@ -48,6 +48,13 @@ type InboxStats struct {
 	// WakeupsWithdrawn counts wakes not typed because the parent had already
 	// read the result the record announces (`session output` on the child).
 	WakeupsWithdrawn int64 `json:"wakeups_withdrawn,omitempty"`
+	// WakeupsUrgent counts wake sends dispatched for urgent records. The
+	// send runs detached, so one its input-box guard refused still counts.
+	// WakeupsGated counts records that were eligible to wake the parent but
+	// dispatched no wake: the parent is not a wake target (see isWakeTarget),
+	// was busy, was inside the debounce window, or the dispatch failed
+	// (issue #3131).
+	WakeupsGated int64 `json:"wakeups_gated,omitempty"`
 
 	// Consumer side.
 	Drains           int64 `json:"drains"`

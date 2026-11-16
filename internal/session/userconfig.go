@@ -5243,6 +5243,14 @@ func GetToolIcon(toolName string) string {
 func MergeToolPatterns(toolName string) *tmux.RawPatterns {
 	defaults := tmux.DefaultRawPatterns(toolName)
 	toolDef := GetToolDef(toolName)
+	// Keep in sync with patternOnlyOverride in toolregistry.go, which skips the shadow warning for these entries.
+	if toolDef == nil && defaults != nil {
+		if config, err := LoadUserConfig(); err == nil && config != nil {
+			if configured, ok := config.Tools[toolName]; ok {
+				toolDef = &configured
+			}
+		}
+	}
 
 	// No defaults and no config entry: nothing to do
 	if defaults == nil && toolDef == nil {

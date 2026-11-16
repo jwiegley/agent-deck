@@ -218,11 +218,17 @@ func (i *Instance) mergeReloaded(loaded *Instance, mergeMetadata, mergeRuntime b
 	i.CodexSessionID, i.CodexDetectedAt = bindingValue("codex")
 	i.GeminiSessionID, i.GeminiDetectedAt = bindingValue("gemini")
 	i.OpenCodeSessionID, i.OpenCodeDetectedAt = bindingValue("opencode")
+	if incoming.Generation == current.Generation && loaded.LaunchedTool != "" {
+		i.LaunchedTool, i.PiSocketExported = loaded.LaunchedTool, loaded.PiSocketExported
+	}
 	if incoming.Generation < current.Generation ||
 		(incoming.Generation == current.Generation && incoming.StatusRevision < current.StatusRevision) {
 		return true
 	}
 	i.adoptRuntimeStateLocked(incoming)
+	if loaded.LaunchedTool != "" {
+		i.LaunchedTool, i.PiSocketExported = loaded.LaunchedTool, loaded.PiSocketExported
+	}
 	return true
 }
 
@@ -332,8 +338,8 @@ var (
 	runtimeCandidateSetEnvFn      = func(session *tmux.Session, key, value string) error { return session.SetEnvironment(key, value) }
 	runtimeCleanupIdentityStampFn = tmux.StampRuntimeCleanupIdentity
 	runtimeCandidateRespawnFn     = tmux.RespawnRuntimeGenerationCandidate
-	runtimeTransitionCommitFn     = func(db *statedb.StateDB, expected uint64, incarnation string, next statedb.RuntimeState, plan []statedb.RuntimeBindingTransition) error {
-		return db.CommitRuntimeTransitionWithBindingPlan(expected, incarnation, next, plan)
+	runtimeTransitionCommitFn     = func(db *statedb.StateDB, expected uint64, incarnation string, next statedb.RuntimeState, plan []statedb.RuntimeBindingTransition, launch *statedb.RuntimeLaunchDecision) (statedb.RuntimePublication, error) {
+		return db.CommitRuntimeTransitionWithLaunch(expected, incarnation, next, plan, launch)
 	}
 	runtimeDuplicateSweepFn = func(i *Instance, observedSockets ...string) { i.sweepDuplicateToolSessions(observedSockets...) }
 )
@@ -357,6 +363,7 @@ type runtimeTransitionAuthority struct {
 	db               *statedb.StateDB
 	bindings         map[string]statedb.RuntimeBinding
 	plan             []statedb.RuntimeBindingTransition
+	launchDecision   *statedb.RuntimeLaunchDecision
 	fresh            bool
 	freshSnapshot    freshRuntimeBindingSnapshot
 	currentCandidate *tmux.RuntimeCandidate
@@ -445,40 +452,33 @@ func (e *RuntimeReconciliationAmbiguityError) Error() string {
 // never stamps, starts, restarts, or kills the observed candidate.
 func (i *Instance) ReconcileRestartResult(restartErr error) error {
 	var partial *RestartPartialSuccessError
-	if !errors.As(restartErr, &partial) {
+	if !errors.As(restartErr, &partial) || spawnedRuntimeGone(partial.Err) {
 		return restartErr
 	}
-	if spawnedRuntimeGone(partial.Err) {
-		// A spawn proved gone published nothing and left nothing live: there
-		// is no winner to prove, and trying would only append that failure.
-		return restartErr
-	}
-	if !partial.NeedsReconciliation {
-		result, err := i.ReconcileRuntime()
-		if err == nil && result.Live {
-			return nil
-		}
+	var err error
+	if partial.NeedsReconciliation {
+		err = i.reconcileRuntimeCandidate(partial.Runtime, partial.BindingPlan, partial.LaunchDecision)
+	} else {
+		var result RuntimeReconciliationResult
+		result, err = i.ReconcileRuntime()
 		if err == nil {
-			err = fmt.Errorf("no live durable runtime winner was proved")
-		}
-		return &RestartPartialSuccessError{
-			InstanceID: partial.InstanceID, Operation: partial.Operation, Runtime: partial.Runtime,
-			BindingPlan:         append([]statedb.RuntimeBindingTransition(nil), partial.BindingPlan...),
-			NeedsReconciliation: false,
-			MessageUndelivered:  partial.MessageUndelivered,
-			Err:                 errors.Join(partial.Err, fmt.Errorf("post-commit reconciliation failed: %w", err)),
+			if !result.Live || !samePhysicalRuntime(result.State, partial.Runtime) {
+				err = fmt.Errorf("no live durable runtime winner matching the completed runtime was proved")
+			} else if partial.LaunchDecision != nil {
+				err = i.recordReconciledLaunch(result.State, partial.LaunchDecision)
+			}
 		}
 	}
-	if err := i.reconcileRuntimeCandidate(partial.Runtime, partial.BindingPlan); err != nil {
-		return &RestartPartialSuccessError{
-			InstanceID: partial.InstanceID, Operation: partial.Operation, Runtime: partial.Runtime,
-			BindingPlan:         append([]statedb.RuntimeBindingTransition(nil), partial.BindingPlan...),
-			NeedsReconciliation: true,
-			MessageUndelivered:  partial.MessageUndelivered,
-			Err:                 fmt.Errorf("%v; durability reconciliation failed: %w", partial.Err, err),
-		}
+	if err == nil {
+		return nil
 	}
-	return nil
+	return &RestartPartialSuccessError{
+		InstanceID: partial.InstanceID, Operation: partial.Operation, Runtime: partial.Runtime,
+		BindingPlan:    append([]statedb.RuntimeBindingTransition(nil), partial.BindingPlan...),
+		LaunchDecision: partial.LaunchDecision, NeedsReconciliation: partial.NeedsReconciliation,
+		MessageUndelivered: partial.MessageUndelivered,
+		Err:                errors.Join(partial.Err, fmt.Errorf("durability reconciliation failed: %w", err)),
+	}
 }
 
 func samePhysicalRuntime(left, right statedb.RuntimeState) bool {
@@ -551,7 +551,9 @@ func (i *Instance) beginRuntimeTransition(fresh bool) (*runtimeTransitionAuthori
 	}
 	if current.Generation > observed.Generation {
 		if durable {
-			i.adoptRuntimeSnapshot(current, bindings)
+			if err := i.adoptDurableRuntimeSnapshot(db, incarnation, current, bindings); err != nil {
+				return fail(err)
+			}
 		} else {
 			i.adoptRuntimeState(current)
 		}
@@ -712,6 +714,10 @@ func (i *Instance) adoptRuntimeState(state statedb.RuntimeState) {
 }
 
 func (i *Instance) adoptRuntimeStateLocked(state statedb.RuntimeState) {
+	if !samePhysicalRuntime(i.runtimeStateSnapshotLocked(), state) {
+		i.LaunchedTool = ""
+		i.PiSocketExported = false
+	}
 	i.RuntimeGeneration = state.Generation
 	i.StatusRevision = state.StatusRevision
 	i.Status = Status(state.Status)
@@ -818,8 +824,49 @@ func applyTmuxSessionSettings(sess *tmux.Session) {
 func (i *Instance) adoptRuntimeSnapshot(state statedb.RuntimeState, bindings map[string]statedb.RuntimeBinding) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
+	i.adoptRuntimeSnapshotLocked(state, bindings, nil)
+}
+
+func (i *Instance) adoptRuntimeSnapshotLocked(state statedb.RuntimeState, bindings map[string]statedb.RuntimeBinding, launch *statedb.RuntimeLaunchDecision) {
 	i.adoptRuntimeStateLocked(state)
 	i.adoptRuntimeBindingsLocked(bindings)
+	if launch != nil {
+		i.LaunchedTool, i.PiSocketExported = launch.Tool, launch.PiSocketExported
+	}
+}
+
+func (i *Instance) adoptDurableRuntimeSnapshot(db *statedb.StateDB, incarnation string, state statedb.RuntimeState, bindings map[string]statedb.RuntimeBinding) error {
+	row, err := db.LoadInstanceByID(state.InstanceID)
+	if err != nil {
+		return err
+	}
+	var launch *statedb.RuntimeLaunchDecision
+	if row == nil {
+		// Before the first metadata save, only the reserved incarnation exists.
+		if err := db.ValidateRuntimeIncarnation(state.InstanceID, incarnation); err != nil {
+			return err
+		}
+	} else {
+		if row.Incarnation != incarnation {
+			return statedb.ErrInstanceParentConflict
+		}
+		stored := statedb.RuntimeState{
+			InstanceID: row.ID, Generation: row.RuntimeGeneration, TmuxSession: row.TmuxSession,
+			TmuxSocketName: row.TmuxSocketName, LastStartedAt: row.LastStartedAt,
+		}
+		if !samePhysicalRuntime(state, stored) {
+			return statedb.ErrRuntimeGenerationConflict
+		}
+		exported, tool := rowLaunchDecision(row)
+		launch = &statedb.RuntimeLaunchDecision{Tool: tool, PiSocketExported: exported}
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.persistenceIncarnation != incarnation {
+		return statedb.ErrInstanceParentConflict
+	}
+	i.adoptRuntimeSnapshotLocked(state, bindings, launch)
+	return nil
 }
 
 // reconcileReservedRuntimeBeforeCompatibilityLocked completes or restores an
@@ -875,7 +922,7 @@ func (i *Instance) adoptDurableRuntimeLocked() error {
 		if bindingErr != nil {
 			return bindingErr
 		}
-		i.adoptRuntimeSnapshot(state, bindings)
+		return i.adoptDurableRuntimeSnapshot(db, incarnation, state, bindings)
 	}
 	return nil
 }
@@ -1158,6 +1205,7 @@ func (i *Instance) commitPhysicalRuntime(authority *runtimeTransitionAuthority) 
 	if authority == nil {
 		return next, nil, false, fmt.Errorf("runtime transition authority unavailable")
 	}
+	authority.launchDecision = i.noteLaunch()
 	next = i.runtimeStateSnapshot()
 	next.Generation = authority.expected.Generation + 1
 	next.StatusRevision = 0
@@ -1177,7 +1225,7 @@ func (i *Instance) commitPhysicalRuntime(authority *runtimeTransitionAuthority) 
 		return next, nil, false, fmt.Errorf("physical runtime %s was not verified live: %w", next.TmuxSession, errSpawnedRuntimeGone)
 	}
 	plan = authority.bindingPlanForCommit(i)
-	bindingKind := activeRuntimeBindingKind(i)
+	bindingKind := authority.launchDecision.BindingKind
 	bindingValue, _ := i.currentRuntimeBinding(bindingKind)
 	if err := runtimeCandidateStampFn(i.tmuxSession, next, bindingKind, bindingValue); err != nil {
 		return next, plan, false, fmt.Errorf("stamp runtime generation %d: %w", next.Generation, err)
@@ -1192,12 +1240,13 @@ func (i *Instance) commitPhysicalRuntime(authority *runtimeTransitionAuthority) 
 		if err := authority.db.RequireRuntimeWriterCompatibility(); err != nil {
 			return next, plan, false, err
 		}
-		if err := runtimeTransitionCommitFn(authority.db, authority.expected.Generation, authority.incarnation, next, plan); err != nil {
+		publication, err := runtimeTransitionCommitFn(authority.db, authority.expected.Generation, authority.incarnation, next, plan, authority.launchDecision)
+		if err != nil {
 			if !errors.Is(err, statedb.ErrInstanceParentConflict) {
 				winner, found, readErr := authority.db.ReadRuntimeState(i.ID)
 				if readErr == nil && found && winner.Generation >= next.Generation {
 					if bindings, _, bindingErr := i.readRuntimeBindingPlan(authority.db, winner, true); bindingErr == nil {
-						i.adoptRuntimeSnapshot(winner, bindings)
+						err = errors.Join(err, i.adoptDurableRuntimeSnapshot(authority.db, authority.incarnation, winner, bindings))
 					}
 				}
 			}
@@ -1208,8 +1257,10 @@ func (i *Instance) commitPhysicalRuntime(authority *runtimeTransitionAuthority) 
 			return next, plan, true, readErr
 		}
 		i.adoptRuntimeSnapshot(next, bindings)
+		i.acceptLaunchPublication(next, authority.launchDecision, publication)
 	} else {
 		i.applyLocalRuntimeTransition(next, plan)
+		i.acceptLaunchPublication(next, authority.launchDecision, statedb.RuntimePublication{})
 	}
 	recordInstanceSpawn(i.ID)
 	if err := runtimeTransitionFaultFn(RuntimeTransitionAfterCommitBeforeSweep, next); err != nil {
@@ -1407,7 +1458,9 @@ func (i *Instance) reconcileRuntimeCandidatesLocked(db *statedb.StateDB, durable
 		if err != nil {
 			return result, err
 		}
-		i.adoptRuntimeSnapshot(completed, bindings)
+		if err := i.adoptDurableRuntimeSnapshot(db, incarnation, completed, bindings); err != nil {
+			return result, err
+		}
 		result.Live = true
 		return result, nil
 	}
@@ -1432,7 +1485,7 @@ func (i *Instance) reconcileRuntimeCandidatesLocked(db *statedb.StateDB, durable
 			TmuxSocketName: next.SocketName, Status: next.Status,
 			LastStartedAt: time.Unix(0, next.LastStartedUnixNano).UTC(),
 		}
-		if err := runtimeTransitionCommitFn(db, durable.Generation, incarnation, adopted, plan); err != nil {
+		if _, err := runtimeTransitionCommitFn(db, durable.Generation, incarnation, adopted, plan, nil); err != nil {
 			if !errors.Is(err, statedb.ErrInstanceParentConflict) {
 				winner, winnerFound, readErr := db.ReadRuntimeState(i.ID)
 				if readErr == nil && winnerFound && winner.Generation >= adopted.Generation {
@@ -1453,7 +1506,9 @@ func (i *Instance) reconcileRuntimeCandidatesLocked(db *statedb.StateDB, durable
 	if err != nil {
 		return result, err
 	}
-	i.adoptRuntimeSnapshot(durable, bindings)
+	if err := i.adoptDurableRuntimeSnapshot(db, incarnation, durable, bindings); err != nil {
+		return result, err
+	}
 	for _, candidate := range lower {
 		generation := tmux.RuntimeGenerationCandidate{
 			SessionName: candidate.SessionName, SessionID: candidate.SessionID,
@@ -1606,7 +1661,7 @@ func applyCandidateBindingDecision(plan []statedb.RuntimeBindingTransition, cand
 	return explicit
 }
 
-func (i *Instance) reconcileRuntimeCandidate(candidate statedb.RuntimeState, plan []statedb.RuntimeBindingTransition) error {
+func (i *Instance) reconcileRuntimeCandidate(candidate statedb.RuntimeState, plan []statedb.RuntimeBindingTransition, launch *statedb.RuntimeLaunchDecision) error {
 	if candidate.InstanceID != i.ID || candidate.Generation == 0 || candidate.TmuxSession == "" {
 		return fmt.Errorf("invalid runtime candidate for %s", i.ID)
 	}
@@ -1639,6 +1694,12 @@ func (i *Instance) reconcileRuntimeCandidate(candidate statedb.RuntimeState, pla
 		if !result.Live {
 			return i.runtimeAmbiguity("durable partial-success winner is not uniquely proved live", result.Candidates)
 		}
+		if !samePhysicalRuntime(result.State, candidate) {
+			return statedb.ErrRuntimeGenerationConflict
+		}
+		if launch != nil {
+			return i.recordReconciledLaunch(result.State, launch)
+		}
 		return nil
 	}
 	if !found || durable.Generation+1 != candidate.Generation {
@@ -1651,10 +1712,15 @@ func (i *Instance) reconcileRuntimeCandidate(candidate statedb.RuntimeState, pla
 	if err != nil {
 		return err
 	}
-	if err := i.validatePartialRuntimeCandidate(durable, candidate, plan, candidates); err != nil {
+	bindingKind := activeRuntimeBindingKind(i)
+	if launch != nil {
+		bindingKind = launch.BindingKind
+	}
+	if err := i.validatePartialRuntimeCandidate(durable, candidate, plan, candidates, bindingKind); err != nil {
 		return err
 	}
-	if err := runtimeTransitionCommitFn(db, durable.Generation, incarnation, candidate, plan); err != nil {
+	publication, err := runtimeTransitionCommitFn(db, durable.Generation, incarnation, candidate, plan, launch)
+	if err != nil {
 		if !errors.Is(err, statedb.ErrInstanceParentConflict) {
 			winner, winnerFound, readErr := db.ReadRuntimeState(i.ID)
 			if readErr == nil && winnerFound && winner.Generation >= candidate.Generation {
@@ -1668,12 +1734,15 @@ func (i *Instance) reconcileRuntimeCandidate(candidate statedb.RuntimeState, pla
 		return err
 	}
 	i.adoptRuntimeSnapshot(candidate, bindings)
+	if launch != nil {
+		i.acceptLaunchPublication(candidate, launch, publication)
+	}
 	recordInstanceSpawn(i.ID)
 	runtimeDuplicateSweepFn(i, runtimeCandidateObservedSocketNames(candidates)...)
 	return nil
 }
 
-func (i *Instance) validatePartialRuntimeCandidate(durable, expected statedb.RuntimeState, plan []statedb.RuntimeBindingTransition, candidates []tmux.RuntimeCandidate) error {
+func (i *Instance) validatePartialRuntimeCandidate(durable, expected statedb.RuntimeState, plan []statedb.RuntimeBindingTransition, candidates []tmux.RuntimeCandidate, activeKind string) error {
 	var currentCount int
 	var selected *tmux.RuntimeCandidate
 	for index := range candidates {
@@ -1713,7 +1782,6 @@ func (i *Instance) validatePartialRuntimeCandidate(durable, expected statedb.Run
 		selected.Status != expected.Status || selected.LastStartedUnixNano != expected.LastStartedAt.UnixNano() {
 		return i.runtimeAmbiguity("partial-success candidate lacks the exact complete runtime tuple", candidates)
 	}
-	activeKind := activeRuntimeBindingKind(i)
 	expectedBinding, bindingKnown := "", false
 	for _, transition := range plan {
 		if transition.Kind == activeKind {

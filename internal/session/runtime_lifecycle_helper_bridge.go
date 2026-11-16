@@ -120,10 +120,10 @@ func RunRuntimeLifecycleContenderHelper(config RuntimeLifecycleHelperConfig) (Ru
 	}
 	runtimeTransitionCommitFn = func(
 		db *statedb.StateDB, expected uint64, incarnation string,
-		next statedb.RuntimeState, plan []statedb.RuntimeBindingTransition,
-	) error {
+		next statedb.RuntimeState, plan []statedb.RuntimeBindingTransition, launch *statedb.RuntimeLaunchDecision,
+	) (statedb.RuntimePublication, error) {
 		result.CommitCalls++
-		return db.CommitRuntimeTransitionWithBindingPlan(expected, incarnation, next, plan)
+		return db.CommitRuntimeTransitionWithLaunch(expected, incarnation, next, plan, launch)
 	}
 	runtimeDuplicateSweepFn = func(*Instance, ...string) { result.SweepCalls++ }
 	nowFn = func() time.Time { return time.Unix(100, 123).UTC() }

@@ -62,16 +62,20 @@ type InstanceData struct {
 	// Persisted via the tool_data extras zone (see
 	// WriteSubcommandPassthroughToToolData), not a dedicated SQL column, so
 	// it round-trips across binary versions without a schema migration.
-	SubcommandPassthrough bool      `json:"subcommand_passthrough,omitempty"`
-	TrackCommandExit      bool      `json:"track_command_exit,omitempty"`
-	AutoName              bool      `json:"auto_name,omitempty"`             // marks Title as a machine-generated quick-session handle
-	AutoNameDescription   string    `json:"auto_name_description,omitempty"` // last captured Claude task description for an AutoName session
-	Command               string    `json:"command"`
-	Wrapper               string    `json:"wrapper,omitempty"`
-	Tool                  string    `json:"tool"`
-	Status                Status    `json:"status"`
-	CreatedAt             time.Time `json:"created_at"`
-	LastAccessedAt        time.Time `json:"last_accessed_at,omitempty"`
+	SubcommandPassthrough bool `json:"subcommand_passthrough,omitempty"`
+	TrackCommandExit      bool `json:"track_command_exit,omitempty"`
+	// PiSocketExported mirrors Instance.PiSocketExported (tool_data extras zone).
+	PiSocketExported bool `json:"pi_socket_exported,omitempty"`
+	// LaunchedTool mirrors the runtime-bound launch observation.
+	LaunchedTool        string    `json:"launched_tool,omitempty"`
+	AutoName            bool      `json:"auto_name,omitempty"`             // marks Title as a machine-generated quick-session handle
+	AutoNameDescription string    `json:"auto_name_description,omitempty"` // last captured Claude task description for an AutoName session
+	Command             string    `json:"command"`
+	Wrapper             string    `json:"wrapper,omitempty"`
+	Tool                string    `json:"tool"`
+	Status              Status    `json:"status"`
+	CreatedAt           time.Time `json:"created_at"`
+	LastAccessedAt      time.Time `json:"last_accessed_at,omitempty"`
 	// LastStartedAt mirrors Instance.LastStartedAt (issue #30 / #1704 fix).
 	// Persisted via the tool_data extras zone (see last_started_persist.go),
 	// not a typed SQL column. Zero means unknown (old record or never
@@ -484,11 +488,13 @@ func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([
 	UpdateClaudeSessionsWithDedup(instances)
 	updates := make([]statedb.InstanceSnapshot, len(instances))
 	clearIntents := make([]bool, len(instances))
+	launchesWritten := make([]bool, len(instances))
 	for i, inst := range instances {
 		if inst == nil {
 			return nil, fmt.Errorf("nil instance")
 		}
 		inst.setOwningDB(s.db)
+		launchesWritten[i] = inst.launchUnrecorded.Load()
 		row, err := instanceToRow(inst)
 		if err != nil {
 			return nil, err
@@ -525,6 +531,9 @@ func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([
 		original.StatusRevision = committed.StatusRevision
 		original.LastStartedAt = committed.LastStartedAt
 		original.RuntimeBindings = committed.RuntimeBindings
+		if launchesWritten[i] {
+			inst.launchUnrecorded.CompareAndSwap(true, false) // the save recorded the launch
+		}
 		if clearIntents[i] {
 			inst.genericSessionIDCleared = false
 			original.ToolData = WriteGenericSessionIDToToolData(original.ToolData, "", time.Time{}, false)
@@ -1382,6 +1391,17 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// command that was never explicitly validated as one.
 	toolData = WriteSubcommandPassthroughToToolData(toolData, inst.SubcommandPassthrough)
 	toolData = writeTrackCommandExitToToolData(toolData, inst.TrackCommandExit)
+	// The launch decision is the launch's to write (pi_socket_persist.go); a
+	// save writes it only for a launch that found no row (a session started
+	// before its first save). Otherwise it is left out, and the stored one is
+	// carried forward.
+	if inst.launchUnrecorded.Load() {
+		recorded, err := writeLaunchDecisionToToolData(toolData, inst.RuntimeState(), inst.PersistenceIncarnation(), inst.LaunchedTool, inst.PiSocketExported)
+		if err != nil {
+			return nil, fmt.Errorf("encode launch decision: %w", err)
+		}
+		toolData = recorded
+	}
 	// Identity-injection opt-out lives in the same extras zone so a restart
 	// from any process honours `--no-identity`.
 	toolData = WriteIdentityInjectionDisabledToToolData(toolData, inst.IdentityInjectionDisabled)
@@ -1654,6 +1674,8 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			Favorite:                  ReadFavoriteFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
 			TrackCommandExit:          readTrackCommandExitFromToolData(r.ToolData),
+			PiSocketExported:          rowPiSocketExported(r),
+			LaunchedTool:              rowLaunchedTool(r),
 			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
 			ConductorName:             ReadConductorNameFromToolData(r.ToolData),
 			ContextLevel:              ReadContextLevelFromToolData(r.ToolData),
@@ -1813,6 +1835,8 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			Favorite:                  ReadFavoriteFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
 			TrackCommandExit:          readTrackCommandExitFromToolData(r.ToolData),
+			PiSocketExported:          rowPiSocketExported(r),
+			LaunchedTool:              rowLaunchedTool(r),
 			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
 			ConductorName:             ReadConductorNameFromToolData(r.ToolData),
 			ContextLevel:              ReadContextLevelFromToolData(r.ToolData),
@@ -2177,6 +2201,8 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			hermesBoundAt:                instData.HermesDetectedAt,
 			SubcommandPassthrough:        instData.SubcommandPassthrough,
 			TrackCommandExit:             instData.TrackCommandExit,
+			PiSocketExported:             instData.PiSocketExported,
+			LaunchedTool:                 instData.LaunchedTool,
 			IdentityInjectionDisabled:    instData.IdentityInjectionDisabled,
 			ConductorName:                instData.ConductorName,
 			ContextLevel:                 instData.ContextLevel,
@@ -2277,4 +2303,22 @@ func decodeSandboxConfig(data json.RawMessage) *SandboxConfig {
 		return nil
 	}
 	return &cfg
+}
+
+func rowLaunchDecision(r *statedb.InstanceRow) (bool, string) {
+	state := statedb.RuntimeState{
+		InstanceID: r.ID, Generation: r.RuntimeGeneration, TmuxSession: r.TmuxSession,
+		TmuxSocketName: r.TmuxSocketName, LastStartedAt: r.LastStartedAt,
+	}
+	return ReadLaunchDecisionFromToolData(r.ToolData, state, r.Incarnation)
+}
+
+func rowPiSocketExported(r *statedb.InstanceRow) bool {
+	exported, _ := rowLaunchDecision(r)
+	return exported
+}
+
+func rowLaunchedTool(r *statedb.InstanceRow) string {
+	_, tool := rowLaunchDecision(r)
+	return tool
 }

@@ -2,6 +2,10 @@ package session
 
 import (
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -234,6 +238,31 @@ func TestRestartReportsAnUnrecordedTmuxName(t *testing.T) {
 	}
 }
 
+// The restoration verdict is tested directly: the fork refuses an uncertain
+// predecessor termination before attempting a replacement.
+func TestRestoreTmuxBindingAfterSpawnIsKilled(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	const oldName = "agentdeck_restartbinding_deadbeef"
+	storage, inst := restartPersistFixture(t, "_test_restart_binding_restore", oldName)
+	realTmux := seedRealTmuxSession(t, oldName)
+	previous := inst.GetTmuxSession()
+	inst.recreateTmuxSession()
+	restartBindingShim(t, realTmux, `*" new-session "*`)
+	if err := inst.GetTmuxSession().Start("sleep 60"); err == nil {
+		t.Fatal("the replacement spawn did not reach the injected failure")
+	}
+	inst.restoreTmuxBindingOnFailure(previous, false)
+	if inst.GetTmuxSession() != previous || !realTmuxHasSession(realTmux, oldName) {
+		t.Fatal("failed spawn lost its surviving predecessor binding")
+	}
+	if err := storage.SaveWithGroups([]*Instance{inst}, NewGroupTree([]*Instance{inst})); err != nil {
+		t.Fatal(err)
+	}
+	if got := storedTmuxName(t, storage, inst.ID); got != oldName {
+		t.Fatalf("stored binding = %q, want %q", got, oldName)
+	}
+}
+
 // TestRestartTmuxNameRecordedDefaultsToRecorded keeps the accessor from
 // reporting a problem on an instance that has never restarted -- callers use it
 // to decide whether to warn, and a warning about a restart that did not happen
@@ -245,5 +274,153 @@ func TestRestartTmuxNameRecordedDefaultsToRecorded(t *testing.T) {
 	recorded, err := inst.RestartTmuxNameRecorded()
 	if !recorded || err != nil {
 		t.Errorf("RestartTmuxNameRecorded() = (%v, %v) before any restart, want (true, nil)", recorded, err)
+	}
+}
+
+// restartBindingShim puts a tmux shim first on PATH that SIGKILLs itself for
+// every invocation matching one of the given shell case patterns (matched
+// against " $* ") and hands everything else to the real binary. A
+// signal-killed client is exactly the indeterminate outcome the restore
+// verdict has to reason about.
+func restartBindingShim(t *testing.T, realTmux string, killPatterns ...string) {
+	t.Helper()
+	script := "#!/bin/sh\ncase \" $* \" in\n"
+	for _, p := range killPatterns {
+		script += "  " + p + ") kill -9 $$ ;;\n"
+	}
+	script += "esac\nexec " + realTmux + " \"$@\"\n"
+	shimDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shimDir, "tmux"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write tmux shim: %v", err)
+	}
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// seedRealTmuxSession starts a detached session with the real binary and
+// returns the tmux path.
+func seedRealTmuxSession(t *testing.T, name string) string {
+	t.Helper()
+	realTmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skipf("tmux not on PATH: %v", err)
+	}
+	if out, err := exec.Command(realTmux, "new-session", "-d", "-s", name, "sleep 60").CombinedOutput(); err != nil {
+		t.Fatalf("seed old session %q: %v: %s", name, err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command(realTmux, "kill-session", "-t", "="+name).Run() })
+	return realTmux
+}
+
+// killSessionsCreatedDuring snapshots the server's sessions now and, at
+// cleanup, kills any session that was not there before, so a replacement the
+// restart created cannot leak whichever binding the instance ends up with.
+func killSessionsCreatedDuring(t *testing.T, realTmux string) {
+	t.Helper()
+	list := func() map[string]bool {
+		out, _ := exec.Command(realTmux, "list-sessions", "-F", "#{session_name}").Output()
+		names := map[string]bool{}
+		for _, n := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if n != "" {
+				names[n] = true
+			}
+		}
+		return names
+	}
+	before := list()
+	t.Cleanup(func() {
+		for n := range list() {
+			if !before[n] {
+				_ = exec.Command(realTmux, "kill-session", "-t", "="+n).Run()
+			}
+		}
+	})
+}
+
+func realTmuxHasSession(realTmux, name string) bool {
+	return exec.Command(realTmux, "has-session", "-t", "="+name).Run() == nil
+}
+
+func TestRestoreTmuxBindingDoesNotRebindToKilledPredecessor(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	const oldName = "agentdeck_restartbinding_killedok"
+	_, inst := restartPersistFixture(t, "_test_restart_binding_killed_ok", oldName)
+	realTmux := seedRealTmuxSession(t, oldName)
+	killSessionsCreatedDuring(t, realTmux)
+	previous := inst.GetTmuxSession()
+	if out, err := exec.Command(realTmux, "kill-session", "-t", "="+oldName).CombinedOutput(); err != nil {
+		t.Fatalf("kill predecessor: %v: %s", err, out)
+	}
+	inst.recreateTmuxSession()
+	replacement := inst.GetTmuxSession()
+	if err := replacement.Start("sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	restartBindingShim(t, realTmux, `*" has-session "*`+oldName+`*`)
+	inst.restoreTmuxBindingOnFailure(previous, true)
+	if inst.GetTmuxSession() != replacement || !realTmuxHasSession(realTmux, replacement.Name) || realTmuxHasSession(realTmux, oldName) {
+		t.Fatal("restoration replaced the live replacement with a killed predecessor")
+	}
+}
+
+func TestRestoreTmuxBindingOnIndeterminateProbe(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	const oldName = "agentdeck_restartbinding_indeterminate"
+	_, inst := restartPersistFixture(t, "_test_restart_binding_indeterminate", oldName)
+	realTmux := seedRealTmuxSession(t, oldName)
+	previous := inst.GetTmuxSession()
+	inst.recreateTmuxSession()
+	restartBindingShim(t, realTmux, `*" has-session "*`+oldName+`*`, `*" new-session "*`)
+	if err := inst.GetTmuxSession().Start("sleep 60"); err == nil {
+		t.Fatal("the replacement spawn did not reach the injected failure")
+	}
+	inst.restoreTmuxBindingOnFailure(previous, false)
+	if inst.GetTmuxSession() != previous || !realTmuxHasSession(realTmux, oldName) {
+		t.Fatal("an inconclusive probe discarded the surviving predecessor")
+	}
+}
+
+// TestRestartDoesNotRestoreAuthoritativelyAbsentBinding: the old name is
+// provably gone (a completed has-session says "can't find session"), so a
+// failed spawn must not point the instance back at it.
+func TestRestartDoesNotRestoreAuthoritativelyAbsentBinding(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+
+	const oldName = "agentdeck_restartbinding_absent"
+	_, inst := restartPersistFixture(t, "_test_restart_binding_absent", oldName)
+	realTmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skipf("tmux not on PATH: %v", err)
+	}
+	if realTmuxHasSession(realTmux, oldName) {
+		t.Fatalf("fixture: %q unexpectedly exists", oldName)
+	}
+	killSessionsCreatedDuring(t, realTmux)
+
+	restartBindingShim(t, realTmux, `*" new-session "*`)
+
+	if err := inst.Restart(); err == nil {
+		t.Fatal("restart must fail when its new-session child is killed")
+	}
+
+	if live := inst.GetTmuxSession(); live != nil && live.Name == oldName {
+		t.Fatalf("binding after failed restart = %q: restored a session a completed probe proved gone", oldName)
+	}
+}
+
+func TestRestoreTmuxBindingKeepsExistingReplacement(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	const oldName = "agentdeck_restartbinding_replacement"
+	_, inst := restartPersistFixture(t, "_test_restart_binding_replacement", oldName)
+	realTmux := seedRealTmuxSession(t, oldName)
+	killSessionsCreatedDuring(t, realTmux)
+	previous := inst.GetTmuxSession()
+	inst.recreateTmuxSession()
+	replacement := inst.GetTmuxSession()
+	if err := replacement.Start("sleep 60"); err != nil {
+		t.Fatal(err)
+	}
+	inst.restoreTmuxBindingOnFailure(previous, false)
+	if inst.GetTmuxSession() != replacement || !realTmuxHasSession(realTmux, replacement.Name) || !realTmuxHasSession(realTmux, oldName) {
+		t.Fatal("restoration abandoned a live replacement")
 	}
 }

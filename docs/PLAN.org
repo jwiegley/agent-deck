@@ -375,3 +375,56 @@ A Codex send that lands while a turn runs starts no turn: Codex records the inpu
 ]
 #+end_src
 
+* DONE [#C] Upgrade fork to Agent Deck v1.16.39
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-r3e
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-11-16 Mon 10:39]
+:MODIFIED: [2026-11-16 Mon 13:50]
+:CREATED_BY: johnw
+:FINISHED: [2026-11-16 Mon 13:50]
+:CLOSE_REASON: Integrated v1.16.39; focused regressions and pre-commit verified. Signed publication follows through the goal and mandatory pre-push gate.
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Integrate upstream v1.16.39 while preserving fork runtime authority and service ownership, verify in Docker, then publish the signed fork update for the Hera Nix pin.
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 47,
+    "issue_id": "agent-deck-r3e",
+    "author": "johnw",
+    "text": "Refocus 2026-11-16T19:47:30Z (four minutes late): preserve ordered upgrade/publish/Nix/Hera scope. User approved deeper integration repair after independent audit. Orders ownership regression red on staged upstream integration, green with shared helpers. Generation/incarnation-bound launch records now publish atomically with runtime; read/reload/reconciliation and race fixtures pass focused checks. Remaining focused failures: three incoming restart restoration fixtures and intended storage-byte golden changes. No commits, pushes, or activation. Next: resolve those fixtures/goldens, rerun full gates and audit. Next refocus due 2026-11-16T20:47:30Z.",
+    "created_at": "2026-11-16T19:48:08Z"
+  },
+  {
+    "id": 48,
+    "issue_id": "agent-deck-r3e",
+    "author": "johnw",
+    "text": "Refocus 2026-11-16T20:36:26Z: ordered fork upgrade/publication, Nix pin/publication, then Hera activation remains unchanged. User authorized repairs after hook-4 failed six tests. All six now pass together with launch/runtime lifecycle race regressions; new reservation recovery regression is red before repair and green afterward, including late legacy writer. Independent focused audit closes A/B with no remaining blockers in reviewed scope. Frozen code tree acc19fe702fc9c0a9c5f5edb3b8b781298b30fd4 passes fresh pre-commit; full pre-push-5 running with Go package parallelism two, no weakened tests. No commits, pushes, Nix edits, or activation. Stop Nix preparation until fork published. Next: inspect full-hook result, then signed merge/protected publication if green. Next refocus due 2026-11-16T21:36:26Z.",
+    "created_at": "2026-11-16T20:37:15Z"
+  },
+  {
+    "id": 49,
+    "issue_id": "agent-deck-r3e",
+    "author": "johnw",
+    "text": "Refocus 2026-11-16T21:37:43Z (1m17s late): user reaffirmed version-only scope and authorized only four remaining gate blockers, no broader audits/redesigns. Hook-5 build/lint/format/vet pass; full suite failed fork metadata, two pane-retention cases and a visual transient. Fork test now exercises public CLI rather than inheriting process-global state; repeated runs pass. Visual harness waits for restart toast dismissal, leaves goldens unchanged, full visual check passes. Retention failures reproduced in isolated repeated tests: actual tmux pane is dead but returns neither exit status nor signal; investigate this exact environment/runtime issue only. No commits, pushes, Nix edits, or activation. Next: resolve retention blockers, then required commit/push gates; no extra manual full suite. Next refocus due 2026-11-16T22:37:43Z.",
+    "created_at": "2026-11-16T21:38:21Z"
+  },
+  {
+    "id": 50,
+    "issue_id": "agent-deck-r3e",
+    "author": "johnw",
+    "text": "Upgrade integration verified. Pre-commit-6 passes. Fork launch metadata is verified through the real CLI (three repeats); visual check passes with unchanged goldens after waiting for restarted version and toast dismissal. Bare tmux 3.3a reproduced the retention defect without agent-deck (2/40); user authorized comparison with Hera tmux 3.8, which passes unchanged retention assertions across ten repeats. No application workaround added. Required full pre-push will run during authorized publication; no extra manual full-suite run. Publication and subsequent Nix/Hera work remain tracked by goal mwjljk76-ntvtiz.",
+    "created_at": "2026-11-16T21:50:42Z"
+  }
+]
+#+end_src
+

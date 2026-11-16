@@ -60,6 +60,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	ignoreBudget := fs.Bool("ignore-budget", false, ignoreBudgetFlagHelp)
 	assertDone := fs.Bool("assert-done", false, "Append a completion-sentinel instruction to the message (default on for -c claude)")
 	noAssertDone := fs.Bool("no-assert-done", false, "Disable the completion-sentinel instruction")
+	noTag := fs.Bool("no-tag", false, "Do not prefix the [agent-deck from:<id>] envelope a launch from inside its parent session gets by default ([send] tag_sends)")
 	parent := fs.String("parent", "", "Parent session (creates sub-session; group is cwd-derived by default — auto-inherits the parent's group for git worktree children or with --inherit-group)")
 	parentShort := fs.String("p", "", "Parent session (short)")
 	noParent := fs.Bool("no-parent", false, "Disable automatic parent linking")
@@ -101,7 +102,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 
 	// Plugin channel flag - can be specified multiple times; requires -c claude.
 	// Mirrors handleAdd's --channel; both routes feed Instance.Channels which
-	// buildClaudeExtraFlags emits as --channels <csv> on every Start/Restart.
+	// buildClaudeExtraFlags emits as one --channels <entry> per channel on every Start/Restart.
 	var channelFlags []string
 	fs.Func("channel", "Plugin channel id (can specify multiple times); requires -c claude", func(s string) error {
 		channelFlags = append(channelFlags, s)
@@ -794,6 +795,18 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	}
 	sessionHints, sessionTags := applyCreationHints(storage, newInstance, creationHints, autoHints)
 
+	// Issue #3131: a kickoff from inside the parent session is the parent's
+	// ask, tagged like a `session send` (after the purpose hint, which must
+	// stay the message's own first line).
+	initialMessage, kickoffTagged := tagLaunchKickoff(initialMessage, launchKickoffTagInputs{
+		senderID:  sendSenderID(),
+		parent:    parentInstance,
+		childTool: newInstance.Tool,
+		enabled:   !*noTag && sendTagsEnabled(),
+
+		childReportsTurns: newInstance.TurnsReportedToParent(),
+	})
+
 	// Keep validation and writing inside the compensated post-insert step.
 	if err := creationRollback.run("configure MCPs", func() error {
 		if len(mcpFlags) == 0 {
@@ -996,6 +1009,9 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		if sessionCommandNote != "" {
 			jsonData["command_note"] = sessionCommandNote
 		}
+	}
+	if initialMessage != "" {
+		jsonData["tagged"] = kickoffTagged
 	}
 	if len(mcpFlags) > 0 {
 		jsonData["mcps"] = mcpFlags

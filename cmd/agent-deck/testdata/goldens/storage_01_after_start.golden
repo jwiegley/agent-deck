@@ -211,7 +211,7 @@
       "tmux_session": "ad-golden-sess-shell",
       "tmux_socket_name": "",
       "tool": "shell",
-      "tool_data": "{\"last_started_at\":\"\u003cVOLATILE_LAST_STARTED_AT\u003e\"}",
+      "tool_data": "{\"last_started_at\":\"\u003cVOLATILE_LAST_STARTED_AT\u003e\",\"launch_instance_id\":\"golden-sess-shell\",\"launch_incarnation\":\"\u003cVOLATILE_LAUNCH_INCARNATION\u003e\",\"launch_runtime_generation\":1,\"launch_tmux_session\":\"ad-golden-sess-shell\",\"launch_tmux_socket_name\":\"\",\"launch_last_started_at\":\"\u003cVOLATILE_LAUNCH_LAST_STARTED_AT\u003e\",\"launched_tool\":\"shell\",\"pi_socket_exported\":false}",
       "worktree_branch": "",
       "worktree_path": "",
       "worktree_repo": "",

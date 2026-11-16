@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -497,6 +498,12 @@ type Session struct {
 	// reconnected without a clock, so hasErrorBannerIndicator must not read a
 	// preserved startup-timeout banner as current (#2938).
 	startupArmed bool
+	// startupTimeoutHint is an optional paragraph the startup-timeout hold
+	// shows between its banner and the recovery command, naming what would
+	// have let agent-deck see the agent start (#3098). Set by the session
+	// layer before each spawn. Atomic rather than under mu so a spawn never
+	// waits on a status poll that holds mu.
+	startupTimeoutHint atomic.Pointer[string]
 	// afterStartupTimeoutClaim is a test seam for scheduling a competing pane
 	// generation after timeout recovery releases mu but before GetStatus decides
 	// which generation's status to return.
@@ -548,6 +555,11 @@ type Session struct {
 	// every row's frame from that single tmux call even when the pass itself
 	// runs longer than 500ms on a loaded host.
 	cachePrimedUntil time.Time
+	// captureSkipUntil is set when a batched capture timed out before
+	// reaching this pane (#3089): until then CapturePane answers from the
+	// last frame or with ErrCaptureTimeout instead of starting its own tmux
+	// client on a host that just failed to answer one.
+	captureSkipUntil time.Time
 	captureSf        singleflight.Group // Deduplicates concurrent CapturePane subprocess calls
 
 	// Content tracking for HasUpdated (separate from StateTracker)
@@ -669,6 +681,15 @@ type Session struct {
 	// tool by the session layer via SetPreEnterDelay.
 	preEnterDelay time.Duration
 
+	// framePastes routes EVERY body through the framed (bracketed-paste)
+	// transport, including a short single-line body that `send-keys -l` would
+	// otherwise type directly. A composer that re-processes a typed burst
+	// character by character is still ingesting it when the submitting Enter
+	// lands, and such a composer treats that Enter as a newline inside the
+	// paste rather than as a submit. Zero value keeps the historical
+	// transport. Set per tool by the session layer via SetFramePastes.
+	framePastes bool
+
 	// Custom patterns for generic tool support
 	customToolName       string
 	customBusyPatterns   []string
@@ -738,6 +759,7 @@ func (s *Session) invalidateCache() {
 	s.cacheContent = ""
 	s.cacheTime = time.Time{}
 	s.cachePrimedUntil = time.Time{}
+	s.captureSkipUntil = time.Time{}
 }
 
 // SetCustomPatterns sets custom patterns for generic tool support
@@ -795,6 +817,37 @@ func (s *Session) effectivePreEnterDelay() time.Duration {
 		return s.preEnterDelay
 	}
 	return preEnterDelayDefault
+}
+
+// SetFramePastes forces the framed (bracketed-paste) transport for message
+// bodies that would otherwise go out as an unframed `send-keys -l` burst,
+// including short single-line messages.
+//
+// The unframed transport gives a TUI composer one character event per byte.
+// A composer that repaints per character (Codex) is still consuming that burst
+// when the submitting Enter arrives: its paste-burst detector classifies the
+// burst as a paste, turns the Enter into a newline inside the paste, and
+// re-arms its 120ms suppression window from that moment. The message then sits
+// in the composer, unsent, and a later Enter only re-arms the window again.
+// With the frame (tmux `paste-buffer -p`), the composer receives ONE paste
+// event, ingests it whole, and clears its suppression window, so the ordinary
+// pre-Enter delay is enough.
+//
+// Measured on codex-cli 0.159.3 under tmux 3.4 with a 513-byte single-line
+// body: unframed + Enter at 100ms and 200ms was never submitted and 500ms
+// submitted; the identical body framed + Enter at 50ms submitted every time.
+// Zero value (the default) keeps each tool's historical transport.
+func (s *Session) SetFramePastes(frame bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.framePastes = frame
+}
+
+// framesPastesForSend reports the SetFramePastes choice.
+func (s *Session) framesPastesForSend() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.framePastes
 }
 
 // SetInjectStatusLine controls whether ConfigureStatusBar modifies tmux settings.
@@ -1454,33 +1507,14 @@ func (s *Session) Exists() bool {
 // session's own socket.
 func (s *Session) existsProbe() bool {
 	// Cache is stale (or skipped for an isolated socket): fall back to a
-	// direct tmux check on the session's own socket. Bound it: a server that
-	// is briefly busy can make the probe hang, and a probe that never answers
-	// is indeterminate — assume the session still exists rather than reporting
-	// it dead (which would flip a live session to StatusError). Only a probe
-	// that actually completes with a non-success status means "gone".
+	// direct tmux check on the session's own socket, bounded so a briefly
+	// busy server cannot hang the status path. What each probe outcome means
+	// for a "must not call a live session dead" caller — timeout, protocol
+	// mismatch, killed client — is owned by hasSessionProbeAssumesAlive.
 	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
 	defer cancel()
 	err := commandRun(s.tmuxCmdContext(ctx, "has-session", "-t", s.TmuxName()))
-	if ctx.Err() == context.DeadlineExceeded {
-		return true // probe timed out: indeterminate, assume still alive
-	}
-	// A completed non-zero exit is only AUTHORITATIVE if the client reached the
-	// server. A client/server protocol version mismatch fails every command on
-	// this socket fast with a non-zero exit, and the refusal itself proves the
-	// server — and therefore this session — is alive: only the client binary is
-	// wrong. Treating it as "gone" flipped live sessions to StatusError (via
-	// terminatedPaneStatus) even though nothing crashed. Assume alive, like the
-	// timeout branch, and let a later poll with a matching client resolve it.
-	//
-	// The verdict is a property of the client/server binary pair, not of this
-	// session, so it is settled out of band and cached per socket. That keeps
-	// this probe on Run() with nil stdio: no pipe, no copy goroutine, nothing
-	// for WaitDelay to bound on the status hot path.
-	if err != nil && socketHasProtocolMismatch(s.SocketName) {
-		return true
-	}
-	return err == nil
+	return hasSessionProbeAssumesAlive(ctx, s.SocketName, err)
 }
 
 // AbsentFromCache reports, without spawning a subprocess, that the current

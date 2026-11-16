@@ -456,7 +456,7 @@ type Instance struct {
 
 	// Channels are Claude Code plugin-channel ids (e.g. "plugin:telegram@user/repo").
 	// When non-empty on a claude session, buildClaudeExtraFlags emits
-	// `--channels <csv>` so the session subscribes to inbound plugin messages.
+	// one `--channels <entry>` per channel so the session subscribes to inbound plugin messages.
 	// Without this flag the channel plugin runs as a plain MCP (tools only,
 	// no inbound delivery) which silently drops Telegram/Discord/Slack
 	// messages on conductor restart.
@@ -490,6 +490,20 @@ type Instance struct {
 	// the tool_data extras zone so a restart honours the choice. CLI flag:
 	// `--no-identity` on `agent-deck add` / `agent-deck launch`.
 	IdentityInjectionDisabled bool `json:"identity_injection_disabled,omitempty"`
+
+	// PiSocketExported records that the physical launch exported
+	// AGENTDECK_PI_SOCKET: the daemon must not type into that Pi during a
+	// socket outage. The persisted decision is bound to the insertion
+	// incarnation and complete runtime identity, not just a reusable tmux name.
+	PiSocketExported bool `json:"pi_socket_exported,omitempty"`
+
+	// LaunchedTool is the tool the last launch of this session ran: what its
+	// pane runs now. A tool edit changes Tool at once but takes effect only at
+	// the next restart, so the comms ledger reads the parent's harness from
+	// here (commsParentTool). Published atomically with the runtime, or by the
+	// first save of an unsaved launch. Empty means no matching runtime-bound
+	// launch record exists; metadata saves must not invent a launch.
+	LaunchedTool string `json:"launched_tool,omitempty"`
 
 	// ContextLevel is the per-session override of the harness context-level
 	// (issue #2260): "none", "primer", or "full". Empty means unset — falls
@@ -678,6 +692,7 @@ type Instance struct {
 	skipRecoveryTurn            bool        // SkipConductorRecoveryTurn: the next spawn sends no recovery turn
 	restartReason               string      // SetRestartReason: why the next restart happens, for its resume note
 	launchesFresh               atomic.Bool // the Claude command last built starts a new conversation (#2954, fresh_start.go)
+	launchUnrecorded            atomic.Bool // the last launch found no row for its launched tool: the first save writes it
 	configDirLeftToCommand      bool        // the export prefix last built left CLAUDE_CONFIG_DIR to the command (#1822 F3; noteFreshStart)
 	codexStartedGeneration      string
 	codexCompletedGeneration    string
@@ -715,6 +730,7 @@ type Instance struct {
 	// hook file. Entries are versioned with the authoritative runtime binding,
 	// so a new hook event or binding transition still takes the durable CAS path.
 	validatedHookBindings map[string]validatedHookRuntimeBinding
+	launchRecordStamps    statedb.WriteStamps // the last launch write's, for LaunchRecordStamps
 
 	// SSE-based status detection for OpenCode (set by OpenCodeSSEWatcher,
 	// issue #1614). Not persisted; rebuilt from the live event stream.
@@ -1633,6 +1649,7 @@ func (i *Instance) applyLaunchSettingsFromConfig() {
 	// local directory nothing reads. Every local session keeps the guards.
 	i.tmuxSession.WorkDirIsPlaceholder = i.IsSSH()
 	i.applyVimModeFromConfig()
+	i.applyStartupTimeoutHint()
 }
 
 // applyVimModeFromConfig copies [claude].vim_mode onto the tmux session so the
@@ -1649,6 +1666,28 @@ func (i *Instance) applyVimModeFromConfig() {
 		return
 	}
 	i.tmuxSession.VimMode = cfg.Claude.GetVimMode()
+}
+
+// framePasteForTool reports whether a tool's input composer must receive the
+// message body as ONE framed (bracketed) paste even when it is a short
+// single-line message that the unframed `send-keys -l` transport could type
+// directly.
+//
+// Codex re-processes a typed burst character by character. While that
+// ingestion is still running its paste-burst detector treats an arriving Enter
+// as a newline inside the paste rather than a submit, and re-arms its 120ms
+// suppression window from that Enter — so the fixed pre-Enter delay left the
+// message sitting in the composer, unsent, and the Codex send path (which has
+// no automatic Enter retry) reported typed_not_submitted. Measured on
+// codex-cli 0.159.3 under tmux 3.4: a 513-byte single-line body sent with
+// `send-keys -l` was never submitted with Enter at 100ms or 200ms and
+// submitted at 500ms, while the identical body sent as a framed paste
+// submitted with Enter at 50ms. The frame gives the composer one paste event
+// to ingest, so the ordinary delay is enough.
+//
+// Every other tool returns false and keeps its transport unchanged.
+func framePasteForTool(tool string) bool {
+	return IsCodexCompatible(tool)
 }
 
 // preEnterDelayForTool returns the pause a tool's input composer needs between
@@ -2125,7 +2164,7 @@ func (i *Instance) start(result *statedb.RuntimeState) (startErr error) {
 	captureRuntimeResult(result, candidate)
 	if err != nil {
 		return &RestartPartialSuccessError{
-			InstanceID: i.ID, Operation: "start", Runtime: candidate, BindingPlan: plan,
+			InstanceID: i.ID, Operation: "start", Runtime: candidate, BindingPlan: plan, LaunchDecision: transition.launchDecision,
 			NeedsReconciliation: !committed, Err: err,
 		}
 	}
@@ -2520,7 +2559,7 @@ func (i *Instance) startWithMessage(message string, result *statedb.RuntimeState
 	captureRuntimeResult(result, candidate)
 	if err != nil {
 		return &RestartPartialSuccessError{
-			InstanceID: i.ID, Operation: "start", Runtime: candidate, BindingPlan: plan,
+			InstanceID: i.ID, Operation: "start", Runtime: candidate, BindingPlan: plan, LaunchDecision: transition.launchDecision,
 			NeedsReconciliation: !committed,
 			MessageUndelivered:  message != "" && !promptEmbeddedInCommand,
 			Err:                 err,

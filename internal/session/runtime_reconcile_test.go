@@ -86,8 +86,8 @@ func installRuntimeLifecycleTestSeams(t *testing.T) {
 	runtimeCandidateSetEnvFn = func(*tmux.Session, string, string) error { return nil }
 	runtimeCleanupIdentityStampFn = func(*tmux.Session, string, uint64, string, string) error { return nil }
 	runtimeCandidateRespawnFn = func(*tmux.Session, tmux.RuntimeGenerationCandidate, string) error { return nil }
-	runtimeTransitionCommitFn = func(db *statedb.StateDB, expected uint64, incarnation string, next statedb.RuntimeState, plan []statedb.RuntimeBindingTransition) error {
-		return db.CommitRuntimeTransitionWithBindingPlan(expected, incarnation, next, plan)
+	runtimeTransitionCommitFn = func(db *statedb.StateDB, expected uint64, incarnation string, next statedb.RuntimeState, plan []statedb.RuntimeBindingTransition, launch *statedb.RuntimeLaunchDecision) (statedb.RuntimePublication, error) {
+		return db.CommitRuntimeTransitionWithLaunch(expected, incarnation, next, plan, launch)
 	}
 	runtimeDuplicateSweepFn = func(*Instance, ...string) {}
 	killRuntimeGenerationCandidateFn = func(tmux.RuntimeGenerationCandidate, bool) error { return nil }
@@ -242,11 +242,12 @@ func TestRuntimeLifecycle_PersistenceFailureRetriesDurabilityOnly(t *testing.T) 
 	if err != nil || winner != nil {
 		t.Fatalf("begin winner=%v err=%v", winner, err)
 	}
+	inst.PiSocketExported = true
 	spawnCount++
 	setRuntimeTestCandidate(inst, "runtime-g1")
 	persistFailure := errors.New("injected transaction failure")
-	runtimeTransitionCommitFn = func(*statedb.StateDB, uint64, string, statedb.RuntimeState, []statedb.RuntimeBindingTransition) error {
-		return persistFailure
+	runtimeTransitionCommitFn = func(*statedb.StateDB, uint64, string, statedb.RuntimeState, []statedb.RuntimeBindingTransition, *statedb.RuntimeLaunchDecision) (statedb.RuntimePublication, error) {
+		return statedb.RuntimePublication{}, persistFailure
 	}
 	candidate, plan, committed, err := inst.commitPhysicalRuntime(authority)
 	authority.close()
@@ -258,8 +259,8 @@ func TestRuntimeLifecycle_PersistenceFailureRetriesDurabilityOnly(t *testing.T) 
 		t.Fatalf("failed transaction left generation=%d sweep=%d", state.Generation, sweepCount)
 	}
 
-	runtimeTransitionCommitFn = func(db *statedb.StateDB, expected uint64, incarnation string, next statedb.RuntimeState, plan []statedb.RuntimeBindingTransition) error {
-		return db.CommitRuntimeTransitionWithBindingPlan(expected, incarnation, next, plan)
+	runtimeTransitionCommitFn = func(db *statedb.StateDB, expected uint64, incarnation string, next statedb.RuntimeState, plan []statedb.RuntimeBindingTransition, launch *statedb.RuntimeLaunchDecision) (statedb.RuntimePublication, error) {
+		return db.CommitRuntimeTransitionWithLaunch(expected, incarnation, next, plan, launch)
 	}
 	runtimeCandidateInventoryFn = func(string, string) ([]tmux.RuntimeCandidate, error) {
 		return []tmux.RuntimeCandidate{{
@@ -272,11 +273,19 @@ func TestRuntimeLifecycle_PersistenceFailureRetriesDurabilityOnly(t *testing.T) 
 		}}, nil
 	}
 	partial := &RestartPartialSuccessError{
-		InstanceID: inst.ID, Runtime: candidate, BindingPlan: plan,
+		InstanceID: inst.ID, Runtime: candidate, BindingPlan: plan, LaunchDecision: authority.launchDecision,
 		NeedsReconciliation: true, Err: persistFailure,
 	}
+	inst.Tool, inst.PiSocketExported = "claude", false // metadata changes cannot rewrite the completed launch
 	if err := inst.ReconcileRestartResult(partial); err != nil {
 		t.Fatal(err)
+	}
+	row, err := db.LoadInstanceByID(inst.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exported, tool := rowLaunchDecision(row); !exported || tool != "pi" || inst.LaunchedTool != "pi" || !inst.PiSocketExported {
+		t.Fatalf("reconciliation lost the captured launch: row=%q/%v instance=%q/%v", tool, exported, inst.LaunchedTool, inst.PiSocketExported)
 	}
 	state, _, _ = db.ReadRuntimeState("one")
 	if state.Generation != 1 || spawnCount != 1 || sweepCount != 1 {
@@ -800,7 +809,7 @@ func TestRuntimeLifecycle_PartialSuccessRejectsAnyAmbiguousInventory(t *testing.
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := inst.validatePartialRuntimeCandidate(durable, expected, nil, test.candidates)
+			err := inst.validatePartialRuntimeCandidate(durable, expected, nil, test.candidates, activeRuntimeBindingKind(inst))
 			var ambiguity *RuntimeReconciliationAmbiguityError
 			if !errors.As(err, &ambiguity) || len(ambiguity.Candidates) != len(test.candidates) {
 				t.Fatalf("ambiguous inventory error = %v", err)

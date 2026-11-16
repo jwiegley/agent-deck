@@ -5,12 +5,10 @@ import (
 	"testing"
 )
 
-// alignRuntimeStartTimes copies each raced instance's runtime-owned
-// last_started_at onto the serial fixture. The fork keeps LastStartedAt in
-// instance_runtime_state (nanoseconds) as well as in the tool_data projection
-// alignStorageTimes already aligns, so the same wall-clock start time lives in
-// both places. Generation, status revision, tmux identity and status stay
-// compared byte for byte.
+// alignRuntimeStartTimes copies each raced instance's nanosecond start time
+// into the serial runtime state and launch observation. alignStorageTimes
+// aligns the seconds-based tool_data projection separately. Generation,
+// status revision, tmux identity and status stay compared byte for byte.
 func alignRuntimeStartTimes(t *testing.T, raced, serial *sql.DB) {
 	t.Helper()
 	rows, err := raced.Query("SELECT instance_id, last_started_at FROM instance_runtime_state ORDER BY instance_id")
@@ -25,6 +23,9 @@ func alignRuntimeStartTimes(t *testing.T, raced, serial *sql.DB) {
 			t.Fatal(err)
 		}
 		if _, err := serial.Exec("UPDATE instance_runtime_state SET last_started_at=? WHERE instance_id=?", started, id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := serial.Exec("UPDATE instances SET tool_data=json_set(tool_data, '$.launch_last_started_at', ?) WHERE id=? AND json_type(tool_data, '$.launch_last_started_at') IS NOT NULL", started, id); err != nil {
 			t.Fatal(err)
 		}
 	}

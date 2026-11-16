@@ -71,7 +71,7 @@ func (i *Instance) ensureClaudeSessionIDFromDiskForRestart() {
 		return
 	}
 	lookupPath := i.EffectiveWorkingDir()
-	uuid, found := discoverLatestClaudeJSONL(lookupPath)
+	uuid, found := discoverLatestClaudeJSONLForInstance(i, lookupPath)
 	if !found {
 		return
 	}
@@ -201,6 +201,53 @@ func (i *Instance) recreateTmuxSession() {
 	i.tmuxSession.SocketName = i.TmuxSocketName
 	i.tmuxSession.InstanceID = i.ID
 	applyTmuxSessionSettings(i.tmuxSession)
+}
+
+// restoreTmuxBindingOnFailure puts the pre-recreate tmux session back onto
+// the instance when it still names a live session. The recreate path swaps
+// i.tmuxSession — and with it the name every later save persists — before
+// the replacement session is proven to exist, so a spawn that fails (or a
+// spawn subprocess killed externally before tmux ever ran) would otherwise
+// leave this instance bound to a name nothing answers on while the old
+// pane is still alive. Pointing back at the surviving session keeps the
+// pane attachable; a provably dead previous session is not restored.
+//
+// The verdict comes from ProbeExists, not Exists: a positive activity cache
+// can still describe a session we killed moments ago, and a completed
+// "session gone" probe is authoritative — while an inconclusive one (the
+// probe process itself was killed) errs toward the old binding, exactly the
+// reading that keeps the surviving pane reachable.
+//
+// Two cases never restore, whatever the old-name probe says:
+//   - prevKilled: the restart's own Kill() of the old session succeeded, so
+//     an inconclusive probe of that name must not resurrect it.
+//   - the replacement session exists: Start() can fail after new-session
+//     already ran (a later step such as send-keys), and rebinding then would
+//     leave the running replacement pane with nothing pointing at it.
+func (i *Instance) restoreTmuxBindingOnFailure(prevTmux *tmux.Session, prevKilled bool) {
+	if prevTmux == nil || prevTmux == i.tmuxSession {
+		return
+	}
+	if prevKilled {
+		mcpLog.Info("restart_binding_restore_skipped",
+			slog.String("session_name", prevTmux.Name),
+			slog.String("reason", "old_session_killed"))
+		return
+	}
+	if cur := i.tmuxSession; cur != nil {
+		if exists, probeErr := cur.ProbeExists(); exists && probeErr == nil {
+			mcpLog.Info("restart_binding_restore_skipped",
+				slog.String("session_name", prevTmux.Name),
+				slog.String("reason", "replacement_exists"))
+			return
+		}
+	}
+	if exists, probeErr := prevTmux.ProbeExists(); !exists && probeErr == nil {
+		return
+	}
+	mcpLog.Info("restart_binding_restored",
+		slog.String("session_name", prevTmux.Name))
+	i.tmuxSession = prevTmux
 }
 
 func (i *Instance) prepareRestartMCPConfig() {
@@ -658,19 +705,13 @@ func (i *Instance) restartWithTransition(transition *runtimeTransitionAuthority,
 		captureRuntimeResult(result, candidate)
 		if persistErr != nil {
 			err = &RestartPartialSuccessError{
-				InstanceID: i.ID, Operation: "restart", Runtime: candidate, BindingPlan: plan,
+				InstanceID: i.ID, Operation: "restart", Runtime: candidate, BindingPlan: plan, LaunchDecision: transition.launchDecision,
 				NeedsReconciliation: !committed, Err: persistErr,
 			}
 			return
 		}
-		// A fallback recreate changes the only durable handle for the live
-		// process. The runtime transition above publishes that handle first;
-		// only then may the compatibility write acknowledge the exact committed
-		// generation and emit the change-detection stamp used by the TUI.
-		if candidate.TmuxSession != transition.expected.TmuxSession ||
-			candidate.TmuxSocketName != transition.expected.TmuxSocketName {
-			i.recordRestartOutcome(candidate, transition.incarnation)
-		}
+		// Record the launch only after its exact runtime has been committed.
+		i.recordRestartOutcome(candidate, transition.incarnation)
 		runtimeDuplicateSweepFn(i, transition.expected.TmuxSocketName)
 		i.recoverConductorAfterSpawn()
 	}()
@@ -1084,13 +1125,15 @@ fallbackRecreate:
 	// (the watcher was already superseded at the top of restart(), which covers
 	// this path and every early-returning respawn fast path alike.)
 
-	// Kill the exact predecessor captured under transition authority. A mutable
-	// tmux pointer may already describe a replacement and must never be used as
-	// the target of this destructive fallback.
+	// Kill only the predecessor captured under transition authority.
+	prevTmux := i.tmuxSession
+	prevKilled := transition.predecessorTerminated
 	if transition.expected.TmuxSession != "" && !transition.predecessorTerminated {
 		mcpLog.Debug("restart_killing_old_session", slog.String("session_name", transition.expected.TmuxSession))
 		if killErr := i.terminateTransitionPredecessor(transition); killErr != nil {
 			return fmt.Errorf("failed to kill predecessor runtime: %w", killErr)
+		} else {
+			prevKilled = true
 		}
 	}
 
@@ -1124,6 +1167,7 @@ fallbackRecreate:
 		// session shows no state at all. The freshly respawned process sits at
 		// its prompt, which is exactly "waiting".
 		if _, err := i.seedHermesHookGeneration("waiting", false); err != nil {
+			i.restoreTmuxBindingOnFailure(prevTmux, prevKilled)
 			return fmt.Errorf("seed hermes restart baseline: %w", err)
 		}
 		command = i.buildHermesCommand(i.Command)
@@ -1197,6 +1241,7 @@ fallbackRecreate:
 	command, containerName, err := i.prepareCommand(command)
 	if err != nil {
 		i.recordPrepareFailure(command, err) // #1924, sister path
+		i.restoreTmuxBindingOnFailure(prevTmux, prevKilled)
 		return err
 	}
 	ownershipCommand = command
@@ -1220,6 +1265,7 @@ fallbackRecreate:
 	mcpLog.Debug("restart_starting_new_session", slog.String("command", logging.RedactCommandEnv(command)))
 	command, err = i.wrapTrackedCommandExit(command)
 	if err != nil {
+		i.restoreTmuxBindingOnFailure(prevTmux, prevKilled)
 		return err
 	}
 
@@ -1241,6 +1287,7 @@ fallbackRecreate:
 		// changed something and is most likely to ask "why?" was the one that
 		// set StatusError with nothing to show for it.
 		i.recordTmuxStartFailure(command, err)
+		i.restoreTmuxBindingOnFailure(prevTmux, prevKilled)
 		i.Status = StatusError
 		return fmt.Errorf("failed to restart tmux session: %w", err)
 	}

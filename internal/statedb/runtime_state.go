@@ -1154,6 +1154,22 @@ func (s *StateDB) CommitRuntimeTransition(expectedGeneration uint64, expectedInc
 // every binding captured for its current generation. Current bindings may not
 // be omitted: each must be explicitly carried or released.
 func (s *StateDB) CommitRuntimeTransitionWithBindingPlan(expectedGeneration uint64, expectedIncarnation string, next RuntimeState, plan []RuntimeBindingTransition) error {
+	var publication RuntimePublication
+	return s.commitRuntimeTransition(expectedGeneration, expectedIncarnation, next, plan, nil, &publication)
+}
+
+// CommitRuntimeTransitionWithLaunch publishes launch intent in the same transaction
+// as its generation and bindings. A missing metadata parent defers the record to
+// the new instance's first save without weakening runtime authority.
+func (s *StateDB) CommitRuntimeTransitionWithLaunch(expectedGeneration uint64, expectedIncarnation string, next RuntimeState, plan []RuntimeBindingTransition, launch *RuntimeLaunchDecision) (RuntimePublication, error) {
+	var publication RuntimePublication
+	if err := s.commitRuntimeTransition(expectedGeneration, expectedIncarnation, next, plan, launch, &publication); err != nil {
+		return RuntimePublication{}, err
+	}
+	return publication, nil
+}
+
+func (s *StateDB) commitRuntimeTransition(expectedGeneration uint64, expectedIncarnation string, next RuntimeState, plan []RuntimeBindingTransition, launch *RuntimeLaunchDecision, publication *RuntimePublication) error {
 	if next.InstanceID == "" || next.Generation != expectedGeneration+1 {
 		return fmt.Errorf("%w: expected %d, next %d", ErrRuntimeGenerationConflict, expectedGeneration, next.Generation)
 	}
@@ -1171,6 +1187,7 @@ func (s *StateDB) CommitRuntimeTransitionWithBindingPlan(expectedGeneration uint
 		planned[item.Kind] = item
 	}
 	return withBusyRetry(func() error {
+		*publication = RuntimePublication{}
 		return s.withImmediateTransaction(func(tx *immediateTransaction) error {
 			if err := s.requireRuntimeWriterCompatibility(tx, time.Now()); err != nil {
 				return err
@@ -1296,6 +1313,18 @@ func (s *StateDB) CommitRuntimeTransitionWithBindingPlan(expectedGeneration uint
 			}
 			if err := projectRuntimeToolDataTx(tx, next.InstanceID); err != nil {
 				return err
+			}
+			if launch != nil {
+				publication.LaunchRecorded, err = writeRuntimeLaunchDecisionTx(tx, next, expectedIncarnation, *launch)
+				if err != nil {
+					return err
+				}
+				if publication.LaunchRecorded {
+					publication.Stamps, err = writeModificationStamp(tx)
+					if err != nil {
+						return err
+					}
+				}
 			}
 			if _, err := tx.Exec(`DELETE FROM instance_legacy_runtime_adoption WHERE instance_id = ?`, next.InstanceID); err != nil {
 				return err

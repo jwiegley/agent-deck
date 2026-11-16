@@ -313,7 +313,9 @@ func dumpStateDBRows(t *testing.T, dbPath string) string {
 			// on every other row remain literal in the storage golden.
 			m["last_accessed"] = "<VOLATILE_LAST_ACCESSED>"
 			if toolData, ok := m["tool_data"].(string); ok {
-				m["tool_data"] = regexp.MustCompile(`"last_started_at":\d+`).ReplaceAllString(toolData, `"last_started_at":"<VOLATILE_LAST_STARTED_AT>"`)
+				toolData = regexp.MustCompile(`"last_started_at":\d+`).ReplaceAllString(toolData, `"last_started_at":"<VOLATILE_LAST_STARTED_AT>"`)
+				toolData = regexp.MustCompile(`"launch_incarnation":"[0-9a-f]+"`).ReplaceAllString(toolData, `"launch_incarnation":"<VOLATILE_LAUNCH_INCARNATION>"`)
+				m["tool_data"] = regexp.MustCompile(`"launch_last_started_at":\d+`).ReplaceAllString(toolData, `"launch_last_started_at":"<VOLATILE_LAUNCH_LAST_STARTED_AT>"`)
 			}
 		}
 		out.Instances = append(out.Instances, m)

@@ -21,6 +21,8 @@ type RestartPartialSuccessError struct {
 	// BindingPlan is the exact CAS intent captured before the physical spawn.
 	// Durability reconciliation reuses it verbatim and never spawns again.
 	BindingPlan []statedb.RuntimeBindingTransition
+	// LaunchDecision is captured before publication can adopt a competing winner.
+	LaunchDecision *statedb.RuntimeLaunchDecision
 	// NeedsReconciliation is true only when publication of Runtime failed.
 	// Post-start actions such as initial message delivery may also return this
 	// error type, but must not rewrite an already durable generation.

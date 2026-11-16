@@ -23,7 +23,7 @@ func TestLaunchJSON_FolderNotTrustedWarning(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			home, env := installDefaultsCLIHome(t)
 			binDir := filepath.Join(home, "bin")
-			tmuxDir := filepath.Join(home, "tmux")
+			tmuxDir := shortTempDir(t, "adtrust")
 			project := filepath.Join(home, "code", "proj")
 			for _, d := range []string{binDir, tmuxDir, project} {
 				if err := os.MkdirAll(d, 0o700); err != nil {

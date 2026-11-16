@@ -40,6 +40,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/telemetry"
+	"github.com/asheshgoplani/agent-deck/internal/termbg"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/ui"
 	"github.com/asheshgoplani/agent-deck/internal/update"
@@ -47,7 +48,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.16.38" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.16.39" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -403,7 +404,7 @@ const credsRefreshRemovedIn = "v1.16.21"
 // and remote-agent dispatch. Drop this stub two releases after
 // credsRefreshRemovedIn.
 func printCredsRefreshRemoved() {
-	fmt.Printf("creds-refresh was removed in %s. Disable any old unit with: systemctl --user disable --now agent-deck-creds-refresh. For long-lived logins use: claude setup-token (see README \"Vendor terms and logins\").\n", credsRefreshRemovedIn)
+	fmt.Printf("creds-refresh was removed in %s. Disable any old unit with: systemctl --user disable --now agent-deck-creds-refresh. For long-lived logins use: claude setup-token (see https://github.com/asheshgoplani/agent-deck/blob/main/docs/guide/tools.md#vendor-terms-and-logins).\n", credsRefreshRemovedIn)
 }
 
 func main() {
@@ -692,6 +693,9 @@ func main() {
 		case "triggers":
 			handleTriggers(profile, args[1:])
 			return
+		case "orders":
+			handleOrders(profile, args[1:])
+			return
 		case "trace":
 			handleTrace(profile, args[1:])
 			return
@@ -700,6 +704,9 @@ func main() {
 			return
 		case "recall":
 			handleRecall(profile, args[1:])
+			return
+		case "connect":
+			handleConnect(profile, args[1:])
 			return
 		case "usage":
 			handleUsage(profile, args[1:])
@@ -956,6 +963,13 @@ func main() {
 		// Same rows and words as the TUI quick check page (check_text.go).
 		fmt.Fprint(os.Stderr, outerTmuxRefusalText(tmuxVersionLine(), Version))
 		exitCLI(1)
+	}
+
+	// Ask the terminal for its background colour now, before the TUI owns
+	// the terminal. Only the TUI renders adaptive colours; every other
+	// command skips the query (#3105, see internal/termbg).
+	if !webHeadless {
+		termbg.DetectForTUI()
 	}
 
 	// Startup reviver scan (v1.7.8, REPORT-D). Fire-and-forget — rebuilds
@@ -1661,7 +1675,7 @@ var commandRegistry = map[string]bool{
 	"group": true, "try": true, "launch": true, "conductor": true,
 	"agents": true, "agent": true,
 	"telegram-doctor": true, "watcher": true, "openclaw": true, "oc": true,
-	"remote": true, "remote-agent": true, "provider": true, "system": true, "worktree": true, "wt": true, "costs": true, "open": true, "switch": true, "ask": true, "browser": true, "file": true, "events": true, "triggers": true, "trace": true, "daemon": true, "usage": true, "web": true, "config": true, "recall": true,
+	"remote": true, "remote-agent": true, "provider": true, "system": true, "worktree": true, "wt": true, "costs": true, "open": true, "switch": true, "ask": true, "browser": true, "file": true, "events": true, "triggers": true, "orders": true, "trace": true, "daemon": true, "usage": true, "web": true, "config": true, "recall": true, "connect": true,
 	"uninstall": true, "migrate-paths": true, "hook-handler": true,
 	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
 	"hermes-hooks": true, "cursor-hooks": true, "tmux-hooks": true, "pi-hooks": true, "deepseek": true, "notify-daemon": true,
@@ -2054,7 +2068,7 @@ func handleAddCommand(profile string, args []string, inspectFlags func(*flag.Fla
 	})
 
 	// Plugin channel flag - can be specified multiple times; requires -c claude.
-	// Persisted on Instance.Channels and emitted as --channels <csv> on every
+	// Persisted on Instance.Channels and emitted as one --channels <entry> per channel on every
 	// claude Start/Restart so plugin channels deliver inbound messages.
 	var channelFlags []string
 	fs.Func("channel", "Plugin channel id (can specify multiple times); requires -c claude", func(s string) error {
@@ -3092,6 +3106,7 @@ func handleList(profile string, args []string) {
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	allProfiles := fs.Bool("all", false, "List sessions from all profiles")
 	includeSuperseded := fs.Bool("include-superseded", false, "Include archived source rows retained for cross-harness recovery")
+	noArchived := fs.Bool("no-archived", false, noArchivedFlagUsage)
 	// Undocumented: SSHRunner passes this on its own remote invocation
 	// (#2331) so a slow `list --json` names its own status-pass duration
 	// instead of leaving the caller with one opaque round-trip number.
@@ -3112,6 +3127,7 @@ func handleList(profile string, args []string) {
 		fmt.Println("  agent-deck list                    # List from default profile")
 		fmt.Println("  agent-deck -p work list            # List from 'work' profile")
 		fmt.Println("  agent-deck list --all              # List from all profiles")
+		fmt.Println("  agent-deck list --json --no-archived  # Live listing without archived sessions")
 	}
 
 	if err := parseCLIFlags(fs, normalizeArgs(fs, args)); err != nil {
@@ -3119,7 +3135,7 @@ func handleList(profile string, args []string) {
 	}
 
 	if *allProfiles {
-		handleListAllProfiles(*jsonOutput, *includeSuperseded)
+		handleListAllProfiles(*jsonOutput, *includeSuperseded, *noArchived)
 		return
 	}
 	ensureTmuxInPathOrExit()
@@ -3139,6 +3155,12 @@ func handleList(profile string, args []string) {
 	if !*includeSuperseded {
 		instances = defaultListInstances(instances)
 	}
+	// all keeps the archived rows for parent-path recovery; only the listed
+	// rows get a status pass (#3089).
+	all := instances
+	if *noArchived {
+		instances = session.FilterInstancesByArchive(instances, false)
+	}
 
 	if len(instances) == 0 {
 		if *jsonOutput {
@@ -3156,9 +3178,10 @@ func handleList(profile string, args []string) {
 		// reports the same Status the TUI and /api/menu do (issue #610).
 		statusStarted := time.Now()
 		tmuxBefore := tmux.SubprocessStarts()
+		skipsBefore := tmux.CaptureBatchSkips()
 		refresh, cached := session.CLIStatusCandidates(instances)
 		session.RefreshInstancesForCLIStatus(refresh)
-		output, err := buildListJSON(storage.Profile(), instances, cached)
+		output, err := buildListJSONRows(storage.Profile(), instances, all, cached)
 		statusElapsed := time.Since(statusStarted)
 		tmuxCalls := tmux.SubprocessStarts() - tmuxBefore
 		// #2331: this status pass is the one thing both the poll (`list
@@ -3170,7 +3193,12 @@ func handleList(profile string, args []string) {
 		// can read, since a remote's own health.jsonl is never fetched back.
 		health.RecordStatusPass(statusElapsed, len(instances), tmuxCalls)
 		if *statsFlag {
-			emitListStats(statusElapsed, tmuxCalls, len(instances))
+			emitListStats(session.ListStats{
+				StatusPassMS:    statusElapsed.Milliseconds(),
+				TmuxCalls:       tmuxCalls,
+				Sessions:        len(instances),
+				CapturesSkipped: tmux.CaptureBatchSkips() - skipsBefore,
+			})
 		}
 		if err != nil {
 			fmt.Printf("Error: failed to format JSON output: %v\n", err)
@@ -3208,8 +3236,11 @@ func defaultListInstances(instances []*session.Instance) []*session.Instance {
 	return session.VisibleInstances(instances)
 }
 
-func emitListStats(elapsed time.Duration, tmuxCalls int64, sessions int) {
-	stats := session.ListStats{StatusPassMS: elapsed.Milliseconds(), TmuxCalls: tmuxCalls, Sessions: sessions}
+// noArchivedFlagUsage is the `list --no-archived` help text, shared by both
+// list implementations.
+const noArchivedFlagUsage = "Skip archived sessions (no status work or output for them); for pollers that only need live sessions"
+
+func emitListStats(stats session.ListStats) {
 	encoded, err := json.Marshal(stats)
 	if err != nil {
 		return
@@ -3228,6 +3259,13 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 	if len(cachedStatus) != 0 {
 		cached = cachedStatus[0]
 	}
+	return buildListJSONRows(profileName, instances, instances, cached)
+}
+
+// buildListJSONRows is buildListJSON for a subset of the profile's rows
+// (`list --no-archived`): instances are the rows listed, all the full set
+// their parent paths are recovered from.
+func buildListJSONRows(profileName string, instances, all []*session.Instance, cached map[*session.Instance]bool) ([]byte, error) {
 	type sessionJSON struct {
 		ID                string `json:"id"`
 		ParentSessionID   string `json:"parent_session_id,omitempty"`
@@ -3306,7 +3344,7 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 		} else {
 			substate = string(inst.HistoricalSubstate())
 		}
-		parentProjectPath := listParentProjectPath(inst, instances)
+		parentProjectPath := listParentProjectPath(inst, all)
 		sj := sessionJSON{
 			ID:                inst.ID,
 			ParentSessionID:   inst.ParentSessionID,
@@ -3345,6 +3383,9 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 		}
 		if cached[inst] {
 			sj.StatusSource = "cached"
+		} else if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil && tmuxSess.CaptureSkipped() {
+			// #3089: the batched capture timed out before this pane.
+			sj.StatusSource = "stale"
 		}
 		sj.TmuxSocketName, sj.TmuxBinary = tmuxRouteFields(inst)
 		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
@@ -3368,7 +3409,7 @@ func buildListJSON(profileName string, instances []*session.Instance, cachedStat
 }
 
 // handleListAllProfiles lists sessions from all profiles
-func handleListAllProfiles(jsonOutput, includeSuperseded bool) {
+func handleListAllProfiles(jsonOutput, includeSuperseded, noArchived bool) {
 	profiles, err := session.ListProfiles()
 	if err != nil {
 		fmt.Printf("Error: failed to list profiles: %v\n", err)
@@ -3415,12 +3456,16 @@ func handleListAllProfiles(jsonOutput, includeSuperseded bool) {
 			if !includeSuperseded {
 				instances = defaultListInstances(instances)
 			}
+			all := instances
+			if noArchived {
+				instances = session.FilterInstancesByArchive(instances, false)
+			}
 			transcripts := session.ListedTranscriptPaths(instances)
 			for _, inst := range instances {
 				allSessions = append(allSessions, sessionJSON{
 					ID:                inst.ID,
 					ParentSessionID:   inst.ParentSessionID,
-					ParentProjectPath: listParentProjectPath(inst, instances),
+					ParentProjectPath: listParentProjectPath(inst, all),
 					Title:             inst.Title,
 					Path:              inst.ProjectPath,
 					Group:             inst.GroupPath,
@@ -3461,6 +3506,9 @@ func handleListAllProfiles(jsonOutput, includeSuperseded bool) {
 		}
 		if !includeSuperseded {
 			instances = defaultListInstances(instances)
+		}
+		if noArchived {
+			instances = session.FilterInstancesByArchive(instances, false)
 		}
 
 		if len(instances) == 0 {
@@ -4753,10 +4801,12 @@ func printHelp() {
 	fmt.Println("  usage            Show remaining provider subscription quota")
 	fmt.Println("  recall           Search every Claude conversation on this machine (docs/recall.md)")
 	fmt.Println("  web              Start TUI with web UI server running alongside")
+	fmt.Println("  connect          Connect an assistant bot (Hermes, Claude, ChatGPT, Telegram...) with a scoped token")
 	fmt.Println("  remote           Manage remote agent-deck instances")
 	fmt.Println("  provider         List and test sandbox providers (remote add --provider)")
 	fmt.Println("  conductor        Manage conductor meta-agent orchestration")
 	fmt.Println("  triggers         What wakes each session: jobs, heartbeats, channels (docs/triggers.md)")
+	fmt.Println("  orders           Standing orders: cheap checks that wake a conductor only on change (docs/orders.md)")
 	fmt.Println("  agents           List adopted agents, grouped by machine")
 	fmt.Println("  agent            Adopt and inspect agent definitions")
 	fmt.Println("  telegram-doctor  Audit channel-owning sessions for telegram drops (#1138)")
@@ -4816,7 +4866,7 @@ func printHelp() {
 	fmt.Println("  tmux-hooks status         Show whether the tmux hook slot is agent-deck's")
 	fmt.Println("  pi-hooks install          Install or upgrade the pi extension")
 	fmt.Println("  pi-hooks uninstall        Remove the pi extension")
-	fmt.Println("  pi-hooks status           Show pi extension install status")
+	fmt.Println("  pi-hooks status           Show pi extension, pi version and wake socket status")
 	fmt.Println("  deepseek status           Show resolved dsh binary, DSH_HOME, profile")
 	fmt.Println("  deepseek profiles         List profiles under $DSH_HOME/profiles")
 	fmt.Println("  deepseek sessions [path]  List dsh sessions recorded for a workspace")

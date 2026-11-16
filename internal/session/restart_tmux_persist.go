@@ -65,9 +65,16 @@ func (i *Instance) recordRestartOutcome(runtime statedb.RuntimeState, incarnatio
 	stamps, err := i.writeRestartOutcome(runtime, incarnation)
 
 	i.restartTmuxRecordMu.Lock()
+	if prior := i.launchRecordStamps; err == nil && prior.After != 0 && prior.After == stamps.Before {
+		stamps.Before = prior.Before
+	}
 	i.restartTmuxRecordErr = err
 	i.restartTmuxRecordStamps = stamps
+	i.launchRecordStamps = stamps // zero when the write failed
 	i.restartTmuxRecordMu.Unlock()
+	if err == nil {
+		i.launchUnrecorded.Store(false) // the outcome carried the launch decision
+	}
 
 	if err != nil {
 		sessionLog.Warn("restart_outcome_persist_failed",
@@ -89,6 +96,7 @@ func (i *Instance) writeRestartOutcome(runtime statedb.RuntimeState, incarnation
 	var stamps statedb.WriteStamps
 	err := i.withOwningStateDB(func(db *statedb.StateDB) error {
 		var werr error
+		// Launch intent was already committed with the runtime generation.
 		stamps, werr = db.WriteRestartOutcome(runtime, incarnation)
 		return werr
 	})
@@ -132,4 +140,59 @@ func (i *Instance) RestartRecordStamps() statedb.WriteStamps {
 		return statedb.WriteStamps{}
 	}
 	return i.restartTmuxRecordStamps
+}
+
+// LaunchRecordStamps returns the last_modified values the last launch's
+// targeted write (a start's, or a restart's outcome) replaced and wrote, or the
+// zero value if it recorded nothing. Like RestartRecordStamps, it lets a
+// process that launched and then saves tell its own bump from another
+// process's change.
+func (i *Instance) LaunchRecordStamps() statedb.WriteStamps {
+	i.restartTmuxRecordMu.Lock()
+	defer i.restartTmuxRecordMu.Unlock()
+	return i.launchRecordStamps
+}
+
+// noteLaunch records on the instance what the launch now spawning ran: its
+// tool, and no wake socket unless it is a pi whose launch exported one (the
+// flag is left from an earlier pi launch otherwise).
+func (i *Instance) noteLaunch() *statedb.RuntimeLaunchDecision {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.LaunchedTool = i.Tool
+	if i.Tool != "pi" {
+		i.PiSocketExported = false
+	}
+	return &statedb.RuntimeLaunchDecision{Tool: i.LaunchedTool, PiSocketExported: i.PiSocketExported, BindingKind: activeRuntimeBindingKind(i)}
+}
+
+func (i *Instance) acceptLaunchPublication(state statedb.RuntimeState, launch *statedb.RuntimeLaunchDecision, publication statedb.RuntimePublication) {
+	i.mu.Lock()
+	if !samePhysicalRuntime(i.runtimeStateSnapshotLocked(), state) {
+		i.mu.Unlock()
+		return
+	}
+	i.LaunchedTool, i.PiSocketExported = launch.Tool, launch.PiSocketExported
+	i.mu.Unlock()
+	i.launchUnrecorded.Store(!publication.LaunchRecorded)
+	i.restartTmuxRecordMu.Lock()
+	if prior := i.launchRecordStamps; publication.Stamps.After != 0 && prior.After != 0 && prior.After == publication.Stamps.Before {
+		publication.Stamps.Before = prior.Before
+	}
+	i.launchRecordStamps = publication.Stamps
+	i.restartTmuxRecordMu.Unlock()
+}
+
+func (i *Instance) recordReconciledLaunch(state statedb.RuntimeState, launch *statedb.RuntimeLaunchDecision) error {
+	var stamps statedb.WriteStamps
+	err := i.withOwningStateDB(func(db *statedb.StateDB) error {
+		var err error
+		stamps, err = db.WriteLaunchDecision(state, i.PersistenceIncarnation(), launch.Tool, launch.PiSocketExported)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	i.acceptLaunchPublication(state, launch, statedb.RuntimePublication{LaunchRecorded: true, Stamps: stamps})
+	return nil
 }

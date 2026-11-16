@@ -723,8 +723,15 @@ func (i *Instance) buildClaudeExtraFlagsWithName(opts *ClaudeOptions, launchName
 	// entry (index wipe, record rebuild) is restored from conductor config
 	// so the wiring can't silently disappear (telegram_reliability.go).
 	reconcileConductorTelegramChannel(i)
-	if len(i.Channels) > 0 {
-		flags = append(flags, "--channels "+shellescape.Quote(strings.Join(i.Channels, ","))) // audit F1
+	// One `--channels <entry>` pair per channel: Claude declares the flag as
+	// variadic (`--channels <servers...>`) and does not split on commas, so
+	// a comma-joined value is a single entry that matches no plugin and
+	// silences inbound delivery for every channel. This is also the form
+	// Claude itself re-emits when it relaunches.
+	for _, ch := range i.Channels {
+		if ch = strings.TrimSpace(ch); ch != "" {
+			flags = append(flags, "--channels "+shellescape.Quote(ch)) // audit F1
+		}
 	}
 
 	// Pass the exact title as one argument to the same startup process whose
@@ -1364,10 +1371,11 @@ func (i *Instance) buildPiCommand(baseCommand string) string {
 	quotedProfile := shellescape.Quote(sessionProfileEnvValue())
 
 	return envPrefix + fmt.Sprintf(
-		"session_dir=%s; mkdir -p \"$session_dir\" && AGENTDECK_INSTANCE_ID=%s AGENTDECK_PROFILE=%s %s --continue --session-dir \"$session_dir\"%s",
+		"session_dir=%s; mkdir -p \"$session_dir\" && AGENTDECK_INSTANCE_ID=%s AGENTDECK_PROFILE=%s %s%s --continue --session-dir \"$session_dir\"%s",
 		sessionDir,
 		quotedInstanceID,
 		quotedProfile,
+		i.piSocketLaunchPrefix(cmd),
 		cmd,
 		i.piIdentityFlag(),
 	)
@@ -1472,6 +1480,17 @@ func (i *Instance) buildCopilotCommand(baseCommand string) string {
 	return envPrefix + GetToolCommand("copilot")
 }
 
+// resumeRunsCustomCommand reports whether a resuming restart runs the
+// session's own custom command (launch -c, a gateway wrapper) in place of the
+// configured Claude command: a Command other than "claude" that is not a
+// fork's baked command (buildClaudeResumeCommand). The restart token asks it
+// too: such a command may pick a config dir the hooks are not in.
+func (i *Instance) resumeRunsCustomCommand() bool {
+	return i.Command != "" && i.Command != "claude" &&
+		!commandHasToken(i.Command, "--fork-session") &&
+		!commandHasToken(i.Command, "--session-id")
+}
+
 // buildClaudeResumeCommand builds the claude resume command with proper config options
 // Respects: CLAUDE_CONFIG_DIR, dangerous_mode, and [shell].env_files + init_script
 // CLAUDE_SESSION_ID is set via host-side SetEnvironment (called by SyncSessionIDsToTmux after restart)
@@ -1511,9 +1530,7 @@ func (i *Instance) buildClaudeResumeCommand() string {
 	// because the string starts with `exec cd`. Same shape as the #1830
 	// finding, one path over.
 	claudeCmd := GetClaudeCommandForInstance(i)
-	customCommand := i.Command != "" && i.Command != "claude" &&
-		!commandHasToken(i.Command, "--fork-session") &&
-		!commandHasToken(i.Command, "--session-id")
+	customCommand := i.resumeRunsCustomCommand()
 	if customCommand {
 		claudeCmd = i.Command
 	}

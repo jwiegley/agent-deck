@@ -42,9 +42,10 @@
     <meta name="twitter:image" content="https://asheshgoplani.github.io/agent-deck/og-image.svg">
     <meta name="twitter:creator" content="@AsheshGoplani">
 
-    <!-- Favicon - Status Grid Logo -->
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 32'%3E%3Crect fill='%231a1b26' width='48' height='32' rx='4'/%3E%3Ccircle cx='10' cy='16' r='5' fill='%239ece6a'/%3E%3Ccircle cx='24' cy='16' r='5' fill='%23e0af68'/%3E%3Ccircle cx='38' cy='16' r='5' fill='%23565f89'/%3E%3C/svg%3E">
-    <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 32'%3E%3Crect fill='%231a1b26' width='48' height='32' rx='4'/%3E%3Ccircle cx='10' cy='16' r='5' fill='%239ece6a'/%3E%3Ccircle cx='24' cy='16' r='5' fill='%23e0af68'/%3E%3Ccircle cx='38' cy='16' r='5' fill='%23565f89'/%3E%3C/svg%3E">
+    <!-- Favicon: the agent-deck mark (status dots on Calm Navy) -->
+    <link rel="icon" href="favicon.ico" sizes="any">
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link rel="apple-touch-icon" href="apple-touch-icon.png">
 
     <!-- LLM documentation reference -->
     <link rel="alternate" type="text/plain" href="https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/llms-full.txt" title="LLM Documentation">
@@ -294,10 +295,8 @@
     <header class="fixed top-0 left-0 right-0 z-50 bg-tn-bg/80 backdrop-blur-md border-b border-tn-border">
         <nav class="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
             <a href="#" class="flex items-center gap-3 text-xl font-semibold">
-                <!-- Status Grid Logo -->
-                <span class="flex items-center gap-0.5 mono text-sm bg-tn-surface px-1.5 py-0.5 rounded border border-tn-border">
-                    <span class="text-tn-border">[</span><span class="text-tn-green">●</span><span class="text-tn-border">│</span><span class="text-tn-yellow">◐</span><span class="text-tn-border">│</span><span class="text-tn-dim">○</span><span class="text-tn-border">]</span>
-                </span>
+                <!-- agent-deck mark -->
+                <img src="logo-header-dark.svg" alt="Agent Deck" class="h-6 w-12">
             </a>
             <div class="flex items-center gap-6">
                 <a href="https://github.com/asheshgoplani/agent-deck" target="_blank" rel="noopener"
@@ -318,7 +317,7 @@
         <section class="max-w-6xl mx-auto px-6 py-4 text-center">
             <!-- Compact Logo & Title -->
             <div class="mb-4 flex flex-col md:flex-row items-center justify-center gap-4 md:gap-6">
-                <!-- Status Grid Logo SVG -->
+                <!-- agent-deck mark on its navy tile -->
                 <img src="logo.svg" alt="Agent Deck Logo" class="w-20 md:w-24">
 
                 <div class="text-center md:text-left">
@@ -399,7 +398,7 @@
                 <p class="text-center text-tn-dim text-xs">
                     <span class="text-tn-yellow">Windows:</span> <a href="https://learn.microsoft.com/en-us/windows/wsl/install" class="text-tn-accent hover:underline">Install WSL</a> first
                     <span class="mx-2">•</span>
-                    <a href="https://github.com/asheshgoplani/agent-deck#installation" class="text-tn-accent hover:underline">Other methods</a>
+                    <a href="https://github.com/asheshgoplani/agent-deck/blob/main/docs/guide/install.md" class="text-tn-accent hover:underline">Other methods</a>
                 </p>
             </div>
         </section>
@@ -612,7 +611,7 @@ bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "xclip
 <span class="text-tn-cyan">args</span> = [<span class="text-tn-green">"-y"</span>, <span class="text-tn-green">"@modelcontextprotocol/server-memory"</span>]
 <span class="text-tn-cyan">description</span> = <span class="text-tn-green">"Persistent memory via knowledge graph"</span></code></pre>
                     </div>
-                    <p class="text-tn-dim text-xs mt-3">See <a href="https://github.com/asheshgoplani/agent-deck#mcp-manager" class="text-tn-cyan hover:underline">README</a> for more MCP examples.</p>
+                    <p class="text-tn-dim text-xs mt-3">See the <a href="https://github.com/asheshgoplani/agent-deck/blob/main/skills/agent-deck/references/config-reference.md#common-mcp-examples" class="text-tn-cyan hover:underline">configuration reference</a> for more MCP examples.</p>
                 </div>
             </div>
         </section>

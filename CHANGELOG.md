@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.39] - 2026-11-15
+
+### Highlights
+
+- Connect any assistant bot (Hermes, OpenClaw, Claude, Codex, a Slack or Telegram bot) to agent-deck with `agent-deck connect` and a scoped token that is read-only by default (see New features).
+- Standing orders: tell a conductor "check X every N minutes and wake me only when it changes", and permission prompts in unattended turns are denied with a `NEED:` instead of hanging (see New features).
+- `session send` to Codex submits on the first try and no longer gets stuck during a long Codex turn, and a failed send tells you what it left typed (see Fixes; thanks @barjatiyasaurabh).
+- Archived sessions are left out of status counts and heartbeats, a logged-out Claude session is held as auth-401, and builds use Go 1.26.11 for a `net/http` fix (see Changed, Fixes and Security; thanks @wallacms).
+
+### New features
+
+- Standing orders for conductors: `agent-deck orders` and an `ORDERS.md` file per conductor. Each order has a `check:` command that runs on a timer (`every:`, default 15m) with no AI, and the conductor is woken once only when its output changes, with the old and new output and the order's `do:` text. Orders can have active hours, a daily wake cap and an expiry. `conductor setup` installs one host-wide one-minute timer for them (`--no-orders` skips it; `orders install|uninstall` manage it). Nothing changes for a conductor without `ORDERS.md`. An order turn cannot add, pause or remove orders. See `docs/orders.md` and `examples/standing-orders/ORDERS.md` (#3095).
+- In a Claude conductor turn started by a heartbeat or a standing order, a permission prompt is now denied at once and one urgent `NEED:` naming the command reaches you, instead of the conductor waiting forever for an answer nobody gives. Turns you start yourself are unchanged (#3095).
+- `agent-deck list --no-archived` leaves archived sessions out, a cheaper poll when you only want live ones (#3092).
+- pi: the agent-deck extension v5 can be woken through a local socket instead of typed input, and `pi-hooks status` shows your pi version and whether the socket is on (#3078; thanks @fpmx3bp).
+- The session row that holds the voice mic now shows a mic badge with its state (listening, speaking, muted and so on), for local sessions and sessions under a remote. A collapsed group holding it shows the mic too (#3102).
+- `agent-deck remote <name> session ownership inspect <id> --json` now works, so you can ask a remote whether a session is still owned. It only reads, and `reconcile` and `abandon` are still not forwarded (#3111; thanks @jordanhubbard).
+- Connect any assistant bot (Hermes, OpenClaw, Claude, Codex, a Slack or Telegram bot, your own orchestrator) with `agent-deck connect`, which prints one copy-paste block for the assistant's config. The assistant gets a scoped token (`read`, `send`, `approve`, `launch`; read-only by default) and talks to agent-deck over MCP (on this machine or over HTTP at `/mcp`) or a plain HTTP API under `/api/assistant/v1/`. You can also paste one line into the assistant and let it set itself up from `docs/assistants/SETUP-PROMPT.md`, or use the new `/connect` page in `agent-deck web`. Tokens are stored hashed, each has a rate limit, and every call is written to an audit log without message text. With `[web].mutations_enabled = false`, assistant tokens can read but not send, approve or launch. A call with an argument a tool does not list is refused with `invalid_arguments` (#3137; the feature is Sharjeel's work from #3082, with thanks).
+- `[inbox] wake_parents = true` also wakes an idle Claude parent that is not a conductor when a child's result is in your `wake_on` list. Off by default. A wake never types over text someone left in the input box, and is skipped while the parent shows a menu or a permission dialog (#3138).
+- `launch --no-tag` starts a child without the `[agent-deck from:<parent id>]` envelope on its first message, so its result does not wake the parent (#3138).
+- A much shorter README: what agent-deck is, a 30-second install, three commands to a first session, and how to connect your assistant. The long sections moved unchanged into `docs/guide/` (#3141; the README is Sharjeel's work from #3083, with thanks).
+
+### Security
+
+- Builds use Go 1.26.11, which fixes GO-2026-6859 (an HTTP/1 server crash in the Go standard library's `net/http`, a `MaxBytesReader` header race) (#3128).
+
+### Changed
+
+- The TUI header, splash screens, help footer and welcome box show the agent-deck mark `●●○` (running, waiting, idle), in your light or dark theme, and the README and site use the same mark (#3096).
+- An idle Claude session that launched a child is now woken by that child's result (a done line, a question or an error), also when it is not a conductor. Turn it off with `[send] tag_sends = false` or `launch --no-tag`. Conductors see no change (#3138; thanks @tarekrached for the report in #3131).
+- Owner routes of `agent-deck web` now accept a lowercase `bearer` scheme, as RFC 9110 allows, and a request with more than one Authorization header is refused with 401 on every authenticated route (#3137).
+- `agent-deck status`, the TUI status counts, both conductor heartbeats and `group list` leave archived sessions out. `session_count` and `total_sessions` in `group list` count active sessions only, so they can be lower than the rows `list --json` still prints. `session show --json` now reports `archived` and `archived_at` (#3127, #3140; thanks @wallacms for #3127).
+
+### Fixes
+
+- A Claude session that shows "Not logged in · Please run /login" after `/logout` is now held as an auth failure (auth-401) instead of showing as idle or model-unavailable (#3115; thanks Sharjeel for the report).
+- `session send` now sees the Codex 0.167 approval picker as a menu, so a send can no longer confirm it by accident (#3088).
+- A session on an account slot no longer picks up the newest conversation of the default Claude dir when its own session id is empty at start or restart. It looks only in its own config dir (#3122).
+- A Claude session with two or more channels (for example telegram and discord) gets its messages again, and a commented-out `TELEGRAM_STATE_DIR` line no longer turns telegram on (#3091).
+- `list` stays fast on a busy machine: when reading the panes times out it no longer starts dozens of extra tmux calls (#3092).
+- `session archive` with an expected content version checks only this session's own Claude transcript, never a same-id file from another project (#3076; thanks @arnzchen).
+- With `[updates] check_enabled = false`, the TUI no longer checks for updates once at startup (#3077; thanks @ruiheng).
+- A restart that fails partway keeps the session attached to its running tmux session instead of a dead one (#3079; thanks @ruiheng).
+- `session output` now reads the reply of a session started on an account slot (`--account`) from the slot's own transcript, instead of falling back to the pane (#3116; thanks Sharjeel for the report).
+- `session send` that holds back Enter now tells you what it left typed in the target's input box. Before, that leftover text made every later send to the session fail until someone cleared it (#3123; thanks Sharjeel for the report).
+- `mcp attach --global` for a Claude session now writes `~/.claude.json` when no config dir is set, the file Claude Code reads, so the server loads. `mcp attached` shows the right path too (#3110; thanks @zach-marto).
+- `mcp attach --global` and detach for an OpenCode session keep the servers you set up by hand and the headers of an attached HTTP server, instead of replacing the whole `mcp` list (#3109; thanks @zach-marto).
+- `agent-deck remote sessions` now prints the error and exits 1 when a remote cannot be reached, so "host down" no longer looks like "no sessions" (#3112; thanks @jordanhubbard, and @aron-intframe for a patch sketch).
+- `session attach` and other commands outside the TUI no longer wait about 5 seconds on a terminal that does not answer the background colour query, and keys typed in that time are kept (#3113; thanks @jordanhubbard).
+- A pi session with a footer extension (such as `pi-powerline-footer`) is no longer killed by the startup timeout while it sits idle at its prompt (#3100; thanks @tessneau for the report).
+- `doctor`, `session show` and the startup timeout message now say when a pi session has no agent-deck pi extension, which is what prevents that timeout (#3099; thanks @tessneau).
+- Your `[tools.pi]`, `[tools.claude]` and other built-in tool settings for `busy_patterns`, `prompt_patterns` and `spinner_chars` (and the `_extra` forms) now take effect. Before, they were ignored (#3114; thanks @ckjeter).
+- The footer error and notice lines in the TUI, such as "closed 'x'. R to restart", now show on a full screen instead of being cut off (#3120; thanks @tessneau).
+- A pi session started inside a standing order or heartbeat turn no longer clears that turn's origin, so permission prompts in it are still denied and an order turn cannot change orders (#3118; thanks @fpmx3bp).
+- A failed pi wake now names the pi wake socket, and the pi wake peer check is stricter. Review follow-ups to the pi wake work (#3117; thanks @fpmx3bp).
+- A tagged `session send` that reaches Claude Code as a pasted prompt is now recognised, so the reply goes back to the sender. `inbox stats` counts only wakeups that were really sent (#3132; thanks @tarekrached for the report).
+- `session archive` on a session whose pane was already gone (after a reboot, say) is now stored as `stopped` instead of keeping the `error` the dead pane left behind. The TUI header pill, the Error filter and `agent-deck status` now agree, and archived sessions no longer show up as crashes on every conductor heartbeat (#3127, #3140; thanks @wallacms for #3127).
+- `session send` to a Codex session now submits on the first attempt instead of leaving the message typed in the composer (`typed_not_submitted`), and a send during a long Codex turn is no longer refused with "cannot reconcile Codex submission marker" when the marker is intact (#3125; thanks @barjatiyasaurabh).
+- A Codex session with a long-running turn no longer gets stuck refusing sends after an earlier send's input was taken into that turn: the check now reads as far back as the rest of the send path does. A `--wait` send to such a session also re-reads its rollout less while it waits for the receipt (#3142, follow-up to #3125).
+- A restarted idle child is judged by the hook turn count, so the parent gets one "Restarted while idle; conversation resumed, no new turn." line instead of the old reply again when the daemon reads a different transcript path than the restart did (for example `CLAUDE_CONFIG_DIR` set only in the shell that ran the restart). A turn the resolved transcript does not show is now news instead of being taken for the boot. Claude children with hooks installed only (#3139; step 3 of #3012, thanks @tarekrached for the plan).
+- An OpenCode V2 config with an MCP server named `type` is read again, and `mcp attach` keeps it under `mcp.servers` instead of moving the whole servers map one level down (#3143; thanks @Bowen-Xue-ac2 for the report in #3104).
+- A pi session whose command clears an inherited `PI_CODING_AGENT_DIR` (`PI_CODING_AGENT_DIR= pi`) now gets an install hint that spells out `PI_CODING_AGENT_DIR= agent-deck pi-hooks install`, so the extension lands where that pi loads it (#3136, refs #3098).
+- pi: a pi parent that is listed in the Comms Ledger now reads its children's results as a full ledger consumer. Its doorbell goes through the extension's socket, a listed pi is never typed into, and a pi parent that is busy when an urgent result lands is rung once when it settles idle. A pi started inside the parent's pane no longer takes the parent's records (#3024; thanks @fpmx3bp).
+- A child turn that runs longer than the transcript tail window is now attributed to the session that sent the prompt instead of `unknown`, so the asker gets its reply and wake. A wake into a session that is not a conductor is skipped while it shows a menu or a permission dialog. `inbox stats` counts wakeups dispatched, not confirmed (#3138).
+- Conductor heartbeat: a heartbeat that `session send` skipped or muted is no longer recorded as delivered, so it is sent again later. A conductor that is in error, stopped or gone now gets one `heartbeat.log` line and one urgent notice per outage instead of going quiet. Heartbeat runs no longer overlap (a lock where `flock` exists), and two ticks can no longer break each other's heartbeat file (#3094).
+- A `[tools.<built-in>]` entry that sets only detection patterns no longer logs "ignored custom tool: name shadows a built-in" in `debug.log`; the patterns were already applied (#3145; thanks @ckjeter).
+
+### Under the hood
+
+- The "has this child had a turn since it started" check now reads the hook turn count, which is simpler and more reliable (#3084; thanks @tarekrached).
+- The weekly screenshot test has a new settings drawer baseline (#3087).
+- CI: the native macOS job runs on macos-15 because GitHub retired macos-14, the nightly runtime health check builds again, and a Go dependency group is updated (#3121, #3129, #3101).
+- The MCP proxy backpressure tests now fill the buffers until the kernel blocks, so they pass on hosts with large socket buffers (#3130).
+- CHANGELOG: changes now get their line under Unreleased when they land, `make changelog-release VERSION=X.Y.Z` moves them to the release heading, and the release check fails when the version being tagged has no CHANGELOG heading (#3093).
+
 ## [1.16.38] - 2026-11-07
 
 ### Highlights
