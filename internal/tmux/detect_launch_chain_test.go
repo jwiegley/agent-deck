@@ -45,16 +45,16 @@ func TestDetectToolFromCommand_LaunchChain(t *testing.T) {
 			command: `bash -c 'cd -- /src && unset CLAUDE_JOB_DIR && pi --continue'; code=$?; (umask 077; printf '%s\n' "$code" > /rt/exit/f7407e3b); exit "$code"`,
 			want:    "pi",
 		},
-		// An env file is sourced as `if [ -f f ]; then source f; fi`. Its path is
+		// An env file is sourced as one `source "$(...)"` command. Its path is
 		// setup, whatever tool it names.
 		{
 			name:    "pi after an env file under a claude directory",
-			command: `cd -- /src/project && if [ -f '/cfg/claude/keys.env' ]; then source '/cfg/claude/keys.env'; fi && unset CLAUDE_JOB_DIR && pi --continue`,
+			command: `cd -- /src/project && source "$([ -f '/cfg/claude/keys.env' ] && printf %s '/cfg/claude/keys.env' || printf /dev/null)" && unset CLAUDE_JOB_DIR && pi --continue`,
 			want:    "pi",
 		},
 		{
 			name:    "env file only",
-			command: `cd -- /src/project && if [ -f '/cfg/claude/keys.env' ]; then source '/cfg/claude/keys.env'; fi`,
+			command: `cd -- /src/project && source "$([ -f '/cfg/claude/keys.env' ] && printf %s '/cfg/claude/keys.env' || printf /dev/null)"`,
 			want:    "",
 		},
 		{

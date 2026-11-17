@@ -298,15 +298,19 @@ func paneWarning(msg string) string {
 
 // buildSourceCmd creates a shell command to source a file.
 // If ignoreMissing is true, a missing file is skipped: the command then
-// succeeds, so the && chain it is joined into goes on to the agent.
+// sources /dev/null and succeeds, so the && chain it is joined into goes on
+// to the agent.
 // The path is single-quoted so $(...), backticks or quotes in it (from
 // config, env expansion or the project dir) stay literal.
 func buildSourceCmd(path string, ignoreMissing bool) string {
 	quoted := shellQuote(path)
 	if ignoreMissing {
 		// Not `[ -f file ] && source file`: that is false for a missing
-		// file and stops the chain, so the agent never starts.
-		return fmt.Sprintf(`if [ -f %s ]; then source %s; fi`, quoted, quoted)
+		// file and stops the chain, so the agent never starts. One simple
+		// command, in syntax bash, zsh and fish share: [shell] launch_shell
+		// runs the chain under the user's login shell, and the tmux layer
+		// drops a `source ...` command when it reads the tool from the chain.
+		return fmt.Sprintf(`source "$([ -f %s ] && printf %%s %s || printf /dev/null)"`, quoted, quoted)
 	}
 	return "source " + quoted
 }

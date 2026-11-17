@@ -186,7 +186,7 @@ func TestEnvFilePolicy_RelativeEnvFileNeedsTrustedFolder(t *testing.T) {
 			inst := &Instance{Title: "envtest", Tool: "claude", ProjectPath: dir}
 			got := inst.buildEnvSourceCommand()
 			resolved := resolvePath(envFile, dir)
-			sourced := strings.Contains(got, "source "+shellQuote(resolved))
+			sourced := strings.Contains(got, buildSourceCmd(resolved, true))
 			if sourced != tc.wantSource {
 				t.Fatalf("env_file %s sourced = %v, want %v\n%s", resolved, sourced, tc.wantSource, got)
 			}

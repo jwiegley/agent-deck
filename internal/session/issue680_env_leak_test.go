@@ -75,7 +75,7 @@ func configWithConductorAndGroup(name, envFilePath string) *UserConfig {
 		},
 	}
 	// IgnoreMissingEnvFiles default: true. Leave Shell zero so
-	// buildSourceCmd uses the `if [ -f ... ]; then source ...; fi` form.
+	// buildSourceCmd uses the form that skips a missing file.
 	return cfg
 }
 
