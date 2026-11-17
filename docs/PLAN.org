@@ -1353,20 +1353,80 @@ Logs: ~/Products/agent-deck-conductor-setup-fix/logs/final-selfcheck-rerun-1873-
 ]
 #+end_src
 
-* DOING [#C] Full suite on dd9762bc fails TestSessionSendSocketWaitPeerReply/late-turn and the visual attach-shell frame
+* TODO [#D] Full pre-push run in Docker cannot pass reliably: no rerun policy, internal/session near its 20-minute cap, visual status frames unsettled
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-szh
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-11-17 Tue 11:02]
+:MODIFIED: [2026-11-17 Tue 11:03]
+:CREATED_BY: johnw
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+Evidence from five full Docker runs of the pre-push hook (image agentdeck-ci:go1.26.11-tmux3.8, GOFLAGS=-p=2), 2026-11-16 and 11-17.
+
+1. scripts/test.sh runs go test once; upstream CI and make verify-docker run gotestsum --rerun-fails=2 --rerun-fails-abort-on-data-race. Each run failed one to three different timing tests. 7418bbdd on local branch fix/tq5-flaky-fixtures adds CI's policy to a full run, with tests; John dropped it from main on 2026-11-17, undecided.
+2. internal/session took 1056 to 1154 s of its 1200 s package timeout on a quiet Hera and timed out at host load about 21. CI splits it into three shards (^Test[A-C], ^Test[D-I], the rest), each with its own 20 minutes. gotestsum reruns nothing after a timeout panic.
+3. tools/visualcheck failed on different frames in four of the five runs: 18-view-active-top and 14-fork at 200x50, 12-attach-shell at 120x40 (fixed, 2f25867f), then 02-preview at 120x40 (a 12 s wait timed out) with 01-list and 15-jump at 200x50 (session statuses not yet settled when captured).
+
+John's options on 2026-11-17 were: shard internal/session in the runner as CI does; rerun on a quiet host; or keep skipping the hook's test step on pushes. He chose to decide another day.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-szh",
+    "depends_on_id": "agent-deck-tq5",
+    "type": "discovered-from",
+    "created_at": "2026-11-17T19:03:02.609681Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* DONE [#C] Full suite on dd9762bc fails TestSessionSendSocketWaitPeerReply/late-turn and the visual attach-shell frame
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
 :ID:       agent-deck-tq5
 :LABELS:   []
 :ISSUE_TYPE: bug
 :CREATED:  [2026-11-17 Tue 00:38]
-:MODIFIED: [2026-11-17 Tue 00:38]
+:MODIFIED: [2026-11-17 Tue 11:02]
 :CREATED_BY: johnw
+:FINISHED: [2026-11-17 Tue 11:02]
+:CLOSE_REASON: Fixed in 2f25867f (attach-shell wait) and f5ddd734 (socket-wait limit), each reproduced red and verified green by focused Docker runs. No full run has passed with them; the gate's remaining problems are tracked separately.
 :SOURCE_REPO: .
 :ORIGINAL_SIZE: 0
 :END:
 
 The last full Docker pre-push run on dd9762bc (v1.16.39 merge, 2026-11-16 23:16 PST, image agentdeck-ci:go1.26.11-tmux3.8, GOFLAGS=-p=2) failed two tests: the socket peer-reply late-turn subtest and the visualcheck attach-shell frame, which captured a migration warning instead of the shell prompt. dd9762bc was published with the hook's test step skipped by John's choice. Candidate fixture fixes for both exist but no run has verified them. John, 2026-11-17: find the root cause of each and fix it properly.
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 57,
+    "issue_id": "agent-deck-tq5",
+    "author": "johnw",
+    "text": "Root causes, 2026-11-17. (1) 12-attach-shell: upstream's stepAttachShell took the list's absence for the attach having landed and never read the outer pane again; between the TUI releasing the terminal and the attached tmux client drawing (about 20 ms idle) the pane shows the safer-defaults notice printed before the TUI started. A 1 s delay injected into the sandbox's tmux attach-session reproduced the failed frame at every width; 2f25867f waits for the attached client's status line and the cleared prompt, and passes 99 of 99 frames with and without the delay. (2) late-turn: the 600 ms limit covers SendOverClaudeSocket's 150 ms pause, the send's records and the exit as well as the 300 ms budget; a timed-out wait takes about 456 ms idle. CPU load did not reproduce it; disk-sync load did (9 of 36 failed, up to 782 ms, the records alone up to 240 ms). f5ddd734 bounds the interval by pause + budget + one budget scaled by PERF_BUDGET_MULTIPLIER; 36 of 36 pass under the same load. (3) d476a5dd's candidates were wrong: its attach wait read the status line as a prompt and timed out at every width; its reply timestamp excluded 3 to 12 ms. (4) Gate: scripts/test.sh ran go test once while upstream CI reruns failures twice; the runner now uses CI's policy (John's decision, 2026-11-17).",
+    "created_at": "2026-11-17T18:18:15Z"
+  },
+  {
+    "id": 58,
+    "issue_id": "agent-deck-tq5",
+    "author": "johnw",
+    "text": "Correction, 2026-11-17: point (4) of the previous comment did not land. The rerun-policy change (7418bbdd, kept on local branch fix/tq5-flaky-fixtures) ran the full pre-push hook in Docker and failed: internal/session hit its 20-minute package timeout with Hera at load about 21, and gotestsum reruns nothing after a timeout panic, so a visual-check failure on other frames (02-preview at 120x40; 01-list and 15-jump at 200x50) was not retried. John dropped the commit from main. scripts/test.sh still runs go test once.",
+    "created_at": "2026-11-17T19:02:29Z"
+  }
+]
+#+end_src
 
 * TODO [#D] self-check.sh gives each package go test's default 10m; internal/session needs about 11m in its container under load
 :PROPERTIES:
