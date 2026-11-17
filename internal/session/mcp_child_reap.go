@@ -212,6 +212,11 @@ func (i *Instance) captureMCPChildrenFromPaneTree() ([]tmux.ProcessIdentity, err
 func (i *Instance) mcpDescendantSnapshot() (int, []int, error) {
 	panePID := mcpReadPanePIDFn(i)
 	if panePID <= 0 {
+		if i.tmuxSession != nil {
+			if dead, err := i.tmuxSession.ProbePaneDead(); err == nil && dead {
+				return 0, nil, nil
+			}
+		}
 		return 0, nil, errors.New("MCP pane PID unavailable")
 	}
 	procTable, err := mcpProcessTableSnapshotFn()

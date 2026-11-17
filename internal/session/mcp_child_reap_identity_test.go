@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
@@ -196,6 +197,52 @@ func TestRuntimeLifecycle_MCPDiscoveryRejectsTreeAndLifetimeSubstitution(t *test
 			}
 			if snapshots != 2 || closeCalls != 1 {
 				t.Fatalf("snapshots=%d closes=%d, want two snapshots and one cleanup", snapshots, closeCalls)
+			}
+		})
+	}
+}
+
+func TestMCPUnavailablePIDRequiresDirectDeathProof(t *testing.T) {
+	skipIfNoTmuxServer(t)
+	for _, tc := range []struct {
+		name, command string
+		dead          bool
+	}{
+		{"live", "exec sleep 300", false},
+		{"dead", "exit 7", true},
+		{"missing", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sess := tmux.NewSession("mcp-no-pid-"+tc.name, t.TempDir())
+			sess.RunCommandAsInitialProcess = true
+			sess.OptionOverrides = map[string]string{"remain-on-exit": "on"}
+			if tc.command != "" {
+				if err := sess.Start(tc.command); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := sess.KillAndWait(); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for tc.dead && !sess.IsPaneDead() {
+				if time.Now().After(deadline) {
+					t.Fatal("fixture pane did not exit")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			oldPID, oldTable := mcpReadPanePIDFn, mcpProcessTableSnapshotFn
+			mcpReadPanePIDFn = func(*Instance) int { return 0 }
+			mcpProcessTableSnapshotFn = func() ([]byte, error) {
+				t.Fatal("missing pane PID acquired process-tree authority")
+				return nil, nil
+			}
+			t.Cleanup(func() { mcpReadPanePIDFn, mcpProcessTableSnapshotFn = oldPID, oldTable })
+			identities, err := (&Instance{tmuxSession: sess}).captureMCPChildrenFromPaneTree()
+			if (err == nil) != tc.dead || len(identities) != 0 {
+				t.Fatalf("dead=%v: identities=%v err=%v", tc.dead, identities, err)
 			}
 		})
 	}

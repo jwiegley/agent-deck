@@ -73,21 +73,37 @@ func stepStateVisibility(w *widthRun) error {
 	if err := w.moveCursorToText(galleryRowOrder[0], 40); err != nil {
 		return err
 	}
-	for _, state := range []struct{ key, frame string }{
-		{"!", "15-filter-running"},
-		{"@", "16-filter-waiting"},
-		{"&", "21-filter-empty"},
-		{"*", "17-time-today"},
-		{"t", "18-view-active-top"},
-		{"^", "19-archived-empty"},
+	pane, err := w.pane()
+	if err != nil {
+		return err
+	}
+	lines := strings.SplitN(pane, "\n", 3)
+	if len(lines) < 2 {
+		return fmt.Errorf("state fixture has no mode header")
+	}
+	baselineHeader := lines[1]
+	waitHeader := func(hint string) error {
+		return w.waitFor(func() (bool, error) {
+			pane, err := w.pane()
+			if err != nil {
+				return false, err
+			}
+			lines := strings.SplitN(pane, "\n", 3)
+			return len(lines) > 1 && strings.Contains(lines[1], hint), nil
+		}, 5*time.Second)
+	}
+	for _, state := range []struct{ key, frame, hint string }{
+		{"!", "15-filter-running", "Running"},
+		{"@", "16-filter-waiting", "Waiting"},
+		{"&", "21-filter-empty", "Error"},
+		{"*", "17-time-today", "* Today"},
+		{"t", "18-view-active-top", "t Active"},
+		{"^", "19-archived-empty", "Archived"},
 	} {
 		if err := w.send(state.key); err != nil {
 			return err
 		}
-		// The baseline hides the selected state at 80 columns. Wait for a
-		// stable list rather than using the new label as a capture gate.
-		time.Sleep(100 * time.Millisecond)
-		if err := waitScreen(w, 5*time.Second, "SESSIONS"); err != nil {
+		if err := waitHeader(state.hint); err != nil {
 			return fmt.Errorf("%s: %w", state.frame, err)
 		}
 		w.capture(state.frame)
@@ -98,7 +114,18 @@ func stepStateVisibility(w *widthRun) error {
 			}
 		case "*", "t":
 			for i := 0; i < cycleRestorePresses(state.key); i++ {
+				hint := baselineHeader
+				if i+1 < cycleRestorePresses(state.key) {
+					if state.key == "*" {
+						hint = strings.TrimPrefix(session.TimeFilterMode(i+2).Label(), "Last ")
+					} else {
+						hint = "t Populated"
+					}
+				}
 				if err := w.send(state.key); err != nil {
+					return err
+				}
+				if err := waitHeader(hint); err != nil {
 					return err
 				}
 			}
@@ -107,7 +134,7 @@ func stepStateVisibility(w *widthRun) error {
 				return err
 			}
 		}
-		if err := w.waitContains("alpha", 5*time.Second); err != nil {
+		if err := waitHeader(baselineHeader); err != nil {
 			return fmt.Errorf("restore after %s: %w", state.frame, err)
 		}
 	}
@@ -695,6 +722,7 @@ func stepFork(w *widthRun) error {
 		}
 		return strings.Contains(pane, "claude-waiting (fork)  ◐ waiting") &&
 			strings.Contains(pane, "Claude Code synthetic fixture") &&
+			strings.Contains(pane, "Status:  clean") &&
 			!strings.Contains(pane, "Starting Claude session..."), nil
 	}, 30*time.Second); err != nil {
 		return fmt.Errorf("forked client did not settle: %w", err)

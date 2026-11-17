@@ -382,7 +382,7 @@ A Codex send that lands while a turn runs starts no turn: Codex records the inpu
 :LABELS:   []
 :ISSUE_TYPE: task
 :CREATED:  [2026-11-16 Mon 10:39]
-:MODIFIED: [2026-11-16 Mon 15:36]
+:MODIFIED: [2026-11-16 Mon 17:32]
 :CREATED_BY: johnw
 :FINISHED: [2026-11-16 Mon 15:36]
 :CLOSE_REASON: Upgrade and authorized tmux 3.8 compatibility verified by focused race regressions, visual check, guard review and pre-commit; protected publication follows mandatory hook.
@@ -438,6 +438,20 @@ Integrate upstream v1.16.39 while preserving fork runtime authority and service 
     "author": "johnw",
     "text": "Refocus 2026-11-16T23:36:42Z: user-authorized scope remains v1.16.39 plus narrow tmux 3.8 compatibility. Dead panes use explicit no-process observations; exact identity/generation/death is rechecked before mutation, live PID/birth guards unchanged. Real replacement-preservation tests and prior-failure/runtime guard checks pass; visual check passes with unchanged goldens. Related fixtures use live fake Claude, grace expiry/eventual observation, isolated Go telemetry and deterministic visual transient state. Scoped guard review found no blockers; pre-commit-7 passes. Signed merge 4cb2c421 remains unpublished; remote still original lease. No Nix edits/activation. Next: signed follow-up and mandatory Docker pre-push, with LEFTHOOK_BIN set inside direnv exec. Next refocus due 2026-11-17T00:36:42Z.",
     "created_at": "2026-11-16T23:36:42Z"
+  },
+  {
+    "id": 53,
+    "issue_id": "agent-deck-r3e",
+    "author": "johnw",
+    "text": "Refocus 2026-11-17T00:40:38Z (previous deadline exceeded by about four minutes): only three remaining publication blockers, no Nix work. Dead-PID MCP fallback and generic stable-session teardown extended with uncached death proof, preserving live process guards. Visual cycle keys paced; visual check passes unchanged goldens. Full CLI-only fail-fast reproduction now captures fork failure: child persisted idle at generation 0 with no launch record, indicating start was bypassed rather than record identity mismatch. Investigate test binary/routing context, not another launch-state redesign. Next: resolve that concrete fixture context, focused checks, then protected push. Next refocus due 2026-11-17T01:40:38Z.",
+    "created_at": "2026-11-17T00:40:38Z"
+  },
+  {
+    "id": 54,
+    "issue_id": "agent-deck-r3e",
+    "author": "johnw",
+    "text": "Refocus 2026-11-17T01:32:26Z: remaining scope unchanged, no Nix edits/activation. Prior protected push rejected three checks. MCP missing-PID cleanup now requires uncached direct death proof; generic stable-session dead cleanup has the same no-signal and conditional-death guards. Real live/dead/missing regression and focused cleanup/CLI checks pass; scoped guard follow-up found no blockers. Fork fixture now uses its absolute fake Pi executable; diagnostic trace showed tool exit before publication, not a launch-record identity rewrite problem. Temporary diagnostics removed. Visual fixture now acknowledges rendered mode transitions and waits for clean Git status; visual check passes unchanged goldens. Next: signed follow-up and mandatory full Docker publication hook. Next refocus due 2026-11-17T02:32:26Z.",
+    "created_at": "2026-11-17T01:32:27Z"
   }
 ]
 #+end_src

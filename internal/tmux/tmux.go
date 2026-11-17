@@ -1654,13 +1654,30 @@ func (s *Session) IsPaneDead() bool {
 	// loop (via UpdateStatus → GetStatus) where a stall freezes all delivery.
 	// A timed-out (indeterminate) probe is treated as "not dead": reporting a
 	// live pane as dead would flip the session to an error state.
+	dead, err := s.ProbePaneDead()
+	return err == nil && dead
+}
+
+// ProbePaneDead observes the primary pane directly, without trusting cached status.
+func (s *Session) ProbePaneDead() (bool, error) {
+	name := s.TmuxName()
+	if name == "" {
+		return false, errors.New("tmux: empty pane death probe target")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
 	defer cancel()
-	out, err := commandOutput(s.tmuxCmdContext(ctx, "list-panes", "-t", "="+s.primaryWindowTarget(), "-F", "#{pane_dead}"))
+	out, err := commandOutput(s.tmuxCmdContext(ctx, "list-panes", "-t", "="+name+":^", "-F", "#{pane_dead}"))
 	if err != nil {
-		return false
+		return false, err
 	}
-	return primaryPaneLine(string(out)) == "1"
+	switch state := primaryPaneLine(string(out)); state {
+	case "0":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, fmt.Errorf("tmux: invalid pane death state %q", state)
+	}
 }
 
 // PaneDeadExitStatus returns the exit code of the process that ran in the
@@ -1772,14 +1789,15 @@ func (s *Session) EnableMouseMode() error {
 }
 
 // stableSessionTarget is the physical tmux runtime selected by a Session name.
-// SessionID and PaneID are immutable for their tmux lifetimes; PanePID binds the
-// process-tree proof to the process still installed in that pane.
+// SessionID and PaneID are immutable for their tmux lifetimes. A live PanePID
+// binds process-tree proof to that pane's process; PaneDead carries no PID.
 type stableSessionTarget struct {
 	SessionName string
 	SessionID   string
 	SocketName  string
 	PaneID      string
 	PanePID     int
+	PaneDead    bool
 }
 
 var errStableSessionTargetChanged = errors.New("tmux: stable session target changed")
@@ -1805,7 +1823,7 @@ func captureStableSessionProcessTree(session *Session) (stableSessionTarget, []P
 	}
 	out, err := session.runBoundedOutput(
 		"display-message", "-t", session.Name+":", "-p",
-		tmuxFmt("#{session_id}", "#{session_name}", "#{pane_id}", "#{pane_pid}"),
+		tmuxFmt("#{session_id}", "#{session_name}", "#{pane_id}", runtimePanePIDFormat),
 	)
 	if err != nil {
 		return stableSessionTarget{}, nil, err
@@ -1820,12 +1838,14 @@ func captureStableSessionProcessTree(session *Session) (stableSessionTarget, []P
 		SocketName:  session.SocketName,
 		PaneID:      strings.TrimSpace(fields[2]),
 	}
-	target.PanePID, err = strconv.Atoi(strings.TrimSpace(fields[3]))
+	target.PanePID, target.PaneDead, err = parseRuntimePanePID(fields[3])
 	if target.SessionName != session.Name || !validTmuxStableID(target.SessionID, '$') ||
-		!validTmuxStableID(target.PaneID, '%') || err != nil || target.PanePID <= 0 {
+		!validTmuxStableID(target.PaneID, '%') || err != nil {
 		return stableSessionTarget{}, nil, errStableSessionTargetChanged
 	}
-
+	if target.PaneDead {
+		return target, nil, nil
+	}
 	identities, err := captureStableProcessTree(func() ([]int, error) {
 		panePID, pids, probeErr := paneProcessTreeForPaneID(target.SocketName, target.PaneID)
 		if probeErr != nil {
@@ -1843,11 +1863,18 @@ func captureStableSessionProcessTree(session *Session) (stableSessionTarget, []P
 }
 
 func stableSessionTargetCondition(target stableSessionTarget) (string, error) {
+	if (target.PaneDead && target.PanePID != 0) || (!target.PaneDead && target.PanePID <= 0) {
+		return "", errStableSessionTargetChanged
+	}
+	paneKey, paneValue := "pane_pid", strconv.Itoa(target.PanePID)
+	if target.PaneDead {
+		paneKey, paneValue = "pane_dead", "1"
+	}
 	return runtimeCandidateCondition([][2]string{
 		{"session_id", target.SessionID},
 		{"session_name", target.SessionName},
 		{"pane_id", target.PaneID},
-		{"pane_pid", strconv.Itoa(target.PanePID)},
+		{paneKey, paneValue},
 	})
 }
 
