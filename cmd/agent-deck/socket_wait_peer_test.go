@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -14,7 +13,12 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/testutil"
 )
+
+// socketClientSettle is how long send.SendOverClaudeSocket pauses after its
+// write, as Claude's own client does, before the send returns.
+const socketClientSettle = 150 * time.Millisecond
 
 func TestSessionSendSocketWaitPeerReply(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
@@ -83,7 +87,9 @@ func TestSessionSendSocketWaitPeerReply(t *testing.T) {
 				}
 				time.Sleep(20 * time.Millisecond)
 			}
-			out, stderr, code, finished := runSocketWaitSend(t, home, env, budget)
+			out, stderr, code = runAgentDeckEnv(t, home, "", env, "session", "send", "socket-wait",
+				"--no-tag", "--no-wait", "--wait", "--timeout", budget, "--json", "reply ok")
+			finished := time.Now()
 			t.Logf("send exit=%d stdout=%s stderr=%s", code, out, stderr)
 			// Busy waits may return before the receiver flushes its frame marker.
 			deadline = time.Now().Add(time.Second)
@@ -103,9 +109,17 @@ func TestSessionSendSocketWaitPeerReply(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				// Measure receipt through reply bytes, excluding CLI startup and shutdown.
-				if elapsed := finished.Sub(info.ModTime()); elapsed > 600*time.Millisecond {
-					t.Fatalf("socket wait exceeded its shared 300ms budget: %s", elapsed)
+				// Start at socket receipt, excluding unrelated CLI startup work.
+				// The interval still holds more than the wait: the socket
+				// client's pause after its write and the send's own records
+				// come before the budget starts, the exit after it ends. Disk
+				// load stretches the last two, so they get an allowance scaled
+				// as the perf budgets are. A wait that ignored --timeout would
+				// run for seconds.
+				limit := socketClientSettle + 300*time.Millisecond +
+					time.Duration(float64(300*time.Millisecond)*testutil.BudgetMultiplier(t))
+				if elapsed := finished.Sub(info.ModTime()); elapsed > limit {
+					t.Fatalf("socket wait exceeded its shared 300ms budget: %s (limit %s)", elapsed, limit)
 				}
 			}
 			var result map[string]interface{}
@@ -132,42 +146,6 @@ func TestSessionSendSocketWaitPeerReply(t *testing.T) {
 			}
 		})
 	}
-}
-
-// socketWaitOutput timestamps the reply rather than later subprocess shutdown.
-type socketWaitOutput struct {
-	strings.Builder
-	received time.Time
-}
-
-func (out *socketWaitOutput) Write(p []byte) (int, error) {
-	n, err := out.Builder.Write(p)
-	if n > 0 {
-		out.received = time.Now()
-	}
-	return n, err
-}
-
-func runSocketWaitSend(t *testing.T, home string, env []string, budget string) (string, string, int, time.Time) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), agentDeckExecTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, channelsCLIBinary(t), "session", "send", "socket-wait",
-		"--no-tag", "--no-wait", "--wait", "--timeout", budget, "--json", "reply ok")
-	cmd.Env = agentDeckTestEnv(home, env)
-	cmd.WaitDelay = 10 * time.Second
-	var out socketWaitOutput
-	var stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &out, &stderr
-	code := 0
-	if err := cmd.Run(); err != nil {
-		if exit, ok := err.(*exec.ExitError); ok {
-			code = exit.ExitCode()
-		} else {
-			t.Fatalf("socket send process: %v", err)
-		}
-	}
-	return out.String(), stderr.String(), code, out.received
 }
 
 // The helper is only the external paid tool; every parent assertion invokes
