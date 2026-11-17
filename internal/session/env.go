@@ -129,7 +129,7 @@ func (i *Instance) buildEnvSourceCommand() string {
 		// no feature is lost.
 		if probedPath, exists, probed := statEnvFileProbe(resolved, i.ProjectPath); probed && !exists {
 			// An explicitly configured env_file that is absent at spawn is a
-			// misconfiguration, not a soft default — the silent `[ -f ] &&`
+			// misconfiguration, not a soft default — the silent `[ -f ]`
 			// skip below is exactly how a typo'd env_file stanza goes
 			// unnoticed. Warn in the pane and the debug log; the
 			// ignore_missing_env_files=false hard-fail path is unchanged.
@@ -297,14 +297,16 @@ func paneWarning(msg string) string {
 }
 
 // buildSourceCmd creates a shell command to source a file.
-// If ignoreMissing is true, wraps in a file existence check.
+// If ignoreMissing is true, a missing file is skipped: the command then
+// succeeds, so the && chain it is joined into goes on to the agent.
 // The path is single-quoted so $(...), backticks or quotes in it (from
 // config, env expansion or the project dir) stay literal.
 func buildSourceCmd(path string, ignoreMissing bool) string {
 	quoted := shellQuote(path)
 	if ignoreMissing {
-		// Use [ -f file ] && source file pattern for safe sourcing
-		return fmt.Sprintf(`[ -f %s ] && source %s`, quoted, quoted)
+		// Not `[ -f file ] && source file`: that is false for a missing
+		// file and stops the chain, so the agent never starts.
+		return fmt.Sprintf(`if [ -f %s ]; then source %s; fi`, quoted, quoted)
 	}
 	return "source " + quoted
 }

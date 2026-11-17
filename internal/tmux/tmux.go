@@ -328,12 +328,13 @@ func toolForExecutable(base string) string {
 }
 
 // setupCommands are what agent-deck runs around a tool launch: cd -- <project>,
-// env files ([ -f … ] && source …), unset and export of its variables, the
+// env files (if [ -f … ]; then source …; fi), unset and export of its variables, the
 // per-session directory (mkdir), and the exit-receipt trailer (umask, printf,
 // exit). Their arguments are paths and variable names, never the tool.
 var setupCommands = map[string]bool{
 	"cd": true, "export": true, "unset": true, "source": true, ".": true,
 	"[": true, "mkdir": true, "umask": true, "printf": true, "exit": true,
+	"fi": true,
 }
 
 // launchCommands drops agent-deck's setup commands from a launch chain and
@@ -395,10 +396,11 @@ func shellScript(words []string) (string, bool) {
 
 // isSetupCommand reports whether a simple command only prepares the pane: a
 // bare assignment (session_dir=…, code=$?) or one of setupCommands, ignoring a
-// subshell's opening parenthesis.
+// subshell's opening parenthesis and the `if` and `then` in front of an env
+// file's test and source.
 func isSetupCommand(words []string) bool {
 	for _, word := range words {
-		if isShellAssignmentToken(word) {
+		if isShellAssignmentToken(word) || word == "if" || word == "then" {
 			continue
 		}
 		return setupCommands[strings.TrimLeft(word, "({")]
