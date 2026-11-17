@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/testutil"
 )
 
 // `session fork` starts the fork before its first save, so the launch's
@@ -35,6 +36,8 @@ func TestSessionFork_TheForkRecordsItsLaunchedTool(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bin, "pi"), []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.3.0; exit 0; fi\nexec sleep 300\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Bind tmux's cached server environment to this fixture's HOME and PATH.
+	t.Cleanup(testutil.IsolateTmuxSocket())
 
 	parent := session.NewInstanceWithGroupAndTool("pi-parent", home, "pi-group", "pi")
 	parent.Command = filepath.Join(bin, "pi")

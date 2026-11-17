@@ -382,10 +382,10 @@ A Codex send that lands while a turn runs starts no turn: Codex records the inpu
 :LABELS:   []
 :ISSUE_TYPE: task
 :CREATED:  [2026-11-16 Mon 10:39]
-:MODIFIED: [2026-11-16 Mon 17:32]
+:MODIFIED: [2026-11-16 Mon 22:40]
 :CREATED_BY: johnw
-:FINISHED: [2026-11-16 Mon 15:36]
-:CLOSE_REASON: Upgrade and authorized tmux 3.8 compatibility verified by focused race regressions, visual check, guard review and pre-commit; protected publication follows mandatory hook.
+:FINISHED: [2026-11-16 Mon 22:40]
+:CLOSE_REASON: Bounded upgrade and fixture lifecycle repairs verified by focused race checks and formerly failing context; mandatory protected publication remains tracked by goal.
 :SOURCE_REPO: agent-deck
 :SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
 :ORIGINAL_SIZE: 0
@@ -452,6 +452,20 @@ Integrate upstream v1.16.39 while preserving fork runtime authority and service 
     "author": "johnw",
     "text": "Refocus 2026-11-17T01:32:26Z: remaining scope unchanged, no Nix edits/activation. Prior protected push rejected three checks. MCP missing-PID cleanup now requires uncached direct death proof; generic stable-session dead cleanup has the same no-signal and conditional-death guards. Real live/dead/missing regression and focused cleanup/CLI checks pass; scoped guard follow-up found no blockers. Fork fixture now uses its absolute fake Pi executable; diagnostic trace showed tool exit before publication, not a launch-record identity rewrite problem. Temporary diagnostics removed. Visual fixture now acknowledges rendered mode transitions and waits for clean Git status; visual check passes unchanged goldens. Next: signed follow-up and mandatory full Docker publication hook. Next refocus due 2026-11-17T02:32:26Z.",
     "created_at": "2026-11-17T01:32:27Z"
+  },
+  {
+    "id": 55,
+    "issue_id": "agent-deck-r3e",
+    "author": "johnw",
+    "text": "Refocus 2026-11-17T06:13:39Z after interrupted wait/resume: mandatory push of signed 1f8bbc0c rejected two CLI tests (fork launch metadata; notifier TempDir cleanup race). No publication from this push, no Nix work. User explicitly authorized only these two remaining blockers. Generated root direnv environment became blocked; user authorized direnv allow and loading works again. Earlier last deadline elapsed during interruption; next refocus due 2026-11-17T07:13:39Z. Diagnose exact pre-publication absence and fixture process lifetime; keep launch ownership guards unchanged. Use actual CLI process lifetime for notifier fixture instead of async in-process teardown if confirmed.",
+    "created_at": "2026-11-17T06:13:39Z"
+  },
+  {
+    "id": 56,
+    "issue_id": "agent-deck-r3e",
+    "author": "johnw",
+    "text": "Refocus 2026-11-17T06:40:24Z: only the two authorized remaining CLI fixtures changed (nine insertions, one deletion), no production changes. Notifier sweep runs real CLI subprocess so asynchronous bus writers cannot outlive fixture lifetime; 30 race-enabled repetitions pass with all sweep/survivor assertions intact. Fork context bisected to TestCustomCommandExitCLI followed by launch-record fixture: fake Pi never executed on shared tmux context. Existing nested IsolateTmuxSocket helper gives fork fixture its own HOME/PATH server lifetime; exact formerly failing pair passes ten race-enabled repetitions. Largest known failing predecessor context (896 tests plus target) now passes on final code. Temporary diagnostics removed; formatting clean. Next: signed test-only follow-up and mandatory protected Docker publication gate; no Nix work before publication. Next refocus due 2026-11-17T07:40:24Z.",
+    "created_at": "2026-11-17T06:40:24Z"
   }
 ]
 #+end_src

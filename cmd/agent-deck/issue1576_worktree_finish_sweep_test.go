@@ -122,7 +122,12 @@ func TestIssue1576_WorktreeFinishSweepsNotifierState(t *testing.T) {
 	}
 
 	// --- Finish the worktree session (no merge, keep branch, no prompt). ---
-	handleWorktreeFinish(profile, []string{"wt-finish-1576", "--no-merge", "--force", "--keep-branch"})
+	// Keep asynchronous CLI writers within the subprocess's lifetime.
+	stdout, stderr, code := runAgentDeckEnv(t, home, "", []string{"AGENTDECK_PROFILE=" + profile},
+		"-p", profile, "worktree", "finish", "wt-finish-1576", "--no-merge", "--force", "--keep-branch")
+	if code != 0 {
+		t.Fatalf("worktree finish: exit %d: %s %s", code, stdout, stderr)
+	}
 
 	// --- Ledger: doomed record gone, survivor intact. ---
 	gotState, err := os.ReadFile(statePath)
