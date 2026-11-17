@@ -49,3 +49,32 @@ func TestShellPromptReady(t *testing.T) {
 		}
 	}
 }
+
+// TestAttachedPaneBody pins the signal stepAttachShell waits on. The step once
+// took the list's absence for the attach having landed and captured the notice
+// agent-deck prints before its TUI starts, which the terminal shows again until
+// the attached client draws.
+func TestAttachedPaneBody(t *testing.T) {
+	const name = "agentdeck_shell-live_342dbbf3"
+	status := "[" + name + "] 0:sh*    ctrl+q detach · ctrl+s switch │ 📁 shell-live | shell-live"
+	for _, c := range []struct {
+		label, pane string
+		attached    bool
+		body        string
+	}{
+		{"list", " ●●○ Agent Deck\nSESSIONS   │ PREVIEW\n   └─ ○ shell-live shell\n", false, ""},
+		{"main screen before the client draws", "agent-deck: new installs now start with safer defaults.\nThis notice is shown once.\n\n\n", false, ""},
+		{"another session's client", "$\n\n[agentdeck_other_1234abcd] 0:sh*\n", false, ""},
+		{"attached, launch line still shown", "$ export AGENTDECK_INSTANCE_ID=x; exec sh\n$\n\n" + status + "\n", true, "$ export AGENTDECK_INSTANCE_ID=x; exec sh\n$\n"},
+		{"attached and cleared", "$\n\n\n" + status + "\n\n", true, "$\n\n"},
+	} {
+		body, attached := attachedPaneBody(c.pane, name)
+		if attached != c.attached || body != c.body {
+			t.Errorf("%s: attachedPaneBody = (%q, %v), want (%q, %v)", c.label, body, attached, c.body, c.attached)
+		}
+	}
+	// The body of an attached, cleared pane is what the step's prompt check reads.
+	if body, _ := attachedPaneBody("$\n\n\n"+status+"\n", name); !shellPromptReady(body) {
+		t.Errorf("cleared attached pane body %q must read as a ready prompt", body)
+	}
+}

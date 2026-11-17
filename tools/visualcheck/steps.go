@@ -592,14 +592,17 @@ func stepAttachShell(w *widthRun) error {
 	if err := w.send("Enter"); err != nil {
 		return err
 	}
-	// Attaching replaces the list chrome with the raw child pane; the
-	// sandbox's /bin/sh prompt is the signal it landed.
+	// Attaching replaces the list chrome with the raw child pane. The list
+	// going away is not the signal it landed: between the TUI releasing the
+	// terminal and the attached client drawing, the pane shows whatever was
+	// printed before the TUI started. The attached client's status line is.
 	if err := w.waitFor(func() (bool, error) {
 		pane, err := w.pane()
 		if err != nil {
 			return false, err
 		}
-		return !contains(pane, "SESSIONS") && shellPromptReady(pane), nil
+		_, attached := attachedPaneBody(pane, w.sd.shellLive.tmuxName)
+		return attached, nil
 	}, 8*time.Second); err != nil {
 		return err
 	}
@@ -628,13 +631,19 @@ func stepAttachShell(w *widthRun) error {
 	if _, err := w.s.exec("tmux", "clear-history", "-t", w.sd.shellLive.tmuxName); err != nil {
 		return err
 	}
+	// The waits above read shell-live's own pane; the frame is the outer
+	// pane. Wait until the attached client has drawn the cleared prompt there.
 	if err := w.waitFor(func() (bool, error) {
 		name, err := w.s.exec("tmux", "display-message", "-p", "-t", w.sd.shellLive.tmuxName, "#{window_name}")
 		if err != nil || strings.TrimSpace(name) != "sh" {
 			return false, err
 		}
 		pane, err := w.pane()
-		return err == nil && shellPromptReady(pane) && !contains(pane, "SESSIONS"), err
+		if err != nil {
+			return false, err
+		}
+		body, attached := attachedPaneBody(pane, w.sd.shellLive.tmuxName)
+		return attached && shellPromptReady(body) && !strings.Contains(body, "export AGENTDECK"), nil
 	}, 5*time.Second); err != nil {
 		return err
 	}
@@ -770,6 +779,20 @@ func stepTriggers(w *widthRun) error {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// attachedPaneBody reports whether pane shows a client attached to the tmux
+// session tmuxName, and returns the lines above that client's status line.
+// tmux draws the status line last, beginning with the session name in square
+// brackets, so it tells an attached session apart from the list and from
+// output left on the terminal's main screen.
+func attachedPaneBody(pane, tmuxName string) (body string, attached bool) {
+	lines := strings.Split(strings.TrimRight(pane, " \t\r\n"), "\n")
+	last := len(lines) - 1
+	if !strings.HasPrefix(lines[last], "["+tmuxName+"]") {
+		return "", false
+	}
+	return strings.Join(lines[:last], "\n"), true
+}
 
 // shellPromptRe matches a shell prompt marker at the end of a line: $ for a
 // regular user, # for root (a root container's sandbox shell).
