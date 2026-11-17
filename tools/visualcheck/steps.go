@@ -599,7 +599,7 @@ func stepAttachShell(w *widthRun) error {
 		if err != nil {
 			return false, err
 		}
-		return !contains(pane, "SESSIONS"), nil
+		return !contains(pane, "SESSIONS") && shellPromptReady(pane), nil
 	}, 8*time.Second); err != nil {
 		return err
 	}
@@ -630,7 +630,11 @@ func stepAttachShell(w *widthRun) error {
 	}
 	if err := w.waitFor(func() (bool, error) {
 		name, err := w.s.exec("tmux", "display-message", "-p", "-t", w.sd.shellLive.tmuxName, "#{window_name}")
-		return err == nil && strings.TrimSpace(name) == "sh", err
+		if err != nil || strings.TrimSpace(name) != "sh" {
+			return false, err
+		}
+		pane, err := w.pane()
+		return err == nil && shellPromptReady(pane) && !contains(pane, "SESSIONS"), err
 	}, 5*time.Second); err != nil {
 		return err
 	}
