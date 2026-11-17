@@ -65,6 +65,33 @@ func TestBuildSourceCmd_FailureModesKept(t *testing.T) {
 	}
 }
 
+// TestBuildSourceCmd_EdgePaths records two behaviours of the ignoreMissing
+// form at its edges. A path that is a directory is not a file to source, so
+// it is skipped like a missing one. A file whose name ends in a newline is
+// not sourced: command substitution strips the trailing newline, the source
+// then names a file that does not exist, and the chain stops.
+func TestBuildSourceCmd_EdgePaths(t *testing.T) {
+	dir := t.TempDir()
+
+	sub := filepath.Join(dir, "a-directory")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cmd := buildSourceCmd(sub, true) + ` && printf ran`
+	if out, err := runSourceCmdInBash(t, dir, cmd); err != nil || out != "ran" {
+		t.Errorf("command after a directory path did not run (err=%v, out=%q)\ncmd: %s", err, out, cmd)
+	}
+
+	newline := filepath.Join(dir, "newline.env\n")
+	if err := os.WriteFile(newline, []byte("export LOC5_SENTINEL=sourced\n"), 0o600); err != nil {
+		t.Skipf("file name ending in a newline not supported here: %v", err)
+	}
+	cmd = buildSourceCmd(newline, true) + ` && printf '%s' "ran:$LOC5_SENTINEL"`
+	if out, err := runSourceCmdInBash(t, dir, cmd); err == nil || strings.Contains(out, "ran:") {
+		t.Errorf("a file name ending in a newline: want the chain stopped, got err=%v, out=%q\ncmd: %s", err, out, cmd)
+	}
+}
+
 // TestBuildEnvSourceCommand_MissingShellEnvFileStillLaunches: the whole
 // prefix a session is started with. A [shell] env_files entry that does not
 // exist must leave the command after the prefix running, and an entry that

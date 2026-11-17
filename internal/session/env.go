@@ -299,7 +299,8 @@ func paneWarning(msg string) string {
 // buildSourceCmd creates a shell command to source a file.
 // If ignoreMissing is true, a missing file is skipped: the command then
 // sources /dev/null and succeeds, so the && chain it is joined into goes on
-// to the agent.
+// to the agent. A directory is skipped the same way. A file name ending in a
+// newline is not supported: "$(...)" strips it and the source fails.
 // The path is single-quoted so $(...), backticks or quotes in it (from
 // config, env expansion or the project dir) stay literal.
 func buildSourceCmd(path string, ignoreMissing bool) string {

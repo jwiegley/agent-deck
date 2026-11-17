@@ -320,7 +320,7 @@ func (i *Instance) prepareCommand(cmd string) (string, string, error) {
 	// A SubcommandPassthrough Tool=="shell" instance needs the same wrap for
 	// a different reason even though it has no configured wrapper:
 	// buildShellPassthroughCommand injects bash/POSIX-only syntax ahead of
-	// the subcommand — `export VAR='val' && `, `[ -f x ] && . x && `, inline
+	// the subcommand — `export VAR='val' && `, `source "$(...)" && `, inline
 	// `VAR=val cmd` prefix assignments. Tool=="shell" instances are delivered
 	// via tmux send-keys into the user's actual interactive login shell
 	// (RunCommandAsInitialProcess is false for them), which is not

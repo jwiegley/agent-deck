@@ -611,7 +611,7 @@ func TestIssue1821_ShellPassthroughClaude_RetroactiveCaptureDenied(t *testing.T)
 // TestIssue1821_ShellPassthroughSubcommand_WrapsInBashCForNonBashShells is
 // the regression test for the Claude review HIGH #2 finding on PR #1821: a
 // SubcommandPassthrough instance's built command contains bash/POSIX-only
-// syntax (inline `VAR=val` assignments, `export ... && `, `[ -f x ] && . x`)
+// syntax (inline `VAR=val` assignments, `export ... && `, `source "$(...)"`)
 // that instance.prepareCommand must wrap in `bash -c '...'` — Tool=="shell"
 // instances are delivered via tmux send-keys into the user's actual
 // interactive login shell, which is not necessarily bash (e.g. fish, which

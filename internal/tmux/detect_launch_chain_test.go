@@ -6,8 +6,8 @@ import "testing"
 // unset/export, mkdir). #2683 put `unset CLAUDE_JOB_DIR` into that chain for
 // every hook-status tool, and a Codex launch carries the identity block, which
 // mentions claude, in its arguments. Neither may decide which tool runs. The
-// chains below are the ones 1.16.29 builds, with values shortened.
-const launchChainSetup = `cd -- /src/project && export COLORFGBG='15;0' && [ -f "/cfg/agent-deck/agent-cat.env" ] && source "/cfg/agent-deck/agent-cat.env" && `
+// chains below are the ones agent-deck builds, with values shortened.
+const launchChainSetup = `cd -- /src/project && export COLORFGBG='15;0' && source "$([ -f '/cfg/agent-deck/agent-cat.env' ] && printf %s '/cfg/agent-deck/agent-cat.env' || printf /dev/null)" && `
 
 func TestDetectToolFromCommand_LaunchChain(t *testing.T) {
 	tests := []struct {
