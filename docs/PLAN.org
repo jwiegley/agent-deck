@@ -2,6 +2,23 @@
 #+SEQ_TODO: TODO DOING DRAFT WAIT DEFER NOTE | DONE CANCELED
 #+ISSUE_PREFIX: agent-deck
 
+* TODO [#D] Make session set tmux-socket a runtime transition
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-0lv
+:LABELS:   []
+:ISSUE_TYPE: feature
+:CREATED:  [2026-11-09 Mon 14:57]
+:MODIFIED: [2026-11-09 Mon 14:57]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Since the v1.16.38 rebase (2026-11-09) SetField refuses FieldTmuxSocket moves. Upstream 7d13e4e6 (#3045) moves a stopped session to another tmux socket by changing inst.TmuxSocketName and the wrapper in memory and saving with SaveWithGroups, but the socket is runtime-owned here (instance_runtime_state.tmux_socket_name): the snapshot merge skips it and beginRuntimeTransition re-adopts the durable socket, so the move never persisted and the CLI reported success.
+To support it: under the instance spawn lock and beginRuntimeTransition, require that reconciliation finds no live runtime and that ProbeExactSession(oldSocket, oldName) proves the old session absent (an indeterminate answer refuses); write the new socket with a CAS on generation, status revision, session name and socket, updating tmux_socket_name and its instances projection; adopt the result with a fresh wrapper. Then lift the refusal, restore upstream's TestSetField_TmuxSocket_MovesStoppedSession intent with a durable check, and update config-reference.md's [tmux].binaries row.
+
 * TODO [#C] Reproduce tmux blocking PTY read after Eternal Terminal client exit
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
@@ -27,6 +44,241 @@ Athena tmux 3.6a with Eternal Terminal 6.2.11: original attached tmux client was
     "depends_on_id": "agent-deck-oa3",
     "type": "discovered-from",
     "created_at": "2026-10-21T00:26:54.012343Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#D] Exclusive creates leave a partial file when the write fails
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-32z
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-01 Sun 15:07]
+:MODIFIED: [2026-11-01 Sun 15:07]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found during Task 3 of the conductor-setup-safe-reinstall plan (work/conductor-setup-fix). replaceGeneratedFile now removes the partial file when its O_EXCL create fails mid-write, but the other exclusive creates do not. (1) internal/session/conductor.go createFileIfAbsent returns (true, writeErr) or (true, closeErr) and leaves the partial file; its callers are writeFileIfAbsent, used by InstallPolicyMD at conductor.go:2052 (so conductor setup can leave a truncated POLICY.md that every later run keeps as the user's), and writeCursorTrustFileExclusive at cursor_trust.go:139. (2) internal/watcher/layout.go:86-100 writeIfAbsent has the same shape. A file left half-written by a full disk then reads as a user-owned file and is never regenerated. Fix at the creating function: remove the file it created when the write or close fails, and pin it with a test that injects the failure.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-32z",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-01T23:07:06.762120Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#C] update timer rewrites and reloads com.agentdeck.autoupdate without an ownership check
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-388
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-01 Sun 02:36]
+:MODIFIED: [2026-11-01 Sun 19:21]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+internal/update/timer.go InstallTimerPlan (darwin, :301-303 at 0953876e) writes the launchd plist, then runs launchctl bootout and bootstrap, with no check that the plist is read-only or a symlink. Same bug class as agent-deck-z8i (design 5.2); not fixed in that series.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-388",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-01T10:36:03.711357Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 30,
+    "issue_id": "agent-deck-388",
+    "author": "johnw",
+    "text": "Also the Linux side (found during Task 7 of the conductor-setup series, df34b235): internal/update/timer.go writes the autoupdate systemd units (SystemdTimerTimer and its service) and runs systemctl --user daemon-reload / enable --now with no ownership check either. The conductor units now go through requireOwnedSystemdUnits in internal/session/service_files.go; the update timer should get the same rule on both platforms.",
+    "created_at": "2026-11-02T03:21:20Z"
+  }
+]
+#+end_src
+
+* TODO [#E] agent-deck --help: 'conductor teardown' line overstates what teardown removes (main.go:4787)
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-4cw
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-02 Mon 13:57]
+:MODIFIED: [2026-11-02 Mon 13:57]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found by the scoped re-review of the final fix wave on work/conductor-setup-fix.
+
+cmd/agent-deck/main.go:4787, in the top-level `agent-deck --help`, reads: "conductor teardown        Stop conductor and remove bridge daemon". It was already loose: a single-conductor teardown never removes the bridge daemon. Since this branch it is also inexact for an external bridge, which `teardown --all` leaves alone with a [skip] line. No golden pins it; help_conductor.golden:8 holds only the other string.
+
+This branch did not fix it, because cmd/agent-deck/main.go is one of the files patched by nix-config's overlays/ai/agent-deck-legacy-remote-capability.patch. Those files were promised to the nix session on 2026-10-31, so the change has to be coordinated with that patch.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-4cw",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-02T21:57:57.706618Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#E] Tests print production stderr notices into the test output
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-4sw
+:LABELS:   []
+:ISSUE_TYPE: chore
+:CREATED:  [2026-11-01 Sun 15:23]
+:MODIFIED: [2026-11-01 Sun 15:23]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found while reviewing Tasks 2 and 3 of the conductor-setup-safe-reinstall plan. Focused internal/session runs print production notices straight to os.Stderr: 'notify-daemon install skipped — Background launchd domain, ...' (conductor.go:2899, reached by TestInstallTransitionNotifierLaunchd_BackgroundRunning_SkipsUnload and _SkipReturnsNotifierPath) and 'Moved ... aside' (conductor.go:1225, reached by TestSetupConductorWithAgent_Switch*). The output is not wrong, but it buries real warnings in test logs. Inject the writer (or capture stderr in those tests) so test output stays clean.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-4sw",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-01T23:23:36.870877Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#E] Go telemetry writes race TempDir cleanup in HOME-isolated tests
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-5dw
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-09 Mon 14:57]
+:MODIFIED: [2026-11-09 Mon 14:57]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Seen in the v1.16.38 rebase's container runs (2026-11-09, golang 1.26.10 bookworm): TestAccountDoctorDirectories (internal/session) and TestStorageWatcherBuildCacheDefaultsSurviveHomeIsolation (internal/ui) each failed once with 'TempDir RemoveAll cleanup: unlinkat .../.config/go/telemetry...: directory not empty' and passed on rerun. A go subprocess run under the test's temporary HOME leaves Go's telemetry writing there while the TempDir is removed. Both tests are unchanged at the old fork main and upstream; gotestsum's --rerun-fails absorbs it in CI. Fix idea: run such go subprocesses with telemetry off (GOTELEMETRY=off in go env, or a telemetry dir outside the TempDir), or wait for the telemetry child before cleanup.
+
+* TODO [#D] SystemdUserDir ignores XDG_CONFIG_HOME
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-78t
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-01 Sun 19:38]
+:MODIFIED: [2026-11-01 Sun 19:38]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found reviewing Task 7 of the conductor-setup-safe-reinstall plan (df34b235). internal/session/conductor.go SystemdUserDir() hard-codes ~/.config/systemd/user, but the systemd user manager reads $XDG_CONFIG_HOME/systemd/user when XDG_CONFIG_HOME is set in its environment (home-manager with a custom xdg.configHome, for example). There, conductor setup writes units systemd never loads, and the new ownership checks and BridgeDaemonExternal/HeartbeatDaemonExternal probes inspect a file systemd does not read, so an externally managed unit in the real directory is missed. Resolve the unit directory the way systemd does (XDG_CONFIG_HOME, else ~/.config).
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-78t",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-02T03:38:20.196751Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#D] Same-label service definitions outside agent-deck's path: setup shadows them and teardown reports [ok] without touching them
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-7ya
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-02 Mon 09:33]
+:MODIFIED: [2026-11-02 Mon 09:33]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found by the final whole-branch review of work/conductor-setup-fix (findings core-4 and spec-teardown-false-ok).
+
+Ownership checks look only at agent-deck's own path for each service file (serviceFileExternal Lstats ~/Library/LaunchAgents/<label>.plist or ~/.config/systemd/user/<unit>). A same-label agent defined elsewhere is invisible to them. Examples: NixOS system-level `systemd.user.services` puts the unit in /etc/systemd/user; nix-darwin `launchd.user.agents` writes a root-owned /Library/LaunchAgents plist.
+
+- setup: the probe sees a missing file and treats it as agent-deck's. It runs pip, writes its own unit or plist (~/.config/systemd/user takes precedence over /etc/systemd/user), and enables or loads it. agent-deck's definition then shadows the external one.
+- teardown --all: when the daemon is running but no file exists at agent-deck's path, removeSystemdUnits makes no call (Task 7), and reportTeardownStop still prints "[ok] Daemon stopped and removed", so the bridge or notifier keeps running. Base ran `systemctl --user disable --now <unit>` by name.
+
+Possible fix: before treating a missing file as agent-deck's, ask the manager where the loaded definition lives, with an allow-listed query: `systemctl --user show -p FragmentPath <unit>`, or the `path =` line of `launchctl print gui/<uid>/<label>`. A definition from another path counts as external ("defined elsewhere"). In teardown, print a [skip] line instead of [ok].
+
+hera is not affected: its agents are home-manager files at agent-deck's own path.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-7ya",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-02T17:33:36.819312Z",
     "created_by": "johnw",
     "metadata": "{}",
     "thread_id": ""
@@ -78,6 +330,123 @@ Fixed in dc163e96 (pushed in eba2e06d..ef8209d8, 2026-10-23).
 ]
 #+end_src
 
+* TODO [#D] A TUI import can drop an acknowledged watcher load
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-81y
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-09 Mon 15:27]
+:MODIFIED: [2026-11-09 Mon 15:27]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found in the v1.16.38 rebase review (2026-11-09); the logic predates the rebase, and upstream's welcome-screen Import now reaches it too.
+- internal/ui/home.go's loadSessionsMsg handler passes a watcher load to storageWatcher.acknowledge before the fork's reloadVersion check drops it. Upstream has no such check, so it never drops a load it acknowledged.
+- Both import paths (home_persist.go importSessionsCounted and addImportedSessions) call beginReload outside sessionLoadCmd. A watcher load in flight when an import starts is therefore acknowledged and then thrown away.
+- If the import then fails before writing anything (say the first InsertSessionAndVerify returns ErrSessionAlreadyExists), nothing triggers a reload, and the TUI misses that external change until the next database write.
+Fix: check reloadVersion before acknowledging, or TriggerReload() on the import error paths. Also pre-existing: importSessionsCounted calls h.preserveState() in the command goroutine, reading cursor, flatItems and groupTree without a lock. The loadSessionsMsg handler re-reads them anyway, so pass &reloadState{}.
+
+* DONE [#C] conductor launchd plists: ProcessType Interactive, no LowPriorityIO (bridge, heartbeat, gh-watcher)
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-8tz
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-11-02 Mon 13:26]
+:MODIFIED: [2026-11-02 Mon 20:05]
+:CREATED_BY: johnw
+:FINISHED: [2026-11-02 Mon 20:05]
+:CLOSE_REASON: Done on work/conductor-setup-fix as 0ce4c535 (Task 15; branch tip 3885df52), verified with the branch; push and nix's pin bump remain with John and the nix session
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Requested by the nix session (mail of 2026-11-02 20:57 UTC), citing John's decision of 2026-11-02 (nix-config obr nix-6dox, comment 1205). John confirmed in session fork-conductor-setup on 2026-11-02 that the change rides branch work/conductor-setup-fix, and he added the gh-watcher plist to it.
+
+Why: agent sessions inherit the launchd limits of whichever job starts the default tmux server. The conductor's launchd jobs set LowPriorityIO and no ProcessType.
+
+Change: drop LowPriorityIO and set ProcessType to Interactive in these files:
+- internal/session/conductor.go: the heartbeat and bridge plist templates;
+- setup.sh's copy of the bridge plist, conductor/com.agentdeck.conductor-bridge.plist;
+- the gh-watcher plist, conductor/gh-watcher/com.agentdeck.gh-watcher.plist.
+
+Tests pin both keys.
+
+Not changed: the transition-notifier template stays as it is, by John's decision. On hera both conductor plists are nix-managed. nix-config changes its own units, and nix moves the agent-deck pin after John pushes.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-8tz",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-02T21:26:35.422851Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#C] conductor/setup.sh overwrites HEARTBEAT_RULES.md unconditionally
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-9gc
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-01 Sun 02:36]
+:MODIFIED: [2026-11-01 Sun 02:36]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+conductor/setup.sh:100 (0953876e) copies the shipped HEARTBEAT_RULES.md over the user's copy on every run. Same bug class as agent-deck-z8i (design 5.4); not fixed in that series.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-9gc",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-01T10:36:04.061615Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#C] Bound the ps and pgrep probes on the fork's lifecycle paths
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-9xy
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-09 Mon 14:57]
+:MODIFIED: [2026-11-09 Mon 14:57]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found in the v1.16.38 rebase review (2026-11-09). Upstream f12246d4 (#3072) bounded ps and pgrep in its pane process tree probe; three fork paths that hold the instance spawn lock still run them unbounded:
+- internal/tmux/tmux.go processTreeFromPanePID runs pgrep per node with no deadline; reached through captureStableProcessTree for captured kill, candidate respawn and Kill (runtime_binding_candidates.go, tmux.go).
+- internal/session/mcp_child_reap.go runs ps -eo with no deadline, via discoverCapturedRuntimeChildrenFn (instance_restart.go), after the destruction reservation is taken.
+- internal/session/instance_codex_detect.go runs ps -p with no deadline, via detectCodexSessionAttempt, which holds the lock (the darwin path).
+A hung ps or pgrep wedges that instance's lifecycle lock and leaves a reservation pending. Fix: boundedProcessOutput (or CommandContext with WaitDelay) under a shared budget, so a timeout fails the capture closed; put child enumeration behind a seam so a TestRuntimeLifecycle_ gate test needs no pgrep.
+
 * TODO [#D] Keep the web menu's pooled status pass ahead of the serial pass under -race
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
@@ -111,6 +480,56 @@ The fork's per-instance UpdateStatus path loses most of the pool's gain under th
 ]
 #+end_src
 
+* TODO [#D] teardown --all --remove deletes an owned bridge.py that an external bridge agent still runs
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-aqh
+:LABELS:   []
+:ISSUE_TYPE: question
+:CREATED:  [2026-11-02 Mon 09:33]
+:MODIFIED: [2026-11-02 Mon 13:26]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found by the final whole-branch review of work/conductor-setup-fix (finding spec-teardown-strands-external-bridge). The plan mandates this behaviour and the design accepts it (§5.1/§5.2); recorded so the trade-off has a home.
+
+setup writes and stamps bridge.py even when the bridge agent is external, so an external agent running an agent-deck-owned bridge.py is the normal state (hera once it moves to the embedded bridge, design 8). `conductor teardown --all --remove` prints "[skip] com.agentdeck.conductor-bridge: managed externally (read-only)" and leaves the agent running. The shared cleanup (RemoveBridgeScript, conductor_cmd.go around :1206) then deletes bridge.py, .bridge.py.sha256 and .bridge.py.previous, and the KeepAlive/Restart=always agent crash-loops on the missing script until its manager is changed. teardown.sh's remove_bridge_script does the same.
+
+Possible change, if John wants it: skip RemoveBridgeScript while BridgeDaemonExternal() != nil and print "[skip] bridge.py kept: <label> is managed externally and runs it". teardown.sh would guard remove_bridge_script with service_file_external on the bridge plist.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-aqh",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-02T17:33:37.241695Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 39,
+    "issue_id": "agent-deck-aqh",
+    "author": "johnw",
+    "text": "John decided on 2026-11-02, in session fork-conductor-setup: keep it as designed. --remove deletes agent-deck's own files whatever runs them. No change on work/conductor-setup-fix. This issue stays open as a recorded behaviour.\n",
+    "created_at": "2026-11-02T21:26:40Z"
+  }
+]
+#+end_src
+
 * TODO [#D] Pin the fork's stop against a racing status sample at the CLI or core level
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
@@ -127,6 +546,100 @@ The fork's per-instance UpdateStatus path loses most of the pool's gain under th
 The v1.16.34 rebase (dab9e0a2) removed upstream's twelve Defect 317 (#2850) stop-path race tests; 6d851a3e lists them. They inject a concurrent status writer through StopAfterKillHook between a stop's kill and its stopped write, and no stop path of the fork calls that hook or WriteStoppedAfterKill: `session stop`, the core registry's stop, the TUI's close and archive, and the web stop and archive go through KillCaptured, whose destruction reservation keeps a status sample from landing over the stop. The fork pins that only at the session level (TestRuntimeLifecycle_StatusPublisherCannotPassReservedKillBarrier).
 
 Add one CLI- or core-level test that stops a stored, started session through its real stop path while another writer races a WriteStatusIfVersion sample (error, or running for a dead pane) into the kill window, and requires stopped. internal/session/stop_status.go (BeforeStopKill, WriteStoppedAfterKill, StopAfterKillHook) is kept from upstream with no production caller; only defect317_stop_spawn_guard_test.go and the #2853 emulation use it. Raised by review round 1 of the v1.16.34 rebase (optional there).
+
+* TODO [#D] Docs name only Telegram and Slack as conductor channels in places
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-cm3
+:LABELS:   []
+:ISSUE_TYPE: docs
+:CREATED:  [2026-11-01 Sun 02:36]
+:MODIFIED: [2026-11-01 Sun 02:36]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+README.md:614 and :641 and skills/agent-deck/references/conductors.md:7 and :37 (0953876e) say Telegram/Slack, though Discord and Mattermost bridges exist. Found while planning agent-deck-z8i (AGENTS.md rule 1: a separate docs fix).
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-cm3",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-01T10:36:04.876389Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#C] make test-runtime-lifecycle (nix's checkPhase gate) fails under load: helper builds killed at a 2-minute cap, session near the 10m default
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-cmg
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-02 Mon 20:04]
+:MODIFIED: [2026-11-03 Tue 14:27]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+`make test-runtime-lifecycle`, the gate that nix-config's agent-deck checkPhase runs, fails on a loaded host at HEAD and at base alike. Three things time out:
+
+- TestRuntimeLifecycle_PackagedHelper (internal/statedb, runtime_lifecycle_packaged_helper_test.go:412) and TestRuntimeLifecycle_PackagedCrashHelper (internal/session, :389) each build a helper with a fresh GOCACHE under a 2-minute cap. At a load average above about 100 (hera, 32 cores) both builds are killed (`signal: killed`, about 125 s) at 3885df52 and at main 0953876e. At about 70, the statedb build passed alone in 84-102 s, close to the cap.
+- internal/session's lifecycle set (`-run '^TestRuntimeLifecycle_'`, 191 tests) takes about 10 minutes at that load at both trees (596-757 s), and the gate does not raise go test's default 10m timeout. One run panicked with `test timed out after 10m0s` at 604 s.
+
+On 2026-11-02 the gate failed twice at load 60-136 and passed on its third run at load 45-77. A nix build on a loaded builder can therefore fail its checkPhase without any code change.
+
+Options: give the helper builds a cap that scales or a warm cache; pass -timeout to the gate's go test.
+
+Logs: ~/Products/agent-deck-conductor-setup-fix/logs/final2-gate-run{1,2,3}.log and final2-rerun*-{head,base}.log; the judging is in sdd/final-verify-host-report.md (H3.3, H3.4).
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-cmg",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-03T04:04:11.225383Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 41,
+    "issue_id": "agent-deck-cmg",
+    "author": "johnw",
+    "text": "Same-load pairs on hera, 2026-11-02 ~20:05-20:40, HEAD 3885df52 and base 0953876e started together: at load 39-53, PackagedHelper passed at both in 76.7/77.3 s and PackagedCrashHelper passed at both in 119.2/122.0 s, within about 3 s of the 120 s build cap; the session lifecycle set with -timeout 10m passed 191/191 at both in 296/297 s. Gate run side by side at load 44 rising to ~96: exit 2 at both trees with the same crash-helper signal: killed and the same 10m session timeout, walls 1635/1633 s. So the crash helper's cap is marginal even at moderate load. Logs: ~/Products/agent-deck-conductor-setup-fix/logs/final2-pair-*.log and final2-gate-pair-{head,base}.log.",
+    "created_at": "2026-11-03T04:50:35Z"
+  },
+  {
+    "id": 43,
+    "issue_id": "agent-deck-cmg",
+    "author": "johnw",
+    "text": "2026-11-03, fork-conductor-setup cleanup: the session has ended at John's request. Its workspace /Users/johnw/Products/agent-deck-conductor-setup-fix was trimmed from 713 MB to 12 MB. Every file this issue cites was kept, along with the scripts that produced those files (the list is cleanup/keep.txt in that directory). Nothing else depends on the directory: delete it once agent-deck-cmg, -vmg, -sen and -muu are closed.\n",
+    "created_at": "2026-11-03T22:27:53Z"
+  }
+]
+#+end_src
 
 * DONE [#D] Stamp issue965's test session so the runtime ownership check lets Kill reap it
 :PROPERTIES:
@@ -176,6 +689,79 @@ In a golang:1.26 container (self-check.sh, FULL_TESTS=1), TestKillInternal_Disco
 ]
 #+end_src
 
+* TODO [#C] Teardown on Darwin leaves every ownership receipt in recovery_required
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-es3
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-09 Mon 17:34]
+:MODIFIED: [2026-11-09 Mon 17:34]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found on Hera, 2026-11-10, while checking whether the Agent Deck 1.16.38 switch (generation 1472) ended a session. It did not: ob-agent-deck-mail stopped and removed its probe session mailbox-check (d6f18751-1794273649) itself. The health journal has an explicit stop, then macapp.session.closed reason removed, 0.4 s apart. Its other probe, 5ae62630-1794273651, went the same way 6 minutes after the switch.
+
+Both receipts in ~/.local/share/agent-deck/runtime/ownership were left in recovery_required:
+- d6f18751: note "19 recorded identity/identities could not be verified as ours and were left alone".
+- 5ae62630: the same note, for 2 identities.
+None of those 21 pids exists any more.
+
+This is not new:
+- 225 receipts are in recovery_required (40 are live). Every one has that note, dated from 2026-09-22 to 2026-11-09, every day.
+- Since 2026-11-01, session-id-lifecycle.jsonl records 227 ownership_claimed and 0 ownership_reaped. ownership_reaped is written only when the reap signalled and cleared, so this suggests but does not prove that no teardown reap completes on Hera.
+
+What it means:
+- Teardown (internal/session/ownership.go: procowner.Reap, then markOwnershipRecoveryRequired) never clears these receipts, and it signals none of the recorded descendants.
+- So the fork's reap of escaped descendants (own pgid, such as MCP servers) does nothing on Hera, and those processes die only if tmux's teardown reaches them.
+- The receipts and their .lock files pile up for sessions that no longer exist.
+
+Ruled out: a pid that is already gone. DarwinProber.Inspect maps ps's empty exit 1 to ErrNoProcess. The cause lies elsewhere, perhaps in the lstart identity comparison or the descendant walk. Undiagnosed.
+
+Acceptance:
+- On Darwin, the stop and remove of a session whose processes are its own clears its receipt. A test pins this, run in a container where it can be, or on a darwin runner.
+- Receipts of removed sessions do not accumulate.
+- The existing recovery_required receipts for rows that no longer exist get a documented cleanup (session ownership reconcile, or a sweep).
+
+* TODO [#D] conductor/setup.sh stops at Step 5 on Linux, so the gh-watcher systemd units are never installed
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-fgm
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-02 Mon 09:33]
+:MODIFIED: [2026-11-02 Mon 09:33]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found by the final whole-branch review of work/conductor-setup-fix (finding sp-4). Pre-existing.
+
+On Linux, conductor/setup.sh Step 5 calls install_launch_agent unconditionally (around :423). It writes ~/Library/LaunchAgents/com.agentdeck.conductor-bridge.plist, then `launchctl load` exits 127 and `set -e` stops the script. Step 6's Linux branch (install_ghw_systemd_units) is never reached, although conductor/gh-watcher/README.md says setup.sh installs agent-deck-gh-watcher.{service,timer} on Linux. The branch hardened and tested that systemd path through the function-level driver only.
+
+Possible fix: a `uname -s` guard on Step 5, or skip the bridge plist when launchctl is absent. This is a behaviour change John has not approved for this branch.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-fgm",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-02T17:33:37.066559Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
 * TODO [#D] Review the visualcheck 14-fork DIFF against its golden
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
@@ -183,7 +769,7 @@ In a golang:1.26 container (self-check.sh, FULL_TESTS=1), TestKillInternal_Disco
 :LABELS:   []
 :ISSUE_TYPE: bug
 :CREATED:  [2026-10-21 Wed 10:16]
-:MODIFIED: [2026-10-23 Fri 12:09]
+:MODIFIED: [2026-11-09 Mon 14:57]
 :CREATED_BY: johnw
 :SOURCE_REPO: agent-deck
 :SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
@@ -218,6 +804,45 @@ TestVisualCheckAgainstRealBinary (tools/visualcheck) fails in a golang:1.26 cont
     "author": "johnw",
     "text": "Decision 2026-10-23 (John): John judges the 14-fork 200x50 frame. An agent reruns visualcheck in the self-check container, ties the diff to a commit, and shows him the golden and actual frames side by side. TestVisualCheckAgainstRealBinary still fails in the full container suite at dc163e96.",
     "created_at": "2026-10-23T19:09:05Z"
+  },
+  {
+    "id": 46,
+    "issue_id": "agent-deck-h3v",
+    "author": "johnw",
+    "text": "2026-11-09, v1.16.38 rebase: tools/visualcheck's TestVisualCheckAgainstRealBinary passes in the golang:1.26.10 container (187 s). Upstream #3032 (45daab97) made a new Claude fork forkable at once through its transcript fallback and moved the 14-fork goldens, so the fork's frames now match upstream's. Closing is John's call.",
+    "created_at": "2026-11-09T22:57:41Z"
+  }
+]
+#+end_src
+
+* TODO [#D] conductor/setup.sh rewrites each profile's CLAUDE.md, keeping one CLAUDE.md.bak
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-j5d
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-01 Sun 02:36]
+:MODIFIED: [2026-11-01 Sun 02:36]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+conductor/setup.sh:191-197 (0953876e) copies an existing <profile>/CLAUDE.md to CLAUDE.md.bak, replacing any earlier .bak, then writes the template over it on every run. Same bug class as agent-deck-z8i; not fixed in that series.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-j5d",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-01T10:36:04.272532Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
   }
 ]
 #+end_src
@@ -312,6 +937,52 @@ Race suite on macOS/Nix reproduces these failures on unchanged HEAD in an isolat
 
 A session's last response was read from the Claude config dir the calling process resolves to, not the one the session resolves to. getClaudeLastResponse resolved the transcript under the process-wide GetClaudeConfigDir(), and findLatestClaudeTranscriptOnDisk, the rollover scan behind it, scanned the same dir; both ignored the account, conductor and group levels that GetJSONLPath has walked since #2769 and that `session send --wait` uses. The conductor bridge runs under launchd without CLAUDE_CONFIG_DIR, so on Hera (2026-11-05) its `session output --json` of a steward in the conductor group, whose transcripts live under the Positron config dir, found no transcript, GetLastResponseBestEffort fell through to the pane capture, and the steward's status line was relayed as its reply. Fix: both readers resolve the instance's own config dir first and keep the process-wide dir as the fallback, exactly as GetJSONLPath does. Regression tests: TestGetClaudeLastResponse_ReadsTheInstanceConfigDir, TestGetClaudeLastResponse_KeepsTheProcessWideFallback, TestFindLatestClaudeTranscriptOnDisk_ScansTheInstanceConfigDir and TestFindLatestClaudeTranscriptOnDisk_KeepsTheProcessWideFallback (internal/session). nix-config's agent-deck runtime-lifecycle check runs them by name.
 
+* TODO [#D] Extend the service-manager test guard beyond internal/session
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-muu
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-11-01 Sun 13:45]
+:MODIFIED: [2026-11-03 Tue 14:27]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found during Task 2 of the conductor-setup-safe-reinstall plan (commit e8bc1a27 on work/conductor-setup-fix). That commit guards launchctl/systemctl only inside internal/session: serviceManagerCommand panics in a test binary when a mutating verb would reach a tool outside os.TempDir(). Three sibling call paths are not covered: (1) internal/update (launchd.go, timer.go, timer_ensure.go) runs launchctl bootout/bootstrap and systemctl --user enable/disable/daemon-reload through its own Runner seam, protected only by AutoUpdateSuppressed under go test; (2) internal/tmux/service_unit_ownership.go:361-362 runs systemctl --user stop and reset-failed through tmux's execCommand seam; (3) internal/triggers/store.go:168-170 returns systemctl --user start / launchctl kickstart argv that its caller executes. A temp HOME does not isolate launchd or the systemd user manager, so a test reaching any of these acts on the live services. Also add the new guard to AGENTS.md's 'What guards the code if a test still runs somewhere it should not' list.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-muu",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-01T21:45:31.891817Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 42,
+    "issue_id": "agent-deck-muu",
+    "author": "johnw",
+    "text": "2026-11-03, fork-conductor-setup cleanup (John asked for the session, its worktree and its branch to be removed): e8bc1a27 was the local pre-amend Task 2 commit. Once work/conductor-setup-fix and its worktree are gone, no ref reaches it, so gc will eventually prune it. The guard it describes landed, extended by review fixes, as 9a215897 (in b29bc5a4's history; b29bc5a4 = fa2dba28^2) and, after nix's rebase onto v1.16.36, as 3919e895 on main. Read the issue's \"commit e8bc1a27\" as 3919e895. The original is kept as a patch, with its full hash on the From line: /Users/johnw/Products/agent-deck-conductor-setup-fix/cleanup/orphan-commits/e8bc1a275402c13cbc312137cb74e89db61233aa.patch\n",
+    "created_at": "2026-11-03T22:27:53Z"
+  }
+]
+#+end_src
+
 * DONE [#B] Bound tmux viewer queries and status mouse bindings
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
@@ -344,6 +1015,98 @@ Athena tmux 3.6a blocked in readv on a stale Eternal Terminal PTY. CLI viewer qu
 ]
 #+end_src
 
+* DONE [#D] WATCHDOG.md's launchd plist sets no ProcessType; a tmux server the watchdog bootstraps runs with launchd limits
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-oug
+:LABELS:   []
+:ISSUE_TYPE: question
+:CREATED:  [2026-11-02 Mon 16:07]
+:MODIFIED: [2026-11-02 Mon 22:45]
+:CREATED_BY: johnw
+:FINISHED: [2026-11-02 Mon 22:45]
+:CLOSE_REASON: John (2026-11-02, /decide): add it. Done on work/conductor-setup-fix as b29bc5a4 (docs-only: ProcessType Interactive plus a comment in WATCHDOG.md's launchd snippet; plutil -lint OK).
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+documentation/WATCHDOG.md:120-137 gives macOS users a launchd plist for com.agentdeck.watchdog (RunAtLoad, KeepAlive) that sets neither ProcessType nor LowPriorityIO. An unset ProcessType gets launchd's light resource limits (launchd.plist(5)). The watchdog's _restart_or_start (scripts/watchdog/watchdog.py:745-774) falls back to `agent-deck session start` when tmux was fully dead ("tmux bootstrap"), so after a tmux crash this job starts the default tmux server, and by Task 15's premise (agent-deck-8tz) every session on that server inherits the job's limits.
+
+Found by the Tasks 15-16 review (t15-2, confirmed). Task 15 changed exactly the four sites John chose on 2026-11-02 (bridge and heartbeat templates, setup.sh's bridge plist, gh-watcher; notifier unchanged), so this sibling was left for John's call: add `<key>ProcessType</key> <string>Interactive</string>` to the snippet, or leave it. AGENTS.md rule 1: listed in the PR notes.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-oug",
+    "depends_on_id": "agent-deck-8tz",
+    "type": "discovered-from",
+    "created_at": "2026-11-03T00:07:53.098683Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#D] setup.sh overwrites the gh-watcher runtime files (scripts, classes.json, schema.sql, README.md) on every run
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-pbv
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-02 Mon 09:33]
+:MODIFIED: [2026-11-02 Mon 09:33]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found by the final whole-branch review of work/conductor-setup-fix (finding sp-2). Pre-existing; a sibling of agent-deck-9gc and agent-deck-j5d.
+
+With [conductor.github_watcher] enabled = true, conductor/setup.sh (Step 6, around :441-443) copies the checkout's gh-watcher scripts/*, schema.sql, classes.json and README.md over <conductor>/gh-watcher on every run. There is no ownership check and no backup; only watcher.toml is kept. This runs even when the gh-watcher launch agent is external and install_launch_agent skips it. gh-watcher/README.md and docs/WATCHER-SETUP.md tell users to re-run setup.sh, so a tuned classes.json or a patched tick.sh is lost silently.
+
+Possible fix: the same stamp-or-identical rule as bridge.py, or keep-if-different with a [skip] line.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-pbv",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-02T17:33:36.940437Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#D] Resolve the tmux socket from the final argv when [tmux.binaries] rewrites an empty socket
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-pc9
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-09 Mon 14:57]
+:MODIFIED: [2026-11-09 Mon 14:57]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found in the v1.16.38 rebase review (2026-11-09). Upstream 7d13e4e6 (#3045) makes tmuxArgs (internal/tmux/socket.go) turn an empty socket into -L default when $TMUX names a socket listed in [tmux.binaries]. Three readers still resolve the pre-rewrite argv:
+- the spawn guard assertTmuxSpawnIsolated (socket.go, default_socket_guard.go, including the fork's marker path) believes the spawn goes to $TMUX's server;
+- the orphan sweep isLiveTmuxClientOrServer (pipemanager.go) confirms a candidate on $TMUX's socket, then asks the default server whether the pid is a live client;
+- emptySocketResolvesAwayFromDefault (foreign_server.go) still reports foreign, so a stop or delete from such a pane is refused (safe but misleading) when the default socket file is missing.
+Only matters with [tmux.binaries] configured and $TMUX naming a listed socket. Fix: guard and sweep with tmuxArgs(socketName, args...); make the foreign-server check false when tmuxEnvNamesConfiguredSocket is true.
+
 * DONE [#C] Reconcile a Codex submission that the running turn took up
 :PROPERTIES:
 :OBR_SCHEMA_VERSION: 17
@@ -371,6 +1134,38 @@ A Codex send that lands while a turn runs starts no turn: Codex records the inpu
     "author": "johnw",
     "text": "Upstream now carries this fix: c7aa23a2 (fix(codex): reconcile a send the running turn took up (#2836) (#2877)), first released in v1.16.33 and written from eba2e06d with John credited as co-author. The rebase onto v1.16.34 dropped eba2e06d as superseded. The regression tests are upstream's TestIssue2836CodexSendTakenUpMidTurnReconciles (cmd/agent-deck) and TestIssue2836CodexTurnTookInputSince, TestIssue2836CodexTurnTookInputFailsClosedPastScanWindow, TestIssue2836ReconcileClearsOnlyWithMidTurnInput and TestIssue2836MarkerWithoutTurnNeverAsksForInput (internal/session); a consumer that ran this fork's TestCodexTurnTookInputSince, TestCodexSubmissionMarker or TestCodexAcceptanceGuardReconcilesInputTheRunningTurnTookUp by name must switch to them.",
     "created_at": "2026-10-28T04:50:16Z"
+  }
+]
+#+end_src
+
+* TODO [#D] internal/update tests run the real gh CLI to resolve a GitHub token
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-qot
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-01 Sun 17:16]
+:MODIFIED: [2026-11-01 Sun 17:16]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found during Task 5 of the conductor-setup-safe-reinstall plan. internal/update's resolveGitHubToken (update.go:229-244) falls back to exec.Command("gh", "auth", "token", "--hostname", "github.com") whenever GITHUB_TOKEN and GH_TOKEN are unset and gh is on PATH. scripts/test.sh passes the caller's PATH through, so a package run on a developer machine runs the real gh, which can read the developer's real credential from the OS keyring even under a temporary HOME, and githubAPIGetConditional (update.go:262) then sends it as an Authorization header to whatever URL the test points at. Only the two resolveGitHubToken tests (update_test.go:726-757) put a fake gh on PATH. Put the gh lookup behind a seam (or refuse it under testing.Testing()) and make the package's TestMain set one, so no test can reach a real credential.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-qot",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-02T01:16:26.755766Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
   }
 ]
 #+end_src
@@ -466,6 +1261,467 @@ Integrate upstream v1.16.39 while preserving fork runtime authority and service 
     "author": "johnw",
     "text": "Refocus 2026-11-17T06:40:24Z: only the two authorized remaining CLI fixtures changed (nine insertions, one deletion), no production changes. Notifier sweep runs real CLI subprocess so asynchronous bus writers cannot outlive fixture lifetime; 30 race-enabled repetitions pass with all sweep/survivor assertions intact. Fork context bisected to TestCustomCommandExitCLI followed by launch-record fixture: fake Pi never executed on shared tmux context. Existing nested IsolateTmuxSocket helper gives fork fixture its own HOME/PATH server lifetime; exact formerly failing pair passes ten race-enabled repetitions. Largest known failing predecessor context (896 tests plus target) now passes on final code. Temporary diagnostics removed; formatting clean. Next: signed test-only follow-up and mandatory protected Docker publication gate; no Nix work before publication. Next refocus due 2026-11-17T07:40:24Z.",
     "created_at": "2026-11-17T06:40:24Z"
+  }
+]
+#+end_src
+
+* TODO [#D] test_discord_typing_best_effort.py fails on 0953876e under Python 3.14
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-rke
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-01 Sun 02:36]
+:MODIFIED: [2026-11-01 Sun 02:36]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+internal/session/test_discord_typing_best_effort.py::TestDiscordTypingBestEffort::test_typing_failure_does_not_abort_reply_path fails with: no logs of level WARNING or higher triggered on conductor-bridge (1 failed, 1 passed; nixpkgs python3 3.14 env with pytest, isolated HOME and AGENT_DECK_CONDUCTOR_DIR; checked 2026-11-01 at 6333ffde, whose bridge equals 0953876e's). A planning subagent's diagnostic run showed the typing task cancelled before its first step. Pre-existing; not caused by agent-deck-z8i.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-rke",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-01T10:36:04.557532Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* TODO [#D] TestIssue1873_ChildThatDetachesBeforeAttributionIsNeverClaimed fails intermittently in the self-check container
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-sen
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-02 Mon 17:53]
+:MODIFIED: [2026-11-03 Tue 14:27]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+In the self-check container (golang:1.26, Go 1.26.10, linux/arm64, 8 CPUs; host load about 100 on 32 cores), this test fails intermittently when run alone:
+
+    go test -count=1 -v -run '^TestIssue1873_ChildThatDetachesBeforeAttributionIsNeverClaimed$' ./internal/session/
+
+It failed 1 of 5 runs at 3885df52 (work/conductor-setup-fix) and 2 of 5 at main 0953876e. It also failed once inside a whole-package run at 3885df52. The error:
+
+    start completed for <id> but runtime generation persistence failed: stamp runtime generation 1: stamp <AGENTDECK_RUNTIME_* or runtime cleanup identity>: exit status 1[: no such session: agentdeck_test-1873-unattributable_<id>]
+
+The test's tmux session is gone before the stamp. The final verification of work/conductor-setup-fix found it; that branch touches neither the test (issue1873_ownership_receipt_test.go) nor restart_result.go or runtime_transition.go.
+
+Logs: ~/Products/agent-deck-conductor-setup-fix/logs/final-selfcheck-rerun-1873-{head,base}.log and final-selfcheck-rerun2-session-head.log.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-sen",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-03T01:53:17.091282Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 45,
+    "issue_id": "agent-deck-sen",
+    "author": "johnw",
+    "text": "2026-11-03, fork-conductor-setup cleanup: the session has ended at John's request. Its workspace /Users/johnw/Products/agent-deck-conductor-setup-fix was trimmed from 713 MB to 12 MB. Every file this issue cites was kept, along with the scripts that produced those files (the list is cleanup/keep.txt in that directory). Nothing else depends on the directory: delete it once agent-deck-cmg, -vmg, -sen and -muu are closed.\n",
+    "created_at": "2026-11-03T22:27:54Z"
+  }
+]
+#+end_src
+
+* DOING [#C] Full suite on dd9762bc fails TestSessionSendSocketWaitPeerReply/late-turn and the visual attach-shell frame
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-tq5
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-17 Tue 00:38]
+:MODIFIED: [2026-11-17 Tue 00:38]
+:CREATED_BY: johnw
+:SOURCE_REPO: .
+:ORIGINAL_SIZE: 0
+:END:
+
+The last full Docker pre-push run on dd9762bc (v1.16.39 merge, 2026-11-16 23:16 PST, image agentdeck-ci:go1.26.11-tmux3.8, GOFLAGS=-p=2) failed two tests: the socket peer-reply late-turn subtest and the visualcheck attach-shell frame, which captured a migration warning instead of the shell prompt. dd9762bc was published with the hook's test step skipped by John's choice. Candidate fixture fixes for both exist but no run has verified them. John, 2026-11-17: find the root cause of each and fix it properly.
+
+* TODO [#D] self-check.sh gives each package go test's default 10m; internal/session needs about 11m in its container under load
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-vmg
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-02 Mon 17:53]
+:MODIFIED: [2026-11-03 Tue 14:27]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+skills/agent-deck/scripts/contributing/self-check.sh:144 runs `sandboxed go test $PKGS` with no -timeout, so go test's default of 10m applies to each package. CI's go-test.yml gives each shard -timeout 20m.
+
+In the self-check container (golang:1.26, 8 CPUs; host load about 100 on 32 cores), internal/session timed out at 600.4s in a FULL_TESTS=1 run at 3885df52, which fails sandboxed-tests. Rerun with -timeout 20m, it took 647-677s at 3885df52 and 648-677s at main 0953876e. The package runs nearly serially (7 parallel tests); its slowest tests are tmux tests of 30-45s each.
+
+So the gate's verdict on internal/session depends on the machine's load, not on the code. Options: pass -timeout 20m as CI does, or report a package timeout as such rather than as a test failure.
+
+Logs: ~/Products/agent-deck-conductor-setup-fix/logs/final-selfcheck-docker.log and final-selfcheck-rerun{,2}-session-{head,base}.log.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-vmg",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-03T01:53:19.597707Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 44,
+    "issue_id": "agent-deck-vmg",
+    "author": "johnw",
+    "text": "2026-11-03, fork-conductor-setup cleanup: the session has ended at John's request. Its workspace /Users/johnw/Products/agent-deck-conductor-setup-fix was trimmed from 713 MB to 12 MB. Every file this issue cites was kept, along with the scripts that produced those files (the list is cleanup/keep.txt in that directory). Nothing else depends on the directory: delete it once agent-deck-cmg, -vmg, -sen and -muu are closed.\n",
+    "created_at": "2026-11-03T22:27:54Z"
+  }
+]
+#+end_src
+
+* TODO [#D] Removing a never-started session fails when no tmux server runs
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-y7i
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-11-09 Mon 15:39]
+:MODIFIED: [2026-11-09 Mon 15:39]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Seen 2026-11-09 smoke-testing the v1.16.38 Nix build, under an isolated HOME and TMUX_TMPDIR. After 'agent-deck add -t smoke -c bash <dir>', with no tmux server running, 'agent-deck remove smoke' fails with 'failed to remove selected runtime: tmux: snapshot runtime candidates: exit status 1', and the session stays listed. The installed 1.16.36 build (9e57638b) does the same, so the rebase did not cause it. The candidate snapshot fails closed on tmux's 'no server running' exit. A session whose durable runtime never started (generation 0, no tmux session ever stamped) cannot have a runtime to protect, so its removal need not snapshot candidates. A started session whose server is gone keeps the fail-closed answer.
+
+* TODO [#E] restart_result.go: pin the RestartCompleted errors.As contract at compile time
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-yq3
+:LABELS:   []
+:ISSUE_TYPE: task
+:CREATED:  [2026-11-02 Mon 13:58]
+:MODIFIED: [2026-11-02 Mon 13:58]
+:CREATED_BY: johnw
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+Found by the scoped re-review of the final fix wave on work/conductor-setup-fix (AGENTS.md rule 1: a sibling copy in another area).
+
+internal/session/restart_result.go:99 matches an anonymous `interface{ RestartCompleted() bool }` with errors.As, and nothing asserts at compile time that *RestartPartialSuccessError implements it. A rename on either side compiles and passes while the match silently stops working. The branch fixed the same shape for the kept-bridge contract by exporting update.BridgeKeptNotifier and adding a `var _` assertion (final review finding F5, commit d2060f2f). This one is in the restart area, unrelated to the branch.
+
+** Dependencies
+
+#+begin_src json
+[
+  {
+    "issue_id": "agent-deck-yq3",
+    "depends_on_id": "agent-deck-z8i",
+    "type": "discovered-from",
+    "created_at": "2026-11-02T21:58:01.607606Z",
+    "created_by": "johnw",
+    "metadata": "{}",
+    "thread_id": ""
+  }
+]
+#+end_src
+
+* DONE [#B] conductor setup: leave a customized bridge.py and externally managed launchd agents alone; carry the Discord Q&A hook
+:PROPERTIES:
+:OBR_SCHEMA_VERSION: 17
+:ID:       agent-deck-z8i
+:LABELS:   []
+:ISSUE_TYPE: bug
+:CREATED:  [2026-10-31 Sat 21:34]
+:MODIFIED: [2026-11-02 Mon 20:05]
+:CREATED_BY: johnw
+:FINISHED: [2026-11-02 Mon 20:05]
+:CLOSE_REASON: Fixed on work/conductor-setup-fix at 3885df52, verified on darwin and in Docker (sdd/final-verify-*-report.md in ~/Products/agent-deck-conductor-setup-fix); push, nix pin bump and hera activation remain with John and the nix and pi sessions
+:SOURCE_REPO: agent-deck
+:SOURCE_REPO_PATH: /Users/johnw/src/fork/agent-deck
+:ORIGINAL_SIZE: 0
+:END:
+
+John's decision 21 (2026-10-31): plan only, build after approval. Verified: InstallBridgeScript overwrites bridge.py unconditionally (setup, migrate-dir; update with .backup); installBridgeDaemonLaunchd and installTransitionNotifierLaunchd run launchctl unload before os.WriteFile, which fails on hera's 0444 home-manager plists, leaving both agents unloaded; the notifier step runs even with no chat channel configured (guarded only in the Background domain). Acceptance: conductor setup steward-probe -agent claude -no-heartbeat on a copy of the conductor dir leaves bridge.py byte-identical and both agents loaded; teardown steward-probe --remove cleans up. Also: fold the Q&A hook (route_question, on_interaction qna: buttons, reply routing) into the embedded bridge.
+
+** Comments
+
+#+begin_src json
+[
+  {
+    "id": 6,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Handoff: mailbox name fork-conductor-setup (watcher: agent-mail watch --parent). Phase: brainstorming; claims verified 2026-10-31 ~21:45 PDT; next: ask John Q1-Q5 (bridge rule, plist rule, Q&A hook shape, fork vs upstream, acceptance method). PLAN.org: memory says local-only, but the repo tracks it since 2026-10-28; not committing it until John says.",
+    "created_at": "2026-11-01T04:34:42Z"
+  },
+  {
+    "id": 7,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "John Q1 (2026-10-31): bridge.py rule = stamp what we wrote (hidden sha256 stamp; replace only when missing or matching its stamp; setup, update, migrate-dir).",
+    "created_at": "2026-11-01T04:48:02Z"
+  },
+  {
+    "id": 8,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "John Q2 (2026-10-31): plists/units that are read-only or symlinks are external: never unload, rewrite, reload or remove them; print [skip] managed externally. My additions stated in the question: no unload before the replacement is known writable; no-op when the plist already matches.",
+    "created_at": "2026-11-01T04:48:31Z"
+  },
+  {
+    "id": 9,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "John Q3 (2026-10-31): fork only; both parts are fork commits carried in the rebase series; no upstream PR planned (no PR body, self-check PR gates or repro report required).",
+    "created_at": "2026-11-01T04:49:25Z"
+  },
+  {
+    "id": 10,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "John Q4 (2026-10-31): router path hard-coded <conductor dir>/director/discord_qna.py as on hera; inert when missing. John Q5: acceptance = sandbox (temp HOME under ~/Products, copies of config/conductor dir/plists, private TMUX_TMPDIR, launchctl shim refusing mutations) before and after the fix, then the steward plan's day-zero check as the live proof; no separate live run.",
+    "created_at": "2026-11-01T04:52:22Z"
+  },
+  {
+    "id": 11,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Handoff 2026-10-31 ~22:00 PDT: design written at docs/superpowers/specs/2026-10-31-conductor-setup-safe-reinstall-design.md (uncommitted); builder check running; nix mailed (pin bump heads-up; promised no change to main.go, version_capabilities.go, remote_channel.go). Next: sort builder questions, John's approval, commit design, mail mail-conductor, then writing-plans.",
+    "created_at": "2026-11-01T04:56:53Z"
+  },
+  {
+    "id": 12,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Handoff 2026-10-31 ~22:40 PDT: builder check done (5 questions, all settled as my calls, none for John). Design moved to docs/plans/2026-10-31-conductor-setup-safe-reinstall-design.md because .gitignore excludes docs/superpowers/ (repo convention: docs/plans/ holds committed design+plan pairs). Commit running under 'nix shell nixpkgs#go_1_26' (lefthook pre-commit needs go vet). Reference copies frozen at ~/Products/agent-deck-conductor-setup-fix/reference/. Session is in launchd Background domain: sandbox shim must answer managername=Aqua. Next: John's approval of the design, then mail mail-conductor, then writing-plans.",
+    "created_at": "2026-11-01T05:33:48Z"
+  },
+  {
+    "id": 13,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "John approved the design 2026-10-31 (6333ffde). mail-conductor mailed. Next: superpowers:writing-plans (Ultracode on: workflow fan-out for the plan).",
+    "created_at": "2026-11-01T06:08:57Z"
+  },
+  {
+    "id": 14,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Handoff 2026-10-31 ~23:10 PDT: writing-plans started; plan path docs/plans/2026-10-31-conductor-setup-safe-reinstall-plan.md. Understand workflow wf_01aa3683-d11 running (9 readers + critic); runner check (scripts/test.sh single test) running in background, log ~/Products/agent-deck-conductor-setup-fix/logs/runner-check.log.",
+    "created_at": "2026-11-01T06:13:32Z"
+  },
+  {
+    "id": 15,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Handoff 2026-11-01 ~00:30 PDT: map workflow done (10 agents; per-area files in ~/Products/agent-deck-conductor-setup-fix/map/). Contract with pinned interfaces at ~/Products/agent-deck-conductor-setup-fix/plan-work/contract.md (14 tasks). Draft+verify workflow wf_759db921-26a running. Verified commands: Go via 'nix shell nixpkgs#go_1_26 -c bash scripts/test.sh -race -count=1 -timeout 20m -run ...'; pytest via nix python3.withPackages [pytest toml] with HOME and AGENT_DECK_CONDUCTOR_DIR isolated (20 passed, live bridge.log untouched). Plan additions beyond the design (to flag to John): service-manager test guard; heartbeat.sh preservation (design said already safe; map disproved); config sanitizer replaces the Discord token (no secret copied).",
+    "created_at": "2026-11-01T07:46:25Z"
+  },
+  {
+    "id": 16,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Handoff 2026-11-01: draft+verify workflow done (29 agents; long sections in ~/Products/agent-deck-conductor-setup-fix/plan-work/sections/, critic.md). Decisions recorded in plan-work/revisions.md (G1-G7, T1-T14): no NFS fallback (pinned error); create path stays O_EXCL; fail-closed verb allow-list; removeSystemdUnits strictDisable; Docker available for Linux runs. Revise+check workflow wf_01d43654-5ee running; next: assemble plan at docs/plans/2026-10-31-conductor-setup-safe-reinstall-plan.md, self-review, commit, present to John.",
+    "created_at": "2026-11-01T09:12:13Z"
+  },
+  {
+    "id": 17,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Handoff 2026-11-01 ~02:50 PDT: revise+check workflow wf_01d43654-5ee done (29 agents). Plan assembled at docs/plans/2026-10-31-conductor-setup-safe-reinstall-plan.md (14 tasks, 1527 lines; commit running). Applied the consistency fixes (plist-modes format, teardown symlink line, byte-exact shell stamp compare, migrate-dir Lstat plus dangling subtest, launchd return convention, TestShell* names, helper signature) and my calls (a failed first write removes its partial file; setup.sh doc clause moved to Task 13; update guard assertion; Linux run covers Tasks 3-4). Filed discovered work: agent-deck-388, 9gc, j5d, rke, cm3. obr from the worktree resolves to the main checkout's .obr; obr create auto-exported docs/PLAN.org there at 02:36, so every obr write now uses --no-auto-flush. Next: John reviews the plan and picks the execution method.",
+    "created_at": "2026-11-01T10:42:32Z"
+  },
+  {
+    "id": 18,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "John approved the plan 2026-11-01 (328d1f17) and chose subagent-driven execution. mail-conductor mailed. Next: superpowers:subagent-driven-development over Tasks 1-14.",
+    "created_at": "2026-11-01T16:48:04Z"
+  },
+  {
+    "id": 19,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Sandbox before-run (Task 1): binary /nix/store/pfwwhcn8i3gmh0pqzk5d0cq816f2y0j1-agent-deck-1.16.34/bin/agent-deck; evidence ~/Products/agent-deck-conductor-setup-fix/acceptance/evidence-before. setup exit 0, teardown exit 0. Shim log: answered Aqua | managername; refused | unload /Users/johnw/Products/agent-deck-conductor-setup-fix/sandbox/home/Library/LaunchAgents/com.agentdeck.transition-notifier.plist. bridge.py 47e7629d26b1 -> cc3a785e11ab (overwritten). Plists 444 and unchanged; Warning: failed to install transition notifier daemon: failed to write notifier plist: open /Users/johnw/Products/agent-deck-conductor-setup-fix/sandbox/home/Library/LaunchAgents/com.agentdeck.transition-notifier.plist: permission denied. Pip: ⚠  Python dependencies install failed. Live agents: list rc 0 0 0 0 (bridge and notifier, before and after); print rc 0 0 0 0; live-unchanged yes. Setup also changed outside conductor/steward-probe/: ./.claude.json, ./.claude.json.agentdeck.lock, ./.config/claude/personal/.claude.json, ./.config/claude/personal/.claude.json.agentdeck.lock, ./.local/share/agent-deck/conductor/bridge.py, ./.local/share/agent-deck/locks/conductor-base.lock, ./.local/share/agent-deck/profiles/default/state.db, ./.local/share/agent-deck/profiles/default/state.db-shm, ./.local/share/agent-deck/profiles/default/state.db-wal. Router round trip on the unfixed tree: python exit 1; last stdout line: ; director unchanged; evidence in /Users/johnw/Products/agent-deck-conductor-setup-fix/acceptance/roundtrip-before. Verdict: differs: every design section 7 before-expectation holds (refused notifier unload and no load, bridge.py overwritten, pip block printed, both live agents loaded and unchanged), but the brief check grep -c Library/LaunchAgents setup.diff printed 2, not 0: both are diff -u context lines (the plist entries sort right after the added state.db-wal entry). No added or removed line names a plist, neither changed-paths file lists one, and both plist hashes are identical in snap0, snap1 and snap2 and equal the live ones. The record list also holds the two .claude.json files setup created (sandbox HOME and the claude config_dir) with their .agentdeck.lock siblings, which the brief did not anticipate; it holds no log or bus file (teardown wrote the bus files) and no shared CLAUDE.md.",
+    "created_at": "2026-11-01T17:05:23Z"
+  },
+  {
+    "id": 20,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Execution started 2026-11-01 (subagent-driven; ledger ~/Products/agent-deck-conductor-setup-fix/sdd/progress.md). Task 1 done by its implementer (before-run confirms the bug; live agents untouched); its review is running.",
+    "created_at": "2026-11-01T17:11:05Z"
+  },
+  {
+    "id": 21,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Sandbox before-run (Task 1), clarification after review: the before-run matches design section 7 before-expectations. The earlier verdict said differs only because the brief check grep -c Library/LaunchAgents setup.diff counted diff -u context lines; counting only added or removed hash lines that name ./Library/LaunchAgents/ gives 0. Harness hardened after review: the router round trip now runs with the shim-first PATH (sandbox bin, /usr/bin, /bin) and private TMUX_TMPDIR and TMPDIR, and copies the shim log into its OUTDIR; ENVI gains a private TMPDIR; the binary and the router run with the sandbox home as working directory; cleanup skips tmux sockets that are links, sit in linked directories or resolve outside the sandbox; a dangling /nix/store link must also have its first existing ancestor resolve into the store; the sanitizer removes its output on any exception. Both before runs were repeated with the hardened harness; the first evidence is kept as evidence-before.r0 and roundtrip-before.r0. New run: setup exit 0, teardown exit 0. Shim log: answered Aqua | managername; refused | unload /Users/johnw/Products/agent-deck-conductor-setup-fix/sandbox/home/Library/LaunchAgents/com.agentdeck.transition-notifier.plist. bridge.py 47e7629d26b1 -> cc3a785e11ab (overwritten). Plists 444 at every snapshot; changed LaunchAgents lines 0. Live agents: list rc 0 0 0 0, print rc 0 0 0 0; live-unchanged yes. Round trip on the unfixed tree: python exit 1; last stdout line: ; director unchanged; evidence in /Users/johnw/Products/agent-deck-conductor-setup-fix/acceptance/roundtrip-before; its launchctl.log is empty. Apart from the per-run session id in three teardown lock paths, the new evidence matches the r0 evidence.",
+    "created_at": "2026-11-01T17:38:35Z"
+  },
+  {
+    "id": 22,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 1 complete (harness hardened in fix round 1; before runs repeated; review clean). Task 2 dispatched from 328d1f17.",
+    "created_at": "2026-11-01T18:41:03Z"
+  },
+  {
+    "id": 23,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 2 implemented (e8bc1a27, service-manager seams + test-binary guard), under opus review. internal/session full run is red on hera with or without the change (pre-existing tmux pane-pid failures and leaking tests); per-test protocol shows no regression. cmd/agent-deck full run in progress as a controller check. Siblings filed as agent-deck-muu.",
+    "created_at": "2026-11-01T21:45:42Z"
+  },
+  {
+    "id": 24,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 2 complete: 9a215897 (amended from e8bc1a27 over three fix rounds: pre-verb option rule in the classifier, guarded branch runs the resolved binary, a test per seam closure, accurate commit body and comments). cmd/agent-deck full run: guard never fired; two load flakes pass alone at base and here. Task 3 dispatched from 9a215897.",
+    "created_at": "2026-11-01T22:48:01Z"
+  },
+  {
+    "id": 25,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 3 complete: b5ea2891 (replaceGeneratedFile: predicate, outcome, displaced copy; plus partial-create removal with joined error and race-row tests). Discovered: agent-deck-32z (O_EXCL siblings leave partial files), agent-deck-4sw (tests print production stderr). Task 4 (bridge.py stamp ownership) dispatched from b5ea2891.",
+    "created_at": "2026-11-01T23:45:37Z"
+  },
+  {
+    "id": 26,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Mailbox: fork-conductor-setup@hera; agent-mail now /nix/store/56vf5mhmnh25snx6sxpl8hnx0zisd3lm-agent-mail-2.0.0/bin/agent-mail (self-test 401 checks passed, 2026-11-01); no MCP tools in this session, so the CLI watcher (watch NAME --parent $PPID) delivers mail. Mail handled: mail-dev correction notice (join with /mailbox NAME at next restart), no reply needed.",
+    "created_at": "2026-11-01T23:54:28Z"
+  },
+  {
+    "id": 27,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 4 complete: 7e097cc1 (bridge.py replaced only while it matches .bridge.py.sha256; customized/unstamped/symlinked bridge kept; open-descriptor stamp read with FIFO pins). Task 5 (update honours a kept bridge) dispatched from 7e097cc1.",
+    "created_at": "2026-11-02T01:04:25Z"
+  },
+  {
+    "id": 28,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 5 complete: f591163f (update writes no bridge.py.backup; a kept bridge prints its notice and succeeds). Discovered: agent-deck-qot (internal/update tests can run the real gh auth token). Task 6 (launch-agent ownership: external plists untouched, safe replace/remove) dispatched from f591163f.",
+    "created_at": "2026-11-02T01:29:31Z"
+  },
+  {
+    "id": 29,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 6 complete: 520e5bcc (external launchd plists — symlink or unwritable — get no launchctl call and no write; owned plists replaced via temp with rollback; requireOwnedServiceFile). Task 7 (systemd units, same rule, plus BridgeDaemonExternal/HeartbeatDaemonExternal probes) dispatched from 520e5bcc.",
+    "created_at": "2026-11-02T02:39:39Z"
+  },
+  {
+    "id": 31,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 7 complete: df34b235 (external systemd units untouched; requireOwnedSystemdUnits; BridgeDaemonExternal/HeartbeatDaemonExternal probes). Discovered: agent-deck-78t (SystemdUserDir ignores XDG_CONFIG_HOME); update-timer systemd sibling noted on agent-deck-388. Task 8 (keep a custom heartbeat.sh) dispatched from df34b235.",
+    "created_at": "2026-11-02T03:38:45Z"
+  },
+  {
+    "id": 32,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 8 complete: 6fa9126c (a heartbeat.sh without the managed markers is kept by setup and migrate-dir). Task 9 (conductor setup wiring: kept bridge, external agents, [skip] lines, --json bridge_script/external, docs) dispatched from 6fa9126c.",
+    "created_at": "2026-11-02T04:02:58Z"
+  },
+  {
+    "id": 33,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 9 complete: 6455c80e (conductor setup keeps a kept bridge.py, leaves external agents alone with [skip] lines, skips pip for an external bridge; --json bridge_script/external; docs). Task 10 (teardown wiring) dispatched from 6455c80e.",
+    "created_at": "2026-11-02T05:12:05Z"
+  },
+  {
+    "id": 34,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 10 complete: 8a523703 (teardown: [skip] for external bridge/notifier, warnings on failed stops, external heartbeat turned off in meta without failing, --all --remove deletes bridge.py only when owned). Task 11 (migrate-dir refuses to strand an external agent, carries the stamp) dispatched from 8a523703.",
+    "created_at": "2026-11-02T06:16:16Z"
+  },
+  {
+    "id": 35,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 11 complete: ac97ef8f (migrate-dir refuses a move that would strand an external bridge/heartbeat agent; stamp carried; [skip] at reload; bridge_script in --json). Open question for John: the blocker's remedy text cannot clear the blocker while the agent stays external (rule safe, UX trap). Task 12 (Discord Q&A hook in the embedded bridge) dispatched from ac97ef8f.",
+    "created_at": "2026-11-02T07:42:28Z"
+  },
+  {
+    "id": 36,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 12 complete: b7d6c152 (Discord Q&A hook in the embedded bridge; router not shipped; PYTEST 44 passed, 1 skipped — Task 14 must expect 44, not the plan's 43). Task 13 (conductor/setup.sh and teardown.sh: stamp, external plists/units, owned-bridge removal) dispatched from b7d6c152.",
+    "created_at": "2026-11-02T08:22:17Z"
+  },
+  {
+    "id": 37,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 13 complete: f2163046 fix(conductor): keep custom bridges and external service files in setup.sh and teardown.sh (opus bash-reviewer approved; two fix rounds: SIGPIPE-safe `launchctl list | grep -F -- label >/dev/null` reload probe with a >128 KiB list row, canonical-bridge guard and temp-file cleanup, stdin hashing in both scripts, three safety rows, a root-free staging-failure row). ./conductor/ ok, 12 tests / 39 subtests, also with a BSD-only PATH; lint 0 issues. Next: Task 14 (final verification, Linux Docker runs, sandbox after-run, router round trip).\n",
+    "created_at": "2026-11-02T16:48:26Z"
+  },
+  {
+    "id": 38,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Task 14 final verification of work/conductor-setup-fix at f2163046 (base 0953876e; nothing committed or pushed). Step 1: 14 commits (design 6333ffde, plan 328d1f17, one per Task 2-13), none touching the nix-patched files, go.mod/go.sum, Makefile, CHANGELOG.md, .github, the goldens or docs/PLAN.org; TestRuntimeLifecycle_ names unchanged; writeVersionJSON/errRemoteAgentUnsupported absent from *.go. Step 2: gofmt clean on the 23 changed Go files; go vet clean for darwin and for linux/amd64. Step 3: golangci-lint v2.14.0 \"0 issues.\" on the branch and on 0953876e, no new finding. Steps 4-5 (GOTEST-FULL, gh stub first on PATH): internal/update and conductor ok; internal/session and cmd/agent-deck red on hera for the pre-existing host reasons Task 2 recorded (tmux \"invalid binding candidate pane pid\", goroutines leaked by TestIssue953_KillSurvivesConcurrentUpdateStatus, and the same \"panic: close of closed channel\" in TestRuntimeLifecycle_ObservedFullInterleaving). Every failure was rerun alone at both trees: 3 pre-existing, failing at both (TestCodexAcceptance_ProjectInstructionsDeliveredWithIdentity, TestDeepSeekLifecycle_HeadlessRestartReplaysTask, TestStatusUpdatePass_UncachedLiveRowsCostOneListingPerSocket); 56 load-only, passing alone at both (including the crasher and cmd's TestDefect317_StopWithoutARaceSavesStopped); 10 skip alone at both (only the bootstrap tmux session exists). internal/session rerun at both trees with those tests skipped: branch 5085 pass/10 fail/28 skip, base 5036/10/28; the difference is exactly the series' 49 new session tests, all passing. No regression. Step 6: nix checkPhase gate \"runtime lifecycle tests passed\". Step 7: the overlay patch applies (git apply --check exit 0) and its five tests pass on the patched HEAD (cmd/agent-deck and internal/session ok). Step 8: pytest \"44 passed, 1 skipped\" (the skip is test_bridge_imports_on_python_38); test_discord_typing_best_effort.py \"1 failed, 1 passed\" at the branch and identically at 0953876e (test_typing_failure_does_not_abort_reply_path, nixpkgs Python 3.14.7; pre-existing, agent-deck-rke). Step 9: verify-docker gofmt, build, vet and lint OK, test (internal/update, conductor) OK, VERIFY_RC=0 both times; the Linux container (golang:1.26.10-bookworm, uid 10001, the series' tests by regex) ok for internal/session and cmd/agent-deck, with the FIFO stamp rows, the systemd probe rows, StopFailureKeepsEnabled, UnknownAgentDisablesAndPreservesMeta and the CLI setup, teardown and migrate-dir tests passing by name; ./conductor/ as root ok, three by-design root skips, \"no write bit\" passing. Step 10: binary built from the clean HEAD tree (main.Version 1.16.34, the series' strings present); its vcs stamp reads 0953876e/modified=true because go1.26.10 accepts only a .git directory as a git root and so stamped the main checkout, not this worktree. Steps 11-12: sandbox after-run setup exit 0, teardown exit 0; the launchctl shim logged no call at all (before: a refused unload of the notifier plist); bridge.py and both plists byte-identical and 0444 at every snapshot, no .bridge.py.sha256 or .previous written; the four [skip] lines present and none of the old pip, daemon or notifier lines; both live agents loaded before and after, with unchanged print results and hashes; setup changed nothing the unfixed binary did not change (Claude trust seed, state DB, conductor lock, steward-probe/), and teardown nothing outside agent-deck's own state. Step 13: the real router answered {\"handled\": false} and left director/ unchanged (before: AttributeError, no route_question). Evidence: ~/Products/agent-deck-conductor-setup-fix/{acceptance/evidence-before,acceptance/evidence-after,acceptance/evidence-roundtrip,logs} (logs/final-*).\n",
+    "created_at": "2026-11-02T19:15:13Z"
+  },
+  {
+    "id": 40,
+    "issue_id": "agent-deck-z8i",
+    "author": "johnw",
+    "text": "Scope added by John on 2026-11-02, in session fork-conductor-setup:\n(1) agent-deck-8tz: ProcessType Interactive with no LowPriorityIO, in the conductor's heartbeat and bridge plist templates, setup.sh's bridge plist and the gh-watcher plist.\n(2) Task 11 M2: migrate-dir's external-agent blocker text now says what clears it. The rule itself is unchanged.\nagent-deck-aqh stays as designed.\nBoth changes land as their own commits after the final review's fix wave, each with its own review.\n",
+    "created_at": "2026-11-02T21:26:58Z"
   }
 ]
 #+end_src
